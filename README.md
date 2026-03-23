@@ -10,7 +10,7 @@ This tool runs `claude --dangerously-skip-permissions` and exposes a `/run` comm
 
 - Python 3.11+
 - [Claude Code](https://claude.ai/code) installed and authenticated (`claude` on PATH)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- A Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather) on Telegram
 
 ## Install
 
@@ -45,6 +45,30 @@ link-project-to-chat start --project project-a
 link-project-to-chat start --project project-b
 ```
 
+## Example session
+
+```
+You: what does the auth module do?
+Claude: The auth module handles JWT token validation and...
+
+You: /run pytest tests/auth/ -x
+[+ #1 pytest | 4s | exit 0]
+
+Running 12 tests...
+12 passed in 3.81s
+
+You: add a test for expired token handling
+Claude: I'll add a test for that. [edits file]...
+
+You: /tasks
++ #1 [command] 4s pytest
++ #2 [claude] 12s add a test for expired token...
+```
+
+## How it works
+
+Claude messages and `/run` commands both execute in **parallel** — they don't block each other. Claude messages share the same session context, so responses build on each other even when sent concurrently.
+
 ## Commands
 
 | Command | Description |
@@ -69,6 +93,14 @@ link-project-to-chat start [--project NAME] [--path PATH] [--token TOKEN] [--mod
 ```
 
 Config is stored at `~/.link-project-to-chat/config.json`.
+
+## Planned features
+
+- **Discord support** — same interface over Discord instead of Telegram
+- **Voice commands** — transcribe voice messages via a speech-to-text service and forward as text prompts
+- **Other coding agents** — pluggable backend to support agents beyond Claude Code (e.g. Aider)
+
+Contributions welcome.
 
 ## License
 

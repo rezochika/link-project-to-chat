@@ -100,8 +100,6 @@ class TaskManager:
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._claude = ClaudeClient(model, project_path)
-        self._claude_queue: asyncio.Queue[Task] = asyncio.Queue()
-        self._claude_worker: asyncio.Task | None = None
 
     @property
     def claude(self) -> ClaudeClient:
@@ -118,8 +116,7 @@ class TaskManager:
         )
         self._next_id += 1
         self._tasks[task.id] = task
-        self._claude_queue.put_nowait(task)
-        self._ensure_claude_worker()
+        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
         return task
 
     def submit_compact(self, chat_id: int, message_id: int) -> Task:
@@ -134,8 +131,7 @@ class TaskManager:
         )
         self._next_id += 1
         self._tasks[task.id] = task
-        self._claude_queue.put_nowait(task)
-        self._ensure_claude_worker()
+        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
         return task
 
     def run_command(self, chat_id: int, message_id: int, command: str,
@@ -155,42 +151,34 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_command(task))
         return task
 
-    # -- Claude queue (sequential) --
+    # -- Claude execution (parallel) --
 
-    def _ensure_claude_worker(self) -> None:
-        if self._claude_worker is None or self._claude_worker.done():
-            self._claude_worker = asyncio.create_task(self._process_claude_queue())
-
-    async def _process_claude_queue(self) -> None:
-        while True:
-            task = await self._claude_queue.get()
-            if task.status == TaskStatus.CANCELLED:
-                self._claude_queue.task_done()
-                continue
-
-            task.status = TaskStatus.RUNNING
-            task.started_at = time.monotonic()
-
+    async def _exec_claude(self, task: Task) -> None:
+        task.status = TaskStatus.RUNNING
+        task.started_at = time.monotonic()
+        if not task._compact:
             await self._safe_callback(self._on_claude_started, task)
-
-            try:
-                if task._compact:
-                    task.result = await self._do_compact()
-                else:
-                    task.result = await self._claude.chat(task.input)
-                task.status = TaskStatus.DONE
-            except asyncio.CancelledError:
-                task.status = TaskStatus.CANCELLED
-            except Exception as e:
-                logger.exception("Claude task #%d failed", task.id)
-                task.status = TaskStatus.FAILED
-                task.error = str(e)
-            finally:
-                task.finished_at = time.monotonic()
-                self._claude_queue.task_done()
-
-            if task.status != TaskStatus.CANCELLED:
-                await self._safe_callback(self._on_complete, task)
+        try:
+            if task._compact:
+                task.result = await self._do_compact()
+            else:
+                task.result = await self._claude.chat(
+                    task.input,
+                    on_proc=lambda p: setattr(task, '_proc', p),
+                )
+            task.status = TaskStatus.DONE
+        except asyncio.CancelledError:
+            if task._proc and task._proc.poll() is None:
+                task._proc.kill()
+            task.status = TaskStatus.CANCELLED
+        except Exception as e:
+            logger.exception("Claude task #%d failed", task.id)
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+        finally:
+            task.finished_at = time.monotonic()
+        if task.status != TaskStatus.CANCELLED:
+            await self._safe_callback(self._on_complete, task)
 
     COMPACT_PROMPT = (
         "Summarize our entire conversation concisely. Include:\n"
@@ -289,18 +277,10 @@ class TaskManager:
         task = self._tasks.get(task_id)
         if not task:
             return False
-        if task.type == TaskType.CLAUDE and task.status == TaskStatus.RUNNING:
-            self._claude.cancel()
         return task.cancel()
 
     def cancel_all(self) -> int:
-        count = 0
-        for task in list(self._tasks.values()):
-            if task.type == TaskType.CLAUDE and task.status == TaskStatus.RUNNING:
-                self._claude.cancel()
-            if task.cancel():
-                count += 1
-        return count
+        return sum(1 for t in list(self._tasks.values()) if t.cancel())
 
     @property
     def running_count(self) -> int:

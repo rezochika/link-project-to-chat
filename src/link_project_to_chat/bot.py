@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 COMMANDS = [
     ("run", "Run a background command"),
-    ("tasks", "List tasks"),
+    ("tasks", "List all tasks"),
     ("log", "Show task output"),
     ("cancel", "Cancel a task"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
@@ -82,7 +82,7 @@ class ProjectBot:
             output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
             if len(output) > 3000:
                 output = output[:3000] + "\n... (truncated, use /log)"
-            await self._send_to_chat(task.chat_id, f"{header}\n\n{output}")
+            await self._send_raw(task.chat_id, f"{header}\n\n{output}")
 
     # -- Command handlers --
 
@@ -128,15 +128,11 @@ class ProjectBot:
         )
 
     async def _on_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """/tasks [all] - list active tasks (or all with 'all')."""
         if not self._auth(update.effective_user):
             return
-        show_all = ctx.args and ctx.args[0].lower() == "all"
         tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
-        if not show_all:
-            tasks = [t for t in tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
         if not tasks:
-            return await update.effective_message.reply_text("No active tasks.")
+            return await update.effective_message.reply_text("No tasks.")
 
         icons = {
             TaskStatus.WAITING: "~",
@@ -188,7 +184,8 @@ class ProjectBot:
         elif task.status == TaskStatus.WAITING:
             lines.append("\nWaiting...")
 
-        await self._send_to_chat(
+        send = self._send_to_chat if task.type == TaskType.CLAUDE else self._send_raw
+        await send(
             update.effective_chat.id, "\n".join(lines),
             reply_to=update.effective_message.message_id,
         )
@@ -277,19 +274,39 @@ class ProjectBot:
 
     async def _send_to_chat(self, chat_id: int, text: str,
                             reply_to: int | None = None) -> None:
+        """Send Claude markdown output — converts to Telegram HTML."""
         text = text or "[No output]"
-        html = md_to_telegram(text)
+        html = md_to_telegram(text).replace("\x00", "")
         for chunk in split_html(html):
             try:
                 await self._app.bot.send_message(
                     chat_id, chunk, parse_mode="HTML",
                     reply_to_message_id=reply_to)
             except Exception:
-                logger.debug("HTML send failed, falling back to plain", exc_info=True)
-                plain = strip_html(chunk)
+                logger.warning("HTML send failed, falling back to plain", exc_info=True)
+                plain = strip_html(chunk).replace("\x00", "")
+                if plain.strip():
+                    await self._app.bot.send_message(
+                        chat_id, plain[:4096] if len(plain) > 4096 else plain,
+                        reply_to_message_id=reply_to)
+
+    async def _send_raw(self, chat_id: int, text: str,
+                        reply_to: int | None = None) -> None:
+        """Send raw shell output — wraps in <pre>, no markdown processing."""
+        text = text or "[No output]"
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        html = f"<pre>{escaped}</pre>"
+        for chunk in split_html(html):
+            try:
                 await self._app.bot.send_message(
-                    chat_id, plain[:4096] if len(plain) > 4096 else plain,
+                    chat_id, chunk, parse_mode="HTML",
                     reply_to_message_id=reply_to)
+            except Exception:
+                logger.warning("Raw send failed, falling back to plain", exc_info=True)
+                if text.strip():
+                    await self._app.bot.send_message(
+                        chat_id, text[:4096] if len(text) > 4096 else text,
+                        reply_to_message_id=reply_to)
 
     @staticmethod
     async def _keep_typing(chat) -> None:

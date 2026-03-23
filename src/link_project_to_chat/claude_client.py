@@ -25,7 +25,7 @@ class ClaudeClient:
         self._last_duration: float | None = None
         self._total_requests: int = 0
 
-    async def chat(self, user_message: str) -> str:
+    async def chat(self, user_message: str, on_proc=None) -> str:
         cmd = [
             "claude", "-p",
             "--model", self.model,
@@ -57,6 +57,8 @@ class ClaudeClient:
             env=env,
         )
         self._proc = proc
+        if on_proc:
+            on_proc(proc)
         logger.info("claude subprocess started pid=%s", proc.pid)
 
         try:
