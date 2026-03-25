@@ -84,12 +84,13 @@ class ProjectBot:
                 text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
         else:
-            icon = "+" if task.status == TaskStatus.DONE else "!"
-            header = f"[{icon} #{task.id} {task.name} | {task.elapsed_human} | exit {task.exit_code}]"
             output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
             if len(output) > 3000:
                 output = output[:3000] + "\n... (truncated, use /log)"
-            await self._send_raw(task.chat_id, f"{header}\n\n{output}")
+            if task.status != TaskStatus.DONE:
+                await self._send_raw(task.chat_id, f"[exit {task.exit_code}]\n\n{output}")
+            else:
+                await self._send_raw(task.chat_id, output)
 
     # -- Command handlers --
 
@@ -98,7 +99,7 @@ class ProjectBot:
             return await update.effective_message.reply_text("Unauthorized.")
         cmd_list = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
         await update.effective_message.reply_text(
-            f"Project: {self.name}\nPath: {self.path}\nModel: {self.model}\n\n"
+            f"Project: {self.name}\nPath: {self.path}\n\n"
             f"Send a message to chat with Claude.\n{cmd_list}"
         )
 
