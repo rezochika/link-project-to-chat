@@ -117,10 +117,13 @@ class ProjectBot:
             if typing:
                 typing.cancel()
 
+        prompt = msg.text
+        if msg.reply_to_message and msg.reply_to_message.text:
+            prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
         self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
-            prompt=msg.text,
+            prompt=prompt,
         )
 
     async def _on_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
