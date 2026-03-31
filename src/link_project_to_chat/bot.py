@@ -48,7 +48,7 @@ class ProjectBot:
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
-            on_claude_started=self._on_claude_started,
+            on_task_started=self._on_task_started,
         )
 
     def _auth(self, user) -> bool:
@@ -66,7 +66,7 @@ class ProjectBot:
 
     # -- Task callbacks --
 
-    async def _on_claude_started(self, task: Task) -> None:
+    async def _on_task_started(self, task: Task) -> None:
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
@@ -205,27 +205,38 @@ class ProjectBot:
         if not self._auth(update.effective_user):
             return
 
+        def stop_typing(task_id: int) -> None:
+            typing = self._typing_tasks.pop(task_id, None)
+            if typing:
+                typing.cancel()
+
         if not ctx.args:
             tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
             running = [t for t in tasks if t.status == TaskStatus.RUNNING]
             if running:
                 t = running[0]
                 self.task_manager.cancel(t.id)
+                stop_typing(t.id)
                 return await update.effective_message.reply_text(f"#{t.id} cancelled.")
             return await update.effective_message.reply_text("Nothing running.")
 
         arg = ctx.args[0].lower()
         if arg == "all":
+            ids = [t.id for t in self.task_manager.list_tasks(chat_id=update.effective_chat.id)]
             count = self.task_manager.cancel_all()
+            for tid in ids:
+                stop_typing(tid)
             msg = f"Cancelled {count} task(s)." if count else "Nothing to cancel."
         else:
             try:
                 task_id = int(arg)
             except ValueError:
                 return await update.effective_message.reply_text("Usage: /cancel [id|all]")
-            msg = (f"#{task_id} cancelled."
-                   if self.task_manager.cancel(task_id)
-                   else f"#{task_id} not found or already finished.")
+            if self.task_manager.cancel(task_id):
+                stop_typing(task_id)
+                msg = f"#{task_id} cancelled."
+            else:
+                msg = f"#{task_id} not found or already finished."
         await update.effective_message.reply_text(msg)
 
     async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,7 +283,7 @@ class ProjectBot:
         lines = [
             f"Project: {self.name}",
             f"Path: {self.path}",
-            f"Model: {self.model}",
+            f"Model: {self.task_manager.claude.model}",
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st['session_id'] or 'none'}",
             f"Claude: {'RUNNING' if st['running'] else 'idle'}",

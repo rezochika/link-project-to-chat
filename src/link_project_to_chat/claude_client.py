@@ -40,7 +40,7 @@ class ClaudeClient:
         if self.session_id:
             cmd.extend(["--resume", self.session_id])
 
-        cmd.append(user_message)
+        cmd.extend(["--", user_message])
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)

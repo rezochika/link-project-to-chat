@@ -93,10 +93,10 @@ OnTaskEvent = Callable[[Task], Awaitable[None]]
 
 class TaskManager:
     def __init__(self, project_path: Path,
-                 on_complete: OnTaskEvent, on_claude_started: OnTaskEvent):
+                 on_complete: OnTaskEvent, on_task_started: OnTaskEvent):
         self.project_path = project_path
         self._on_complete = on_complete
-        self._on_claude_started = on_claude_started
+        self._on_task_started = on_task_started
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._claude = ClaudeClient(project_path)
@@ -156,8 +156,7 @@ class TaskManager:
     async def _exec_claude(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.started_at = time.monotonic()
-        if not task._compact:
-            await self._safe_callback(self._on_claude_started, task)
+        await self._safe_callback(self._on_task_started, task)
         try:
             if task._compact:
                 task.result = await self._do_compact()
@@ -202,6 +201,7 @@ class TaskManager:
     # -- Command execution (parallel) --
 
     async def _exec_command(self, task: Task) -> None:
+        await self._safe_callback(self._on_task_started, task)
         proc = subprocess.Popen(
             task.input, shell=True,
             cwd=str(self.project_path),
