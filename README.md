@@ -57,8 +57,6 @@ You: what does the auth module do?
 Claude: The auth module handles JWT token validation and...
 
 You: /run pytest tests/auth/ -x
-[+ #1 pytest | 4s | exit 0]
-
 Running 12 tests...
 12 passed in 3.81s
 
@@ -66,8 +64,8 @@ You: add a test for expired token handling
 Claude: I'll add a test for that. [edits file]...
 
 You: /tasks
-+ #1 [command] 4s pytest
-+ #2 [claude] 12s add a test for expired token...
++ #1 [command] pytest
++ #2 [claude] add a test for expired token...
 ```
 
 ## How it works
