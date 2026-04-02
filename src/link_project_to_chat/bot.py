@@ -268,6 +268,8 @@ class ProjectBot:
         )
 
     async def _on_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message or not update.effective_chat:
+            return
         if not self._auth(update.effective_user):
             return
         tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
@@ -282,12 +284,36 @@ class ProjectBot:
             TaskStatus.CANCELLED: "x",
         }
         lines = []
+        buttons = []
         for t in tasks:
             icon = icons.get(t.status, "?")
             elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
             label = t.name if t.type == TaskType.COMMAND else t.input[:50]
             lines.append(f"{icon} #{t.id} [{t.type.value}]{elapsed} {label}")
-        await update.effective_message.reply_text("\n".join(lines))
+
+            row = []
+            if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
+                row.append(
+                    InlineKeyboardButton(
+                        f"Cancel #{t.id}",
+                        callback_data=f"task_cancel_{t.id}",
+                    )
+                )
+            if t.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
+                row.append(
+                    InlineKeyboardButton(
+                        f"Log #{t.id}",
+                        callback_data=f"task_log_{t.id}",
+                    )
+                )
+            if row:
+                buttons.append(row)
+
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            reply_markup=markup,
+        )
 
     async def _on_log(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
