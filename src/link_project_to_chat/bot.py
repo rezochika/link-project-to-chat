@@ -263,46 +263,40 @@ class ProjectBot:
             command=command,
         )
 
+    _TASK_ICONS = {
+        TaskStatus.WAITING: "~",
+        TaskStatus.RUNNING: ">",
+        TaskStatus.DONE: "+",
+        TaskStatus.FAILED: "!",
+        TaskStatus.CANCELLED: "x",
+    }
+
+    def _tasks_markup(self, chat_id: int) -> InlineKeyboardMarkup | None:
+        all_tasks = self.task_manager.list_tasks(chat_id=chat_id, limit=100)
+        active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
+        finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
+        tasks = active + finished
+        if not tasks:
+            return None
+        buttons = []
+        for t in tasks:
+            icon = self._TASK_ICONS.get(t.status, "?")
+            elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
+            label = t.name if t.type == TaskType.COMMAND else t.input[:40]
+            buttons.append([InlineKeyboardButton(f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}")])
+        return InlineKeyboardMarkup(buttons)
+
+    async def _render_tasks(self, chat_id: int, edit_query) -> None:
+        markup = self._tasks_markup(chat_id)
+        await edit_query.edit_message_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
+
     async def _on_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message or not update.effective_chat:
             return
         if not self._auth(update.effective_user):
             return
-
-        all_tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id, limit=100)
-        active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
-        finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
-        tasks = active + finished
-
-        if not tasks:
-            return await update.effective_message.reply_text("No tasks.")
-
-        icons = {
-            TaskStatus.WAITING: "~",
-            TaskStatus.RUNNING: ">",
-            TaskStatus.DONE: "+",
-            TaskStatus.FAILED: "!",
-            TaskStatus.CANCELLED: "x",
-        }
-        buttons = []
-        for t in tasks:
-            icon = icons.get(t.status, "?")
-            elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
-            label = t.name if t.type == TaskType.COMMAND else t.input[:25]
-            title = f"{icon} #{t.id}{elapsed} {label}"
-
-            # First button displays task info; subsequent buttons are actions
-            row = [InlineKeyboardButton(title, callback_data="noop")]
-            if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
-                row.append(InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{t.id}"))
-            if t.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
-                row.append(InlineKeyboardButton("Log", callback_data=f"task_log_{t.id}"))
-            buttons.append(row)
-
-        await update.effective_message.reply_text(
-            "Tasks:",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        markup = self._tasks_markup(update.effective_chat.id)
+        await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
     async def _on_log(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -478,15 +472,30 @@ class ProjectBot:
             return
         await query.answer()
 
-        if query.data == "noop":
-            return
-        elif query.data == "reset_confirm":
+        if query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             clear_session(self.name)
             await query.edit_message_text("Session reset.")
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
+        elif query.data.startswith("task_info_"):
+            task_id = int(query.data.split("_")[-1])
+            task = self.task_manager.get(task_id)
+            if not task:
+                await query.edit_message_text(f"Task #{task_id} not found.")
+                return
+            elapsed = f" | {task.elapsed_human}" if task.elapsed_human else ""
+            text = f"#{task.id} [{task.type.value}] {task.status.value}{elapsed}\n{task.input[:200]}"
+            rows = []
+            if task.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
+                rows.append([InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{task_id}")])
+            if task.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
+                rows.append([InlineKeyboardButton("Log", callback_data=f"task_log_{task_id}")])
+            rows.append([InlineKeyboardButton("« Back", callback_data="tasks_back")])
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        elif query.data == "tasks_back":
+            await self._render_tasks(query.message.chat_id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
             task_id = int(query.data.split("_")[-1])
             if self.task_manager.cancel(task_id):
@@ -495,9 +504,7 @@ class ProjectBot:
                     typing.cancel()
                 await query.edit_message_text(f"#{task_id} cancelled.")
             else:
-                await query.edit_message_text(
-                    f"#{task_id} not found or already finished."
-                )
+                await query.edit_message_text(f"#{task_id} not found or already finished.")
         elif query.data.startswith("task_log_"):
             task_id = int(query.data.split("_")[-1])
             task = self.task_manager.get(task_id)
@@ -506,11 +513,9 @@ class ProjectBot:
                 return
             output = task.result or task.error or "(no output)"
             if len(output) > 3000:
-                output = (
-                    output[:3000]
-                    + f"\n... (truncated, {len(task.result or '')} chars total)"
-                )
-            await query.edit_message_text(f"Task #{task_id}:\n{output}")
+                output = output[:3000] + f"\n... (truncated, {len(task.result or '')} chars total)"
+            rows = [[InlineKeyboardButton("« Back", callback_data=f"task_info_{task_id}")]]
+            await query.edit_message_text(f"#{task_id} log:\n{output}", reply_markup=InlineKeyboardMarkup(rows))
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
