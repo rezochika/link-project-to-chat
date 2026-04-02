@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .claude_client import ClaudeClient
+from .stream import Error, Result, StreamEvent, TextDelta
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,9 @@ class Task:
     _compact: bool = field(default=False, repr=False)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
     _asyncio_task: asyncio.Task | None = field(default=None, repr=False)
-    _log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=100), repr=False)
+    _log: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=100), repr=False
+    )
 
     def tail(self, n: int = 10) -> str:
         return "\n".join(list(self._log)[-n:])
@@ -92,11 +95,17 @@ OnTaskEvent = Callable[[Task], Awaitable[None]]
 
 
 class TaskManager:
-    def __init__(self, project_path: Path,
-                 on_complete: OnTaskEvent, on_task_started: OnTaskEvent):
+    def __init__(
+        self,
+        project_path: Path,
+        on_complete: OnTaskEvent,
+        on_task_started: OnTaskEvent,
+        on_stream_event: Callable[[Task, StreamEvent], Awaitable[None]] | None = None,
+    ):
         self.project_path = project_path
         self._on_complete = on_complete
         self._on_task_started = on_task_started
+        self._on_stream_event = on_stream_event
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._claude = ClaudeClient(project_path)
@@ -134,8 +143,9 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_claude(task))
         return task
 
-    def run_command(self, chat_id: int, message_id: int, command: str,
-                    name: str | None = None) -> Task:
+    def run_command(
+        self, chat_id: int, message_id: int, command: str, name: str | None = None
+    ) -> Task:
         task = Task(
             id=self._next_id,
             chat_id=chat_id,
@@ -161,10 +171,26 @@ class TaskManager:
             if task._compact:
                 task.result = await self._do_compact()
             else:
-                task.result = await self._claude.chat(
+                collected_text: list[str] = []
+                async for event in self._claude.chat_stream(
                     task.input,
-                    on_proc=lambda p: setattr(task, '_proc', p),
-                )
+                    on_proc=lambda p: setattr(task, "_proc", p),
+                ):
+                    if self._on_stream_event:
+                        try:
+                            await self._on_stream_event(task, event)
+                        except Exception:
+                            logger.exception(
+                                "stream event callback failed for task #%d", task.id
+                            )
+                    if isinstance(event, TextDelta):
+                        collected_text.append(event.text)
+                    elif isinstance(event, Result):
+                        task.result = event.text
+                    elif isinstance(event, Error):
+                        raise RuntimeError(event.message)
+                if task.result is None:
+                    task.result = "".join(collected_text) or "[No response]"
             task.status = TaskStatus.DONE
         except asyncio.CancelledError:
             if task._proc and task._proc.poll() is None:
@@ -203,7 +229,8 @@ class TaskManager:
     async def _exec_command(self, task: Task) -> None:
         await self._safe_callback(self._on_task_started, task)
         proc = subprocess.Popen(
-            task.input, shell=True,
+            task.input,
+            shell=True,
             cwd=str(self.project_path),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -244,8 +271,13 @@ class TaskManager:
         task.error = "\n".join(stderr_lines) or None
         task.exit_code = proc.returncode
         task.status = TaskStatus.DONE if proc.returncode == 0 else TaskStatus.FAILED
-        logger.info("task #%d %s in %.1fs (exit %d)",
-                     task.id, task.status.value, task.elapsed, proc.returncode)
+        logger.info(
+            "task #%d %s in %.1fs (exit %d)",
+            task.id,
+            task.status.value,
+            task.elapsed,
+            proc.returncode,
+        )
 
         await self._safe_callback(self._on_complete, task)
 
@@ -262,7 +294,8 @@ class TaskManager:
 
     def find_by_message(self, message_id: int) -> list[Task]:
         return [
-            t for t in self._tasks.values()
+            t
+            for t in self._tasks.values()
             if t.message_id == message_id
             and t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)
         ]
