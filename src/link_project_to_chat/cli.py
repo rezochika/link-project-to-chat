@@ -97,6 +97,7 @@ def list_projects(ctx):
     "--username", default=None, help="Allowed Telegram username (overrides config)"
 )
 @click.option("--session-id", default=None, help="Resume a Claude session by ID")
+@click.option("--model", default=None, help="Claude model (haiku/sonnet/opus)")
 @click.pass_context
 def start(
     ctx,
@@ -105,6 +106,7 @@ def start(
     token: str | None,
     username: str | None,
     session_id: str | None,
+    model: str | None,
 ):
     """Start the Telegram bot.
 
@@ -120,6 +122,7 @@ def start(
             token=token,
             username=(username or "").lower().lstrip("@"),
             session_id=session_id,
+            model=model,
         )
         return
 
@@ -142,9 +145,10 @@ def start(
             proj.telegram_bot_token,
             config.allowed_username,
             session_id=session_id,
+            model=model,
         )
     else:
-        run_bots(config)
+        run_bots(config, model=model)
 
 
 @main.command()

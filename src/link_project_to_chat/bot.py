@@ -26,7 +26,7 @@ from .config import (
     save_trusted_user_id,
 )
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS
+from .claude_client import EFFORT_LEVELS, MODELS
 from .stream import StreamEvent, TextDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -37,6 +37,7 @@ COMMANDS = [
     ("tasks", "List all tasks"),
     ("log", "Show task output"),
     ("cancel", "Cancel a task"),
+    ("model", "Set Claude model (haiku/sonnet/opus)"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
     ("compact", "Compress session context"),
     ("status", "Bot status"),
@@ -402,6 +403,25 @@ class ProjectBot:
                 msg = f"#{task_id} not found or already finished."
         await update.effective_message.reply_text(msg)
 
+    async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return
+        if not ctx.args:
+            current = (
+                self.task_manager.claude.model_display or self.task_manager.claude.model
+            )
+            return await update.effective_message.reply_text(
+                f"Current: {current}\nUsage: /model {{{'/'.join(MODELS)}}}"
+            )
+        name = ctx.args[0].lower()
+        if name not in MODELS:
+            return await update.effective_message.reply_text(
+                f"Invalid. Choose: {', '.join(MODELS)}"
+            )
+        self.task_manager.claude.model = name
+        self.task_manager.claude.model_display = None
+        await update.effective_message.reply_text(f"Model: {name}")
+
     async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
@@ -509,7 +529,7 @@ class ProjectBot:
         lines = [
             f"Project: {self.name}",
             f"Path: {self.path}",
-            f"Model: {self.task_manager.claude.model}",
+            f"Model: {self.task_manager.claude.model_display or self.task_manager.claude.model}",
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st['session_id'] or 'none'}",
             f"Claude: {'RUNNING' if st['running'] else 'idle'}",
@@ -706,6 +726,7 @@ class ProjectBot:
             "tasks": self._on_tasks,
             "log": self._on_log,
             "cancel": self._on_cancel,
+            "model": self._on_model,
             "effort": self._on_effort,
             "compact": self._on_compact,
             "reset": self._on_reset,
@@ -741,7 +762,12 @@ class ProjectBot:
 
 
 def run_bot(
-    name: str, path: Path, token: str, username: str, session_id: str | None = None
+    name: str,
+    path: Path,
+    token: str,
+    username: str,
+    session_id: str | None = None,
+    model: str | None = None,
 ) -> None:
     if not username:
         raise SystemExit(
@@ -752,6 +778,8 @@ def run_bot(
     trusted_user_id = load_trusted_user_id()
     bot = ProjectBot(name, path, token, username, trusted_user_id=trusted_user_id)
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
+    if model:
+        bot.task_manager.claude.model = model
     app = bot.build()
     logger.info(
         "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
@@ -759,10 +787,16 @@ def run_bot(
     app.run_polling()
 
 
-def run_bots(config: Config) -> None:
+def run_bots(config: Config, model: str | None = None) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        run_bot(name, Path(proj.path), proj.telegram_bot_token, config.allowed_username)
+        run_bot(
+            name,
+            Path(proj.path),
+            proj.telegram_bot_token,
+            config.allowed_username,
+            model=model,
+        )
     else:
         names = ", ".join(config.projects.keys())
         raise SystemExit(

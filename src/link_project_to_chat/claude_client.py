@@ -13,14 +13,14 @@ from .stream import Error, Result, StreamEvent, parse_stream_line
 logger = logging.getLogger(__name__)
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
-
-
+MODELS = ("haiku", "sonnet", "opus")
 DEFAULT_MODEL = "sonnet"
 
 
 class ClaudeClient:
-    def __init__(self, project_path: Path):
-        self.model = DEFAULT_MODEL
+    def __init__(self, project_path: Path, model: str = DEFAULT_MODEL):
+        self.model = model
+        self.model_display: str | None = None
         self.project_path = project_path
         self.effort: str = "medium"
         self.session_id: str | None = None
@@ -90,7 +90,7 @@ class ClaudeClient:
                     if isinstance(event, Result):
                         self.session_id = event.session_id or self.session_id
                         if event.model:
-                            self.model = event.model
+                            self.model_display = event.model
                     yield event
 
             stderr_bytes = await asyncio.to_thread(proc.stderr.read)

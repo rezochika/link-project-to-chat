@@ -81,10 +81,12 @@ Claude messages and `/run` commands both execute in **parallel** — they don't 
 | `/tasks` | List active tasks |
 | `/log <id>` | Show task output |
 | `/cancel [id\|all]` | Cancel tasks |
+| `/model haiku/sonnet/opus` | Set Claude model |
 | `/effort low/medium/high/max` | Set Claude thinking depth |
 | `/compact` | Compress session context |
 | `/reset` | Clear the Claude session |
 | `/status` | Show bot status |
+| `/help` | Show available commands |
 
 ## CLI reference
 
@@ -93,7 +95,7 @@ link-project-to-chat configure --username USER
 link-project-to-chat link <path> --token TOKEN [--name NAME]
 link-project-to-chat unlink <name>
 link-project-to-chat list
-link-project-to-chat start [--project NAME] [--path PATH] [--token TOKEN] [--username USER] [--session-id ID]
+link-project-to-chat start [--project NAME] [--path PATH] [--token TOKEN] [--username USER] [--session-id ID] [--model MODEL]
 ```
 
 Config is stored at `~/.link-project-to-chat/config.json`.
