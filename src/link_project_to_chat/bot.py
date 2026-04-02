@@ -625,17 +625,19 @@ class ProjectBot:
         try:
             size = path.stat().st_size
             suffix = path.suffix.lower()
+            with path.open("rb") as f:
+                data = f.read()
             if suffix == ".svg" or size > 10 * 1024 * 1024:
                 await self._app.bot.send_document(
                     chat_id,
-                    open(path, "rb"),
+                    data,
                     filename=path.name,
                     reply_to_message_id=reply_to,
                 )
             else:
                 await self._app.bot.send_photo(
                     chat_id,
-                    open(path, "rb"),
+                    data,
                     caption=path.name,
                     reply_to_message_id=reply_to,
                 )

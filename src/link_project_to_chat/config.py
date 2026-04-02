@@ -51,6 +51,7 @@ def save_session(
     sessions[project_name] = session_id
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(sessions, indent=2) + "\n")
+    path.chmod(0o600)
 
 
 def clear_session(project_name: str, path: Path = SESSIONS_FILE) -> None:
