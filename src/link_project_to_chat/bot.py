@@ -40,6 +40,7 @@ COMMANDS = [
     ("compact", "Compress session context"),
     ("status", "Bot status"),
     ("reset", "Clear Claude session"),
+    ("help", "Show available commands"),
 ]
 
 
@@ -318,7 +319,12 @@ class ProjectBot:
             else:
                 lines.append(f"\nRunning for {task.elapsed_human}...")
         elif task.result:
-            lines.append(f"\n{task.result}")
+            output = task.result
+            if len(output) > 3000:
+                output = (
+                    output[:3000] + f"\n... (truncated, {len(task.result)} chars total)"
+                )
+            lines.append(f"\n{output}")
         elif task.error:
             lines.append(f"\nError: {task.error}")
         elif task.status == TaskStatus.WAITING:
@@ -399,6 +405,14 @@ class ProjectBot:
             chat_id=update.effective_chat.id,
             message_id=update.effective_message.message_id,
         )
+
+    async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
+            return
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        cmd_list = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+        await update.effective_message.reply_text(cmd_list)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -626,6 +640,7 @@ class ProjectBot:
             "compact": self._on_compact,
             "reset": self._on_reset,
             "status": self._on_status,
+            "help": self._on_help,
         }
         for name, handler in handlers.items():
             app.add_handler(CommandHandler(name, handler))
