@@ -40,3 +40,7 @@ packages = ["src/link_project_to_chat"]
 
 [project.scripts]
 link-project-to-chat = "link_project_to_chat.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

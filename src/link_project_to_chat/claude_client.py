@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import subprocess
 import time
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
+
+from .stream import Error, Result, StreamEvent, parse_stream_line
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +30,16 @@ class ClaudeClient:
         self._last_duration: float | None = None
         self._total_requests: int = 0
 
-    async def chat(self, user_message: str, on_proc=None) -> str:
+    async def chat_stream(
+        self,
+        user_message: str,
+        on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         cmd = [
             "claude", "-p",
             "--model", self.model,
-            "--output-format", "json",
+            "--output-format", "stream-json",
+            "--verbose",
             "--effort", self.effort,
             "--dangerously-skip-permissions",
         ]
@@ -62,34 +69,47 @@ class ClaudeClient:
         self._proc = proc
         if on_proc:
             on_proc(proc)
-        logger.info("claude subprocess started pid=%s", proc.pid)
+        logger.info("claude stream subprocess started pid=%s", proc.pid)
+
+        def _read_lines():
+            lines = []
+            for raw_line in proc.stdout:
+                lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
+            return lines
 
         try:
-            stdout, stderr = await asyncio.to_thread(proc.communicate)
+            all_lines = await asyncio.to_thread(_read_lines)
+            for line in all_lines:
+                if not line.strip():
+                    continue
+                for event in parse_stream_line(line):
+                    if isinstance(event, Result):
+                        self.session_id = event.session_id or self.session_id
+                        if event.model:
+                            self.model = event.model
+                    yield event
+
+            stderr_bytes = await asyncio.to_thread(proc.stderr.read)
+            await asyncio.to_thread(proc.wait)
+
+            if proc.returncode != 0:
+                err = stderr_bytes.decode("utf-8", errors="replace").strip()
+                yield Error(message=err or f"exit code {proc.returncode}")
         finally:
             self._last_duration = time.monotonic() - started_at
             if self._proc is proc:
                 self._started_at = None
                 self._proc = None
+            logger.info("claude stream pid=%s done, code=%s", proc.pid, proc.returncode)
 
-        logger.info("claude pid=%s done, code=%s, %d bytes", proc.pid, proc.returncode, len(stdout))
-
-        if stderr_text := stderr.decode("utf-8", errors="replace").strip():
-            logger.warning("claude stderr: %s", stderr_text)
-
-        if proc.returncode != 0:
-            return f"Error: {stderr_text or f'exit code {proc.returncode}'}"
-
-        raw = stdout.decode("utf-8", errors="replace").strip()
-        if not raw:
-            return "[No response]"
-
-        try:
-            data = json.loads(raw)
-            self.session_id = data.get("session_id", self.session_id)
-            return data.get("result", raw)
-        except json.JSONDecodeError:
-            return raw
+    async def chat(self, user_message: str, on_proc=None) -> str:
+        result_text = ""
+        async for event in self.chat_stream(user_message, on_proc=on_proc):
+            if isinstance(event, Result):
+                result_text = event.text
+            elif isinstance(event, Error):
+                return f"Error: {event.message}"
+        return result_text or "[No response]"
 
     @property
     def status(self) -> dict:
