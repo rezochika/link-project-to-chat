@@ -8,6 +8,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -128,6 +129,9 @@ class ProjectBot:
                             parse_mode="HTML",
                         )
                         self._stream_messages[task.id] = (msg_id, now)
+                    except BadRequest as e:
+                        if "Message is not modified" not in str(e):
+                            logger.debug("Stream edit failed", exc_info=True)
                     except Exception:
                         logger.debug("Stream edit failed", exc_info=True)
 
@@ -175,6 +179,11 @@ class ProjectBot:
                                     parse_mode="HTML",
                                     reply_to_message_id=task.message_id,
                                 )
+                        except BadRequest as e:
+                            if "Message is not modified" in str(e):
+                                pass  # Last streaming edit already had the final content
+                            else:
+                                logger.warning("Final stream edit failed", exc_info=True)
                         except Exception:
                             logger.warning("Final stream edit failed", exc_info=True)
                             plain = strip_html(chunk).replace("\x00", "")
