@@ -360,16 +360,17 @@ class ProjectBot:
             reply_to=update.effective_message.message_id,
         )
 
+    def _stop_task(self, task_id: int) -> None:
+        """Cancel typing indicator and clean up streaming state for a task."""
+        typing = self._typing_tasks.pop(task_id, None)
+        if typing:
+            typing.cancel()
+        self._stream_messages.pop(task_id, None)
+        self._stream_text.pop(task_id, None)
+
     async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
-
-        def stop_task(task_id: int) -> None:
-            typing = self._typing_tasks.pop(task_id, None)
-            if typing:
-                typing.cancel()
-            self._stream_messages.pop(task_id, None)
-            self._stream_text.pop(task_id, None)
 
         if not ctx.args:
             tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
@@ -377,7 +378,7 @@ class ProjectBot:
             if running:
                 t = running[0]
                 self.task_manager.cancel(t.id)
-                stop_task(t.id)
+                self._stop_task(t.id)
                 return await update.effective_message.reply_text(f"#{t.id} cancelled.")
             return await update.effective_message.reply_text("Nothing running.")
 
@@ -389,7 +390,7 @@ class ProjectBot:
             ]
             count = self.task_manager.cancel_all()
             for tid in ids:
-                stop_task(tid)
+                self._stop_task(tid)
             msg = f"Cancelled {count} task(s)." if count else "Nothing to cancel."
         else:
             try:
@@ -399,7 +400,7 @@ class ProjectBot:
                     "Usage: /cancel [id|all]"
                 )
             if self.task_manager.cancel(task_id):
-                stop_task(task_id)
+                self._stop_task(task_id)
                 msg = f"#{task_id} cancelled."
             else:
                 msg = f"#{task_id} not found or already finished."
@@ -501,11 +502,7 @@ class ProjectBot:
         elif query.data.startswith("task_cancel_"):
             task_id = int(query.data.split("_")[-1])
             if self.task_manager.cancel(task_id):
-                typing = self._typing_tasks.pop(task_id, None)
-                if typing:
-                    typing.cancel()
-                self._stream_messages.pop(task_id, None)
-                self._stream_text.pop(task_id, None)
+                self._stop_task(task_id)
                 await query.edit_message_text(f"#{task_id} cancelled.")
             else:
                 await query.edit_message_text(
