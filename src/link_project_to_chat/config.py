@@ -45,7 +45,9 @@ def load_sessions(path: Path = SESSIONS_FILE) -> dict[str, str]:
     return {}
 
 
-def save_session(project_name: str, session_id: str, path: Path = SESSIONS_FILE) -> None:
+def save_session(
+    project_name: str, session_id: str, path: Path = SESSIONS_FILE
+) -> None:
     """Save a session ID for a project."""
     sessions = load_sessions(path)
     sessions[project_name] = session_id

@@ -36,11 +36,15 @@ class ClaudeClient:
         on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         cmd = [
-            "claude", "-p",
-            "--model", self.model,
-            "--output-format", "stream-json",
+            "claude",
+            "-p",
+            "--model",
+            self.model,
+            "--output-format",
+            "stream-json",
             "--verbose",
-            "--effort", self.effort,
+            "--effort",
+            self.effort,
             "--dangerously-skip-permissions",
         ]
 
@@ -120,7 +124,9 @@ class ClaudeClient:
             "session_id": self.session_id,
             "total_requests": self._total_requests,
             "last_message": self._last_message,
-            "last_duration": round(self._last_duration, 1) if self._last_duration else None,
+            "last_duration": round(self._last_duration, 1)
+            if self._last_duration
+            else None,
         }
         if running and self._started_at:
             info["elapsed"] = round(time.monotonic() - self._started_at, 1)

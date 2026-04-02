@@ -1,4 +1,5 @@
 """Convert Claude's markdown output to Telegram HTML."""
+
 from __future__ import annotations
 
 import re
@@ -21,7 +22,9 @@ def md_to_telegram(text: str) -> str:
 
     text = re.sub(
         r"(?:^\|.+\|[ \t]*\n){2,}",
-        _save_table, text, flags=re.MULTILINE,
+        _save_table,
+        text,
+        flags=re.MULTILINE,
     )
 
     # 2. Extract fenced code blocks (``` ... ```)
@@ -62,7 +65,9 @@ def md_to_telegram(text: str) -> str:
     # Links [text](url)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
     # Blockquotes > text
-    text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE
+    )
 
     # 6. Restore code blocks and inline code
     for i, block in enumerate(code_blocks):

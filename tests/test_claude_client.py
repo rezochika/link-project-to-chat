@@ -51,17 +51,21 @@ class TestClaudeClientInit:
 class TestChatStream:
     async def test_yields_text_and_result(self, client):
         lines = [
-            json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "hello"}]},
-                "session_id": "s1",
-            }),
-            json.dumps({
-                "type": "result",
-                "result": "hello",
-                "session_id": "s1",
-                "modelUsage": {"claude-sonnet-4-20250514": {}},
-            }),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "hello"}]},
+                    "session_id": "s1",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "hello",
+                    "session_id": "s1",
+                    "modelUsage": {"claude-sonnet-4-20250514": {}},
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
@@ -81,22 +85,28 @@ class TestChatStream:
 
     async def test_yields_tool_use(self, client):
         lines = [
-            json.dumps({
-                "type": "assistant",
-                "message": {
-                    "content": [{
-                        "type": "tool_use",
-                        "name": "Write",
-                        "input": {"file_path": "/tmp/img.png"},
-                    }],
-                },
-                "session_id": "s1",
-            }),
-            json.dumps({
-                "type": "result",
-                "result": "done",
-                "session_id": "s1",
-            }),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "name": "Write",
+                                "input": {"file_path": "/tmp/img.png"},
+                            }
+                        ],
+                    },
+                    "session_id": "s1",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "done",
+                    "session_id": "s1",
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
@@ -114,12 +124,14 @@ class TestChatStream:
 
     async def test_updates_session_id_from_result(self, client):
         lines = [
-            json.dumps({
-                "type": "result",
-                "result": "ok",
-                "session_id": "new-sess",
-                "modelUsage": {"sonnet": {}},
-            }),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "ok",
+                    "session_id": "new-sess",
+                    "modelUsage": {"sonnet": {}},
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
@@ -151,11 +163,13 @@ class TestChatStream:
 
     async def test_command_uses_stream_json(self, client):
         lines = [
-            json.dumps({
-                "type": "result",
-                "result": "ok",
-                "session_id": "s1",
-            }),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "ok",
+                    "session_id": "s1",
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
@@ -189,11 +203,13 @@ class TestChatStream:
     async def test_includes_resume_when_session(self, client):
         client.session_id = "existing-sess"
         lines = [
-            json.dumps({
-                "type": "result",
-                "result": "ok",
-                "session_id": "existing-sess",
-            }),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "ok",
+                    "session_id": "existing-sess",
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
@@ -233,21 +249,27 @@ class TestChatStream:
 class TestChatWrapsStream:
     async def test_chat_collects_result_text(self, client):
         lines = [
-            json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "hello "}]},
-                "session_id": "s1",
-            }),
-            json.dumps({
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "world"}]},
-                "session_id": "s1",
-            }),
-            json.dumps({
-                "type": "result",
-                "result": "hello world",
-                "session_id": "s1",
-            }),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "hello "}]},
+                    "session_id": "s1",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "world"}]},
+                    "session_id": "s1",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "hello world",
+                    "session_id": "s1",
+                }
+            ),
         ]
         mock_proc = _mock_stream_popen(lines)
 
