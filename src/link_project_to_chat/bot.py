@@ -74,7 +74,7 @@ class ProjectBot:
 
     def _auth(self, user) -> bool:
         if not self.allowed_username:
-            return True
+            return False  # fail-closed: no access if username is not configured
         if self._trusted_user_id is not None:
             return user.id == self._trusted_user_id
         if (user.username or "").lower() == self.allowed_username:
