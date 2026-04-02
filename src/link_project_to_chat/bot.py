@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import time as time_mod
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -63,10 +62,8 @@ class ProjectBot:
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._stream_messages: dict[
-            int, tuple[int, float]
-        ] = {}  # task_id -> (msg_id, last_edit_time)
-        self._stream_text: dict[int, str] = {}  # task_id -> accumulated text
+        self._stream_messages: dict[int, tuple[int, float]] = {}
+        self._stream_text: dict[int, str] = {}
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -79,15 +76,12 @@ class ProjectBot:
             return True
         if self._trusted_user_id is not None:
             return user.id == self._trusted_user_id
-        # Bootstrap: first contact — match by username, then lock in user_id
         if (user.username or "").lower() == self.allowed_username:
             self._trusted_user_id = user.id
             save_trusted_user_id(user.id)
             logger.info("Trusted user_id %d saved", user.id)
             return True
         return False
-
-    # -- Task callbacks --
 
     async def _on_task_started(self, task: Task) -> None:
         chat = await self._app.bot.get_chat(task.chat_id)
@@ -99,7 +93,6 @@ class ProjectBot:
             self._stream_text[task.id] += event.text
 
             if task.id not in self._stream_messages:
-                # First text chunk — send a new message
                 text = self._stream_text[task.id]
                 html = md_to_telegram(text).replace("\x00", "")
                 try:
@@ -109,15 +102,14 @@ class ProjectBot:
                         parse_mode="HTML",
                         reply_to_message_id=task.message_id,
                     )
-                    self._stream_messages[task.id] = (msg.message_id, time_mod.time())
+                    self._stream_messages[task.id] = (msg.message_id, time.time())
                 except Exception:
                     logger.warning(
                         "Failed to send initial stream message", exc_info=True
                     )
             else:
-                # Subsequent chunks — edit (rate-limited to every 2s)
                 msg_id, last_edit = self._stream_messages[task.id]
-                now = time_mod.time()
+                now = time.time()
                 if now - last_edit >= 2.0:
                     text = self._stream_text[task.id]
                     html = md_to_telegram(text).replace("\x00", "")
@@ -157,7 +149,6 @@ class ProjectBot:
                 )
                 await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             elif task.id in self._stream_messages:
-                # Streaming was active — do final edit
                 msg_id, _ = self._stream_messages.pop(task.id)
                 self._stream_text.pop(task.id, None)
                 if task.status == TaskStatus.DONE:
@@ -180,10 +171,10 @@ class ProjectBot:
                                     reply_to_message_id=task.message_id,
                                 )
                         except BadRequest as e:
-                            if "Message is not modified" in str(e):
-                                pass  # Last streaming edit already had the final content
-                            else:
-                                logger.warning("Final stream edit failed", exc_info=True)
+                            if "Message is not modified" not in str(e):
+                                logger.warning(
+                                    "Final stream edit failed", exc_info=True
+                                )
                         except Exception:
                             logger.warning("Final stream edit failed", exc_info=True)
                             plain = strip_html(chunk).replace("\x00", "")
@@ -207,7 +198,6 @@ class ProjectBot:
                             reply_to=task.message_id,
                         )
             else:
-                # No streaming happened (fallback)
                 text = (
                     task.result
                     if task.status == TaskStatus.DONE
@@ -215,7 +205,6 @@ class ProjectBot:
                 )
                 await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
         else:
-            # Command output — always show exit code
             output = (
                 (task.result or "").rstrip()
                 or (task.error or "").rstrip()
@@ -229,8 +218,6 @@ class ProjectBot:
                 )
             else:
                 await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
-
-    # -- Command handlers --
 
     async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -248,7 +235,6 @@ class ProjectBot:
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
 
-        # If edited message, cancel previous task for this message_id
         for prev in self.task_manager.find_by_message(msg.message_id):
             self.task_manager.cancel(prev.id)
             typing = self._typing_tasks.pop(prev.id, None)
@@ -557,7 +543,6 @@ class ProjectBot:
         else:
             return await msg.reply_text("Unsupported file type.")
 
-        # Handle name collisions
         dest = uploads_dir / filename
         if dest.exists():
             stem = dest.stem
@@ -601,8 +586,6 @@ class ProjectBot:
 
         await msg.reply_text(text)
 
-    # -- Helpers --
-
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 
     def _is_image(self, path: str) -> bool:
@@ -642,7 +625,6 @@ class ProjectBot:
     async def _send_to_chat(
         self, chat_id: int, text: str, reply_to: int | None = None
     ) -> None:
-        """Send Claude markdown output — converts to Telegram HTML."""
         text = text or "[No output]"
         html = md_to_telegram(text).replace("\x00", "")
         for chunk in split_html(html):
@@ -663,7 +645,6 @@ class ProjectBot:
     async def _send_raw(
         self, chat_id: int, text: str, reply_to: int | None = None
     ) -> None:
-        """Send raw shell output — wraps in <pre>, no markdown processing."""
         text = text or "[No output]"
         escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         html = f"<pre>{escaped}</pre>"
@@ -740,11 +721,9 @@ class ProjectBot:
         )
         app.add_handler(MessageHandler(text_filter, self._on_text))
 
-        # File uploads (documents and photos)
         file_filter = filters.Document.ALL | filters.PHOTO
         app.add_handler(MessageHandler(file_filter, self._on_file))
 
-        # Unsupported message types
         unsupported_filter = (
             filters.VOICE
             | filters.VIDEO_NOTE

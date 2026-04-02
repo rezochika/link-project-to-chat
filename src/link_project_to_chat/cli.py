@@ -112,7 +112,6 @@ def start(
     """
     from .bot import run_bot, run_bots
 
-    # Direct params mode: no config needed
     if project_path and token:
         p = Path(project_path).resolve()
         run_bot(
@@ -124,7 +123,6 @@ def start(
         )
         return
 
-    # Config mode
     config = load_config(ctx.obj["config_path"])
     if username:
         config.allowed_username = username.lower().lstrip("@")

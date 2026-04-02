@@ -161,8 +161,6 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_command(task))
         return task
 
-    # -- Claude execution (parallel) --
-
     async def _exec_claude(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.started_at = time.monotonic()
@@ -224,8 +222,6 @@ class TaskManager:
         )
         return summary
 
-    # -- Command execution (parallel) --
-
     async def _exec_command(self, task: Task) -> None:
         await self._safe_callback(self._on_task_started, task)
         proc = subprocess.Popen(
@@ -280,8 +276,6 @@ class TaskManager:
         )
 
         await self._safe_callback(self._on_complete, task)
-
-    # -- Shared helpers --
 
     async def _safe_callback(self, cb: OnTaskEvent, task: Task) -> None:
         try:

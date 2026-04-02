@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class StreamEvent:
-    """Base class for stream events."""
+    pass
 
 
 @dataclass
@@ -35,7 +35,6 @@ class Error(StreamEvent):
 
 
 def parse_stream_line(line: str) -> list[StreamEvent]:
-    """Parse a single JSON line from Claude CLI stream-json output."""
     try:
         data = json.loads(line)
     except json.JSONDecodeError:

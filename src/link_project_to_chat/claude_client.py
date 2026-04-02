@@ -133,7 +133,6 @@ class ClaudeClient:
         return info
 
     def cancel(self) -> bool:
-        """Kill the running claude process. Returns True if a process was killed."""
         if self._proc and self._proc.poll() is None:
             self._proc.kill()
             return True
