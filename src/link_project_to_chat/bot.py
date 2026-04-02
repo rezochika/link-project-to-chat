@@ -268,7 +268,12 @@ class ProjectBot:
             return
         if not self._auth(update.effective_user):
             return
-        tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
+
+        all_tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id, limit=100)
+        active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
+        finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
+        tasks = active + finished
+
         if not tasks:
             return await update.effective_message.reply_text("No tasks.")
 
@@ -279,36 +284,24 @@ class ProjectBot:
             TaskStatus.FAILED: "!",
             TaskStatus.CANCELLED: "x",
         }
-        lines = []
         buttons = []
         for t in tasks:
             icon = icons.get(t.status, "?")
             elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
-            label = t.name if t.type == TaskType.COMMAND else t.input[:50]
-            lines.append(f"{icon} #{t.id} [{t.type.value}]{elapsed} {label}")
+            label = t.name if t.type == TaskType.COMMAND else t.input[:25]
+            title = f"{icon} #{t.id}{elapsed} {label}"
 
-            row = []
+            # First button displays task info; subsequent buttons are actions
+            row = [InlineKeyboardButton(title, callback_data="noop")]
             if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
-                row.append(
-                    InlineKeyboardButton(
-                        f"Cancel #{t.id}",
-                        callback_data=f"task_cancel_{t.id}",
-                    )
-                )
+                row.append(InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{t.id}"))
             if t.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
-                row.append(
-                    InlineKeyboardButton(
-                        f"Log #{t.id}",
-                        callback_data=f"task_log_{t.id}",
-                    )
-                )
-            if row:
-                buttons.append(row)
+                row.append(InlineKeyboardButton("Log", callback_data=f"task_log_{t.id}"))
+            buttons.append(row)
 
-        markup = InlineKeyboardMarkup(buttons) if buttons else None
         await update.effective_message.reply_text(
-            "\n".join(lines),
-            reply_markup=markup,
+            "Tasks:",
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
     async def _on_log(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -485,7 +478,9 @@ class ProjectBot:
             return
         await query.answer()
 
-        if query.data == "reset_confirm":
+        if query.data == "noop":
+            return
+        elif query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             clear_session(self.name)
