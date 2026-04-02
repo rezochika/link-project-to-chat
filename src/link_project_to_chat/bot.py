@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import time as time_mod
 from pathlib import Path
 
 from telegram import Update
@@ -15,9 +16,17 @@ from telegram.ext import (
     filters,
 )
 
-from .config import Config, clear_session, load_sessions, load_trusted_user_id, save_session, save_trusted_user_id
+from .config import (
+    Config,
+    clear_session,
+    load_sessions,
+    load_trusted_user_id,
+    save_session,
+    save_trusted_user_id,
+)
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS
+from .stream import StreamEvent, TextDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
@@ -35,8 +44,14 @@ COMMANDS = [
 
 
 class ProjectBot:
-    def __init__(self, name: str, path: Path, token: str,
-                 allowed_username: str, trusted_user_id: int | None = None):
+    def __init__(
+        self,
+        name: str,
+        path: Path,
+        token: str,
+        allowed_username: str,
+        trusted_user_id: int | None = None,
+    ):
         self.name = name
         self.path = path.resolve()
         self.token = token
@@ -45,10 +60,15 @@ class ProjectBot:
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
+        self._stream_messages: dict[
+            int, tuple[int, float]
+        ] = {}  # task_id -> (msg_id, last_edit_time)
+        self._stream_text: dict[int, str] = {}  # task_id -> accumulated text
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
             on_task_started=self._on_task_started,
+            on_stream_event=self._on_stream_event,
         )
 
     def _auth(self, user) -> bool:
@@ -70,6 +90,51 @@ class ProjectBot:
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
+    async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
+        if isinstance(event, TextDelta):
+            self._stream_text.setdefault(task.id, "")
+            self._stream_text[task.id] += event.text
+
+            if task.id not in self._stream_messages:
+                # First text chunk — send a new message
+                text = self._stream_text[task.id]
+                html = md_to_telegram(text).replace("\x00", "")
+                try:
+                    msg = await self._app.bot.send_message(
+                        task.chat_id,
+                        html or "...",
+                        parse_mode="HTML",
+                        reply_to_message_id=task.message_id,
+                    )
+                    self._stream_messages[task.id] = (msg.message_id, time_mod.time())
+                except Exception:
+                    logger.warning(
+                        "Failed to send initial stream message", exc_info=True
+                    )
+            else:
+                # Subsequent chunks — edit (rate-limited to every 2s)
+                msg_id, last_edit = self._stream_messages[task.id]
+                now = time_mod.time()
+                if now - last_edit >= 2.0:
+                    text = self._stream_text[task.id]
+                    html = md_to_telegram(text).replace("\x00", "")
+                    try:
+                        await self._app.bot.edit_message_text(
+                            html or "...",
+                            chat_id=task.chat_id,
+                            message_id=msg_id,
+                            parse_mode="HTML",
+                        )
+                        self._stream_messages[task.id] = (msg_id, now)
+                    except Exception:
+                        logger.debug("Stream edit failed", exc_info=True)
+
+        elif isinstance(event, ToolUse):
+            if event.path and self._is_image(event.path):
+                await self._send_image(
+                    task.chat_id, event.path, reply_to=task.message_id
+                )
+
     async def _on_task_complete(self, task: Task) -> None:
         typing = self._typing_tasks.pop(task.id, None)
         if typing:
@@ -79,18 +144,80 @@ class ProjectBot:
             if self.task_manager.claude.session_id:
                 save_session(self.name, self.task_manager.claude.session_id)
             if task._compact:
-                text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
+                text = (
+                    "Session compacted."
+                    if task.status == TaskStatus.DONE
+                    else f"Compact failed: {task.error}"
+                )
+                await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+            elif task.id in self._stream_messages:
+                # Streaming was active — do final edit
+                msg_id, _ = self._stream_messages.pop(task.id)
+                self._stream_text.pop(task.id, None)
+                if task.status == TaskStatus.DONE:
+                    text = task.result or "[No output]"
+                    html = md_to_telegram(text).replace("\x00", "")
+                    for i, chunk in enumerate(split_html(html)):
+                        try:
+                            if i == 0:
+                                await self._app.bot.edit_message_text(
+                                    chunk,
+                                    chat_id=task.chat_id,
+                                    message_id=msg_id,
+                                    parse_mode="HTML",
+                                )
+                            else:
+                                await self._app.bot.send_message(
+                                    task.chat_id,
+                                    chunk,
+                                    parse_mode="HTML",
+                                    reply_to_message_id=task.message_id,
+                                )
+                        except Exception:
+                            logger.warning("Final stream edit failed", exc_info=True)
+                            plain = strip_html(chunk).replace("\x00", "")
+                            if plain.strip():
+                                await self._app.bot.send_message(
+                                    task.chat_id,
+                                    plain[:4096],
+                                    reply_to_message_id=task.message_id,
+                                )
+                else:
+                    try:
+                        await self._app.bot.edit_message_text(
+                            f"Error: {task.error}",
+                            chat_id=task.chat_id,
+                            message_id=msg_id,
+                        )
+                    except Exception:
+                        await self._send_to_chat(
+                            task.chat_id,
+                            f"Error: {task.error}",
+                            reply_to=task.message_id,
+                        )
             else:
-                text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
-            await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+                # No streaming happened (fallback)
+                text = (
+                    task.result
+                    if task.status == TaskStatus.DONE
+                    else f"Error: {task.error}"
+                )
+                await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
         else:
-            output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
+            # Command output — always show exit code
+            output = (
+                (task.result or "").rstrip()
+                or (task.error or "").rstrip()
+                or "(no output)"
+            )
             if len(output) > 3000:
                 output = output[:3000] + "\n... (truncated, use /log)"
             if task.status != TaskStatus.DONE:
-                await self._send_raw(task.chat_id, f"[exit {task.exit_code}]\n\n{output}")
+                await self._send_raw(
+                    task.chat_id, f"[exit {task.exit_code}]\n\n{output}"
+                )
             else:
-                await self._send_raw(task.chat_id, output)
+                await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
 
     # -- Command handlers --
 
@@ -172,7 +299,9 @@ class ProjectBot:
 
         task = self.task_manager.get(task_id)
         if not task:
-            return await update.effective_message.reply_text(f"Task #{task_id} not found.")
+            return await update.effective_message.reply_text(
+                f"Task #{task_id} not found."
+            )
 
         lines = [f"Task #{task.id} | {task.type.value} | {task.status.value}"]
         if task.elapsed_human is not None:
@@ -197,7 +326,8 @@ class ProjectBot:
 
         send = self._send_to_chat if task.type == TaskType.CLAUDE else self._send_raw
         await send(
-            update.effective_chat.id, "\n".join(lines),
+            update.effective_chat.id,
+            "\n".join(lines),
             reply_to=update.effective_message.message_id,
         )
 
@@ -222,7 +352,10 @@ class ProjectBot:
 
         arg = ctx.args[0].lower()
         if arg == "all":
-            ids = [t.id for t in self.task_manager.list_tasks(chat_id=update.effective_chat.id)]
+            ids = [
+                t.id
+                for t in self.task_manager.list_tasks(chat_id=update.effective_chat.id)
+            ]
             count = self.task_manager.cancel_all()
             for tid in ids:
                 stop_typing(tid)
@@ -231,7 +364,9 @@ class ProjectBot:
             try:
                 task_id = int(arg)
             except ValueError:
-                return await update.effective_message.reply_text("Usage: /cancel [id|all]")
+                return await update.effective_message.reply_text(
+                    "Usage: /cancel [id|all]"
+                )
             if self.task_manager.cancel(task_id):
                 stop_typing(task_id)
                 msg = f"#{task_id} cancelled."
@@ -245,11 +380,13 @@ class ProjectBot:
         if not ctx.args:
             current = self.task_manager.claude.effort
             return await update.effective_message.reply_text(
-                f"Current: {current}\nUsage: /effort {{{'/'.join(EFFORT_LEVELS)}}}")
+                f"Current: {current}\nUsage: /effort {{{'/'.join(EFFORT_LEVELS)}}}"
+            )
         level = ctx.args[0].lower()
         if level not in EFFORT_LEVELS:
             return await update.effective_message.reply_text(
-                f"Invalid. Choose: {', '.join(EFFORT_LEVELS)}")
+                f"Invalid. Choose: {', '.join(EFFORT_LEVELS)}"
+            )
         self.task_manager.claude.effort = level
         await update.effective_message.reply_text(f"Effort: {level}")
 
@@ -294,26 +431,66 @@ class ProjectBot:
 
     # -- Helpers --
 
-    async def _send_to_chat(self, chat_id: int, text: str,
-                            reply_to: int | None = None) -> None:
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+
+    def _is_image(self, path: str) -> bool:
+        from pathlib import PurePosixPath
+
+        return PurePosixPath(path).suffix.lower() in self.IMAGE_EXTENSIONS
+
+    async def _send_image(
+        self, chat_id: int, file_path: str, reply_to: int | None = None
+    ) -> None:
+        path = (
+            self.path / file_path if not file_path.startswith("/") else Path(file_path)
+        )
+        if not path.exists():
+            logger.warning("Image file not found: %s", path)
+            return
+        try:
+            size = path.stat().st_size
+            suffix = path.suffix.lower()
+            if suffix == ".svg" or size > 10 * 1024 * 1024:
+                await self._app.bot.send_document(
+                    chat_id,
+                    open(path, "rb"),
+                    filename=path.name,
+                    reply_to_message_id=reply_to,
+                )
+            else:
+                await self._app.bot.send_photo(
+                    chat_id,
+                    open(path, "rb"),
+                    caption=path.name,
+                    reply_to_message_id=reply_to,
+                )
+        except Exception:
+            logger.warning("Failed to send image %s", path, exc_info=True)
+
+    async def _send_to_chat(
+        self, chat_id: int, text: str, reply_to: int | None = None
+    ) -> None:
         """Send Claude markdown output — converts to Telegram HTML."""
         text = text or "[No output]"
         html = md_to_telegram(text).replace("\x00", "")
         for chunk in split_html(html):
             try:
                 await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML",
-                    reply_to_message_id=reply_to)
+                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
+                )
             except Exception:
                 logger.warning("HTML send failed, falling back to plain", exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
                     await self._app.bot.send_message(
-                        chat_id, plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to_message_id=reply_to)
+                        chat_id,
+                        plain[:4096] if len(plain) > 4096 else plain,
+                        reply_to_message_id=reply_to,
+                    )
 
-    async def _send_raw(self, chat_id: int, text: str,
-                        reply_to: int | None = None) -> None:
+    async def _send_raw(
+        self, chat_id: int, text: str, reply_to: int | None = None
+    ) -> None:
         """Send raw shell output — wraps in <pre>, no markdown processing."""
         text = text or "[No output]"
         escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -321,14 +498,16 @@ class ProjectBot:
         for chunk in split_html(html):
             try:
                 await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML",
-                    reply_to_message_id=reply_to)
+                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
+                )
             except Exception:
                 logger.warning("Raw send failed, falling back to plain", exc_info=True)
                 if text.strip():
                     await self._app.bot.send_message(
-                        chat_id, text[:4096] if len(text) > 4096 else text,
-                        reply_to_message_id=reply_to)
+                        chat_id,
+                        text[:4096] if len(text) > 4096 else text,
+                        reply_to_message_id=reply_to,
+                    )
 
     @staticmethod
     async def _keep_typing(chat) -> None:
@@ -348,7 +527,9 @@ class ProjectBot:
     async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         err = str(ctx.error)
         if "Conflict" in err:
-            logger.warning("Conflict error (another instance?): %s | update=%s", err, update)
+            logger.warning(
+                "Conflict error (another instance?): %s | update=%s", err, update
+            )
         else:
             logger.error("Update error: %s | update=%s", ctx.error, update)
 
@@ -358,7 +539,13 @@ class ProjectBot:
         await app.bot.set_my_commands(COMMANDS)
 
     def build(self):
-        app = ApplicationBuilder().token(self.token).concurrent_updates(True).post_init(self._post_init).build()
+        app = (
+            ApplicationBuilder()
+            .token(self.token)
+            .concurrent_updates(True)
+            .post_init(self._post_init)
+            .build()
+        )
         self._app = app
         handlers = {
             "start": self._on_start,
@@ -373,23 +560,32 @@ class ProjectBot:
         }
         for name, handler in handlers.items():
             app.add_handler(CommandHandler(name, handler))
-        text_filter = (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE) & filters.TEXT & ~filters.COMMAND
+        text_filter = (
+            (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+            & filters.TEXT
+            & ~filters.COMMAND
+        )
         app.add_handler(MessageHandler(text_filter, self._on_text))
         app.add_error_handler(self._on_error)
         return app
 
 
-def run_bot(name: str, path: Path, token: str, username: str,
-            session_id: str | None = None) -> None:
+def run_bot(
+    name: str, path: Path, token: str, username: str, session_id: str | None = None
+) -> None:
     if not username:
-        raise SystemExit("No allowed username configured. Use --username or run 'configure --username'.")
+        raise SystemExit(
+            "No allowed username configured. Use --username or run 'configure --username'."
+        )
     if session_id:
         save_session(name, session_id)
     trusted_user_id = load_trusted_user_id()
     bot = ProjectBot(name, path, token, username, trusted_user_id=trusted_user_id)
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     app = bot.build()
-    logger.info("Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id)
+    logger.info(
+        "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
+    )
     app.run_polling()
 
 
