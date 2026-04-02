@@ -6,10 +6,11 @@ import time
 import time as time_mod
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -415,12 +416,65 @@ class ProjectBot:
         await update.effective_message.reply_text(cmd_list)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
+            return
         if not self._auth(update.effective_user):
             return
-        self.task_manager.cancel_all()
-        self.task_manager.claude.session_id = None
-        clear_session(self.name)
-        await update.effective_message.reply_text("Session reset.")
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Yes, reset", callback_data="reset_confirm"),
+                    InlineKeyboardButton("Cancel", callback_data="reset_cancel"),
+                ]
+            ]
+        )
+        await update.effective_message.reply_text(
+            "Are you sure? This will clear the Claude session.",
+            reply_markup=keyboard,
+        )
+
+    async def _on_callback(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        if not self._auth(query.from_user):
+            await query.answer("Unauthorized.")
+            return
+        await query.answer()
+
+        if query.data == "reset_confirm":
+            self.task_manager.cancel_all()
+            self.task_manager.claude.session_id = None
+            clear_session(self.name)
+            await query.edit_message_text("Session reset.")
+        elif query.data == "reset_cancel":
+            await query.edit_message_text("Reset cancelled.")
+        elif query.data.startswith("task_cancel_"):
+            task_id = int(query.data.split("_")[-1])
+            if self.task_manager.cancel(task_id):
+                typing = self._typing_tasks.pop(task_id, None)
+                if typing:
+                    typing.cancel()
+                await query.edit_message_text(f"#{task_id} cancelled.")
+            else:
+                await query.edit_message_text(
+                    f"#{task_id} not found or already finished."
+                )
+        elif query.data.startswith("task_log_"):
+            task_id = int(query.data.split("_")[-1])
+            task = self.task_manager.get(task_id)
+            if not task:
+                await query.edit_message_text(f"Task #{task_id} not found.")
+                return
+            output = task.result or task.error or "(no output)"
+            if len(output) > 3000:
+                output = (
+                    output[:3000]
+                    + f"\n... (truncated, {len(task.result or '')} chars total)"
+                )
+            await query.edit_message_text(f"Task #{task_id}:\n{output}")
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -668,6 +722,7 @@ class ProjectBot:
         app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
         app.add_error_handler(self._on_error)
+        app.add_handler(CallbackQueryHandler(self._on_callback))
         return app
 
 
