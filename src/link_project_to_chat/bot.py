@@ -429,6 +429,75 @@ class ProjectBot:
         ]
         await update.effective_message.reply_text("\n".join(lines))
 
+    async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not update.effective_chat:
+            return
+        if not self._auth(update.effective_user):
+            return await msg.reply_text("Unauthorized.")
+
+        uploads_dir = self.path / "uploads"
+        uploads_dir.mkdir(exist_ok=True)
+
+        if msg.photo:
+            photo = msg.photo[-1]
+            file = await photo.get_file()
+            filename = f"photo_{int(time.monotonic() * 1000)}.jpg"
+        elif msg.document:
+            file = await msg.document.get_file()
+            raw_name = msg.document.file_name or f"file_{int(time.monotonic() * 1000)}"
+            filename = "".join(
+                c
+                for c in raw_name.replace("/", "_").replace("\\", "_")
+                if c.isalnum() or c in "._- "
+            )[:200]
+        else:
+            return await msg.reply_text("Unsupported file type.")
+
+        # Handle name collisions
+        dest = uploads_dir / filename
+        if dest.exists():
+            stem = dest.stem
+            suffix = dest.suffix
+            counter = 2
+            while dest.exists():
+                dest = uploads_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+            filename = dest.name
+
+        await file.download_to_drive(str(dest))
+
+        caption = msg.caption or ""
+        prompt = f"[User uploaded uploads/{filename}]"
+        if caption:
+            prompt += f"\n\n{caption}"
+
+        self.task_manager.submit_claude(
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            prompt=prompt,
+        )
+
+    async def _on_unsupported(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
+        if not self._auth(update.effective_user):
+            return await msg.reply_text("Unauthorized.")
+
+        if msg.voice or msg.video_note:
+            text = "Voice messages aren't supported yet. Please type your message."
+        elif msg.sticker:
+            text = "Stickers aren't supported. Please type your message."
+        elif msg.video:
+            text = "Video messages aren't supported. Please type your message."
+        else:
+            text = "This message type isn't supported. Please type your message or send a file."
+
+        await msg.reply_text(text)
+
     # -- Helpers --
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
@@ -566,6 +635,23 @@ class ProjectBot:
             & ~filters.COMMAND
         )
         app.add_handler(MessageHandler(text_filter, self._on_text))
+
+        # File uploads (documents and photos)
+        file_filter = filters.Document.ALL | filters.PHOTO
+        app.add_handler(MessageHandler(file_filter, self._on_file))
+
+        # Unsupported message types
+        unsupported_filter = (
+            filters.VOICE
+            | filters.VIDEO_NOTE
+            | filters.Sticker.ALL
+            | filters.VIDEO
+            | filters.LOCATION
+            | filters.CONTACT
+            | filters.AUDIO
+        )
+        app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
+
         app.add_error_handler(self._on_error)
         return app
 
