@@ -364,12 +364,10 @@ class ProjectBot:
         if not self._auth(update.effective_user):
             return
 
-        def stop_task(task_id: int) -> None:
+        def stop_typing(task_id: int) -> None:
             typing = self._typing_tasks.pop(task_id, None)
             if typing:
                 typing.cancel()
-            self._stream_messages.pop(task_id, None)
-            self._stream_text.pop(task_id, None)
 
         if not ctx.args:
             tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
@@ -377,7 +375,7 @@ class ProjectBot:
             if running:
                 t = running[0]
                 self.task_manager.cancel(t.id)
-                stop_task(t.id)
+                stop_typing(t.id)
                 return await update.effective_message.reply_text(f"#{t.id} cancelled.")
             return await update.effective_message.reply_text("Nothing running.")
 
@@ -389,7 +387,7 @@ class ProjectBot:
             ]
             count = self.task_manager.cancel_all()
             for tid in ids:
-                stop_task(tid)
+                stop_typing(tid)
             msg = f"Cancelled {count} task(s)." if count else "Nothing to cancel."
         else:
             try:
@@ -399,7 +397,7 @@ class ProjectBot:
                     "Usage: /cancel [id|all]"
                 )
             if self.task_manager.cancel(task_id):
-                stop_task(task_id)
+                stop_typing(task_id)
                 msg = f"#{task_id} cancelled."
             else:
                 msg = f"#{task_id} not found or already finished."
@@ -488,14 +486,10 @@ class ProjectBot:
         await query.answer()
 
         if query.data == "reset_confirm":
-            if not self.task_manager.claude.session_id:
-                # Button is stale (e.g. from before a restart or a prior reset)
-                await query.edit_message_text("No active session to reset.")
-            else:
-                self.task_manager.cancel_all()
-                self.task_manager.claude.session_id = None
-                clear_session(self.name)
-                await query.edit_message_text("Session reset.")
+            self.task_manager.cancel_all()
+            self.task_manager.claude.session_id = None
+            clear_session(self.name)
+            await query.edit_message_text("Session reset.")
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
         elif query.data.startswith("task_cancel_"):
@@ -504,8 +498,6 @@ class ProjectBot:
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:
                     typing.cancel()
-                self._stream_messages.pop(task_id, None)
-                self._stream_text.pop(task_id, None)
                 await query.edit_message_text(f"#{task_id} cancelled.")
             else:
                 await query.edit_message_text(
@@ -553,8 +545,8 @@ class ProjectBot:
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
 
-        uploads_dir = Path("/tmp") / self.name
-        uploads_dir.mkdir(parents=True, exist_ok=True)
+        uploads_dir = self.path / "uploads"
+        uploads_dir.mkdir(exist_ok=True)
 
         if msg.photo:
             photo = msg.photo[-1]
@@ -584,7 +576,7 @@ class ProjectBot:
         await file.download_to_drive(str(dest))
 
         caption = msg.caption or ""
-        prompt = f"[User uploaded {dest}]"
+        prompt = f"[User uploaded uploads/{filename}]"
         if caption:
             prompt += f"\n\n{caption}"
 
@@ -633,19 +625,17 @@ class ProjectBot:
         try:
             size = path.stat().st_size
             suffix = path.suffix.lower()
-            with path.open("rb") as f:
-                data = f.read()
             if suffix == ".svg" or size > 10 * 1024 * 1024:
                 await self._app.bot.send_document(
                     chat_id,
-                    data,
+                    open(path, "rb"),
                     filename=path.name,
                     reply_to_message_id=reply_to,
                 )
             else:
                 await self._app.bot.send_photo(
                     chat_id,
-                    data,
+                    open(path, "rb"),
                     caption=path.name,
                     reply_to_message_id=reply_to,
                 )
