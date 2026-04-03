@@ -14,15 +14,28 @@ logger = logging.getLogger(__name__)
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 MODELS = ("haiku", "sonnet", "opus")
+PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
 
 
 class ClaudeClient:
-    def __init__(self, project_path: Path, model: str = DEFAULT_MODEL):
+    def __init__(
+        self,
+        project_path: Path,
+        model: str = DEFAULT_MODEL,
+        skip_permissions: bool = True,
+        permission_mode: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+    ):
         self.model = model
         self.model_display: str | None = None
         self.project_path = project_path
         self.effort: str = "medium"
+        self.skip_permissions: bool = skip_permissions
+        self.permission_mode: str | None = permission_mode
+        self.allowed_tools: list[str] = allowed_tools or []
+        self.disallowed_tools: list[str] = disallowed_tools or []
         self.session_id: str | None = None
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
@@ -45,8 +58,19 @@ class ClaudeClient:
             "--verbose",
             "--effort",
             self.effort,
-            "--dangerously-skip-permissions",
         ]
+
+        if self.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+
+        if self.permission_mode:
+            cmd.extend(["--permission-mode", self.permission_mode])
+
+        if self.allowed_tools:
+            cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
+
+        if self.disallowed_tools:
+            cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
         if self.session_id:
             cmd.extend(["--resume", self.session_id])

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,11 +30,13 @@ from .config import (
     save_trusted_user_id,
 )
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
 from .stream import StreamEvent, TextDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
+
+MAX_MESSAGES_PER_MINUTE = 30
 
 COMMANDS = [
     ("run", "Run a background command"),
@@ -39,9 +45,11 @@ COMMANDS = [
     ("cancel", "Cancel a task"),
     ("model", "Set Claude model (haiku/sonnet/opus)"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
+    ("permissions", "Set permission mode"),
     ("compact", "Compress session context"),
     ("status", "Bot status"),
     ("reset", "Clear Claude session"),
+    ("restart", "Rebuild and restart the bot"),
     ("help", "Show available commands"),
 ]
 
@@ -54,6 +62,10 @@ class ProjectBot:
         token: str,
         allowed_username: str,
         trusted_user_id: int | None = None,
+        skip_permissions: bool = False,
+        permission_mode: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -65,23 +77,45 @@ class ProjectBot:
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._stream_messages: dict[int, tuple[int, float]] = {}
         self._stream_text: dict[int, str] = {}
+        self._rate_limits: dict[int, collections.deque] = {}
+        self._failed_auth_counts: dict[int, int] = {}
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
             on_task_started=self._on_task_started,
             on_stream_event=self._on_stream_event,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
         )
 
     def _auth(self, user) -> bool:
         if not self.allowed_username:
             return False  # fail-closed: no access if username is not configured
+        if self._failed_auth_counts.get(user.id, 0) >= 5:
+            return False
         if self._trusted_user_id is not None:
-            return user.id == self._trusted_user_id
+            if user.id != self._trusted_user_id:
+                self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
+                return False
+            return True
         if (user.username or "").lower() == self.allowed_username:
             self._trusted_user_id = user.id
             save_trusted_user_id(user.id)
             logger.info("Trusted user_id %d saved", user.id)
             return True
+        self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
+        return False
+
+    def _rate_limited(self, user_id: int) -> bool:
+        now = time.monotonic()
+        timestamps = self._rate_limits.setdefault(user_id, collections.deque())
+        while timestamps and now - timestamps[0] > 60:
+            timestamps.popleft()
+        if len(timestamps) >= MAX_MESSAGES_PER_MINUTE:
+            return True
+        timestamps.append(now)
         return False
 
     async def _on_task_started(self, task: Task) -> None:
@@ -235,6 +269,8 @@ class ProjectBot:
             return
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
+        if self._rate_limited(update.effective_user.id):
+            return await msg.reply_text("Rate limited. Try again shortly.")
 
         for prev in self.task_manager.find_by_message(msg.message_id):
             self.task_manager.cancel(prev.id)
@@ -425,6 +461,41 @@ class ProjectBot:
         self.task_manager.claude.effort = level
         await update.effective_message.reply_text(f"Effort: {level}")
 
+    _PERMISSION_OPTIONS = (
+        *PERMISSION_MODES,
+        "dangerously-skip-permissions",
+    )
+
+    async def _on_permissions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return
+        if not ctx.args:
+            claude = self.task_manager.claude
+            if claude.skip_permissions:
+                current = "dangerously-skip-permissions"
+            elif claude.permission_mode:
+                current = claude.permission_mode
+            else:
+                current = "default"
+            options = "\n".join(f"  {o}" for o in self._PERMISSION_OPTIONS)
+            return await update.effective_message.reply_text(
+                f"Current: {current}\n\nOptions:\n{options}\n\n"
+                f"Usage: /permissions <mode>"
+            )
+        mode = ctx.args[0].lower()
+        if mode == "dangerously-skip-permissions":
+            self.task_manager.claude.skip_permissions = True
+            self.task_manager.claude.permission_mode = None
+            await update.effective_message.reply_text("Permissions: dangerously-skip-permissions")
+        elif mode in PERMISSION_MODES:
+            self.task_manager.claude.skip_permissions = False
+            self.task_manager.claude.permission_mode = mode if mode != "default" else None
+            await update.effective_message.reply_text(f"Permissions: {mode}")
+        else:
+            await update.effective_message.reply_text(
+                f"Invalid. Choose: {', '.join(self._PERMISSION_OPTIONS)}"
+            )
+
     async def _on_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
@@ -461,6 +532,54 @@ class ProjectBot:
             reply_markup=keyboard,
         )
 
+    async def _on_restart(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
+            return
+        if not self._auth(update.effective_user):
+            return
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Yes, restart", callback_data="restart_confirm"),
+                    InlineKeyboardButton("Cancel", callback_data="restart_cancel"),
+                ]
+            ]
+        )
+        await update.effective_message.reply_text(
+            "This will rebuild and restart the bot. Continue?",
+            reply_markup=keyboard,
+        )
+
+    async def _do_restart(self, chat_id: int) -> None:
+        from .cli import _ORIGINAL_ARGV, _ORIGINAL_EXECUTABLE
+
+        # Find the package source directory (where pyproject.toml lives)
+        pkg_dir = Path(__file__).resolve().parent.parent.parent
+        pyproject = pkg_dir / "pyproject.toml"
+
+        if pyproject.exists():
+            await self._app.bot.send_message(chat_id, "Installing...")
+            proc = subprocess.run(
+                ["pipx", "install", "-e", str(pkg_dir), "--force"],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                err = (proc.stderr or proc.stdout or "unknown error")[-500:]
+                await self._app.bot.send_message(chat_id, f"Build failed:\n{err}")
+                return
+
+        await self._app.bot.send_message(chat_id, "Restarting...")
+        self.task_manager.cancel_all()
+
+        argv0 = _ORIGINAL_ARGV[0]
+        if os.path.isfile(argv0) and os.access(argv0, os.X_OK):
+            # Console script entry point (e.g. /path/to/venv/bin/link-project-to-chat)
+            os.execv(argv0, _ORIGINAL_ARGV)
+        else:
+            # Invoked as `python -m link_project_to_chat ...`
+            os.execv(_ORIGINAL_EXECUTABLE, [_ORIGINAL_EXECUTABLE] + _ORIGINAL_ARGV)
+
     async def _on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -472,7 +591,14 @@ class ProjectBot:
             return
         await query.answer()
 
-        if query.data == "reset_confirm":
+        if query.data == "restart_confirm":
+            await query.edit_message_text("Rebuilding...")
+            await self._do_restart(query.message.chat_id)
+            return
+        elif query.data == "restart_cancel":
+            await query.edit_message_text("Restart cancelled.")
+            return
+        elif query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             clear_session(self.name)
@@ -544,6 +670,8 @@ class ProjectBot:
             return
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
+        if self._rate_limited(update.effective_user.id):
+            return await msg.reply_text("Rate limited. Try again shortly.")
 
         uploads_dir = self.path / "uploads"
         uploads_dir.mkdir(exist_ok=True)
@@ -712,6 +840,14 @@ class ProjectBot:
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
         await app.bot.set_my_commands(COMMANDS)
+        if self._trusted_user_id:
+            try:
+                await app.bot.send_message(
+                    self._trusted_user_id,
+                    f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+                )
+            except Exception:
+                logger.error("Failed to send startup message", exc_info=True)
 
     def build(self):
         app = (
@@ -730,8 +866,10 @@ class ProjectBot:
             "cancel": self._on_cancel,
             "model": self._on_model,
             "effort": self._on_effort,
+            "permissions": self._on_permissions,
             "compact": self._on_compact,
             "reset": self._on_reset,
+            "restart": self._on_restart,
             "status": self._on_status,
             "help": self._on_help,
         }
@@ -770,6 +908,10 @@ def run_bot(
     username: str,
     session_id: str | None = None,
     model: str | None = None,
+    skip_permissions: bool = False,
+    permission_mode: str | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
 ) -> None:
     if not username:
         raise SystemExit(
@@ -778,7 +920,14 @@ def run_bot(
     if session_id:
         save_session(name, session_id)
     trusted_user_id = load_trusted_user_id()
-    bot = ProjectBot(name, path, token, username, trusted_user_id=trusted_user_id)
+    bot = ProjectBot(
+        name, path, token, username,
+        trusted_user_id=trusted_user_id,
+        skip_permissions=skip_permissions,
+        permission_mode=permission_mode,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
+    )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
         bot.task_manager.claude.model = model
@@ -789,7 +938,14 @@ def run_bot(
     app.run_polling()
 
 
-def run_bots(config: Config, model: str | None = None) -> None:
+def run_bots(
+    config: Config,
+    model: str | None = None,
+    skip_permissions: bool = False,
+    permission_mode: str | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
         run_bot(
@@ -798,6 +954,10 @@ def run_bots(config: Config, model: str | None = None) -> None:
             proj.telegram_bot_token,
             config.allowed_username,
             model=model,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
         )
     else:
         names = ", ".join(config.projects.keys())
