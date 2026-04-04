@@ -3,9 +3,6 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
-import os
-import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -49,7 +46,6 @@ COMMANDS = [
     ("compact", "Compress session context"),
     ("status", "Bot status"),
     ("reset", "Clear Claude session"),
-    ("restart", "Rebuild and restart the bot"),
     ("help", "Show available commands"),
 ]
 
@@ -532,54 +528,6 @@ class ProjectBot:
             reply_markup=keyboard,
         )
 
-    async def _on_restart(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_message:
-            return
-        if not self._auth(update.effective_user):
-            return
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Yes, restart", callback_data="restart_confirm"),
-                    InlineKeyboardButton("Cancel", callback_data="restart_cancel"),
-                ]
-            ]
-        )
-        await update.effective_message.reply_text(
-            "This will rebuild and restart the bot. Continue?",
-            reply_markup=keyboard,
-        )
-
-    async def _do_restart(self, chat_id: int) -> None:
-        from .cli import _ORIGINAL_ARGV, _ORIGINAL_EXECUTABLE
-
-        # Find the package source directory (where pyproject.toml lives)
-        pkg_dir = Path(__file__).resolve().parent.parent.parent
-        pyproject = pkg_dir / "pyproject.toml"
-
-        if pyproject.exists():
-            await self._app.bot.send_message(chat_id, "Installing...")
-            proc = subprocess.run(
-                ["pipx", "install", "-e", str(pkg_dir), "--force"],
-                capture_output=True,
-                text=True,
-            )
-            if proc.returncode != 0:
-                err = (proc.stderr or proc.stdout or "unknown error")[-500:]
-                await self._app.bot.send_message(chat_id, f"Build failed:\n{err}")
-                return
-
-        await self._app.bot.send_message(chat_id, "Restarting...")
-        self.task_manager.cancel_all()
-
-        argv0 = _ORIGINAL_ARGV[0]
-        if os.path.isfile(argv0) and os.access(argv0, os.X_OK):
-            # Console script entry point (e.g. /path/to/venv/bin/link-project-to-chat)
-            os.execv(argv0, _ORIGINAL_ARGV)
-        else:
-            # Invoked as `python -m link_project_to_chat ...`
-            os.execv(_ORIGINAL_EXECUTABLE, [_ORIGINAL_EXECUTABLE] + _ORIGINAL_ARGV)
-
     async def _on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -591,14 +539,7 @@ class ProjectBot:
             return
         await query.answer()
 
-        if query.data == "restart_confirm":
-            await query.edit_message_text("Rebuilding...")
-            await self._do_restart(query.message.chat_id)
-            return
-        elif query.data == "restart_cancel":
-            await query.edit_message_text("Restart cancelled.")
-            return
-        elif query.data == "reset_confirm":
+        if query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             clear_session(self.name)
@@ -869,7 +810,6 @@ class ProjectBot:
             "permissions": self._on_permissions,
             "compact": self._on_compact,
             "reset": self._on_reset,
-            "restart": self._on_restart,
             "status": self._on_status,
             "help": self._on_help,
         }

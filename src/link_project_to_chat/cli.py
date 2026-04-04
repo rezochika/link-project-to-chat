@@ -2,14 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 
 import click
-
-# Captured at import time so /restart can re-exec with the same args.
-_ORIGINAL_ARGV: list[str] = sys.argv[:]
-_ORIGINAL_EXECUTABLE: str = sys.executable
 
 from .config import (
     DEFAULT_CONFIG,
