@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 import click
 
 from .config import (
     DEFAULT_CONFIG,
-    ProjectConfig,
     clear_trusted_user_id,
     load_config,
+    load_trusted_user_id,
     save_config,
+    save_project_trusted_user_id,
 )
 
 
@@ -34,50 +34,148 @@ def main(ctx, config_path: str | None):
     ctx.obj["config_path"] = Path(config_path) if config_path else DEFAULT_CONFIG
 
 
-@main.command()
-@click.argument(
-    "path", type=click.Path(exists=True, file_okay=False, resolve_path=True)
-)
-@click.option("--name", default=None, help="Project name (defaults to directory name)")
-@click.option("--token", prompt="Telegram bot token", help="Bot token from BotFather")
+@main.group(invoke_without_command=True)
 @click.pass_context
-def link(ctx, path: str, name: str | None, token: str):
-    """Link a project directory to a Telegram bot."""
-    cfg_path = ctx.obj["config_path"]
-    config = load_config(cfg_path)
-    project_path = Path(path).resolve()
-    project_name = name or project_path.name
-
-    config.projects[project_name] = ProjectConfig(
-        path=str(project_path), telegram_bot_token=token
-    )
-    save_config(config, cfg_path)
-    click.echo(f"Linked '{project_name}' -> {project_path}")
+def projects(ctx):
+    """Manage linked projects."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(projects_list)
 
 
-@main.command()
-@click.argument("name")
+@projects.command("list")
 @click.pass_context
-def unlink(ctx, name: str):
-    """Remove the linked project."""
-    cfg_path = ctx.obj["config_path"]
-    config = load_config(cfg_path)
-    if name not in config.projects:
-        raise SystemExit(f"Project '{name}' not found.")
-    del config.projects[name]
-    save_config(config, cfg_path)
-    click.echo(f"Unlinked '{name}'")
-
-
-@main.command("list")
-@click.pass_context
-def list_projects(ctx):
-    """Show the linked project."""
+def projects_list(ctx):
+    """List all linked projects."""
     config = load_config(ctx.obj["config_path"])
     if not config.projects:
         return click.echo("No projects linked.")
     for name, proj in config.projects.items():
         click.echo(f"  {name}: {proj.path}")
+
+
+@projects.command("add")
+@click.option("--name", required=True, help="Project name")
+@click.option(
+    "--path",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, resolve_path=True),
+    help="Project directory",
+)
+@click.option("--token", required=True, help="Telegram bot token from BotFather")
+@click.option("--username", default=None, help="Allowed Telegram username")
+@click.option("--model", default=None, help="Claude model (haiku/sonnet/opus)")
+@click.option(
+    "--permission-mode",
+    type=click.Choice(["default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto"]),
+    default=None,
+    help="Claude permission mode",
+)
+@click.option(
+    "--dangerously-skip-permissions",
+    "skip_permissions",
+    is_flag=True,
+    default=False,
+    help="Allow Claude to skip all permission checks",
+)
+@click.pass_context
+def projects_add(ctx, name: str, project_path: str, token: str, username: str | None, model: str | None, permission_mode: str | None, skip_permissions: bool):
+    """Add a project."""
+    from .manager.config import load_project_configs, save_project_configs
+
+    cfg_path = ctx.obj["config_path"]
+    projects = load_project_configs(cfg_path)
+    if name in projects:
+        raise SystemExit(f"Project '{name}' already exists.")
+    entry: dict = {"path": str(Path(project_path).resolve()), "telegram_bot_token": token}
+    if username:
+        entry["username"] = username.lower().lstrip("@")
+    if model:
+        entry["model"] = model
+    if permission_mode:
+        entry["permission_mode"] = permission_mode
+    if skip_permissions:
+        entry["dangerously_skip_permissions"] = True
+    save_project_configs(projects | {name: entry}, cfg_path)
+    click.echo(f"Added '{name}' -> {project_path}")
+
+
+@projects.command("remove")
+@click.argument("name")
+@click.pass_context
+def projects_remove(ctx, name: str):
+    """Remove a project."""
+    from .manager.config import load_project_configs, save_project_configs
+
+    cfg_path = ctx.obj["config_path"]
+    projects = load_project_configs(cfg_path)
+    if name not in projects:
+        raise SystemExit(f"Project '{name}' not found.")
+    del projects[name]
+    save_project_configs(projects, cfg_path)
+    click.echo(f"Removed '{name}'.")
+
+
+@projects.command("edit")
+@click.argument("name")
+@click.argument("field")
+@click.argument("value")
+@click.pass_context
+def projects_edit(ctx, name: str, field: str, value: str):
+    """Edit a project field (name, path, token, username, model, permission_mode, dangerously_skip_permissions)."""
+    from .manager.config import load_project_configs, save_project_configs
+
+    _EDITABLE = ("name", "path", "token", "username", "model", "permission_mode", "dangerously_skip_permissions")
+    cfg_path = ctx.obj["config_path"]
+    projects = load_project_configs(cfg_path)
+    if name not in projects:
+        raise SystemExit(f"Project '{name}' not found.")
+
+    if field == "name":
+        if value in projects:
+            raise SystemExit(f"Project '{value}' already exists.")
+        projects[value] = projects.pop(name)
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Renamed '{name}' to '{value}'.")
+    elif field == "path":
+        if not Path(value).exists():
+            raise SystemExit(f"Path does not exist: {value}")
+        projects[name]["path"] = value
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' path to {value}.")
+    elif field == "token":
+        projects[name]["telegram_bot_token"] = value
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' token.")
+    elif field in ("username", "model", "permission_mode", "dangerously_skip_permissions"):
+        projects[name][field] = value
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' {field} to {value}.")
+    else:
+        raise SystemExit(f"Unknown field. Use: {', '.join(_EDITABLE)}")
+
+
+@main.command()
+@click.option("--username", default=None, help="Allowed Telegram username")
+@click.option("--manager-token", default=None, help="Telegram bot token for the manager bot")
+@click.pass_context
+def configure(ctx, username: str | None, manager_token: str | None):
+    """Configure username and/or manager bot token."""
+    if not username and not manager_token:
+        raise SystemExit("Provide at least one of --username or --manager-token.")
+    cfg_path = ctx.obj["config_path"]
+    config = load_config(cfg_path)
+    if username:
+        new_username = username.lower().lstrip("@")
+        if new_username != config.allowed_username:
+            clear_trusted_user_id(cfg_path)
+            click.echo("Trusted user ID cleared (username changed).")
+        config.allowed_username = new_username
+        click.echo(f"Configured username: @{new_username}")
+    if manager_token:
+        config.manager_bot_token = manager_token
+        click.echo(f"Configured manager token: ***{manager_token[-4:]}")
+    save_config(config, cfg_path)
 
 
 @main.command()
@@ -145,9 +243,7 @@ def start(
     allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else None
     disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else None
 
-    # Environment variable fallback for token
-    if not token:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    cfg_path = ctx.obj["config_path"]
 
     if project_path and token:
         p = Path(project_path).resolve()
@@ -162,33 +258,41 @@ def start(
             permission_mode=permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
+            trusted_user_id=load_trusted_user_id(cfg_path),
         )
         return
 
-    config = load_config(ctx.obj["config_path"])
+    config = load_config(cfg_path)
     if username:
         config.allowed_username = username.lower().lstrip("@")
 
     if not config.projects:
         raise SystemExit(
-            "No projects. Use --path/--token params or 'link' command first."
+            "No projects. Use --path/--token params or 'projects add' command first."
         )
 
     if project:
         if project not in config.projects:
             raise SystemExit(f"Project '{project}' not found.")
         proj = config.projects[project]
+        effective_username = proj.allowed_username or config.allowed_username
+        if proj.allowed_username:
+            effective_trusted_id = proj.trusted_user_id
+        else:
+            effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
         run_bot(
             project,
             Path(proj.path),
             proj.telegram_bot_token,
-            config.allowed_username,
+            effective_username,
             session_id=session_id,
             model=model,
             skip_permissions=skip_permissions,
             permission_mode=permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
+            trusted_user_id=effective_trusted_id,
+            on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
         )
     else:
         run_bots(
@@ -198,25 +302,34 @@ def start(
             permission_mode=permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
+            config_path=cfg_path,
         )
 
 
-@main.command()
-@click.option(
-    "--username",
-    required=True,
-    prompt="Telegram username",
-    help="Allowed Telegram username",
-)
+@main.command("start-manager")
 @click.pass_context
-def configure(ctx, username: str):
-    """Set the allowed Telegram username."""
+def start_manager(ctx):
+    """Start the manager bot."""
+    from .manager.bot import ManagerBot
+    from .manager.config import DEFAULT_CONFIG, load_manager_config
+    from .manager.process import ProcessManager
+
     cfg_path = ctx.obj["config_path"]
-    config = load_config(cfg_path)
-    new_username = username.lower().lstrip("@")
-    if new_username != config.allowed_username:
-        clear_trusted_user_id()
-        click.echo("Trusted user ID cleared (username changed).")
-    config.allowed_username = new_username
-    save_config(config, cfg_path)
-    click.echo(f"Configured username: @{new_username}")
+    main_config = load_config(cfg_path)
+    manager_config = load_manager_config(DEFAULT_CONFIG)
+
+    token = main_config.manager_bot_token
+    if not token:
+        raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
+    if not main_config.allowed_username:
+        raise SystemExit("No username configured. Run 'configure --username USER' first.")
+
+    manager_config.telegram_bot_token = token
+    pm = ProcessManager(config=manager_config)
+    restored = pm.restore()
+    if restored:
+        click.echo(f"Restored {restored} project(s) from previous state.")
+
+    bot = ManagerBot(manager_config, pm, allowed_username=main_config.allowed_username, trusted_user_id=main_config.trusted_user_id, project_config_path=cfg_path)
+    click.echo("Manager bot started.")
+    bot.build().run_polling()

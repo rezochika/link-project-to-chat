@@ -34,8 +34,8 @@ link-project-to-chat start --path /path/to/project --token YOUR_BOT_TOKEN --user
 # Set your Telegram username (once)
 link-project-to-chat configure --username your_telegram_username
 
-# Link a project
-link-project-to-chat link /path/to/project --token YOUR_BOT_TOKEN
+# Add a project
+link-project-to-chat projects add --name myproject --path /path/to/project --token YOUR_BOT_TOKEN
 
 # Start the bot
 link-project-to-chat start
@@ -78,11 +78,10 @@ Claude messages and `/run` commands both execute in **parallel** — they don't 
 |---|---|
 | (message) | Chat with Claude in the project context |
 | `/run <cmd>` | Run a shell command in the project directory |
-| `/tasks` | List active tasks |
-| `/log <id>` | Show task output |
-| `/cancel [id\|all]` | Cancel tasks |
+| `/tasks` | List active tasks with per-task buttons (log, cancel) |
 | `/model haiku/sonnet/opus` | Set Claude model |
 | `/effort low/medium/high/max` | Set Claude thinking depth |
+| `/permissions <mode>` | Set permission mode |
 | `/compact` | Compress session context |
 | `/reset` | Clear the Claude session |
 | `/status` | Show bot status |
@@ -91,14 +90,56 @@ Claude messages and `/run` commands both execute in **parallel** — they don't 
 ## CLI reference
 
 ```
-link-project-to-chat configure --username USER
-link-project-to-chat link <path> --token TOKEN [--name NAME]
-link-project-to-chat unlink <name>
-link-project-to-chat list
-link-project-to-chat start [--project NAME] [--path PATH] [--token TOKEN] [--username USER] [--session-id ID] [--model MODEL]
+link-project-to-chat configure [--username USER] [--manager-token TOKEN]
+
+link-project-to-chat projects
+link-project-to-chat projects list
+link-project-to-chat projects add --name NAME --path PATH --token TOKEN
+                                   [--username USER] [--model MODEL]
+                                   [--permission-mode MODE] [--dangerously-skip-permissions]
+link-project-to-chat projects remove <name>
+link-project-to-chat projects edit <name> <field> <value>
+
+link-project-to-chat start [--project NAME] [--path PATH] [--token TOKEN]
+                            [--username USER] [--session-id ID] [--model MODEL]
+                            [--permission-mode MODE] [--allowed-tools TOOLS]
+                            [--disallowed-tools TOOLS] [--dangerously-skip-permissions]
+link-project-to-chat start-manager
 ```
 
 Config is stored at `~/.link-project-to-chat/config.json`.
+
+## Manager
+
+The manager bot controls multiple project bots from a single Telegram chat — start, stop, view logs, and add/remove projects without touching the terminal.
+
+### Setup
+
+```bash
+# Set your Telegram username and manager bot token
+link-project-to-chat configure --username your_telegram_username --manager-token MANAGER_TOKEN
+
+# Add projects (each needs its own bot token)
+link-project-to-chat projects add --name myproject --path /path/to/project --token PROJECT_BOT_TOKEN
+
+# Start the manager
+link-project-to-chat start-manager
+```
+
+### Manager bot commands
+
+| Command | Description |
+|---|---|
+| `/projects` | List all projects with status and start/stop/logs/remove buttons |
+| `/start_all` | Start all projects |
+| `/stop_all` | Stop all projects |
+| `/add_project` | Add a project interactively |
+| `/edit_project <name> <field> <value>` | Edit a project field |
+| `/help` | Show available commands |
+
+Editable fields: `name`, `path`, `token`, `username`, `model`, `permission_mode`, `dangerously_skip_permissions`
+
+Manager config is stored at `~/.link-project-to-chat/manager/config.json`.
 
 ## Planned features
 

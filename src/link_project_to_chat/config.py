@@ -11,11 +11,15 @@ DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 class ProjectConfig:
     path: str
     telegram_bot_token: str
+    allowed_username: str = ""  # per-project override; falls back to Config.allowed_username
+    trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
 
 
 @dataclass
 class Config:
     allowed_username: str = ""
+    trusted_user_id: int | None = None  # global fallback (also used by manager bot)
+    manager_bot_token: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -24,12 +28,52 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     if path.exists():
         raw = json.loads(path.read_text())
         config.allowed_username = raw.get("allowed_username", "").lower().lstrip("@")
+        config.trusted_user_id = raw.get("trusted_user_id")
+        config.manager_bot_token = raw.get("manager_bot_token", "")
         for name, proj in raw.get("projects", {}).items():
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
-                telegram_bot_token=proj["telegram_bot_token"],
+                telegram_bot_token=proj.get("telegram_bot_token", ""),
+                allowed_username=proj.get("username", "").lower().lstrip("@"),
+                trusted_user_id=proj.get("trusted_user_id"),
             )
     return config
+
+
+def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    raw: dict = {}
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    raw["allowed_username"] = config.allowed_username
+    raw["manager_bot_token"] = config.manager_bot_token
+    if config.trusted_user_id is not None:
+        raw["trusted_user_id"] = config.trusted_user_id
+    else:
+        raw.pop("trusted_user_id", None)
+    # Merge per-project data, preserving unknown keys already in the file
+    existing_projects: dict = raw.get("projects", {})
+    for name, p in config.projects.items():
+        proj = existing_projects.get(name, {})
+        proj["path"] = p.path
+        proj["telegram_bot_token"] = p.telegram_bot_token
+        if p.allowed_username:
+            proj["username"] = p.allowed_username
+        else:
+            proj.pop("username", None)
+        if p.trusted_user_id is not None:
+            proj["trusted_user_id"] = p.trusted_user_id
+        else:
+            proj.pop("trusted_user_id", None)
+        existing_projects[name] = proj
+    # Remove projects that no longer exist in config
+    raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
+    path.write_text(json.dumps(raw, indent=2) + "\n")
+    path.chmod(0o600)
 
 
 SESSIONS_FILE = Path.home() / ".link-project-to-chat" / "sessions.json"
@@ -61,37 +105,46 @@ def clear_session(project_name: str, path: Path = SESSIONS_FILE) -> None:
         path.write_text(json.dumps(sessions, indent=2) + "\n")
 
 
-TRUSTED_USER_ID_FILE = Path.home() / ".link-project-to-chat" / "trusted_user_id.json"
-
-
-def load_trusted_user_id(path: Path = TRUSTED_USER_ID_FILE) -> int | None:
+def _patch_json(patch_fn, path: Path) -> None:
+    """Read-modify-write config JSON via a mutating function."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw: dict = {}
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            raw = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
-            return None
+            pass
+    patch_fn(raw)
+    path.write_text(json.dumps(raw, indent=2) + "\n")
+    path.chmod(0o600)
+
+
+def load_trusted_user_id(path: Path = DEFAULT_CONFIG) -> int | None:
+    """Load the global trusted_user_id from config.json."""
+    if path.exists():
+        try:
+            return json.loads(path.read_text()).get("trusted_user_id")
+        except (json.JSONDecodeError, OSError):
+            pass
     return None
 
 
-def save_trusted_user_id(user_id: int, path: Path = TRUSTED_USER_ID_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(user_id) + "\n")
+def save_trusted_user_id(user_id: int, path: Path = DEFAULT_CONFIG) -> None:
+    """Save the global trusted_user_id into config.json."""
+    _patch_json(lambda raw: raw.update({"trusted_user_id": user_id}), path)
 
 
-def clear_trusted_user_id(path: Path = TRUSTED_USER_ID_FILE) -> None:
-    if path.exists():
-        path.unlink()
+def save_project_trusted_user_id(
+    project_name: str, user_id: int, path: Path = DEFAULT_CONFIG
+) -> None:
+    """Save a per-project trusted_user_id into config.json."""
+    def _patch(raw: dict) -> None:
+        raw.setdefault("projects", {}).setdefault(project_name, {})["trusted_user_id"] = user_id
+    _patch_json(_patch, path)
 
 
-def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    raw = {
-        "allowed_username": config.allowed_username,
-        "projects": {
-            name: {"path": p.path, "telegram_bot_token": p.telegram_bot_token}
-            for name, p in config.projects.items()
-        },
-    }
-    path.write_text(json.dumps(raw, indent=2) + "\n")
-    path.chmod(0o600)
+def clear_trusted_user_id(path: Path = DEFAULT_CONFIG) -> None:
+    """Remove the global trusted_user_id from config.json."""
+    def _patch(raw: dict) -> None:
+        raw.pop("trusted_user_id", None)
+    _patch_json(_patch, path)

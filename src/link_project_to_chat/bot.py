@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import collections
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,12 +20,14 @@ from telegram.ext import (
 
 from .config import (
     Config,
+    DEFAULT_CONFIG,
     clear_session,
     load_sessions,
-    load_trusted_user_id,
     save_session,
+    save_project_trusted_user_id,
     save_trusted_user_id,
 )
+from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
 from .stream import StreamEvent, TextDelta, ToolUse
@@ -33,13 +35,9 @@ from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
 
-MAX_MESSAGES_PER_MINUTE = 30
-
 COMMANDS = [
     ("run", "Run a background command"),
     ("tasks", "List all tasks"),
-    ("log", "Show task output"),
-    ("cancel", "Cancel a task"),
     ("model", "Set Claude model (haiku/sonnet/opus)"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
     ("permissions", "Set permission mode"),
@@ -50,7 +48,7 @@ COMMANDS = [
 ]
 
 
-class ProjectBot:
+class ProjectBot(AuthMixin):
     def __init__(
         self,
         name: str,
@@ -58,6 +56,7 @@ class ProjectBot:
         token: str,
         allowed_username: str,
         trusted_user_id: int | None = None,
+        on_trust: Callable[[int], None] | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
@@ -66,15 +65,15 @@ class ProjectBot:
         self.name = name
         self.path = path.resolve()
         self.token = token
-        self.allowed_username = allowed_username
-        self._trusted_user_id: int | None = trusted_user_id
+        self._allowed_username = allowed_username
+        self._trusted_user_id = trusted_user_id
+        self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._stream_messages: dict[int, tuple[int, float]] = {}
         self._stream_text: dict[int, str] = {}
-        self._rate_limits: dict[int, collections.deque] = {}
-        self._failed_auth_counts: dict[int, int] = {}
+        self._init_auth()
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -86,33 +85,11 @@ class ProjectBot:
             disallowed_tools=disallowed_tools,
         )
 
-    def _auth(self, user) -> bool:
-        if not self.allowed_username:
-            return False  # fail-closed: no access if username is not configured
-        if self._failed_auth_counts.get(user.id, 0) >= 5:
-            return False
-        if self._trusted_user_id is not None:
-            if user.id != self._trusted_user_id:
-                self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
-                return False
-            return True
-        if (user.username or "").lower() == self.allowed_username:
-            self._trusted_user_id = user.id
-            save_trusted_user_id(user.id)
-            logger.info("Trusted user_id %d saved", user.id)
-            return True
-        self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
-        return False
-
-    def _rate_limited(self, user_id: int) -> bool:
-        now = time.monotonic()
-        timestamps = self._rate_limits.setdefault(user_id, collections.deque())
-        while timestamps and now - timestamps[0] > 60:
-            timestamps.popleft()
-        if len(timestamps) >= MAX_MESSAGES_PER_MINUTE:
-            return True
-        timestamps.append(now)
-        return False
+    def _on_trust(self, user_id: int) -> None:
+        if self._on_trust_fn:
+            self._on_trust_fn(user_id)
+        else:
+            save_trusted_user_id(user_id)
 
     async def _on_task_started(self, task: Task) -> None:
         chat = await self._app.bot.get_chat(task.chat_id)
@@ -329,98 +306,6 @@ class ProjectBot:
             return
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
-
-    async def _on_log(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /log <task_id>")
-        try:
-            task_id = int(ctx.args[0])
-        except ValueError:
-            return await update.effective_message.reply_text("Invalid task ID.")
-
-        task = self.task_manager.get(task_id)
-        if not task:
-            return await update.effective_message.reply_text(
-                f"Task #{task_id} not found."
-            )
-
-        lines = [f"Task #{task.id} | {task.type.value} | {task.status.value}"]
-        if task.elapsed_human is not None:
-            lines[0] += f" | {task.elapsed_human}"
-        lines.append(f"Input: {task.input[:200]}")
-
-        if task.type == TaskType.COMMAND and task.exit_code is not None:
-            lines.append(f"Exit: {task.exit_code}")
-
-        if task.status == TaskStatus.RUNNING:
-            tail = task.tail(10)
-            if tail:
-                lines.append(f"\n{tail}")
-            else:
-                lines.append(f"\nRunning for {task.elapsed_human}...")
-        elif task.result:
-            output = task.result
-            if len(output) > 3000:
-                output = (
-                    output[:3000] + f"\n... (truncated, {len(task.result)} chars total)"
-                )
-            lines.append(f"\n{output}")
-        elif task.error:
-            lines.append(f"\nError: {task.error}")
-        elif task.status == TaskStatus.WAITING:
-            lines.append("\nWaiting...")
-
-        send = self._send_to_chat if task.type == TaskType.CLAUDE else self._send_raw
-        await send(
-            update.effective_chat.id,
-            "\n".join(lines),
-            reply_to=update.effective_message.message_id,
-        )
-
-    async def _on_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return
-
-        def stop_typing(task_id: int) -> None:
-            typing = self._typing_tasks.pop(task_id, None)
-            if typing:
-                typing.cancel()
-
-        if not ctx.args:
-            tasks = self.task_manager.list_tasks(chat_id=update.effective_chat.id)
-            running = [t for t in tasks if t.status == TaskStatus.RUNNING]
-            if running:
-                t = running[0]
-                self.task_manager.cancel(t.id)
-                stop_typing(t.id)
-                return await update.effective_message.reply_text(f"#{t.id} cancelled.")
-            return await update.effective_message.reply_text("Nothing running.")
-
-        arg = ctx.args[0].lower()
-        if arg == "all":
-            ids = [
-                t.id
-                for t in self.task_manager.list_tasks(chat_id=update.effective_chat.id)
-            ]
-            count = self.task_manager.cancel_all()
-            for tid in ids:
-                stop_typing(tid)
-            msg = f"Cancelled {count} task(s)." if count else "Nothing to cancel."
-        else:
-            try:
-                task_id = int(arg)
-            except ValueError:
-                return await update.effective_message.reply_text(
-                    "Usage: /cancel [id|all]"
-                )
-            if self.task_manager.cancel(task_id):
-                stop_typing(task_id)
-                msg = f"#{task_id} cancelled."
-            else:
-                msg = f"#{task_id} not found or already finished."
-        await update.effective_message.reply_text(msg)
 
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -803,8 +688,6 @@ class ProjectBot:
             "start": self._on_start,
             "run": self._on_run,
             "tasks": self._on_tasks,
-            "log": self._on_log,
-            "cancel": self._on_cancel,
             "model": self._on_model,
             "effort": self._on_effort,
             "permissions": self._on_permissions,
@@ -852,6 +735,8 @@ def run_bot(
     permission_mode: str | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
+    trusted_user_id: int | None = None,
+    on_trust: Callable[[int], None] | None = None,
 ) -> None:
     if not username:
         raise SystemExit(
@@ -859,10 +744,10 @@ def run_bot(
         )
     if session_id:
         save_session(name, session_id)
-    trusted_user_id = load_trusted_user_id()
     bot = ProjectBot(
         name, path, token, username,
         trusted_user_id=trusted_user_id,
+        on_trust=on_trust,
         skip_permissions=skip_permissions,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
@@ -885,19 +770,32 @@ def run_bots(
     permission_mode: str | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
+    config_path: Path | None = None,
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
+        effective_username = proj.allowed_username or config.allowed_username
+        if proj.allowed_username:
+            effective_trusted_id = proj.trusted_user_id
+        else:
+            effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
+        on_trust = None
+        if config_path:
+            _name = name
+            _path = config_path
+            on_trust = lambda uid: save_project_trusted_user_id(_name, uid, _path)
         run_bot(
             name,
             Path(proj.path),
             proj.telegram_bot_token,
-            config.allowed_username,
+            effective_username,
             model=model,
             skip_permissions=skip_permissions,
             permission_mode=permission_mode,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
+            trusted_user_id=effective_trusted_id,
+            on_trust=on_trust,
         )
     else:
         names = ", ".join(config.projects.keys())
