@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 import click
+
+# Captured at import time so /restart can re-exec with the same args.
+_ORIGINAL_ARGV: list[str] = sys.argv[:]
+_ORIGINAL_EXECUTABLE: str = sys.executable
 
 from .config import (
     DEFAULT_CONFIG,
@@ -98,6 +104,29 @@ def list_projects(ctx):
 )
 @click.option("--session-id", default=None, help="Resume a Claude session by ID")
 @click.option("--model", default=None, help="Claude model (haiku/sonnet/opus)")
+@click.option(
+    "--dangerously-skip-permissions",
+    "skip_permissions",
+    is_flag=True,
+    default=False,
+    help="Allow Claude to skip all permission checks (use with caution)",
+)
+@click.option(
+    "--permission-mode",
+    type=click.Choice(["default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto"]),
+    default=None,
+    help="Claude permission mode",
+)
+@click.option(
+    "--allowed-tools",
+    default=None,
+    help='Comma-separated list of allowed tools (e.g. "Bash(git:*),Edit,Read")',
+)
+@click.option(
+    "--disallowed-tools",
+    default=None,
+    help='Comma-separated list of disallowed tools (e.g. "Bash(rm:*),Write")',
+)
 @click.pass_context
 def start(
     ctx,
@@ -107,12 +136,23 @@ def start(
     username: str | None,
     session_id: str | None,
     model: str | None,
+    skip_permissions: bool,
+    permission_mode: str | None,
+    allowed_tools: str | None,
+    disallowed_tools: str | None,
 ):
     """Start the Telegram bot.
 
     Use --path and --token to run without a config file, or use config.
     """
     from .bot import run_bot, run_bots
+
+    allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else None
+    disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else None
+
+    # Environment variable fallback for token
+    if not token:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
 
     if project_path and token:
         p = Path(project_path).resolve()
@@ -123,6 +163,10 @@ def start(
             username=(username or "").lower().lstrip("@"),
             session_id=session_id,
             model=model,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed,
+            disallowed_tools=disallowed,
         )
         return
 
@@ -146,9 +190,20 @@ def start(
             config.allowed_username,
             session_id=session_id,
             model=model,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed,
+            disallowed_tools=disallowed,
         )
     else:
-        run_bots(config, model=model)
+        run_bots(
+            config,
+            model=model,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed,
+            disallowed_tools=disallowed,
+        )
 
 
 @main.command()

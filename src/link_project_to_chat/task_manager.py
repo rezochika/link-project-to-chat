@@ -101,6 +101,10 @@ class TaskManager:
         on_complete: OnTaskEvent,
         on_task_started: OnTaskEvent,
         on_stream_event: Callable[[Task, StreamEvent], Awaitable[None]] | None = None,
+        skip_permissions: bool = False,
+        permission_mode: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
     ):
         self.project_path = project_path
         self._on_complete = on_complete
@@ -108,7 +112,13 @@ class TaskManager:
         self._on_stream_event = on_stream_event
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
-        self._claude = ClaudeClient(project_path)
+        self._claude = ClaudeClient(
+            project_path,
+            skip_permissions=skip_permissions,
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+        )
 
     @property
     def claude(self) -> ClaudeClient:
