@@ -39,7 +39,7 @@ def main(ctx, config_path: str | None):
 def projects(ctx):
     """Manage linked projects."""
     if ctx.invoked_subcommand is None:
-        ctx.invoke(projects_list)
+        click.echo(ctx.get_help())
 
 
 @projects.command("list")

@@ -92,7 +92,6 @@ Claude messages and `/run` commands both execute in **parallel** — they don't 
 ```
 link-project-to-chat configure [--username USER] [--manager-token TOKEN]
 
-link-project-to-chat projects
 link-project-to-chat projects list
 link-project-to-chat projects add --name NAME --path PATH --token TOKEN
                                    [--username USER] [--model MODEL]
