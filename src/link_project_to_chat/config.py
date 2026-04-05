@@ -75,6 +75,12 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             proj["trusted_user_id"] = p.trusted_user_id
         else:
             proj.pop("trusted_user_id", None)
+        if p.model:
+            proj["model"] = p.model
+        if p.permission_mode:
+            proj["permission_mode"] = p.permission_mode
+        if p.dangerously_skip_permissions:
+            proj["dangerously_skip_permissions"] = True
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}

@@ -104,6 +104,10 @@ def split_html(html: str, limit: int = 4096) -> list[str]:
         else:
             if current.strip():
                 chunks.append(current)
+            current = ""
+            while len(seg) > limit:
+                chunks.append(seg[:limit])
+                seg = seg[limit:]
             current = seg
     if current.strip():
         chunks.append(current)
