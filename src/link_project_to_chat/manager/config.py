@@ -93,14 +93,6 @@ def save_state(running: list[str], path: Path = STATE_FILE) -> None:
 
 
 def resolve_flags(defaults: PermissionDefaults, overrides: dict[str, dict], project_name: str) -> dict:
-    flags = {
-        "permission_mode": defaults.permission_mode,
-        "skip_permissions": defaults.skip_permissions,
-        "allowed_tools": defaults.allowed_tools,
-        "disallowed_tools": defaults.disallowed_tools,
-        "model": defaults.model,
-    }
-    for key, value in overrides.get(project_name, {}).items():
-        if key in flags:
-            flags[key] = value
+    flags = {k: v for k, v in vars(defaults).items()}
+    flags.update({k: v for k, v in overrides.get(project_name, {}).items() if k in flags})
     return flags
