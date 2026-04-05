@@ -192,9 +192,17 @@ class ProjectBot(AuthMixin):
                                 )
                         except BadRequest as e:
                             if "Message is not modified" not in str(e):
-                                logger.warning(
-                                    "Final stream edit failed", exc_info=True
-                                )
+                                logger.warning("Final stream edit failed", exc_info=True)
+                                plain = strip_html(chunk).replace("\x00", "")
+                                if plain.strip():
+                                    try:
+                                        await self._app.bot.send_message(
+                                            task.chat_id,
+                                            plain[:4096],
+                                            reply_to_message_id=task.message_id,
+                                        )
+                                    except Exception:
+                                        logger.warning("Plain fallback also failed", exc_info=True)
                         except Exception:
                             logger.warning("Final stream edit failed", exc_info=True)
                             plain = strip_html(chunk).replace("\x00", "")

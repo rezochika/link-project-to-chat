@@ -72,7 +72,26 @@ def split_html(html: str, limit: int = 4096) -> list[str]:
         if not part:
             continue
         if part.startswith("<pre"):
-            segments.append(part)
+            if len(part) <= limit:
+                segments.append(part)
+            else:
+                # Split large pre blocks by line, re-wrapping each chunk
+                m = re.match(r"(<pre[^>]*>)(.*)(</pre>)", part, re.DOTALL)
+                if not m:
+                    segments.append(part)
+                    continue
+                open_tag, content, close_tag = m.group(1), m.group(2), m.group(3)
+                chunk_lines: list[str] = []
+                for line in content.split("\n"):
+                    candidate = "\n".join(chunk_lines + [line])
+                    if len(open_tag + candidate + close_tag) <= limit:
+                        chunk_lines.append(line)
+                    else:
+                        if chunk_lines:
+                            segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
+                        chunk_lines = [line]
+                if chunk_lines:
+                    segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
         else:
             segments.extend(part.split("\n"))
 
@@ -85,13 +104,7 @@ def split_html(html: str, limit: int = 4096) -> list[str]:
         else:
             if current.strip():
                 chunks.append(current)
-            if len(seg) > limit:
-                while seg:
-                    chunks.append(seg[:limit])
-                    seg = seg[limit:]
-                current = ""
-            else:
-                current = seg
+            current = seg
     if current.strip():
         chunks.append(current)
 
