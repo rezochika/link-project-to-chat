@@ -41,7 +41,7 @@ def test_heading():
 def test_code_block():
     result = md_to_telegram("```python\nprint('hi')\n```")
     assert '<pre><code class="language-python">' in result
-    assert "print(&#x27;hi&#x27;)" in result or "print('hi')" in result
+    assert "print('hi')" in result
 
 
 def test_code_block_no_lang():

@@ -47,6 +47,12 @@ COMMANDS = [
     ("help", "Show available commands"),
 ]
 
+_CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+
+
+def _parse_task_id(data: str) -> int:
+    return int(data.split("_")[-1])
+
 
 class ProjectBot(AuthMixin):
     def __init__(
@@ -153,6 +159,85 @@ class ProjectBot(AuthMixin):
                     task.chat_id, event.path, reply_to=task.message_id
                 )
 
+    async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None) -> None:
+        for chunk in split_html(html):
+            try:
+                await self._app.bot.send_message(
+                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
+                )
+            except Exception:
+                logger.warning("HTML send failed, falling back to plain", exc_info=True)
+                plain = strip_html(chunk).replace("\x00", "")
+                if plain.strip():
+                    await self._app.bot.send_message(
+                        chat_id,
+                        plain[:4096] if len(plain) > 4096 else plain,
+                        reply_to_message_id=reply_to,
+                    )
+
+    async def _send_to_chat(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+        html = md_to_telegram(text or "[No output]").replace("\x00", "")
+        await self._send_html(chat_id, html, reply_to)
+
+    async def _send_raw(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+        escaped = (text or "[No output]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
+
+    async def _send_stream_result(self, task: Task, msg_id: int) -> None:
+        text = task.result or "[No output]"
+        html = md_to_telegram(text).replace("\x00", "")
+        chunks = split_html(html)
+
+        first = chunks[0]
+        try:
+            await self._app.bot.edit_message_text(
+                first, chat_id=task.chat_id, message_id=msg_id, parse_mode="HTML"
+            )
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                logger.warning("Final stream edit failed", exc_info=True)
+                await self._send_html(task.chat_id, first, reply_to=task.message_id)
+        except Exception:
+            logger.warning("Final stream edit failed", exc_info=True)
+            await self._send_html(task.chat_id, first, reply_to=task.message_id)
+
+        for chunk in chunks[1:]:
+            await self._send_html(task.chat_id, chunk, reply_to=task.message_id)
+
+    async def _finalize_claude_task(self, task: Task) -> None:
+        if task._compact:
+            text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
+            await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+            return
+
+        if task.id not in self._stream_messages:
+            text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
+            await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+            return
+
+        msg_id, _ = self._stream_messages.pop(task.id)
+        self._stream_text.pop(task.id, None)
+
+        if task.status != TaskStatus.DONE:
+            try:
+                await self._app.bot.edit_message_text(
+                    f"Error: {task.error}", chat_id=task.chat_id, message_id=msg_id
+                )
+            except Exception:
+                await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+            return
+
+        await self._send_stream_result(task, msg_id)
+
+    async def _finalize_command_task(self, task: Task) -> None:
+        output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
+        if len(output) > 3000:
+            output = output[:3000] + "\n... (truncated, use /log)"
+        if task.status == TaskStatus.DONE:
+            await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
+        else:
+            await self._send_raw(task.chat_id, f"[exit {task.exit_code}]\n\n{output}")
+
     async def _on_task_complete(self, task: Task) -> None:
         typing = self._typing_tasks.pop(task.id, None)
         if typing:
@@ -161,99 +246,16 @@ class ProjectBot(AuthMixin):
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
                 save_session(self.name, self.task_manager.claude.session_id)
-            if task._compact:
-                text = (
-                    "Session compacted."
-                    if task.status == TaskStatus.DONE
-                    else f"Compact failed: {task.error}"
-                )
-                await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
-            elif task.id in self._stream_messages:
-                msg_id, _ = self._stream_messages.pop(task.id)
-                self._stream_text.pop(task.id, None)
-                if task.status == TaskStatus.DONE:
-                    text = task.result or "[No output]"
-                    html = md_to_telegram(text).replace("\x00", "")
-                    for i, chunk in enumerate(split_html(html)):
-                        try:
-                            if i == 0:
-                                await self._app.bot.edit_message_text(
-                                    chunk,
-                                    chat_id=task.chat_id,
-                                    message_id=msg_id,
-                                    parse_mode="HTML",
-                                )
-                            else:
-                                await self._app.bot.send_message(
-                                    task.chat_id,
-                                    chunk,
-                                    parse_mode="HTML",
-                                    reply_to_message_id=task.message_id,
-                                )
-                        except BadRequest as e:
-                            if "Message is not modified" not in str(e):
-                                logger.warning("Final stream edit failed", exc_info=True)
-                                plain = strip_html(chunk).replace("\x00", "")
-                                if plain.strip():
-                                    try:
-                                        await self._app.bot.send_message(
-                                            task.chat_id,
-                                            plain[:4096],
-                                            reply_to_message_id=task.message_id,
-                                        )
-                                    except Exception:
-                                        logger.warning("Plain fallback also failed", exc_info=True)
-                        except Exception:
-                            logger.warning("Final stream edit failed", exc_info=True)
-                            plain = strip_html(chunk).replace("\x00", "")
-                            if plain.strip():
-                                await self._app.bot.send_message(
-                                    task.chat_id,
-                                    plain[:4096],
-                                    reply_to_message_id=task.message_id,
-                                )
-                else:
-                    try:
-                        await self._app.bot.edit_message_text(
-                            f"Error: {task.error}",
-                            chat_id=task.chat_id,
-                            message_id=msg_id,
-                        )
-                    except Exception:
-                        await self._send_to_chat(
-                            task.chat_id,
-                            f"Error: {task.error}",
-                            reply_to=task.message_id,
-                        )
-            else:
-                text = (
-                    task.result
-                    if task.status == TaskStatus.DONE
-                    else f"Error: {task.error}"
-                )
-                await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+            await self._finalize_claude_task(task)
         else:
-            output = (
-                (task.result or "").rstrip()
-                or (task.error or "").rstrip()
-                or "(no output)"
-            )
-            if len(output) > 3000:
-                output = output[:3000] + "\n... (truncated, use /log)"
-            if task.status != TaskStatus.DONE:
-                await self._send_raw(
-                    task.chat_id, f"[exit {task.exit_code}]\n\n{output}"
-                )
-            else:
-                await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
+            await self._finalize_command_task(task)
 
     async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
-        cmd_list = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
         await update.effective_message.reply_text(
             f"Project: {self.name}\nPath: {self.path}\n\n"
-            f"Send a message to chat with Claude.\n{cmd_list}"
+            f"Send a message to chat with Claude.\n{_CMD_HELP}"
         )
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -412,8 +414,7 @@ class ProjectBot(AuthMixin):
             return
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
-        cmd_list = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
-        await update.effective_message.reply_text(cmd_list)
+        await update.effective_message.reply_text(_CMD_HELP)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -452,7 +453,7 @@ class ProjectBot(AuthMixin):
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
         elif query.data.startswith("task_info_"):
-            task_id = int(query.data.split("_")[-1])
+            task_id = _parse_task_id(query.data)
             task = self.task_manager.get(task_id)
             if not task:
                 await query.edit_message_text(f"Task #{task_id} not found.")
@@ -469,7 +470,7 @@ class ProjectBot(AuthMixin):
         elif query.data == "tasks_back":
             await self._render_tasks(query.message.chat_id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
-            task_id = int(query.data.split("_")[-1])
+            task_id = _parse_task_id(query.data)
             if self.task_manager.cancel(task_id):
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:
@@ -478,7 +479,7 @@ class ProjectBot(AuthMixin):
             else:
                 await query.edit_message_text(f"#{task_id} not found or already finished.")
         elif query.data.startswith("task_log_"):
-            task_id = int(query.data.split("_")[-1])
+            task_id = _parse_task_id(query.data)
             task = self.task_manager.get(task_id)
             if not task:
                 await query.edit_message_text(f"Task #{task_id} not found.")
@@ -617,46 +618,6 @@ class ProjectBot(AuthMixin):
                 )
         except Exception:
             logger.warning("Failed to send image %s", path, exc_info=True)
-
-    async def _send_to_chat(
-        self, chat_id: int, text: str, reply_to: int | None = None
-    ) -> None:
-        text = text or "[No output]"
-        html = md_to_telegram(text).replace("\x00", "")
-        for chunk in split_html(html):
-            try:
-                await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
-                )
-            except Exception:
-                logger.warning("HTML send failed, falling back to plain", exc_info=True)
-                plain = strip_html(chunk).replace("\x00", "")
-                if plain.strip():
-                    await self._app.bot.send_message(
-                        chat_id,
-                        plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to_message_id=reply_to,
-                    )
-
-    async def _send_raw(
-        self, chat_id: int, text: str, reply_to: int | None = None
-    ) -> None:
-        text = text or "[No output]"
-        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        html = f"<pre>{escaped}</pre>"
-        for chunk in split_html(html):
-            try:
-                await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
-                )
-            except Exception:
-                logger.warning("Raw send failed, falling back to plain", exc_info=True)
-                if text.strip():
-                    await self._app.bot.send_message(
-                        chat_id,
-                        text[:4096] if len(text) > 4096 else text,
-                        reply_to_message_id=reply_to,
-                    )
 
     @staticmethod
     async def _keep_typing(chat) -> None:

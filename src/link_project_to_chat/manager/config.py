@@ -13,6 +13,15 @@ STATE_FILE = _BASE / "state.json"
 PROJECT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
 
+def _load_json(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
 @dataclass
 class PermissionDefaults:
     permission_mode: str | None = None
@@ -30,22 +39,18 @@ class ManagerConfig:
 
 
 def load_manager_config(path: Path = DEFAULT_CONFIG) -> ManagerConfig:
-    config = ManagerConfig()
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return config
-        d = raw.get("defaults", {})
-        config.defaults = PermissionDefaults(
+    raw = _load_json(path)
+    d = raw.get("defaults", {})
+    return ManagerConfig(
+        defaults=PermissionDefaults(
             permission_mode=d.get("permission_mode"),
             skip_permissions=d.get("skip_permissions", False),
             allowed_tools=d.get("allowed_tools"),
             disallowed_tools=d.get("disallowed_tools"),
             model=d.get("model"),
-        )
-        config.overrides = raw.get("overrides", {})
-    return config
+        ),
+        overrides=raw.get("overrides", {}),
+    )
 
 
 def save_manager_config(config: ManagerConfig, path: Path = DEFAULT_CONFIG) -> None:
@@ -66,21 +71,11 @@ def save_manager_config(config: ManagerConfig, path: Path = DEFAULT_CONFIG) -> N
 
 
 def load_project_configs(path: Path = PROJECT_CONFIG) -> dict[str, dict]:
-    if path.exists():
-        try:
-            return json.loads(path.read_text()).get("projects", {})
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+    return _load_json(path).get("projects", {})
 
 
 def save_project_configs(projects: dict[str, dict], path: Path = PROJECT_CONFIG) -> None:
-    existing: dict = {}
-    if path.exists():
-        try:
-            existing = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
+    existing = _load_json(path)
     existing["projects"] = projects
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2) + "\n")
@@ -88,12 +83,7 @@ def save_project_configs(projects: dict[str, dict], path: Path = PROJECT_CONFIG)
 
 
 def load_state(path: Path = STATE_FILE) -> list[str]:
-    if path.exists():
-        try:
-            return json.loads(path.read_text()).get("running", [])
-        except (json.JSONDecodeError, OSError):
-            return []
-    return []
+    return _load_json(path).get("running", [])
 
 
 def save_state(running: list[str], path: Path = STATE_FILE) -> None:

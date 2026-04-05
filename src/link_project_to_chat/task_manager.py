@@ -124,6 +124,11 @@ class TaskManager:
     def claude(self) -> ClaudeClient:
         return self._claude
 
+    def _submit(self, task: Task) -> Task:
+        self._tasks[task.id] = task
+        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
+        return task
+
     def submit_claude(self, chat_id: int, message_id: int, prompt: str) -> Task:
         task = Task(
             id=self._next_id,
@@ -134,9 +139,7 @@ class TaskManager:
             name=prompt[:40],
         )
         self._next_id += 1
-        self._tasks[task.id] = task
-        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
-        return task
+        return self._submit(task)
 
     def submit_compact(self, chat_id: int, message_id: int) -> Task:
         task = Task(
@@ -149,9 +152,7 @@ class TaskManager:
             _compact=True,
         )
         self._next_id += 1
-        self._tasks[task.id] = task
-        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
-        return task
+        return self._submit(task)
 
     def run_command(
         self, chat_id: int, message_id: int, command: str, name: str | None = None

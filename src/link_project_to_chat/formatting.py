@@ -62,39 +62,27 @@ def md_to_telegram(text: str) -> str:
     return text.strip()
 
 
-def split_html(html: str, limit: int = 4096) -> list[str]:
-    if len(html) <= limit:
-        return [html]
-
+def _split_pre_block(part: str, limit: int) -> list[str]:
+    m = re.match(r"(<pre[^>]*>)(.*)(</pre>)", part, re.DOTALL)
+    if not m:
+        return [part]
+    open_tag, content, close_tag = m.group(1), m.group(2), m.group(3)
     segments: list[str] = []
-    parts = re.split(r"(<pre(?:\s[^>]*)?>.*?</pre>)", html, flags=re.DOTALL)
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("<pre"):
-            if len(part) <= limit:
-                segments.append(part)
-            else:
-                # Split large pre blocks by line, re-wrapping each chunk
-                m = re.match(r"(<pre[^>]*>)(.*)(</pre>)", part, re.DOTALL)
-                if not m:
-                    segments.append(part)
-                    continue
-                open_tag, content, close_tag = m.group(1), m.group(2), m.group(3)
-                chunk_lines: list[str] = []
-                for line in content.split("\n"):
-                    candidate = "\n".join(chunk_lines + [line])
-                    if len(open_tag + candidate + close_tag) <= limit:
-                        chunk_lines.append(line)
-                    else:
-                        if chunk_lines:
-                            segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
-                        chunk_lines = [line]
-                if chunk_lines:
-                    segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
+    chunk_lines: list[str] = []
+    for line in content.split("\n"):
+        candidate = "\n".join(chunk_lines + [line])
+        if len(open_tag + candidate + close_tag) <= limit:
+            chunk_lines.append(line)
         else:
-            segments.extend(part.split("\n"))
+            if chunk_lines:
+                segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
+            chunk_lines = [line]
+    if chunk_lines:
+        segments.append(open_tag + "\n".join(chunk_lines) + close_tag)
+    return segments
 
+
+def _merge_segments(segments: list[str], limit: int) -> list[str]:
     chunks: list[str] = []
     current = ""
     for seg in segments:
@@ -111,8 +99,27 @@ def split_html(html: str, limit: int = 4096) -> list[str]:
             current = seg
     if current.strip():
         chunks.append(current)
+    return chunks
 
-    return chunks or [html[:limit]]
+
+def split_html(html: str, limit: int = 4096) -> list[str]:
+    if len(html) <= limit:
+        return [html]
+
+    segments: list[str] = []
+    parts = re.split(r"(<pre(?:\s[^>]*)?>.*?</pre>)", html, flags=re.DOTALL)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("<pre"):
+            if len(part) <= limit:
+                segments.append(part)
+            else:
+                segments.extend(_split_pre_block(part, limit))
+        else:
+            segments.extend(part.split("\n"))
+
+    return _merge_segments(segments, limit) or [html[:limit]]
 
 
 def strip_html(html: str) -> str:
@@ -124,7 +131,6 @@ def _render_table(table_text: str) -> str:
     rows: list[list[str]] = []
     for line in table_text.strip().splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        # Skip separator rows (----, :---:, etc.)
         if all(re.fullmatch(r":?-+:?", c) for c in cells):
             continue
         rows.append(cells)
@@ -147,7 +153,7 @@ def _render_table(table_text: str) -> str:
         if ri == 0:
             lines.append("  ".join("─" * w for w in widths))
 
-    return f"<pre>{_escape_html(chr(10).join(lines))}</pre>"
+    return f"<pre>{_escape_html('\n'.join(lines))}</pre>"
 
 
 def _escape_html(text: str) -> str:
