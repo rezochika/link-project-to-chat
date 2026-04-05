@@ -13,6 +13,9 @@ class ProjectConfig:
     telegram_bot_token: str
     allowed_username: str = ""  # per-project override; falls back to Config.allowed_username
     trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
+    model: str | None = None
+    permission_mode: str | None = None
+    dangerously_skip_permissions: bool = False
 
 
 @dataclass
@@ -36,6 +39,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
                 allowed_username=proj.get("username", "").lower().lstrip("@"),
                 trusted_user_id=proj.get("trusted_user_id"),
+                model=proj.get("model"),
+                permission_mode=proj.get("permission_mode"),
+                dangerously_skip_permissions=proj.get("dangerously_skip_permissions", False),
             )
     return config
 

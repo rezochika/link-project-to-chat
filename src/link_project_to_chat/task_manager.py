@@ -200,7 +200,7 @@ class TaskManager:
                         task.result = event.text
                     elif isinstance(event, Error):
                         raise RuntimeError(event.message)
-                if task.result is None:
+                if not task.result:
                     task.result = "".join(collected_text) or "".join(collected_thinking) or "[No response]"
             task.status = TaskStatus.DONE
         except asyncio.CancelledError:
