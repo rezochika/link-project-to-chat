@@ -8,7 +8,6 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -77,7 +76,7 @@ class ProjectBot(AuthMixin):
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._stream_messages: dict[int, tuple[int, float]] = {}
+        self._stream_thinking: dict[int, str] = {}
         self._stream_text: dict[int, str] = {}
         self._init_auth()
         self.task_manager = TaskManager(
@@ -103,56 +102,11 @@ class ProjectBot(AuthMixin):
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, ThinkingDelta):
-            if task.id not in self._stream_messages:
-                try:
-                    msg = await self._app.bot.send_message(
-                        task.chat_id,
-                        "💭 Thinking...",
-                        reply_to_message_id=task.message_id,
-                    )
-                    self._stream_messages[task.id] = (msg.message_id, time.time())
-                except Exception:
-                    logger.warning("Failed to send thinking placeholder", exc_info=True)
-
+            self._stream_thinking.setdefault(task.id, "")
+            self._stream_thinking[task.id] += event.text
         elif isinstance(event, TextDelta):
             self._stream_text.setdefault(task.id, "")
             self._stream_text[task.id] += event.text
-
-            if task.id not in self._stream_messages:
-                text = self._stream_text[task.id]
-                html = md_to_telegram(text).replace("\x00", "")
-                try:
-                    msg = await self._app.bot.send_message(
-                        task.chat_id,
-                        html or "...",
-                        parse_mode="HTML",
-                        reply_to_message_id=task.message_id,
-                    )
-                    self._stream_messages[task.id] = (msg.message_id, time.time())
-                except Exception:
-                    logger.warning(
-                        "Failed to send initial stream message", exc_info=True
-                    )
-            else:
-                msg_id, last_edit = self._stream_messages[task.id]
-                now = time.time()
-                if now - last_edit >= 2.0:
-                    text = self._stream_text[task.id]
-                    html = md_to_telegram(text).replace("\x00", "")
-                    try:
-                        await self._app.bot.edit_message_text(
-                            html or "...",
-                            chat_id=task.chat_id,
-                            message_id=msg_id,
-                            parse_mode="HTML",
-                        )
-                        self._stream_messages[task.id] = (msg_id, now)
-                    except BadRequest as e:
-                        if "Message is not modified" not in str(e):
-                            logger.debug("Stream edit failed", exc_info=True)
-                    except Exception:
-                        logger.debug("Stream edit failed", exc_info=True)
-
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(
@@ -183,51 +137,20 @@ class ProjectBot(AuthMixin):
         escaped = (text or "[No output]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
 
-    async def _send_stream_result(self, task: Task, msg_id: int) -> None:
-        text = task.result or "[No output]"
-        html = md_to_telegram(text).replace("\x00", "")
-        chunks = split_html(html)
-
-        first = chunks[0]
-        try:
-            await self._app.bot.edit_message_text(
-                first, chat_id=task.chat_id, message_id=msg_id, parse_mode="HTML"
-            )
-        except BadRequest as e:
-            if "Message is not modified" not in str(e):
-                logger.warning("Final stream edit failed", exc_info=True)
-                await self._send_html(task.chat_id, first, reply_to=task.message_id)
-        except Exception:
-            logger.warning("Final stream edit failed", exc_info=True)
-            await self._send_html(task.chat_id, first, reply_to=task.message_id)
-
-        for chunk in chunks[1:]:
-            await self._send_html(task.chat_id, chunk, reply_to=task.message_id)
-
     async def _finalize_claude_task(self, task: Task) -> None:
+        thinking = self._stream_thinking.pop(task.id, None)
+        self._stream_text.pop(task.id, None)
+
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
 
-        if task.id not in self._stream_messages:
-            text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
-            await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
-            return
+        if thinking:
+            await self._send_to_chat(task.chat_id, f"💭 {thinking}", reply_to=task.message_id)
 
-        msg_id, _ = self._stream_messages.pop(task.id)
-        self._stream_text.pop(task.id, None)
-
-        if task.status != TaskStatus.DONE:
-            try:
-                await self._app.bot.edit_message_text(
-                    f"Error: {task.error}", chat_id=task.chat_id, message_id=msg_id
-                )
-            except Exception:
-                await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
-            return
-
-        await self._send_stream_result(task, msg_id)
+        text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
+        await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
 
     async def _finalize_command_task(self, task: Task) -> None:
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
@@ -329,75 +252,64 @@ class ProjectBot(AuthMixin):
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
+    def _model_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(m, callback_data=f"model_set_{m}")]
+            for m in MODELS
+        ])
+
+    def _current_model(self) -> str:
+        return self.task_manager.claude.model_display or self.task_manager.claude.model
+
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
-        if not ctx.args:
-            current = (
-                self.task_manager.claude.model_display or self.task_manager.claude.model
-            )
-            return await update.effective_message.reply_text(
-                f"Current: {current}\nUsage: /model {{{'/'.join(MODELS)}}}"
-            )
-        name = ctx.args[0].lower()
-        if name not in MODELS:
-            return await update.effective_message.reply_text(
-                f"Invalid. Choose: {', '.join(MODELS)}"
-            )
-        self.task_manager.claude.model = name
-        self.task_manager.claude.model_display = None
-        await update.effective_message.reply_text(f"Model: {name}")
+        await update.effective_message.reply_text(
+            f"Current: {self._current_model()}",
+            reply_markup=self._model_markup(),
+        )
+
+    def _effort_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(e, callback_data=f"effort_set_{e}")]
+            for e in EFFORT_LEVELS
+        ])
+
+    def _current_effort(self) -> str:
+        return self.task_manager.claude.effort
 
     async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
-        if not ctx.args:
-            current = self.task_manager.claude.effort
-            return await update.effective_message.reply_text(
-                f"Current: {current}\nUsage: /effort {{{'/'.join(EFFORT_LEVELS)}}}"
-            )
-        level = ctx.args[0].lower()
-        if level not in EFFORT_LEVELS:
-            return await update.effective_message.reply_text(
-                f"Invalid. Choose: {', '.join(EFFORT_LEVELS)}"
-            )
-        self.task_manager.claude.effort = level
-        await update.effective_message.reply_text(f"Effort: {level}")
+        await update.effective_message.reply_text(
+            f"Current: {self._current_effort()}",
+            reply_markup=self._effort_markup(),
+        )
 
     _PERMISSION_OPTIONS = (
         *PERMISSION_MODES,
         "dangerously-skip-permissions",
     )
 
+    def _permissions_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(o, callback_data=f"permissions_set_{o}")]
+            for o in self._PERMISSION_OPTIONS
+        ])
+
+    def _current_permission(self) -> str:
+        claude = self.task_manager.claude
+        if claude.skip_permissions:
+            return "dangerously-skip-permissions"
+        return claude.permission_mode or "default"
+
     async def _on_permissions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return
-        if not ctx.args:
-            claude = self.task_manager.claude
-            if claude.skip_permissions:
-                current = "dangerously-skip-permissions"
-            elif claude.permission_mode:
-                current = claude.permission_mode
-            else:
-                current = "default"
-            options = "\n".join(f"  {o}" for o in self._PERMISSION_OPTIONS)
-            return await update.effective_message.reply_text(
-                f"Current: {current}\n\nOptions:\n{options}\n\n"
-                f"Usage: /permissions <mode>"
-            )
-        mode = ctx.args[0].lower()
-        if mode == "dangerously-skip-permissions":
-            self.task_manager.claude.skip_permissions = True
-            self.task_manager.claude.permission_mode = None
-            await update.effective_message.reply_text("Permissions: dangerously-skip-permissions")
-        elif mode in PERMISSION_MODES:
-            self.task_manager.claude.skip_permissions = False
-            self.task_manager.claude.permission_mode = mode if mode != "default" else None
-            await update.effective_message.reply_text(f"Permissions: {mode}")
-        else:
-            await update.effective_message.reply_text(
-                f"Invalid. Choose: {', '.join(self._PERMISSION_OPTIONS)}"
-            )
+        await update.effective_message.reply_text(
+            f"Current: {self._current_permission()}",
+            reply_markup=self._permissions_markup(),
+        )
 
     async def _on_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -445,7 +357,36 @@ class ProjectBot(AuthMixin):
             return
         await query.answer()
 
-        if query.data == "reset_confirm":
+        if query.data.startswith("model_set_"):
+            name = query.data[len("model_set_"):]
+            if name in MODELS:
+                self.task_manager.claude.model = name
+                self.task_manager.claude.model_display = None
+            await query.edit_message_text(
+                f"Model: {self._current_model()}",
+                reply_markup=self._model_markup(),
+            )
+        elif query.data.startswith("effort_set_"):
+            level = query.data[len("effort_set_"):]
+            if level in EFFORT_LEVELS:
+                self.task_manager.claude.effort = level
+            await query.edit_message_text(
+                f"Effort: {self._current_effort()}",
+                reply_markup=self._effort_markup(),
+            )
+        elif query.data.startswith("permissions_set_"):
+            mode = query.data[len("permissions_set_"):]
+            if mode == "dangerously-skip-permissions":
+                self.task_manager.claude.skip_permissions = True
+                self.task_manager.claude.permission_mode = None
+            elif mode in PERMISSION_MODES:
+                self.task_manager.claude.skip_permissions = False
+                self.task_manager.claude.permission_mode = mode if mode != "default" else None
+            await query.edit_message_text(
+                f"Permissions: {self._current_permission()}",
+                reply_markup=self._permissions_markup(),
+            )
+        elif query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             clear_session(self.name)

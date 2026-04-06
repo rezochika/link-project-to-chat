@@ -36,6 +36,22 @@
   - `start`, `start-manager` unchanged
   - All old flat commands removed (`link`, `unlink`, `list`, `add-project`, `remove-project`, `edit-project`, `configure-manager`)
   - `projects add`: `--name`, `--path`, `--token` required; optional `--username`, `--model`, `--permission-mode`, `--dangerously-skip-permissions`
+- **Per-project config fields** (v0.6.0): `model`, `permission_mode`, `dangerously_skip_permissions` in `ProjectConfig` — `start --project NAME` uses them as fallbacks when CLI flags are absent
+- **Refactors** (v0.6.0–v0.7.0):
+  - `formatting.py`: extracted `_split_pre_block` and `_merge_segments`; fixed hard-slice for oversized plain-text segments
+  - `task_manager.py`: extracted `_submit` helper used by `submit_claude` and `submit_compact`
+  - `bot.py`: extracted `_CMD_HELP`, `_parse_task_id`, `_send_html`, `_send_stream_result`; split `_on_task_complete` into `_finalize_claude_task` and `_finalize_command_task`
+  - `manager/config.py`: extracted `_load_json` helper; `resolve_flags` uses `vars(defaults)` to auto-include all `PermissionDefaults` fields
+
+## Coding Style
+- Single-purpose functions
+- Functions over 100 lines must be split
+- Avoid nesting — extract helpers instead
+- Fail early: no defensive error handling for internal code, only at system boundaries (user input, external APIs)
+- No magic patterns
+- Distinct, named inputs and outputs
+- No duplicate logic — extract shared helpers
+- No over-engineering: minimum complexity for the current task
 
 ## Pending
 - Stream state (`_stream_messages`, `_stream_text`) not cleaned up on cancel
