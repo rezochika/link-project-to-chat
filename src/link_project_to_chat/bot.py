@@ -207,7 +207,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         if not ctx.args:
             return await update.effective_message.reply_text("Usage: /run <command>")
         command = " ".join(ctx.args)
@@ -248,7 +248,7 @@ class ProjectBot(AuthMixin):
         if not update.effective_message or not update.effective_chat:
             return
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
@@ -263,7 +263,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(
             f"Current: {self._current_model()}",
             reply_markup=self._model_markup(),
@@ -280,7 +280,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(
             f"Current: {self._current_effort()}",
             reply_markup=self._effort_markup(),
@@ -305,7 +305,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_permissions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(
             f"Current: {self._current_permission()}",
             reply_markup=self._permissions_markup(),
@@ -313,7 +313,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         if not self.task_manager.claude.session_id:
             return await update.effective_message.reply_text("No active session.")
         self.task_manager.submit_compact(
@@ -332,7 +332,7 @@ class ProjectBot(AuthMixin):
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -351,6 +351,9 @@ class ProjectBot(AuthMixin):
     ) -> None:
         query = update.callback_query
         if not query or not query.data:
+            return
+        if query.message and query.message.chat.type != "private":
+            await query.answer("Only available in private chats.")
             return
         if not self._auth(query.from_user):
             await query.answer("Unauthorized.")
@@ -433,7 +436,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
-            return
+            return await update.effective_message.reply_text("Unauthorized.")
 
         uptime = time.monotonic() - self._started_at
         h, rem = divmod(int(uptime), 3600)
@@ -618,19 +621,21 @@ class ProjectBot(AuthMixin):
             "status": self._on_status,
             "help": self._on_help,
         }
+        private = filters.ChatType.PRIVATE
         for name, handler in handlers.items():
-            app.add_handler(CommandHandler(name, handler))
+            app.add_handler(CommandHandler(name, handler, filters=private))
         text_filter = (
-            (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+            private
+            & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
             & filters.TEXT
             & ~filters.COMMAND
         )
         app.add_handler(MessageHandler(text_filter, self._on_text))
 
-        file_filter = filters.Document.ALL | filters.PHOTO
+        file_filter = private & (filters.Document.ALL | filters.PHOTO)
         app.add_handler(MessageHandler(file_filter, self._on_file))
 
-        unsupported_filter = (
+        unsupported_filter = private & (
             filters.VOICE
             | filters.VIDEO_NOTE
             | filters.Sticker.ALL
