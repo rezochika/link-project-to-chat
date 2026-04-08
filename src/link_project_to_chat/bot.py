@@ -101,7 +101,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, ThinkingDelta):
-            await self._send_to_chat(task.chat_id, f"💭 {event.text}", reply_to=task.message_id)
+            await self._send_to_chat(task.chat_id, f"🔸 {event.text}", reply_to=task.message_id)
         elif isinstance(event, TextDelta):
             self._stream_text.setdefault(task.id, "")
             self._stream_text[task.id] += event.text
@@ -143,8 +143,10 @@ class ProjectBot(AuthMixin):
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
 
-        text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
-        await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+        if task.status == TaskStatus.DONE:
+            await self._send_to_chat(task.chat_id, f"🔹 {task.result}", reply_to=task.message_id)
+        else:
+            await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
 
     async def _finalize_command_task(self, task: Task) -> None:
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
