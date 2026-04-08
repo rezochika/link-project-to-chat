@@ -76,7 +76,6 @@ class ProjectBot(AuthMixin):
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._stream_thinking: dict[int, str] = {}
         self._stream_text: dict[int, str] = {}
         self._init_auth()
         self.task_manager = TaskManager(
@@ -102,8 +101,7 @@ class ProjectBot(AuthMixin):
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, ThinkingDelta):
-            self._stream_thinking.setdefault(task.id, "")
-            self._stream_thinking[task.id] += event.text
+            await self._send_to_chat(task.chat_id, f"💭 {event.text}", reply_to=task.message_id)
         elif isinstance(event, TextDelta):
             self._stream_text.setdefault(task.id, "")
             self._stream_text[task.id] += event.text
@@ -138,16 +136,12 @@ class ProjectBot(AuthMixin):
         await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
 
     async def _finalize_claude_task(self, task: Task) -> None:
-        thinking = self._stream_thinking.pop(task.id, None)
         self._stream_text.pop(task.id, None)
 
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
-
-        if thinking:
-            await self._send_to_chat(task.chat_id, f"💭 {thinking}", reply_to=task.message_id)
 
         text = task.result if task.status == TaskStatus.DONE else f"Error: {task.error}"
         await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
