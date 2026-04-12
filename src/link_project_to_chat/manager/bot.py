@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
 )
 
-from .config import ManagerConfig, load_project_configs, save_project_configs
+from .config import load_project_configs, save_project_configs, set_project_autostart
 from .process import ProcessManager
 from ..config import DEFAULT_CONFIG, save_trusted_user_id
 from .._auth import AuthMixin
@@ -51,13 +51,13 @@ class ManagerBot(AuthMixin):
 
     def __init__(
         self,
-        config: ManagerConfig,
+        token: str,
         process_manager: ProcessManager,
         allowed_username: str,
         trusted_user_id: int | None = None,
         project_config_path: Path | None = None,
     ):
-        self._config = config
+        self._token = token
         self._pm = process_manager
         self._allowed_username = allowed_username
         self._trusted_user_id = trusted_user_id
@@ -294,6 +294,8 @@ class ManagerBot(AuthMixin):
         elif data.startswith("proj_start_"):
             name = data[len("proj_start_"):]
             self._pm.start(name)
+            path = self._project_config_path
+            set_project_autostart(name, True, path) if path else set_project_autostart(name, True)
             status = self._pm.status(name)
             await query.edit_message_text(
                 f"{name}: {status}", reply_markup=self._proj_detail_markup(name, status)
@@ -302,6 +304,8 @@ class ManagerBot(AuthMixin):
         elif data.startswith("proj_stop_"):
             name = data[len("proj_stop_"):]
             self._pm.stop(name)
+            path = self._project_config_path
+            set_project_autostart(name, False, path) if path else set_project_autostart(name, False)
             status = self._pm.status(name)
             await query.edit_message_text(
                 f"{name}: {status}", reply_markup=self._proj_detail_markup(name, status)
@@ -358,7 +362,7 @@ class ManagerBot(AuthMixin):
     def build(self):
         app = (
             ApplicationBuilder()
-            .token(self._config.telegram_bot_token)
+            .token(self._token)
             .post_init(self._post_init)
             .build()
         )

@@ -173,7 +173,7 @@ def configure(ctx, username: str | None, manager_token: str | None):
         config.allowed_username = new_username
         click.echo(f"Configured username: @{new_username}")
     if manager_token:
-        config.manager_bot_token = manager_token
+        config.manager_telegram_bot_token = manager_token
         click.echo(f"Configured manager token: ***{manager_token[-4:]}")
     save_config(config, cfg_path)
 
@@ -311,25 +311,22 @@ def start(
 def start_manager(ctx):
     """Start the manager bot."""
     from .manager.bot import ManagerBot
-    from .manager.config import DEFAULT_CONFIG, load_manager_config
     from .manager.process import ProcessManager
 
     cfg_path = ctx.obj["config_path"]
     main_config = load_config(cfg_path)
-    manager_config = load_manager_config(DEFAULT_CONFIG)
 
-    token = main_config.manager_bot_token
+    token = main_config.manager_telegram_bot_token
     if not token:
         raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
     if not main_config.allowed_username:
         raise SystemExit("No username configured. Run 'configure --username USER' first.")
 
-    manager_config.telegram_bot_token = token
-    pm = ProcessManager(config=manager_config)
-    restored = pm.restore()
+    pm = ProcessManager(project_config_path=cfg_path)
+    restored = pm.start_autostart()
     if restored:
-        click.echo(f"Restored {restored} project(s) from previous state.")
+        click.echo(f"Autostarted {restored} project(s).")
 
-    bot = ManagerBot(manager_config, pm, allowed_username=main_config.allowed_username, trusted_user_id=main_config.trusted_user_id, project_config_path=cfg_path)
+    bot = ManagerBot(token, pm, allowed_username=main_config.allowed_username, trusted_user_id=main_config.trusted_user_id, project_config_path=cfg_path)
     click.echo("Manager bot started.")
     bot.build().run_polling()

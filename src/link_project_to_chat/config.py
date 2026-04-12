@@ -16,13 +16,15 @@ class ProjectConfig:
     model: str | None = None
     permission_mode: str | None = None
     dangerously_skip_permissions: bool = False
+    session_id: str | None = None
+    autostart: bool = False
 
 
 @dataclass
 class Config:
     allowed_username: str = ""
     trusted_user_id: int | None = None  # global fallback (also used by manager bot)
-    manager_bot_token: str = ""
+    manager_telegram_bot_token: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -32,7 +34,10 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         raw = json.loads(path.read_text())
         config.allowed_username = raw.get("allowed_username", "").lower().lstrip("@")
         config.trusted_user_id = raw.get("trusted_user_id")
-        config.manager_bot_token = raw.get("manager_bot_token", "")
+        # Support old name for backward compatibility
+        config.manager_telegram_bot_token = raw.get(
+            "manager_telegram_bot_token", raw.get("manager_bot_token", "")
+        )
         for name, proj in raw.get("projects", {}).items():
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
@@ -42,6 +47,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 model=proj.get("model"),
                 permission_mode=proj.get("permission_mode"),
                 dangerously_skip_permissions=proj.get("dangerously_skip_permissions", False),
+                session_id=proj.get("session_id"),
+                autostart=proj.get("autostart", False),
             )
     return config
 
@@ -56,7 +63,8 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
         except (json.JSONDecodeError, OSError):
             pass
     raw["allowed_username"] = config.allowed_username
-    raw["manager_bot_token"] = config.manager_bot_token
+    raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
+    raw.pop("manager_bot_token", None)  # remove old name if present
     if config.trusted_user_id is not None:
         raw["trusted_user_id"] = config.trusted_user_id
     else:
@@ -81,40 +89,16 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             proj["permission_mode"] = p.permission_mode
         if p.dangerously_skip_permissions:
             proj["dangerously_skip_permissions"] = True
+        if p.session_id:
+            proj["session_id"] = p.session_id
+        else:
+            proj.pop("session_id", None)
+        proj["autostart"] = p.autostart
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
     path.write_text(json.dumps(raw, indent=2) + "\n")
     path.chmod(0o600)
-
-
-SESSIONS_FILE = Path.home() / ".link-project-to-chat" / "sessions.json"
-
-
-def load_sessions(path: Path = SESSIONS_FILE) -> dict[str, str]:
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
-
-def save_session(
-    project_name: str, session_id: str, path: Path = SESSIONS_FILE
-) -> None:
-    sessions = load_sessions(path)
-    sessions[project_name] = session_id
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(sessions, indent=2) + "\n")
-    path.chmod(0o600)
-
-
-def clear_session(project_name: str, path: Path = SESSIONS_FILE) -> None:
-    sessions = load_sessions(path)
-    if project_name in sessions:
-        del sessions[project_name]
-        path.write_text(json.dumps(sessions, indent=2) + "\n")
 
 
 def _patch_json(patch_fn, path: Path) -> None:
@@ -129,6 +113,33 @@ def _patch_json(patch_fn, path: Path) -> None:
     patch_fn(raw)
     path.write_text(json.dumps(raw, indent=2) + "\n")
     path.chmod(0o600)
+
+
+def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
+    """Load all session IDs from config.json per-project entries."""
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+            return {
+                name: proj["session_id"]
+                for name, proj in raw.get("projects", {}).items()
+                if proj.get("session_id")
+            }
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:
+    def _patch(raw: dict) -> None:
+        raw.setdefault("projects", {}).setdefault(project_name, {})["session_id"] = session_id
+    _patch_json(_patch, path)
+
+
+def clear_session(project_name: str, path: Path = DEFAULT_CONFIG) -> None:
+    def _patch(raw: dict) -> None:
+        raw.setdefault("projects", {}).setdefault(project_name, {}).pop("session_id", None)
+    _patch_json(_patch, path)
 
 
 def load_trusted_user_id(path: Path = DEFAULT_CONFIG) -> int | None:
