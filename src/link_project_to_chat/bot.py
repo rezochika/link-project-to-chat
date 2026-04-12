@@ -22,6 +22,7 @@ from .config import (
     DEFAULT_CONFIG,
     clear_session,
     load_sessions,
+    patch_project,
     save_session,
     save_project_trusted_user_id,
     save_trusted_user_id,
@@ -77,6 +78,8 @@ class ProjectBot(AuthMixin):
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._stream_text: dict[int, str] = {}
+        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking
+        self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
         self.task_manager = TaskManager(
             project_path=self.path,
@@ -101,7 +104,10 @@ class ProjectBot(AuthMixin):
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, ThinkingDelta):
-            await self._send_to_chat(task.chat_id, f"🔸 {event.text}", reply_to=task.message_id)
+            self._thinking_buf.setdefault(task.id, "")
+            if self._thinking_buf[task.id]:
+                self._thinking_buf[task.id] += "\n\n"
+            self._thinking_buf[task.id] += event.text
         elif isinstance(event, TextDelta):
             self._stream_text.setdefault(task.id, "")
             self._stream_text[task.id] += event.text
@@ -111,21 +117,30 @@ class ProjectBot(AuthMixin):
                     task.chat_id, event.path, reply_to=task.message_id
                 )
 
-    async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None) -> None:
-        for chunk in split_html(html):
+    async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None, reply_markup=None) -> int | None:
+        """Send HTML message(s), attaching reply_markup to the last chunk. Returns last message ID."""
+        chunks = split_html(html)
+        last_id = None
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            km = reply_markup if is_last else None
             try:
-                await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
+                msg = await self._app.bot.send_message(
+                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to, reply_markup=km
                 )
+                last_id = msg.message_id
             except Exception:
                 logger.warning("HTML send failed, falling back to plain", exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    await self._app.bot.send_message(
+                    msg = await self._app.bot.send_message(
                         chat_id,
                         plain[:4096] if len(plain) > 4096 else plain,
                         reply_to_message_id=reply_to,
+                        reply_markup=km,
                     )
+                    last_id = msg.message_id
+        return last_id
 
     async def _send_to_chat(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         html = md_to_telegram(text or "[No output]").replace("\x00", "")
@@ -137,6 +152,7 @@ class ProjectBot(AuthMixin):
 
     async def _finalize_claude_task(self, task: Task) -> None:
         self._stream_text.pop(task.id, None)
+        thinking = self._thinking_buf.pop(task.id, None)
 
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
@@ -144,7 +160,9 @@ class ProjectBot(AuthMixin):
             return
 
         if task.status == TaskStatus.DONE:
-            await self._send_to_chat(task.chat_id, f"🔹 {task.result}", reply_to=task.message_id)
+            if thinking:
+                self._thinking_store[task.id] = thinking
+            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
         else:
             await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
 
@@ -361,6 +379,7 @@ class ProjectBot(AuthMixin):
             if name in MODELS:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
+                patch_project(self.name, {"model": name})
             await query.edit_message_text(
                 f"Model: {self._current_model()}",
                 reply_markup=self._model_markup(),
@@ -369,6 +388,7 @@ class ProjectBot(AuthMixin):
             level = query.data[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self.task_manager.claude.effort = level
+                patch_project(self.name, {"effort": level})
             await query.edit_message_text(
                 f"Effort: {self._current_effort()}",
                 reply_markup=self._effort_markup(),
@@ -378,9 +398,12 @@ class ProjectBot(AuthMixin):
             if mode == "dangerously-skip-permissions":
                 self.task_manager.claude.skip_permissions = True
                 self.task_manager.claude.permission_mode = None
+                patch_project(self.name, {"dangerously_skip_permissions": True, "permission_mode": None})
             elif mode in PERMISSION_MODES:
                 self.task_manager.claude.skip_permissions = False
-                self.task_manager.claude.permission_mode = mode if mode != "default" else None
+                pm = mode if mode != "default" else None
+                self.task_manager.claude.permission_mode = pm
+                patch_project(self.name, {"dangerously_skip_permissions": False, "permission_mode": pm})
             await query.edit_message_text(
                 f"Permissions: {self._current_permission()}",
                 reply_markup=self._permissions_markup(),
@@ -405,6 +428,8 @@ class ProjectBot(AuthMixin):
                 rows.append([InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{task_id}")])
             if task.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
                 rows.append([InlineKeyboardButton("Log", callback_data=f"task_log_{task_id}")])
+            if task_id in self._thinking_store:
+                rows.append([InlineKeyboardButton("Thinking", callback_data=f"show_thinking_{task_id}")])
             rows.append([InlineKeyboardButton("« Back", callback_data="tasks_back")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
         elif query.data == "tasks_back":
@@ -429,6 +454,17 @@ class ProjectBot(AuthMixin):
                 output = output[:3000] + f"\n... (truncated, {len(task.result or '')} chars total)"
             rows = [[InlineKeyboardButton("« Back", callback_data=f"task_info_{task_id}")]]
             await query.edit_message_text(f"#{task_id} log:\n{output}", reply_markup=InlineKeyboardMarkup(rows))
+        elif query.data.startswith("show_thinking_"):
+            try:
+                task_id = int(query.data[len("show_thinking_"):])
+            except ValueError:
+                await query.answer("Invalid thinking reference.")
+                return
+            thinking = self._thinking_store.get(task_id)
+            if not thinking:
+                await query.answer("Thinking not available.")
+                return
+            await self._send_to_chat(query.message.chat_id, f"💭 {thinking}")
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -654,6 +690,7 @@ def run_bot(
     username: str,
     session_id: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
     skip_permissions: bool = False,
     permission_mode: str | None = None,
     allowed_tools: list[str] | None = None,
@@ -679,6 +716,8 @@ def run_bot(
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
         bot.task_manager.claude.model = model
+    if effort:
+        bot.task_manager.claude.effort = effort
     app = bot.build()
     logger.info(
         "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
@@ -713,6 +752,7 @@ def run_bots(
             proj.telegram_bot_token,
             effective_username,
             model=model or proj.model,
+            effort=proj.effort,
             skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
             permission_mode=permission_mode or proj.permission_mode,
             allowed_tools=allowed_tools,

@@ -287,6 +287,7 @@ def start(
             effective_username,
             session_id=session_id,
             model=model or proj.model,
+            effort=proj.effort,
             skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
             permission_mode=permission_mode or proj.permission_mode,
             allowed_tools=allowed,

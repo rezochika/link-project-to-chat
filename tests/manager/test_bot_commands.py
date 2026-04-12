@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from link_project_to_chat.manager.bot import ManagerBot
-from link_project_to_chat.manager.config import ManagerConfig
 from link_project_to_chat.manager.process import ProcessManager
 
 
@@ -47,9 +46,8 @@ def _make_callback(data: str, user_id: int = 1, username: str = "testuser"):
 def bot_env(tmp_path: Path):
     proj_cfg = tmp_path / "projects.json"
     proj_cfg.write_text(json.dumps({"projects": {}}))
-    config = ManagerConfig(telegram_bot_token="TOKEN")
-    pm = ProcessManager(config=config, project_config_path=proj_cfg, state_path=tmp_path / "state.json")
-    bot = ManagerBot(config, pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
+    pm = ProcessManager(project_config_path=proj_cfg)
+    bot = ManagerBot("TOKEN", pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
     return bot, pm, proj_cfg
 
 
@@ -194,7 +192,7 @@ async def test_callback_proj_info(bot_env, tmp_path: Path):
 async def test_callback_proj_start(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     update, ctx, query = _make_callback("proj_start_myproj")
     await bot._on_callback(update, ctx)
     query.edit_message_text.assert_called_once()
@@ -206,7 +204,7 @@ async def test_callback_proj_start(bot_env, tmp_path: Path):
 async def test_callback_proj_stop(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
     assert pm.status("myproj") == "running"
     update, ctx, query = _make_callback("proj_stop_myproj")
@@ -219,7 +217,7 @@ async def test_callback_proj_stop(bot_env, tmp_path: Path):
 async def test_callback_proj_remove(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
     update, ctx, query = _make_callback("proj_remove_myproj")
     await bot._on_callback(update, ctx)

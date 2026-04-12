@@ -14,6 +14,7 @@ class ProjectConfig:
     allowed_username: str = ""  # per-project override; falls back to Config.allowed_username
     trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
     model: str | None = None
+    effort: str | None = None
     permission_mode: str | None = None
     dangerously_skip_permissions: bool = False
     session_id: str | None = None
@@ -45,6 +46,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 allowed_username=proj.get("username", "").lower().lstrip("@"),
                 trusted_user_id=proj.get("trusted_user_id"),
                 model=proj.get("model"),
+                effort=proj.get("effort"),
                 permission_mode=proj.get("permission_mode"),
                 dangerously_skip_permissions=proj.get("dangerously_skip_permissions", False),
                 session_id=proj.get("session_id"),
@@ -85,6 +87,8 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             proj.pop("trusted_user_id", None)
         if p.model:
             proj["model"] = p.model
+        if p.effort:
+            proj["effort"] = p.effort
         if p.permission_mode:
             proj["permission_mode"] = p.permission_mode
         if p.dangerously_skip_permissions:
@@ -128,6 +132,18 @@ def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
         except (json.JSONDecodeError, OSError):
             pass
     return {}
+
+
+def patch_project(project_name: str, fields: dict, path: Path = DEFAULT_CONFIG) -> None:
+    """Update specific fields on a project entry. None values remove the key."""
+    def _patch(raw: dict) -> None:
+        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
+        for k, v in fields.items():
+            if v is None:
+                proj.pop(k, None)
+            else:
+                proj[k] = v
+    _patch_json(_patch, path)
 
 
 def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:
