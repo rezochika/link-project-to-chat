@@ -4,6 +4,8 @@ import collections
 import logging
 import time
 
+from .protocols import TelegramUser
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,13 +17,15 @@ class AuthMixin:
     _MAX_MESSAGES_PER_MINUTE: int = 30
 
     def _init_auth(self) -> None:
-        self._rate_limits: dict[int, collections.deque] = {}
+        self._rate_limits: dict[int, collections.deque[float]] = {}
         self._failed_auth_counts: dict[int, int] = {}
 
     def _on_trust(self, user_id: int) -> None:
         """Called when a user_id is trusted for the first time. Override to persist."""
 
-    def _auth(self, user) -> bool:
+    def _auth(self, user: TelegramUser | None) -> bool:
+        if user is None:
+            return False
         if not self._allowed_username:
             return False  # fail-closed
         if self._failed_auth_counts.get(user.id, 0) >= 5:

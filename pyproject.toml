@@ -41,6 +41,31 @@ packages = ["src/link_project_to_chat"]
 [project.scripts]
 link-project-to-chat = "link_project_to_chat.cli:main"
 
+[tool.mypy]
+packages = ["link_project_to_chat"]
+mypy_path = "src"
+warn_return_any = true
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_any_generics = true
+no_implicit_reexport = true
+
+[[tool.mypy.overrides]]
+module = "telegram.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py311"
+src = ["src", "tests"]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["SIM105", "SIM108"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["link_project_to_chat"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

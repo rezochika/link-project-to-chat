@@ -7,7 +7,9 @@ import subprocess
 import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
+from typing import Any
 
+from .protocols import ProcessRunner
 from .stream import Error, Result, StreamEvent, parse_stream_line
 
 logger = logging.getLogger(__name__)
@@ -16,6 +18,19 @@ EFFORT_LEVELS = ("low", "medium", "high", "max")
 MODELS = ("haiku", "sonnet", "opus")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
+
+
+class _SubprocessRunner:
+    def run(
+        self,
+        cmd: list[str],
+        cwd: str,
+        env: dict[str, str],
+        stdin: int,
+        stdout: int,
+        stderr: int,
+    ) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(cmd, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr)
 
 
 class ClaudeClient:
@@ -27,6 +42,7 @@ class ClaudeClient:
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
+        runner: ProcessRunner | None = None,
     ):
         self.model = model
         self.model_display: str | None = None
@@ -37,11 +53,12 @@ class ClaudeClient:
         self.allowed_tools: list[str] = allowed_tools or []
         self.disallowed_tools: list[str] = disallowed_tools or []
         self.session_id: str | None = None
-        self._proc: subprocess.Popen | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
         self._last_duration: float | None = None
         self._total_requests: int = 0
+        self._runner: ProcessRunner = runner or _SubprocessRunner()
 
     async def chat_stream(
         self,
@@ -81,27 +98,35 @@ class ClaudeClient:
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
+        if self._proc is not None and self._proc.poll() is None:
+            raise RuntimeError("ClaudeClient already has an active subprocess")
+
         self._last_message = user_message[:80]
         started_at = time.monotonic()
         self._started_at = started_at
         self._total_requests += 1
 
-        proc = subprocess.Popen(
+        proc = self._runner.run(
             cmd,
             cwd=str(self.project_path),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=env,
         )
         self._proc = proc
         if on_proc:
             on_proc(proc)
         logger.info("claude stream subprocess started pid=%s", proc.pid)
 
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        stdout = proc.stdout
+        stderr = proc.stderr
+
         def _read_lines():
             lines = []
-            for raw_line in proc.stdout:
+            for raw_line in stdout:
                 lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
             return lines
 
@@ -117,7 +142,7 @@ class ClaudeClient:
                             self.model_display = event.model
                     yield event
 
-            stderr_bytes = await asyncio.to_thread(proc.stderr.read)
+            stderr_bytes = await asyncio.to_thread(stderr.read)
             await asyncio.to_thread(proc.wait)
 
             if proc.returncode != 0:
@@ -140,11 +165,11 @@ class ClaudeClient:
         return result_text or "[No response]"
 
     @property
-    def status(self) -> dict:
+    def status(self) -> dict[str, Any]:
         running = self._proc is not None and self._proc.poll() is None
-        info = {
+        info: dict[str, Any] = {
             "running": running,
-            "pid": self._proc.pid if running else None,
+            "pid": self._proc.pid if running and self._proc is not None else None,
             "session_id": self.session_id,
             "total_requests": self._total_requests,
             "last_message": self._last_message,

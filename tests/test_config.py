@@ -35,14 +35,14 @@ def test_save_and_load_config(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg = Config(
         allowed_username="bob",
-        manager_bot_token="MGR",
+        manager_telegram_bot_token="MGR",
         projects={"proj": ProjectConfig(path="/some/path", telegram_bot_token="TOK")},
     )
     save_config(cfg, p)
     assert p.stat().st_mode & 0o777 == 0o600
     loaded = load_config(p)
     assert loaded.allowed_username == "bob"
-    assert loaded.manager_bot_token == "MGR"
+    assert loaded.manager_telegram_bot_token == "MGR"
     assert loaded.projects["proj"].path == "/some/path"
     assert loaded.projects["proj"].telegram_bot_token == "TOK"
 

@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 # Project configs are read from/written to the main tool's config file
 PROJECT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
 
-def _load_json(path: Path) -> dict:
+def _load_json(path: Path) -> dict[str, Any]:
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            raw: dict[str, Any] = json.loads(path.read_text())
+            return raw
         except (json.JSONDecodeError, OSError):
             pass
     return {}
 
 
-def load_project_configs(path: Path = PROJECT_CONFIG) -> dict[str, dict]:
-    return _load_json(path).get("projects", {})
+def load_project_configs(path: Path = PROJECT_CONFIG) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = _load_json(path).get("projects", {})
+    return result
 
 
-def save_project_configs(projects: dict[str, dict], path: Path = PROJECT_CONFIG) -> None:
+def save_project_configs(projects: dict[str, dict[str, Any]], path: Path = PROJECT_CONFIG) -> None:
     existing = _load_json(path)
     existing["projects"] = projects
     path.parent.mkdir(parents=True, exist_ok=True)

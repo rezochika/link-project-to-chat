@@ -7,8 +7,9 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+@dataclass
 class StreamEvent:
-    pass
+    """Base class for all stream events."""
 
 
 @dataclass

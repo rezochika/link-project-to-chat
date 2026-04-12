@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -79,7 +80,10 @@ def projects_list(ctx):
     help="Allow Claude to skip all permission checks",
 )
 @click.pass_context
-def projects_add(ctx, name: str, project_path: str, token: str, username: str | None, model: str | None, permission_mode: str | None, skip_permissions: bool):
+def projects_add(
+    ctx, name: str, project_path: str, token: str, username: str | None,
+    model: str | None, permission_mode: str | None, skip_permissions: bool,
+):
     """Add a project."""
     from .manager.config import load_project_configs, save_project_configs
 
@@ -87,7 +91,7 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
     projects = load_project_configs(cfg_path)
     if name in projects:
         raise SystemExit(f"Project '{name}' already exists.")
-    entry: dict = {"path": str(Path(project_path).resolve()), "telegram_bot_token": token}
+    entry: dict[str, Any] = {"path": str(Path(project_path).resolve()), "telegram_bot_token": token}
     if username:
         entry["username"] = username.lower().lstrip("@")
     if model:
@@ -327,6 +331,11 @@ def start_manager(ctx):
     if restored:
         click.echo(f"Autostarted {restored} project(s).")
 
-    bot = ManagerBot(token, pm, allowed_username=main_config.allowed_username, trusted_user_id=main_config.trusted_user_id, project_config_path=cfg_path)
+    bot = ManagerBot(
+        token, pm,
+        allowed_username=main_config.allowed_username,
+        trusted_user_id=main_config.trusted_user_id,
+        project_config_path=cfg_path,
+    )
     click.echo("Manager bot started.")
     bot.build().run_polling()

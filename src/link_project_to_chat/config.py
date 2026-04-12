@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
@@ -56,7 +58,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
-    raw: dict = {}
+    raw: dict[str, Any] = {}
     if path.exists():
         try:
             raw = json.loads(path.read_text())
@@ -70,7 +72,7 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     else:
         raw.pop("trusted_user_id", None)
     # Merge per-project data, preserving unknown keys already in the file
-    existing_projects: dict = raw.get("projects", {})
+    existing_projects: dict[str, Any] = raw.get("projects", {})
     for name, p in config.projects.items():
         proj = existing_projects.get(name, {})
         proj["path"] = p.path
@@ -101,10 +103,10 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.chmod(0o600)
 
 
-def _patch_json(patch_fn, path: Path) -> None:
+def _patch_json(patch_fn: Callable[[dict[str, Any]], None], path: Path) -> None:
     """Read-modify-write config JSON via a mutating function."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw: dict = {}
+    raw: dict[str, Any] = {}
     if path.exists():
         try:
             raw = json.loads(path.read_text())
@@ -131,13 +133,13 @@ def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
 
 
 def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:
-    def _patch(raw: dict) -> None:
+    def _patch(raw: dict[str, Any]) -> None:
         raw.setdefault("projects", {}).setdefault(project_name, {})["session_id"] = session_id
     _patch_json(_patch, path)
 
 
 def clear_session(project_name: str, path: Path = DEFAULT_CONFIG) -> None:
-    def _patch(raw: dict) -> None:
+    def _patch(raw: dict[str, Any]) -> None:
         raw.setdefault("projects", {}).setdefault(project_name, {}).pop("session_id", None)
     _patch_json(_patch, path)
 
@@ -146,7 +148,8 @@ def load_trusted_user_id(path: Path = DEFAULT_CONFIG) -> int | None:
     """Load the global trusted_user_id from config.json."""
     if path.exists():
         try:
-            return json.loads(path.read_text()).get("trusted_user_id")
+            result = json.loads(path.read_text()).get("trusted_user_id")
+            return int(result) if isinstance(result, int) else None
         except (json.JSONDecodeError, OSError):
             pass
     return None
@@ -161,13 +164,13 @@ def save_project_trusted_user_id(
     project_name: str, user_id: int, path: Path = DEFAULT_CONFIG
 ) -> None:
     """Save a per-project trusted_user_id into config.json."""
-    def _patch(raw: dict) -> None:
+    def _patch(raw: dict[str, Any]) -> None:
         raw.setdefault("projects", {}).setdefault(project_name, {})["trusted_user_id"] = user_id
     _patch_json(_patch, path)
 
 
 def clear_trusted_user_id(path: Path = DEFAULT_CONFIG) -> None:
     """Remove the global trusted_user_id from config.json."""
-    def _patch(raw: dict) -> None:
+    def _patch(raw: dict[str, Any]) -> None:
         raw.pop("trusted_user_id", None)
     _patch_json(_patch, path)

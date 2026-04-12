@@ -54,10 +54,15 @@
 - No over-engineering: minimum complexity for the current task
 
 ## Pending
-- Stream state (`_stream_messages`, `_stream_text`) not cleaned up on cancel
-- Open file handles in `_send_image` (`open(path, "rb")` passed directly without closing)
 - File uploads stored permanently in project dir — consider `/tmp/{project_name}/` for temp files
-- `_proc` on `ClaudeClient` is a single slot — concurrent Claude tasks could overwrite it
-- `chmod 0o600` missing from `clear_session()` write path
-- No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
+
+## Resolved (v0.10.0)
+- Stream state (`_stream_text`) now cleaned up on cancel via `_on_task_complete`
+- `_proc` on `ClaudeClient` now has concurrency guard (raises RuntimeError)
+- `chmod 0o600` applied consistently via `_patch_json()` for all config writes
+- Open file handles in `_send_image` — already properly closed via context manager
+- Protocol interfaces added (ProcessRunner, TelegramUser, OnTaskEvent)
+- Dependency injection: ClaudeClient, TaskManager, ProjectBot all accept dependencies
+- mypy type checking and ruff linting configured
+- py.typed marker for PEP 561 compliance

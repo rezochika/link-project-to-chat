@@ -10,7 +10,7 @@ def md_to_telegram(text: str) -> str:
     code_blocks: list[str] = []
     inline_codes: list[str] = []
 
-    def _save_table(m: re.Match) -> str:
+    def _save_table(m: re.Match[str]) -> str:
         block = _render_table(m.group(0))
         code_blocks.append(block)
         return _CODE_BLOCK_PH.format(len(code_blocks) - 1)
@@ -22,7 +22,7 @@ def md_to_telegram(text: str) -> str:
         flags=re.MULTILINE,
     )
 
-    def _save_block(m: re.Match) -> str:
+    def _save_block(m: re.Match[str]) -> str:
         lang = m.group(1) or ""
         code = _escape_html(m.group(2))
         if lang:
@@ -34,7 +34,7 @@ def md_to_telegram(text: str) -> str:
 
     text = re.sub(r"```(\w*)\n(.*?)```", _save_block, text, flags=re.DOTALL)
 
-    def _save_inline(m: re.Match) -> str:
+    def _save_inline(m: re.Match[str]) -> str:
         code = _escape_html(m.group(1))
         inline_codes.append(f"<code>{code}</code>")
         return _INLINE_CODE_PH.format(len(inline_codes) - 1)
@@ -70,7 +70,7 @@ def _split_pre_block(part: str, limit: int) -> list[str]:
     segments: list[str] = []
     chunk_lines: list[str] = []
     for line in content.split("\n"):
-        candidate = "\n".join(chunk_lines + [line])
+        candidate = "\n".join([*chunk_lines, line])
         if len(open_tag + candidate + close_tag) <= limit:
             chunk_lines.append(line)
         else:
@@ -153,7 +153,8 @@ def _render_table(table_text: str) -> str:
         if ri == 0:
             lines.append("  ".join("─" * w for w in widths))
 
-    return f"<pre>{_escape_html('\n'.join(lines))}</pre>"
+    body = _escape_html("\n".join(lines))
+    return f"<pre>{body}</pre>"
 
 
 def _escape_html(text: str) -> str:

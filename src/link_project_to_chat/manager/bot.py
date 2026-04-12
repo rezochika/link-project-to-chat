@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,10 +16,13 @@ from telegram.ext import (
     filters,
 )
 
+from .._auth import AuthMixin
+from ..config import DEFAULT_CONFIG, save_trusted_user_id
 from .config import load_project_configs, save_project_configs, set_project_autostart
 from .process import ProcessManager
-from ..config import DEFAULT_CONFIG, save_trusted_user_id
-from .._auth import AuthMixin
+
+if TYPE_CHECKING:
+    from telegram.ext import Application
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +66,7 @@ class ManagerBot(AuthMixin):
         self._allowed_username = allowed_username
         self._trusted_user_id = trusted_user_id
         self._started_at = time.monotonic()
-        self._app = None
+        self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._project_config_path = project_config_path
         self._init_auth()
 
@@ -70,11 +74,11 @@ class ManagerBot(AuthMixin):
         path = self._project_config_path or DEFAULT_CONFIG
         save_trusted_user_id(user_id, path)
 
-    def _load_projects(self) -> dict[str, dict]:
+    def _load_projects(self) -> dict[str, dict[str, Any]]:
         path = self._project_config_path
         return load_project_configs(path) if path else load_project_configs()
 
-    def _save_projects(self, projects: dict[str, dict]) -> None:
+    def _save_projects(self, projects: dict[str, dict[str, Any]]) -> None:
         path = self._project_config_path
         if path:
             save_project_configs(projects, path)
@@ -83,12 +87,15 @@ class ManagerBot(AuthMixin):
 
     async def _guard(self, update: Update) -> bool:
         """Returns True if the user is authorized and not rate-limited."""
+        msg = update.effective_message
+        if not msg:
+            return False
         user = update.effective_user
         if not user or not self._auth(user):
-            await update.effective_message.reply_text("Unauthorized.")
+            await msg.reply_text("Unauthorized.")
             return False
         if self._rate_limited(user.id):
-            await update.effective_message.reply_text("Rate limited. Try again shortly.")
+            await msg.reply_text("Rate limited. Try again shortly.")
             return False
         return True
 
@@ -112,8 +119,11 @@ class ManagerBot(AuthMixin):
     async def _on_projects(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
+        msg = update.effective_message
+        if not msg:
+            return
         markup = self._list_markup()
-        await update.effective_message.reply_text(
+        await msg.reply_text(
             self._projects_text() if markup else "No projects configured.",
             reply_markup=markup,
         )
@@ -121,19 +131,28 @@ class ManagerBot(AuthMixin):
     async def _on_start_all(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
+        msg = update.effective_message
+        if not msg:
+            return
         count = self._pm.start_all()
-        await update.effective_message.reply_text(f"Started {count} project(s).")
+        await msg.reply_text(f"Started {count} project(s).")
 
     async def _on_stop_all(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
+        msg = update.effective_message
+        if not msg:
+            return
         count = self._pm.stop_all()
-        await update.effective_message.reply_text(f"Stopped {count} project(s).")
+        await msg.reply_text(f"Stopped {count} project(s).")
 
     async def _on_help(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
-        await update.effective_message.reply_text(
+        msg = update.effective_message
+        if not msg:
+            return
+        await msg.reply_text(
             "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
         )
 
@@ -143,115 +162,147 @@ class ManagerBot(AuthMixin):
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
             return ConversationHandler.END
+        msg = update.effective_message
+        if not msg or ctx.user_data is None:
+            return ConversationHandler.END
         ctx.user_data["new_project"] = {}
-        await update.effective_message.reply_text("Let's add a new project.\n\nWhat is the project name?")
+        await msg.reply_text("Let's add a new project.\n\nWhat is the project name?")
         return self.ADD_NAME
 
     async def _add_name(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        msg = update.effective_message
+        if not msg or not update.message or not update.message.text or ctx.user_data is None:
+            return ConversationHandler.END
         name = update.message.text.strip()
         if name in self._load_projects():
-            await update.effective_message.reply_text(f"Project '{name}' already exists. Try a different name:")
+            await msg.reply_text(f"Project '{name}' already exists. Try a different name:")
             return self.ADD_NAME
         ctx.user_data["new_project"]["name"] = name
-        await update.effective_message.reply_text("Enter the project path:")
+        await msg.reply_text("Enter the project path:")
         return self.ADD_PATH
 
     async def _add_path(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        msg = update.effective_message
+        if not msg or not update.message or not update.message.text or ctx.user_data is None:
+            return ConversationHandler.END
         path = update.message.text.strip()
         if not Path(path).exists():
-            await update.effective_message.reply_text(f"Path does not exist: {path}\nTry again:")
+            await msg.reply_text(f"Path does not exist: {path}\nTry again:")
             return self.ADD_PATH
         ctx.user_data["new_project"]["path"] = path
-        await update.effective_message.reply_text("Enter the Telegram bot token (or /skip):")
+        await msg.reply_text("Enter the Telegram bot token (or /skip):")
         return self.ADD_TOKEN
 
     async def _add_token(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        msg = update.effective_message
+        if not msg or not update.message or not update.message.text or ctx.user_data is None:
+            return ConversationHandler.END
         text = update.message.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["telegram_bot_token"] = text
-        await update.effective_message.reply_text("Enter the allowed username (or /skip):")
+        await msg.reply_text("Enter the allowed username (or /skip):")
         return self.ADD_USERNAME
 
     async def _add_username(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        msg = update.effective_message
+        if not msg or not update.message or not update.message.text or ctx.user_data is None:
+            return ConversationHandler.END
         text = update.message.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["username"] = text
-        await update.effective_message.reply_text("Enter the model name (or /skip):")
+        await msg.reply_text("Enter the model name (or /skip):")
         return self.ADD_MODEL
 
     async def _add_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        msg = update.effective_message
+        if not msg or not update.message or not update.message.text or ctx.user_data is None:
+            return ConversationHandler.END
         text = update.message.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["model"] = text
         data = ctx.user_data.pop("new_project", {})
         name = data.pop("name", None)
         if not name:
-            await update.effective_message.reply_text("Something went wrong. Try again.")
+            await msg.reply_text("Something went wrong. Try again.")
             return ConversationHandler.END
         projects = self._load_projects()
         projects[name] = data
         self._save_projects(projects)
-        await update.effective_message.reply_text(f"Added project '{name}'.")
+        await msg.reply_text(f"Added project '{name}'.")
         return ConversationHandler.END
 
     async def _on_edit_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
+        msg = update.effective_message
+        if not msg:
+            return
         if not ctx.args or len(ctx.args) < 3:
-            return await update.effective_message.reply_text(
+            await msg.reply_text(
                 f"Usage: /edit_project <name> <field> <value>\nFields: {', '.join(_EDITABLE_FIELDS)}"
             )
+            return
         name, field, value = ctx.args[0], ctx.args[1], " ".join(ctx.args[2:])
         await self._apply_edit(update, name, field, value)
 
     async def _apply_edit(self, update: Update, name: str, field: str, value: str) -> None:
         """Apply a field edit and send a confirmation reply."""
+        msg = update.effective_message
+        if not msg:
+            return
         projects = self._load_projects()
         if name not in projects:
-            await update.effective_message.reply_text(f"Project '{name}' not found.")
+            await msg.reply_text(f"Project '{name}' not found.")
             return
 
         if field == "path":
             if not Path(value).exists():
-                await update.effective_message.reply_text(f"Path does not exist: {value}")
+                await msg.reply_text(f"Path does not exist: {value}")
                 return
             projects[name]["path"] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' path to {value}.")
+            await msg.reply_text(f"Updated '{name}' path to {value}.")
         elif field == "name":
             if value in projects:
-                await update.effective_message.reply_text(f"Project '{value}' already exists.")
+                await msg.reply_text(f"Project '{value}' already exists.")
                 return
             projects[value] = projects.pop(name)
             self._save_projects(projects)
             self._pm.rename(name, value)
-            await update.effective_message.reply_text(f"Renamed '{name}' to '{value}'.")
+            await msg.reply_text(f"Renamed '{name}' to '{value}'.")
         elif field == "token":
             projects[name]["telegram_bot_token"] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' token.")
+            await msg.reply_text(f"Updated '{name}' token.")
         elif field in ("username", "model", "permission_mode"):
             projects[name][field] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' {field} to {value}.")
+            await msg.reply_text(f"Updated '{name}' {field} to {value}.")
         else:
-            await update.effective_message.reply_text(
+            await msg.reply_text(
                 f"Unknown field. Use: {', '.join(_EDITABLE_FIELDS)}"
             )
 
     async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if ctx.user_data is None:
+            return
         pending = ctx.user_data.get("pending_edit")
         if not pending:
             return
         if not self._auth(update.effective_user):
+            return
+        if not update.message or not update.message.text:
             return
         ctx.user_data.pop("pending_edit")
         await self._apply_edit(update, pending["name"], pending["field"], update.message.text.strip())
 
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        ctx.user_data.pop("pending_edit", None)
-        await update.effective_message.reply_text("Edit cancelled.")
+        if ctx.user_data is not None:
+            ctx.user_data.pop("pending_edit", None)
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("Edit cancelled.")
 
     def _proj_detail_markup(self, name: str, status: str) -> InlineKeyboardMarkup:
         rows = []
@@ -274,7 +325,8 @@ class ManagerBot(AuthMixin):
             return
         await query.answer()
         # Any button press cancels a pending inline edit
-        ctx.user_data.pop("pending_edit", None)
+        if ctx.user_data is not None:
+            ctx.user_data.pop("pending_edit", None)
 
         data = query.data
 
@@ -335,7 +387,7 @@ class ManagerBot(AuthMixin):
 
         elif data.startswith("proj_efld_"):
             parsed = _parse_edit_callback(data)
-            if parsed:
+            if parsed and ctx.user_data is not None:
                 field, name = parsed
                 ctx.user_data["pending_edit"] = {"name": name, "field": field}
                 await query.edit_message_text(
@@ -359,7 +411,7 @@ class ManagerBot(AuthMixin):
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.bot.set_my_commands(COMMANDS)
 
-    def build(self):
+    def build(self) -> Application[Any, Any, Any, Any, Any, Any]:
         app = (
             ApplicationBuilder()
             .token(self._token)

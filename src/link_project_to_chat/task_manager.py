@@ -6,9 +6,10 @@ import enum
 import logging
 import subprocess
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Protocol
 
 from .claude_client import ClaudeClient
 from .stream import Error, Result, StreamEvent, TextDelta, ThinkingDelta
@@ -45,9 +46,9 @@ class Task:
     started_at: float | None = None
     finished_at: float | None = None
     _compact: bool = field(default=False, repr=False)
-    _proc: subprocess.Popen | None = field(default=None, repr=False)
-    _asyncio_task: asyncio.Task | None = field(default=None, repr=False)
-    _log: collections.deque = field(
+    _proc: subprocess.Popen[bytes] | None = field(default=None, repr=False)
+    _asyncio_task: asyncio.Task[None] | None = field(default=None, repr=False)
+    _log: collections.deque[str] = field(
         default_factory=lambda: collections.deque(maxlen=100), repr=False
     )
 
@@ -91,7 +92,8 @@ class Task:
         return False
 
 
-OnTaskEvent = Callable[[Task], Awaitable[None]]
+class OnTaskEvent(Protocol):
+    async def __call__(self, task: Task) -> None: ...
 
 
 class TaskManager:
@@ -105,6 +107,7 @@ class TaskManager:
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
+        claude: ClaudeClient | None = None,
     ):
         self.project_path = project_path
         self._on_complete = on_complete
@@ -112,7 +115,7 @@ class TaskManager:
         self._on_stream_event = on_stream_event
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
-        self._claude = ClaudeClient(
+        self._claude = claude or ClaudeClient(
             project_path,
             skip_permissions=skip_permissions,
             permission_mode=permission_mode,
@@ -214,7 +217,6 @@ class TaskManager:
             task.error = str(e)
         finally:
             task.finished_at = time.monotonic()
-        if task.status != TaskStatus.CANCELLED:
             await self._safe_callback(self._on_complete, task)
 
     COMPACT_PROMPT = (

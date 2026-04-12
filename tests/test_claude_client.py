@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import io
+import subprocess
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from link_project_to_chat.claude_client import ClaudeClient
+from link_project_to_chat.stream import Error
+
+
+class FakeRunner:
+    """Records the command and returns a fake subprocess."""
+
+    def __init__(self, stdout_lines: list[str] | None = None, returncode: int = 0):
+        self.last_cmd: list[str] = []
+        self.last_env: dict[str, str] = {}
+        self.last_cwd: str = ""
+        self._stdout_lines = stdout_lines or []
+        self._returncode = returncode
+
+    def run(
+        self,
+        cmd: list[str],
+        cwd: str,
+        env: dict[str, str],
+        stdin: int,
+        stdout: int,
+        stderr: int,
+    ) -> subprocess.Popen[bytes]:
+        self.last_cmd = cmd
+        self.last_env = env
+        self.last_cwd = cwd
+
+        raw = "\n".join(self._stdout_lines).encode()
+        proc = MagicMock(spec=subprocess.Popen)
+        proc.stdout = io.BytesIO(raw)
+        proc.stderr = io.BytesIO(b"")
+        proc.returncode = self._returncode
+        proc.pid = 12345
+        proc.poll.return_value = self._returncode
+        proc.wait.return_value = self._returncode
+        return proc
+
+
+def _result_line(text: str = "hello", session_id: str = "sess-1") -> str:
+    import json
+    return json.dumps({
+        "type": "result",
+        "result": text,
+        "session_id": session_id,
+        "modelUsage": {"claude-sonnet-4-20250514": {}},
+    })
+
+
+def _text_line(text: str) -> str:
+    import json
+    return json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+    })
+
+
+# --- Command building tests ---
+
+@pytest.mark.asyncio
+async def test_command_includes_model_and_effort(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, model="opus", runner=runner)
+    client.effort = "high"
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--model" in runner.last_cmd
+    idx = runner.last_cmd.index("--model")
+    assert runner.last_cmd[idx + 1] == "opus"
+    assert "--effort" in runner.last_cmd
+    idx = runner.last_cmd.index("--effort")
+    assert runner.last_cmd[idx + 1] == "high"
+
+
+@pytest.mark.asyncio
+async def test_command_includes_skip_permissions(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, skip_permissions=True, runner=runner)
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--dangerously-skip-permissions" in runner.last_cmd
+
+
+@pytest.mark.asyncio
+async def test_command_without_skip_permissions(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, skip_permissions=False, runner=runner)
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--dangerously-skip-permissions" not in runner.last_cmd
+
+
+@pytest.mark.asyncio
+async def test_command_includes_permission_mode(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(
+        project_path=tmp_path, skip_permissions=False, permission_mode="auto", runner=runner,
+    )
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--permission-mode" in runner.last_cmd
+    idx = runner.last_cmd.index("--permission-mode")
+    assert runner.last_cmd[idx + 1] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_command_includes_allowed_tools(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(
+        project_path=tmp_path, allowed_tools=["Read", "Write"], runner=runner,
+    )
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--allowedTools" in runner.last_cmd
+    idx = runner.last_cmd.index("--allowedTools")
+    assert runner.last_cmd[idx + 1] == "Read,Write"
+
+
+@pytest.mark.asyncio
+async def test_command_includes_disallowed_tools(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(
+        project_path=tmp_path, disallowed_tools=["Bash"], runner=runner,
+    )
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--disallowedTools" in runner.last_cmd
+    idx = runner.last_cmd.index("--disallowedTools")
+    assert runner.last_cmd[idx + 1] == "Bash"
+
+
+@pytest.mark.asyncio
+async def test_command_includes_session_resume(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+    client.session_id = "prev-session"
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--resume" in runner.last_cmd
+    idx = runner.last_cmd.index("--resume")
+    assert runner.last_cmd[idx + 1] == "prev-session"
+
+
+@pytest.mark.asyncio
+async def test_user_message_appended_to_command(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+    async for _ in client.chat_stream("hello world"):
+        pass
+
+    assert runner.last_cmd[-1] == "hello world"
+    assert runner.last_cmd[-2] == "--"
+
+
+# --- Environment tests ---
+
+@pytest.mark.asyncio
+async def test_env_strips_claudecode_vars(tmp_path: Path):
+    import os
+    os.environ["CLAUDECODE"] = "1"
+    os.environ["CLAUDE_CODE_ENTRYPOINT"] = "test"
+    try:
+        runner = FakeRunner(stdout_lines=[_result_line()])
+        client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+        async for _ in client.chat_stream("test"):
+            pass
+
+        assert "CLAUDECODE" not in runner.last_env
+        assert "CLAUDE_CODE_ENTRYPOINT" not in runner.last_env
+    finally:
+        os.environ.pop("CLAUDECODE", None)
+        os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+
+# --- Session handling ---
+
+@pytest.mark.asyncio
+async def test_session_id_updated_from_result(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line("ok", "new-sess")])
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+    assert client.session_id is None
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert client.session_id == "new-sess"
+
+
+# --- Error handling ---
+
+@pytest.mark.asyncio
+async def test_nonzero_exit_yields_error(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[], returncode=1)
+    # Override stderr to contain error message
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+    events: list[Any] = []
+    async for event in client.chat_stream("test"):
+        events.append(event)
+
+    assert any(isinstance(e, Error) for e in events)
+
+
+# --- Concurrency guard ---
+
+@pytest.mark.asyncio
+async def test_concurrent_access_raises(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+    # Simulate an active subprocess
+    active_proc = MagicMock()
+    active_proc.poll.return_value = None  # Still running
+    client._proc = active_proc
+
+    with pytest.raises(RuntimeError, match="already has an active subprocess"):
+        async for _ in client.chat_stream("test"):
+            pass
+
+
+# --- chat() convenience method ---
+
+@pytest.mark.asyncio
+async def test_chat_returns_result_text(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[_result_line("the answer")])
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+    result = await client.chat("question")
+    assert result == "the answer"
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_error_on_failure(tmp_path: Path):
+    runner = FakeRunner(stdout_lines=[], returncode=1)
+    client = ClaudeClient(project_path=tmp_path, runner=runner)
+
+    result = await client.chat("question")
+    assert result.startswith("Error:")
+
+
+# --- Status property ---
+
+def test_status_idle(tmp_path: Path):
+    client = ClaudeClient(project_path=tmp_path)
+    st = client.status
+    assert st["running"] is False
+    assert st["pid"] is None
+    assert st["total_requests"] == 0
+
+
+# --- Cancel ---
+
+def test_cancel_no_proc(tmp_path: Path):
+    client = ClaudeClient(project_path=tmp_path)
+    assert client.cancel() is False

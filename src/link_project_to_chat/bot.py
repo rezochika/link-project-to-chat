@@ -5,6 +5,10 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar
+
+if TYPE_CHECKING:
+    from telegram.ext import Application
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -17,18 +21,17 @@ from telegram.ext import (
     filters,
 )
 
+from ._auth import AuthMixin
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
 from .config import (
     Config,
-    DEFAULT_CONFIG,
     clear_session,
     load_sessions,
-    save_session,
     save_project_trusted_user_id,
+    save_session,
     save_trusted_user_id,
 )
-from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -66,6 +69,7 @@ class ProjectBot(AuthMixin):
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
+        task_manager: TaskManager | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -74,11 +78,11 @@ class ProjectBot(AuthMixin):
         self._trusted_user_id = trusted_user_id
         self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
-        self._app = None
-        self._typing_tasks: dict[int, asyncio.Task] = {}
+        self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
+        self._typing_tasks: dict[int, asyncio.Task[None]] = {}
         self._stream_text: dict[int, str] = {}
         self._init_auth()
-        self.task_manager = TaskManager(
+        self.task_manager = task_manager or TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
             on_task_started=self._on_task_started,
@@ -96,6 +100,7 @@ class ProjectBot(AuthMixin):
             save_trusted_user_id(user_id)
 
     async def _on_task_started(self, task: Task) -> None:
+        assert self._app is not None
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
@@ -105,13 +110,13 @@ class ProjectBot(AuthMixin):
         elif isinstance(event, TextDelta):
             self._stream_text.setdefault(task.id, "")
             self._stream_text[task.id] += event.text
-        elif isinstance(event, ToolUse):
-            if event.path and self._is_image(event.path):
-                await self._send_image(
-                    task.chat_id, event.path, reply_to=task.message_id
-                )
+        elif isinstance(event, ToolUse) and event.path and self._is_image(event.path):
+            await self._send_image(
+                task.chat_id, event.path, reply_to=task.message_id
+            )
 
     async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None) -> None:
+        assert self._app is not None
         for chunk in split_html(html):
             try:
                 await self._app.bot.send_message(
@@ -162,6 +167,10 @@ class ProjectBot(AuthMixin):
         if typing:
             typing.cancel()
 
+        if task.status == TaskStatus.CANCELLED:
+            self._stream_text.pop(task.id, None)
+            return
+
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
                 save_session(self.name, self.task_manager.claude.session_id)
@@ -170,21 +179,29 @@ class ProjectBot(AuthMixin):
             await self._finalize_command_task(task)
 
     async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+            await msg.reply_text("Unauthorized.")
+            return
+        await msg.reply_text(
             f"Project: {self.name}\nPath: {self.path}\n\n"
             f"Send a message to chat with Claude.\n{_CMD_HELP}"
         )
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
-        if not msg:
+        if not msg or not update.effective_chat:
             return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-        if self._rate_limited(update.effective_user.id):
-            return await msg.reply_text("Rate limited. Try again shortly.")
+        user = update.effective_user
+        if not self._auth(user):
+            await msg.reply_text("Unauthorized.")
+            return
+        assert user is not None
+        if self._rate_limited(user.id):
+            await msg.reply_text("Rate limited. Try again shortly.")
+            return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
             self.task_manager.cancel(prev.id)
@@ -192,7 +209,7 @@ class ProjectBot(AuthMixin):
             if typing:
                 typing.cancel()
 
-        prompt = msg.text
+        prompt = msg.text or ""
         if msg.reply_to_message and msg.reply_to_message.text:
             prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
         self.task_manager.submit_claude(
@@ -202,18 +219,23 @@ class ProjectBot(AuthMixin):
         )
 
     async def _on_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not update.effective_chat:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await msg.reply_text("Unauthorized.")
+            return
         if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /run <command>")
+            await msg.reply_text("Usage: /run <command>")
+            return
         command = " ".join(ctx.args)
         self.task_manager.run_command(
             chat_id=update.effective_chat.id,
-            message_id=update.effective_message.message_id,
+            message_id=msg.message_id,
             command=command,
         )
 
-    _TASK_ICONS = {
+    _TASK_ICONS: ClassVar[dict[TaskStatus, str]] = {
         TaskStatus.WAITING: "~",
         TaskStatus.RUNNING: ">",
         TaskStatus.DONE: "+",
@@ -233,7 +255,10 @@ class ProjectBot(AuthMixin):
             icon = self._TASK_ICONS.get(t.status, "?")
             elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
             label = t.name if t.type == TaskType.COMMAND else t.input[:40]
-            buttons.append([InlineKeyboardButton(f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}")])
+            btn = InlineKeyboardButton(
+                f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}"
+            )
+            buttons.append([btn])
         return InlineKeyboardMarkup(buttons)
 
     async def _render_tasks(self, chat_id: int, edit_query) -> None:
@@ -244,7 +269,8 @@ class ProjectBot(AuthMixin):
         if not update.effective_message or not update.effective_chat:
             return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await update.effective_message.reply_text("Unauthorized.")
+            return
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
@@ -258,9 +284,13 @@ class ProjectBot(AuthMixin):
         return self.task_manager.claude.model_display or self.task_manager.claude.model
 
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+            await msg.reply_text("Unauthorized.")
+            return
+        await msg.reply_text(
             f"Current: {self._current_model()}",
             reply_markup=self._model_markup(),
         )
@@ -275,9 +305,13 @@ class ProjectBot(AuthMixin):
         return self.task_manager.claude.effort
 
     async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+            await msg.reply_text("Unauthorized.")
+            return
+        await msg.reply_text(
             f"Current: {self._current_effort()}",
             reply_markup=self._effort_markup(),
         )
@@ -300,35 +334,46 @@ class ProjectBot(AuthMixin):
         return claude.permission_mode or "default"
 
     async def _on_permissions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+            await msg.reply_text("Unauthorized.")
+            return
+        await msg.reply_text(
             f"Current: {self._current_permission()}",
             reply_markup=self._permissions_markup(),
         )
 
     async def _on_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not update.effective_chat:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await msg.reply_text("Unauthorized.")
+            return
         if not self.task_manager.claude.session_id:
-            return await update.effective_message.reply_text("No active session.")
+            await msg.reply_text("No active session.")
+            return
         self.task_manager.submit_compact(
             chat_id=update.effective_chat.id,
-            message_id=update.effective_message.message_id,
+            message_id=msg.message_id,
         )
 
     async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await update.effective_message.reply_text("Unauthorized.")
+            return
         await update.effective_message.reply_text(_CMD_HELP)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await update.effective_message.reply_text("Unauthorized.")
+            return
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -348,7 +393,7 @@ class ProjectBot(AuthMixin):
         query = update.callback_query
         if not query or not query.data:
             return
-        if query.message and query.message.chat.type != "private":
+        if query.message and query.message.chat and query.message.chat.type != "private":
             await query.answer("Only available in private chats.")
             return
         if not self._auth(query.from_user):
@@ -408,7 +453,8 @@ class ProjectBot(AuthMixin):
             rows.append([InlineKeyboardButton("« Back", callback_data="tasks_back")])
             await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
         elif query.data == "tasks_back":
-            await self._render_tasks(query.message.chat_id, edit_query=query)
+            if query.message:
+                await self._render_tasks(query.message.chat.id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
             task_id = _parse_task_id(query.data)
             if self.task_manager.cancel(task_id):
@@ -431,8 +477,12 @@ class ProjectBot(AuthMixin):
             await query.edit_message_text(f"#{task_id} log:\n{output}", reply_markup=InlineKeyboardMarkup(rows))
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
         if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+            await msg.reply_text("Unauthorized.")
+            return
 
         uptime = time.monotonic() - self._started_at
         h, rem = divmod(int(uptime), 3600)
@@ -449,16 +499,20 @@ class ProjectBot(AuthMixin):
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
         ]
-        await update.effective_message.reply_text("\n".join(lines))
+        await msg.reply_text("\n".join(lines))
 
     async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         if not msg or not update.effective_chat:
             return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-        if self._rate_limited(update.effective_user.id):
-            return await msg.reply_text("Rate limited. Try again shortly.")
+        user = update.effective_user
+        if not self._auth(user):
+            await msg.reply_text("Unauthorized.")
+            return
+        assert user is not None
+        if self._rate_limited(user.id):
+            await msg.reply_text("Rate limited. Try again shortly.")
+            return
 
         uploads_dir = self.path / "uploads"
         uploads_dir.mkdir(exist_ok=True)
@@ -476,7 +530,8 @@ class ProjectBot(AuthMixin):
                 if c.isalnum() or c in "._- "
             )[:200]
         else:
-            return await msg.reply_text("Unsupported file type.")
+            await msg.reply_text("Unsupported file type.")
+            return
 
         dest = uploads_dir / filename
         if dest.exists():
@@ -508,7 +563,8 @@ class ProjectBot(AuthMixin):
         if not msg:
             return
         if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
+            await msg.reply_text("Unauthorized.")
+            return
 
         if msg.voice or msg.video_note:
             text = "Voice messages aren't supported yet. Please type your message."
@@ -521,7 +577,7 @@ class ProjectBot(AuthMixin):
 
         await msg.reply_text(text)
 
-    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+    IMAGE_EXTENSIONS: ClassVar[set[str]] = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 
     def _is_image(self, path: str) -> bool:
         from pathlib import PurePosixPath
@@ -542,6 +598,7 @@ class ProjectBot(AuthMixin):
             suffix = path.suffix.lower()
             with path.open("rb") as f:
                 data = f.read()
+            assert self._app is not None
             if suffix == ".svg" or size > 10 * 1024 * 1024:
                 await self._app.bot.send_document(
                     chat_id,
@@ -596,7 +653,7 @@ class ProjectBot(AuthMixin):
             except Exception:
                 logger.error("Failed to send startup message", exc_info=True)
 
-    def build(self):
+    def build(self) -> Application[Any, Any, Any, Any, Any, Any]:
         app = (
             ApplicationBuilder()
             .token(self.token)
@@ -706,7 +763,9 @@ def run_bots(
         if config_path:
             _name = name
             _path = config_path
-            on_trust = lambda uid: save_project_trusted_user_id(_name, uid, _path)
+
+            def on_trust(uid: int) -> None:
+                save_project_trusted_user_id(_name, uid, _path)
         run_bot(
             name,
             Path(proj.path),

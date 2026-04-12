@@ -6,13 +6,14 @@ import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .config import load_project_configs
 
 logger = logging.getLogger(__name__)
 
 
-def _default_command_builder(project_name: str, project_config: dict) -> list[str]:
+def _default_command_builder(project_name: str, project_config: dict[str, Any]) -> list[str]:
     cmd = ["link-project-to-chat", "start", "--project", project_name]
 
     if project_config.get("dangerously_skip_permissions"):
@@ -29,21 +30,22 @@ class ProcessManager:
     def __init__(
         self,
         project_config_path: Path | None = None,
-        command_builder: Callable[[str, dict], list[str]] | None = None,
+        command_builder: Callable[[str, dict[str, Any]], list[str]] | None = None,
     ):
         self._project_config_path = project_config_path
         self._command_builder = command_builder or _default_command_builder
-        self._processes: dict[str, subprocess.Popen] = {}
-        self._logs: dict[str, collections.deque] = {}
+        self._processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._logs: dict[str, collections.deque[str]] = {}
         self._log_threads: dict[str, threading.Thread] = {}
 
-    def _load_projects(self) -> dict[str, dict]:
+    def _load_projects(self) -> dict[str, dict[str, Any]]:
         if self._project_config_path is not None:
             return load_project_configs(self._project_config_path)
         return load_project_configs()
 
-    def _capture_output(self, name: str, proc: subprocess.Popen) -> None:
+    def _capture_output(self, name: str, proc: subprocess.Popen[bytes]) -> None:
         buf = self._logs[name]
+        assert proc.stdout is not None
         try:
             for raw_line in proc.stdout:
                 buf.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
@@ -110,6 +112,7 @@ class ProcessManager:
         return sum(1 for name, proj in projects.items() if proj.get("autostart") and self.start(name))
 
     def rename(self, old_name: str, new_name: str) -> None:
-        for store in (self._processes, self._logs, self._log_threads):
+        stores: list[dict[str, Any]] = [self._processes, self._logs, self._log_threads]
+        for store in stores:
             if old_name in store:
                 store[new_name] = store.pop(old_name)

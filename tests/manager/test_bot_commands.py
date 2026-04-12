@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from link_project_to_chat.manager.bot import ManagerBot
-from link_project_to_chat.manager.config import ManagerConfig
 from link_project_to_chat.manager.process import ProcessManager
 
 
@@ -47,9 +46,8 @@ def _make_callback(data: str, user_id: int = 1, username: str = "testuser"):
 def bot_env(tmp_path: Path):
     proj_cfg = tmp_path / "projects.json"
     proj_cfg.write_text(json.dumps({"projects": {}}))
-    config = ManagerConfig(telegram_bot_token="TOKEN")
-    pm = ProcessManager(config=config, project_config_path=proj_cfg, state_path=tmp_path / "state.json")
-    bot = ManagerBot(config, pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
+    pm = ProcessManager(project_config_path=proj_cfg)
+    bot = ManagerBot("TOKEN", pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
     return bot, pm, proj_cfg
 
 
@@ -89,8 +87,8 @@ async def _run_add_dialogue(bot, tmp_path, name="myproj", token="/skip", usernam
 @pytest.mark.asyncio
 async def test_addproject_success(bot_env, tmp_path: Path):
     from telegram.ext import ConversationHandler
-    bot, pm, proj_cfg = bot_env
-    result, last_update, proj_path = await _run_add_dialogue(bot, tmp_path)
+    bot, _pm, proj_cfg = bot_env
+    result, last_update, _proj_path = await _run_add_dialogue(bot, tmp_path)
     assert result == ConversationHandler.END
     assert "Added" in last_update.effective_message.reply_text.call_args[0][0]
     assert "myproj" in json.loads(proj_cfg.read_text())["projects"]
@@ -99,8 +97,10 @@ async def test_addproject_success(bot_env, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_addproject_with_all_options(bot_env, tmp_path: Path):
     from telegram.ext import ConversationHandler
-    bot, pm, proj_cfg = bot_env
-    result, _, _ = await _run_add_dialogue(bot, tmp_path, name="fullproj", token="MYTOKEN", username="myuser", model="opus")
+    bot, _pm, proj_cfg = bot_env
+    result, _, _ = await _run_add_dialogue(
+        bot, tmp_path, name="fullproj", token="MYTOKEN", username="myuser", model="opus",
+    )
     assert result == ConversationHandler.END
     proj = json.loads(proj_cfg.read_text())["projects"]["fullproj"]
     assert proj["telegram_bot_token"] == "MYTOKEN"
@@ -110,7 +110,7 @@ async def test_addproject_with_all_options(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_addproject_already_exists(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     existing = tmp_path / "existing"
     existing.mkdir()
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(existing)}}}))
@@ -126,14 +126,16 @@ async def test_addproject_already_exists(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_addproject_invalid_path(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, _proj_cfg = bot_env
     update, ctx = _make_update()
     await bot._on_add_project(update, ctx)
     u1, _ = _make_update(text="newproj")
-    c1 = MagicMock(); c1.user_data = ctx.user_data
+    c1 = MagicMock()
+    c1.user_data = ctx.user_data
     await bot._add_name(u1, c1)
     u2, _ = _make_update(text="/nonexistent/xyz")
-    c2 = MagicMock(); c2.user_data = ctx.user_data
+    c2 = MagicMock()
+    c2.user_data = ctx.user_data
     result = await bot._add_path(u2, c2)
     assert result == bot.ADD_PATH
     assert "not exist" in u2.effective_message.reply_text.call_args[0][0]
@@ -141,7 +143,7 @@ async def test_addproject_invalid_path(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_editproject_rename(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"oldname": {"path": str(tmp_path)}}}))
     update, ctx = _make_update(["oldname", "name", "newname"])
     await bot._on_edit_project(update, ctx)
@@ -152,8 +154,9 @@ async def test_editproject_rename(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_editproject_change_path(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
-    new_path = tmp_path / "new"; new_path.mkdir()
+    bot, _pm, proj_cfg = bot_env
+    new_path = tmp_path / "new"
+    new_path.mkdir()
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     update, ctx = _make_update(["myproj", "path", str(new_path)])
     await bot._on_edit_project(update, ctx)
@@ -163,7 +166,7 @@ async def test_editproject_change_path(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_editproject_rename_conflict(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"a": {"path": str(tmp_path)}, "b": {"path": str(tmp_path)}}}))
     update, ctx = _make_update(["a", "name", "b"])
     await bot._on_edit_project(update, ctx)
@@ -172,7 +175,7 @@ async def test_editproject_rename_conflict(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_editproject_invalid_field(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     update, ctx = _make_update(["myproj", "color", "blue"])
     await bot._on_edit_project(update, ctx)
@@ -181,7 +184,7 @@ async def test_editproject_invalid_field(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_callback_proj_info(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     update, ctx, query = _make_callback("proj_info_myproj")
     await bot._on_callback(update, ctx)
@@ -194,7 +197,7 @@ async def test_callback_proj_info(bot_env, tmp_path: Path):
 async def test_callback_proj_start(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     update, ctx, query = _make_callback("proj_start_myproj")
     await bot._on_callback(update, ctx)
     query.edit_message_text.assert_called_once()
@@ -206,7 +209,7 @@ async def test_callback_proj_start(bot_env, tmp_path: Path):
 async def test_callback_proj_stop(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
     assert pm.status("myproj") == "running"
     update, ctx, query = _make_callback("proj_stop_myproj")
@@ -219,7 +222,7 @@ async def test_callback_proj_stop(bot_env, tmp_path: Path):
 async def test_callback_proj_remove(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg, flags: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
     update, ctx, query = _make_callback("proj_remove_myproj")
     await bot._on_callback(update, ctx)
@@ -230,7 +233,7 @@ async def test_callback_proj_remove(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_callback_proj_back(bot_env):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, _proj_cfg = bot_env
     update, ctx, query = _make_callback("proj_back")
     await bot._on_callback(update, ctx)
     query.edit_message_text.assert_called_once()
@@ -238,7 +241,7 @@ async def test_callback_proj_back(bot_env):
 
 @pytest.mark.asyncio
 async def test_callback_unauthorized(bot_env):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, _proj_cfg = bot_env
     update, ctx, query = _make_callback("proj_back", user_id=999, username="hacker")
     await bot._on_callback(update, ctx)
     query.answer.assert_called_with("Unauthorized.")
@@ -247,7 +250,7 @@ async def test_callback_unauthorized(bot_env):
 
 @pytest.mark.asyncio
 async def test_projects_header_shows_count(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     update, ctx = _make_update()
     await bot._on_projects(update, ctx)
@@ -257,7 +260,7 @@ async def test_projects_header_shows_count(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_callback_proj_edit_shows_fields(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     update, ctx, query = _make_callback("proj_edit_myproj")
     await bot._on_callback(update, ctx)
@@ -266,14 +269,14 @@ async def test_callback_proj_edit_shows_fields(bot_env, tmp_path: Path):
     assert "myproj" in text
     markup = query.edit_message_text.call_args[1]["reply_markup"]
     button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("proj_efld_path_myproj" == d for d in button_datas)
-    assert any("proj_efld_model_myproj" == d for d in button_datas)
-    assert any("proj_info_myproj" == d for d in button_datas)  # Back button
+    assert any(d == "proj_efld_path_myproj" for d in button_datas)
+    assert any(d == "proj_efld_model_myproj" for d in button_datas)
+    assert any(d == "proj_info_myproj" for d in button_datas)  # Back button
 
 
 @pytest.mark.asyncio
 async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
 
     # Clicking the "model" field button stores pending_edit and prompts
@@ -293,10 +296,10 @@ async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_edit_field_rename_via_button(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
 
-    update, ctx, query = _make_callback("proj_efld_name_myproj")
+    update, ctx, _query = _make_callback("proj_efld_name_myproj")
     ctx.user_data = {}
     await bot._on_callback(update, ctx)
 
@@ -309,7 +312,7 @@ async def test_edit_field_rename_via_button(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_edit_cancel(bot_env):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, _proj_cfg = bot_env
     update, ctx = _make_update()
     ctx.user_data = {"pending_edit": {"name": "myproj", "field": "model"}}
     await bot._edit_cancel(update, ctx)
@@ -318,17 +321,17 @@ async def test_edit_cancel(bot_env):
 
 @pytest.mark.asyncio
 async def test_button_click_cancels_pending_edit(bot_env, tmp_path: Path):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
 
     # Start an edit
-    update, ctx, query = _make_callback("proj_efld_model_myproj")
+    update, ctx, _query = _make_callback("proj_efld_model_myproj")
     ctx.user_data = {}
     await bot._on_callback(update, ctx)
     assert "pending_edit" in ctx.user_data
 
     # Click back — clears pending_edit
-    update2, ctx2, query2 = _make_callback("proj_back")
+    update2, ctx2, _query2 = _make_callback("proj_back")
     ctx2.user_data = ctx.user_data
     await bot._on_callback(update2, ctx2)
     assert "pending_edit" not in ctx2.user_data
@@ -336,7 +339,7 @@ async def test_button_click_cancels_pending_edit(bot_env, tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_edit_field_save_noop_without_pending(bot_env):
-    bot, pm, proj_cfg = bot_env
+    bot, _pm, _proj_cfg = bot_env
     update, ctx = _make_update(text="some text")
     ctx.user_data = {}
     await bot._edit_field_save(update, ctx)  # should not raise or reply
