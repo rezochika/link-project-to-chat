@@ -15,10 +15,11 @@ logger = logging.getLogger(__name__)
 def _default_command_builder(project_name: str, project_config: dict) -> list[str]:
     cmd = ["link-project-to-chat", "start", "--project", project_name]
 
-    if project_config.get("dangerously_skip_permissions"):
+    permissions = project_config.get("permissions")
+    if permissions == "dangerously-skip-permissions":
         cmd.append("--dangerously-skip-permissions")
-    if project_config.get("permission_mode"):
-        cmd.extend(["--permission-mode", project_config["permission_mode"]])
+    elif permissions and permissions != "default":
+        cmd.extend(["--permission-mode", permissions])
     model = project_config.get("model")
     if model:
         cmd.extend(["--model", model])

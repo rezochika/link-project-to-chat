@@ -15,8 +15,7 @@ class ProjectConfig:
     trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
     model: str | None = None
     effort: str | None = None
-    permission_mode: str | None = None
-    dangerously_skip_permissions: bool = False
+    permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
     session_id: str | None = None
     autostart: bool = False
 
@@ -27,6 +26,24 @@ class Config:
     trusted_user_id: int | None = None  # global fallback (also used by manager bot)
     manager_telegram_bot_token: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+
+
+def _load_permissions(proj: dict) -> str | None:
+    """Read permissions from a project dict, with backward compat for old keys."""
+    if "permissions" in proj:
+        return proj["permissions"] or None
+    if proj.get("dangerously_skip_permissions"):
+        return "dangerously-skip-permissions"
+    return proj.get("permission_mode") or None
+
+
+def resolve_permissions(permissions: str | None) -> tuple[bool, str | None]:
+    """Convert permissions string to (skip_permissions, permission_mode) for CLI/bot use."""
+    if permissions == "dangerously-skip-permissions":
+        return True, None
+    if permissions and permissions != "default":
+        return False, permissions
+    return False, None
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
@@ -47,8 +64,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 trusted_user_id=proj.get("trusted_user_id"),
                 model=proj.get("model"),
                 effort=proj.get("effort"),
-                permission_mode=proj.get("permission_mode"),
-                dangerously_skip_permissions=proj.get("dangerously_skip_permissions", False),
+                permissions=_load_permissions(proj),
                 session_id=proj.get("session_id"),
                 autostart=proj.get("autostart", False),
             )
@@ -89,10 +105,12 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             proj["model"] = p.model
         if p.effort:
             proj["effort"] = p.effort
-        if p.permission_mode:
-            proj["permission_mode"] = p.permission_mode
-        if p.dangerously_skip_permissions:
-            proj["dangerously_skip_permissions"] = True
+        if p.permissions:
+            proj["permissions"] = p.permissions
+        else:
+            proj.pop("permissions", None)
+        proj.pop("permission_mode", None)
+        proj.pop("dangerously_skip_permissions", None)
         if p.session_id:
             proj["session_id"] = p.session_id
         else:

@@ -23,6 +23,7 @@ from .config import (
     clear_session,
     load_sessions,
     patch_project,
+    resolve_permissions,
     save_session,
     save_project_trusted_user_id,
     save_trusted_user_id,
@@ -395,15 +396,11 @@ class ProjectBot(AuthMixin):
             )
         elif query.data.startswith("permissions_set_"):
             mode = query.data[len("permissions_set_"):]
-            if mode == "dangerously-skip-permissions":
-                self.task_manager.claude.skip_permissions = True
-                self.task_manager.claude.permission_mode = None
-                patch_project(self.name, {"dangerously_skip_permissions": True, "permission_mode": None})
-            elif mode in PERMISSION_MODES:
-                self.task_manager.claude.skip_permissions = False
-                pm = mode if mode != "default" else None
+            if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
+                skip, pm = resolve_permissions(mode)
+                self.task_manager.claude.skip_permissions = skip
                 self.task_manager.claude.permission_mode = pm
-                patch_project(self.name, {"dangerously_skip_permissions": False, "permission_mode": pm})
+                patch_project(self.name, {"permissions": mode if mode != "default" else None})
             await query.edit_message_text(
                 f"Permissions: {self._current_permission()}",
                 reply_markup=self._permissions_markup(),
@@ -496,8 +493,8 @@ class ProjectBot(AuthMixin):
         if self._rate_limited(update.effective_user.id):
             return await msg.reply_text("Rate limited. Try again shortly.")
 
-        uploads_dir = self.path / "uploads"
-        uploads_dir.mkdir(exist_ok=True)
+        uploads_dir = Path("/tmp/link-project-to-chat") / self.name / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
 
         if msg.photo:
             photo = msg.photo[-1]
@@ -527,7 +524,7 @@ class ProjectBot(AuthMixin):
         await file.download_to_drive(str(dest))
 
         caption = msg.caption or ""
-        prompt = f"[User uploaded uploads/{filename}]"
+        prompt = f"[User uploaded {dest}]"
         if caption:
             prompt += f"\n\n{caption}"
 
@@ -746,6 +743,7 @@ def run_bots(
             _name = name
             _path = config_path
             on_trust = lambda uid: save_project_trusted_user_id(_name, uid, _path)
+        proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             name,
             Path(proj.path),
@@ -753,8 +751,8 @@ def run_bots(
             effective_username,
             model=model or proj.model,
             effort=proj.effort,
-            skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
-            permission_mode=permission_mode or proj.permission_mode,
+            skip_permissions=skip_permissions or proj_skip,
+            permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             trusted_user_id=effective_trusted_id,

@@ -31,9 +31,9 @@ COMMANDS = [
     ("help", "Show commands"),
 ]
 
-_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permission_mode", "dangerously_skip_permissions")
+_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions")
 # Fields shown as edit buttons (subset — simpler types only)
-_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permission_mode")
+_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions")
 
 
 def _parse_edit_callback(data: str) -> tuple[str, str] | None:
@@ -230,7 +230,7 @@ class ManagerBot(AuthMixin):
             projects[name]["telegram_bot_token"] = value
             self._save_projects(projects)
             await update.effective_message.reply_text(f"Updated '{name}' token.")
-        elif field in ("username", "model", "permission_mode"):
+        elif field in ("username", "model", "permissions"):
             projects[name][field] = value
             self._save_projects(projects)
             await update.effective_message.reply_text(f"Updated '{name}' {field} to {value}.")

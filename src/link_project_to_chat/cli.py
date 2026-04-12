@@ -10,6 +10,7 @@ from .config import (
     clear_trusted_user_id,
     load_config,
     load_trusted_user_id,
+    resolve_permissions,
     save_config,
     save_project_trusted_user_id,
 )
@@ -92,10 +93,10 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
         entry["username"] = username.lower().lstrip("@")
     if model:
         entry["model"] = model
-    if permission_mode:
-        entry["permission_mode"] = permission_mode
     if skip_permissions:
-        entry["dangerously_skip_permissions"] = True
+        entry["permissions"] = "dangerously-skip-permissions"
+    elif permission_mode:
+        entry["permissions"] = permission_mode
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")
 
@@ -280,6 +281,7 @@ def start(
             effective_trusted_id = proj.trusted_user_id
         else:
             effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
+        proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             project,
             Path(proj.path),
@@ -288,8 +290,8 @@ def start(
             session_id=session_id,
             model=model or proj.model,
             effort=proj.effort,
-            skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
-            permission_mode=permission_mode or proj.permission_mode,
+            skip_permissions=skip_permissions or proj_skip,
+            permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
             trusted_user_id=effective_trusted_id,

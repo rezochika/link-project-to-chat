@@ -102,7 +102,7 @@ def test_add_project_optional_fields(runner, cfg):
     proj = json.loads(p.read_text())["projects"]["optproj"]
     assert proj["username"] == "bob"
     assert proj["model"] == "sonnet"
-    assert proj["permission_mode"] == "default"
+    assert proj["permissions"] == "default"
 
 
 # --- projects remove ---
