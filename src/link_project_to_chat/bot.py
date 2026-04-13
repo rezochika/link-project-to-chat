@@ -561,7 +561,11 @@ class ProjectBot(AuthMixin):
             if not task:
                 await query.edit_message_text(f"Task #{task_id} not found.")
                 return
-            output = task.result or task.error or "(no output)"
+            # For running tasks, read from live log buffer; for finished tasks, use result
+            if task._log:
+                output = "\n".join(task._log)
+            else:
+                output = task.result or task.error or "(no output)"
             if len(output) > 3000:
                 output = output[:3000] + f"\n... (truncated, {len(task.result or '')} chars total)"
             rows = [[InlineKeyboardButton("« Back", callback_data=f"task_info_{task_id}")]]
