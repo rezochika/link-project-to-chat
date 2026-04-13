@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -892,23 +893,24 @@ class ManagerBot(AuthMixin):
             fallbacks=[],
         ))
 
-        app.add_handler(ConversationHandler(
-            entry_points=[CommandHandler("create_project", self._on_create_project)],
-            states={
-                self.CREATE_SOURCE: [CallbackQueryHandler(self._create_source_callback)],
-                self.CREATE_REPO_LIST: [CallbackQueryHandler(self._create_repo_list_callback)],
-                self.CREATE_REPO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_repo_url)],
-                self.CREATE_NAME: [CallbackQueryHandler(self._create_name_callback)],
-                self.CREATE_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_name_input)],
-                self.CREATE_BOT: [
-                    CallbackQueryHandler(self._create_bot_callback),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_bot_token_input),
-                ],
-                self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
-            },
-            fallbacks=[CommandHandler("cancel", self._create_cancel)],
-            per_message=True,
-        ))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="If 'per_message=False'", category=UserWarning)
+            app.add_handler(ConversationHandler(
+                entry_points=[CommandHandler("create_project", self._on_create_project)],
+                states={
+                    self.CREATE_SOURCE: [CallbackQueryHandler(self._create_source_callback)],
+                    self.CREATE_REPO_LIST: [CallbackQueryHandler(self._create_repo_list_callback)],
+                    self.CREATE_REPO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_repo_url)],
+                    self.CREATE_NAME: [CallbackQueryHandler(self._create_name_callback)],
+                    self.CREATE_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_name_input)],
+                    self.CREATE_BOT: [
+                        CallbackQueryHandler(self._create_bot_callback),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_bot_token_input),
+                    ],
+                    self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
+                },
+                fallbacks=[CommandHandler("cancel", self._create_cancel)],
+            ))
 
         app.add_handler(CommandHandler("cancel", self._edit_cancel))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._edit_field_save))
