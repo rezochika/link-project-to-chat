@@ -4,6 +4,8 @@ import asyncio
 import collections
 import enum
 import logging
+import os
+import signal
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
@@ -109,6 +111,7 @@ class TaskManager:
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         claude: ClaudeClient | None = None,
+        command_timeout: float | None = None,  # seconds, None = no timeout
     ):
         self.project_path = project_path
         self._on_complete = on_complete
@@ -116,6 +119,7 @@ class TaskManager:
         self._on_stream_event = on_stream_event
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
+        self._command_timeout = command_timeout
         self._claude = claude or ClaudeClient(
             project_path,
             skip_permissions=skip_permissions,
@@ -248,6 +252,7 @@ class TaskManager:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,  # Create process group for clean kill on timeout
         )
         task._proc = proc
         logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
@@ -261,13 +266,30 @@ class TaskManager:
                 lines.append(line)
                 task._log.append(line)
 
+        def _kill_proc_group() -> None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            proc.wait()
+
         assert proc.stdout is not None
         assert proc.stderr is not None
+        timed_out = False
         try:
             out_fut = asyncio.to_thread(_read_stream, proc.stdout, stdout_lines)
             err_fut = asyncio.to_thread(_read_stream, proc.stderr, stderr_lines)
-            await asyncio.gather(out_fut, err_fut)
-            await asyncio.to_thread(proc.wait)
+            gather_fut = asyncio.gather(out_fut, err_fut)
+            if self._command_timeout is not None:
+                try:
+                    await asyncio.wait_for(gather_fut, timeout=self._command_timeout)
+                    await asyncio.to_thread(proc.wait)
+                except TimeoutError:
+                    timed_out = True
+                    await asyncio.to_thread(_kill_proc_group)
+            else:
+                await gather_fut
+                await asyncio.to_thread(proc.wait)
         except asyncio.CancelledError:
             if proc.poll() is None:
                 proc.kill()
@@ -280,6 +302,20 @@ class TaskManager:
         task._proc = None
 
         if task.status == TaskStatus.CANCELLED:
+            return
+
+        if timed_out:
+            assert self._command_timeout is not None
+            t = self._command_timeout
+            timeout_display: float | int = int(t) if t == int(t) else t
+            task.status = TaskStatus.FAILED
+            task.error = f"Command timed out after {timeout_display}s"
+            logger.info(
+                "task #%d timed out after %.1fs",
+                task.id,
+                task.elapsed,
+            )
+            await self._safe_callback(self._on_complete, task)
             return
 
         task.result = "\n".join(stdout_lines)

@@ -172,3 +172,77 @@ async def test_find_by_message(tmp_path):
     found = tm.find_by_message(99)
     assert task in found
     task.cancel()
+
+
+# --- Timeout tests ---
+
+@pytest.mark.asyncio
+async def test_run_command_no_timeout_works_normally(tmp_path):
+    """A command without a timeout completes normally."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        on_complete=_noop,
+        on_task_started=_noop,
+        command_timeout=None,
+    )
+    task = tm.run_command(chat_id=1, message_id=1, command="echo ok")
+    await asyncio.wait_for(task._asyncio_task, timeout=5)
+    assert task.status == TaskStatus.DONE
+    assert "ok" in task.result
+
+
+@pytest.mark.asyncio
+async def test_run_command_completes_within_timeout(tmp_path):
+    """A fast command completes successfully when timeout is generous."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        on_complete=_noop,
+        on_task_started=_noop,
+        command_timeout=5.0,
+    )
+    task = tm.run_command(chat_id=1, message_id=1, command="echo done")
+    await asyncio.wait_for(task._asyncio_task, timeout=10)
+    assert task.status == TaskStatus.DONE
+    assert "done" in task.result
+
+
+@pytest.mark.asyncio
+async def test_run_command_timeout_kills_slow_command(tmp_path):
+    """A slow command is killed when it exceeds the timeout."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        on_complete=_noop,
+        on_task_started=_noop,
+        command_timeout=0.5,
+    )
+    task = tm.run_command(chat_id=1, message_id=1, command="sleep 30")
+    await asyncio.wait_for(task._asyncio_task, timeout=5)
+    assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_run_command_timeout_error_message(tmp_path):
+    """The task error field contains the timeout message."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        on_complete=_noop,
+        on_task_started=_noop,
+        command_timeout=0.5,
+    )
+    task = tm.run_command(chat_id=1, message_id=1, command="sleep 30")
+    await asyncio.wait_for(task._asyncio_task, timeout=5)
+    assert task.error is not None
+    assert "timed out" in task.error
+    assert "0.5s" in task.error
