@@ -163,7 +163,7 @@ class TaskManager:
             message_id=message_id,
             type=TaskType.COMMAND,
             input=command,
-            name=name or command.split()[0] if command else f"task-{self._next_id}",
+            name=name or command or f"task-{self._next_id}",
             status=TaskStatus.RUNNING,
             started_at=time.monotonic(),
         )
