@@ -308,6 +308,90 @@ def start(
         )
 
 
+@main.command()
+@click.option("--github-pat", default=None, help="GitHub Personal Access Token")
+@click.option("--telegram-api-id", default=None, type=int, help="Telegram API ID (from my.telegram.org)")
+@click.option("--telegram-api-hash", default=None, help="Telegram API Hash")
+@click.option("--phone", default=None, help="Phone number for Telethon auth (e.g. +995511166693)")
+@click.pass_context
+def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api_hash: str | None, phone: str | None):
+    """Set up GitHub PAT, Telegram API credentials, and Telethon authentication.
+
+    Run without arguments for interactive setup. Or pass individual options.
+    """
+    cfg_path = ctx.obj["config_path"]
+    config = load_config(cfg_path)
+    changed = False
+
+    # Interactive mode if no args provided
+    interactive = not any([github_pat, telegram_api_id, telegram_api_hash, phone])
+
+    # GitHub PAT
+    if github_pat or (interactive and click.confirm("Configure GitHub PAT?", default=not config.github_pat)):
+        if not github_pat:
+            github_pat = click.prompt("GitHub Personal Access Token")
+        config.github_pat = github_pat
+        changed = True
+        click.echo("GitHub PAT saved.")
+
+    # Telegram API credentials
+    if telegram_api_id or telegram_api_hash or (interactive and click.confirm("Configure Telegram API credentials?", default=not config.telegram_api_id)):
+        if not telegram_api_id:
+            telegram_api_id = click.prompt("Telegram API ID (from my.telegram.org)", type=int)
+        if not telegram_api_hash:
+            telegram_api_hash = click.prompt("Telegram API Hash")
+        config.telegram_api_id = telegram_api_id
+        config.telegram_api_hash = telegram_api_hash
+        changed = True
+        click.echo("Telegram API credentials saved.")
+
+    if changed:
+        save_config(config, cfg_path)
+
+    # Telethon authentication
+    api_id = config.telegram_api_id
+    api_hash = config.telegram_api_hash
+    if not api_id or not api_hash:
+        if phone or (interactive and click.confirm("Authenticate Telethon?")):
+            raise SystemExit("Telegram API ID and Hash must be configured first.")
+        return
+
+    session_path = cfg_path.parent / "telethon.session"
+    if phone or (interactive and click.confirm(
+        "Authenticate Telethon?" if not session_path.exists() else "Re-authenticate Telethon?",
+        default=not session_path.exists(),
+    )):
+        try:
+            from .botfather import BotFatherClient  # noqa: F811
+        except ImportError:
+            raise SystemExit("telethon not installed. Run: pip install link-project-to-chat[create]")
+
+        if not phone:
+            phone = click.prompt("Phone number (with country code, e.g. +995511166693)")
+
+        from telethon.sync import TelegramClient
+        client = TelegramClient(
+            str(session_path), api_id, api_hash,
+            device_model="Desktop", system_version="macOS", app_version="1.0",
+        )
+        try:
+            client.start(phone=phone)
+            session_path.chmod(0o600)
+            click.echo("Telethon authenticated successfully!")
+        except Exception as e:
+            raise SystemExit(f"Authentication failed: {e}")
+        finally:
+            client.disconnect()
+
+    # Show status
+    click.echo("\nSetup status:")
+    click.echo(f"  GitHub PAT: {'configured' if config.github_pat else 'not set'}")
+    click.echo(f"  Telegram API ID: {'configured' if config.telegram_api_id else 'not set'}")
+    click.echo(f"  Telegram API Hash: {'configured' if config.telegram_api_hash else 'not set'}")
+    session_path = cfg_path.parent / "telethon.session"
+    click.echo(f"  Telethon session: {'authenticated' if session_path.exists() else 'not authenticated'}")
+
+
 @main.command("start-manager")
 @click.pass_context
 def start_manager(ctx):
