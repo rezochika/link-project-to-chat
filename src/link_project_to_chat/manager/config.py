@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from link_project_to_chat.constants import DEFAULT_CONFIG, FILE_PERMISSION
+
 # Project configs are read from/written to the main tool's config file
-PROJECT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
+PROJECT_CONFIG = DEFAULT_CONFIG
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -28,7 +30,7 @@ def save_project_configs(projects: dict[str, dict[str, Any]], path: Path = PROJE
     existing["projects"] = projects
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2) + "\n")
-    path.chmod(0o600)
+    path.chmod(FILE_PERMISSION)
 
 
 def set_project_autostart(project_name: str, value: bool, path: Path = PROJECT_CONFIG) -> None:
@@ -36,4 +38,4 @@ def set_project_autostart(project_name: str, value: bool, path: Path = PROJECT_C
     existing.setdefault("projects", {}).setdefault(project_name, {})["autostart"] = value
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2) + "\n")
-    path.chmod(0o600)
+    path.chmod(FILE_PERMISSION)

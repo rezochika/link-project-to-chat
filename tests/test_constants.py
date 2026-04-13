@@ -17,3 +17,7 @@ def test_paths_are_absolute() -> None:
 
 def test_telegram_limit_is_4096() -> None:
     assert TELEGRAM_MESSAGE_LIMIT == 4096
+
+
+def test_file_permission_is_restrictive() -> None:
+    assert FILE_PERMISSION == 0o600
