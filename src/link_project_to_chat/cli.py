@@ -14,6 +14,7 @@ from .config import (
     save_config,
     save_project_trusted_user_id,
 )
+from .exceptions import BotError
 from .logging_config import configure_logging
 
 
@@ -175,18 +176,21 @@ def configure(ctx: click.Context, username: str | None, manager_token: str | Non
     if not username and not manager_token:
         raise SystemExit("Provide at least one of --username or --manager-token.")
     cfg_path = ctx.obj["config_path"]
-    config = load_config(cfg_path)
-    if username:
-        new_username = username.lower().lstrip("@")
-        if new_username != config.allowed_username:
-            clear_trusted_user_id(cfg_path)
-            click.echo("Trusted user ID cleared (username changed).")
-        config.allowed_username = new_username
-        click.echo(f"Configured username: @{new_username}")
-    if manager_token:
-        config.manager_telegram_bot_token = manager_token
-        click.echo(f"Configured manager token: ***{manager_token[-4:]}")
-    save_config(config, cfg_path)
+    try:
+        config = load_config(cfg_path)
+        if username:
+            new_username = username.lower().lstrip("@")
+            if new_username != config.allowed_username:
+                clear_trusted_user_id(cfg_path)
+                click.echo("Trusted user ID cleared (username changed).")
+            config.allowed_username = new_username
+            click.echo(f"Configured username: @{new_username}")
+        if manager_token:
+            config.manager_telegram_bot_token = manager_token
+            click.echo(f"Configured manager token: ***{manager_token[-4:]}")
+        save_config(config, cfg_path)
+    except BotError as e:
+        raise SystemExit(e.user_message) from e
 
 
 @main.command()
@@ -264,67 +268,72 @@ def start(
 
     cfg_path = ctx.obj["config_path"]
 
-    if project_path and token:
-        p = Path(project_path).resolve()
-        run_bot(
-            name=p.name,
-            path=p,
-            token=token,
-            username=(username or "").lower().lstrip("@"),
-            session_id=session_id,
-            model=model,
-            skip_permissions=skip_permissions,
-            permission_mode=permission_mode,
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            trusted_user_id=load_trusted_user_id(cfg_path),
-            health_port=health_port,
-        )
-        return
+    try:
+        if project_path and token:
+            p = Path(project_path).resolve()
+            run_bot(
+                name=p.name,
+                path=p,
+                token=token,
+                username=(username or "").lower().lstrip("@"),
+                session_id=session_id,
+                model=model,
+                skip_permissions=skip_permissions,
+                permission_mode=permission_mode,
+                allowed_tools=allowed,
+                disallowed_tools=disallowed,
+                trusted_user_id=load_trusted_user_id(cfg_path),
+                health_port=health_port,
+            )
+            return
 
-    config = load_config(cfg_path)
-    if username:
-        config.allowed_username = username.lower().lstrip("@")
+        config = load_config(cfg_path)
+        if username:
+            config.allowed_username = username.lower().lstrip("@")
 
-    if not config.projects:
-        raise SystemExit(
-            "No projects. Use --path/--token params or 'projects add' command first."
-        )
+        if not config.projects:
+            raise SystemExit(
+                "No projects. Use --path/--token params or 'projects add' command first."
+            )
 
-    if project:
-        if project not in config.projects:
-            raise SystemExit(f"Project '{project}' not found.")
-        proj = config.projects[project]
-        effective_username = proj.allowed_username or config.allowed_username
-        if proj.allowed_username:
-            effective_trusted_id = proj.trusted_user_id
+        if project:
+            if project not in config.projects:
+                raise SystemExit(f"Project '{project}' not found.")
+            proj = config.projects[project]
+            effective_username = proj.allowed_username or config.allowed_username
+            if proj.allowed_username:
+                effective_trusted_id = proj.trusted_user_id
+            else:
+                effective_trusted_id = (
+                    proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
+                )
+            run_bot(
+                project,
+                Path(proj.path),
+                proj.telegram_bot_token,
+                effective_username,
+                session_id=session_id,
+                model=model or proj.model,
+                skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
+                permission_mode=permission_mode or proj.permission_mode,
+                allowed_tools=allowed,
+                disallowed_tools=disallowed,
+                trusted_user_id=effective_trusted_id,
+                on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
+                health_port=health_port,
+            )
         else:
-            effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
-        run_bot(
-            project,
-            Path(proj.path),
-            proj.telegram_bot_token,
-            effective_username,
-            session_id=session_id,
-            model=model or proj.model,
-            skip_permissions=skip_permissions or proj.dangerously_skip_permissions,
-            permission_mode=permission_mode or proj.permission_mode,
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            trusted_user_id=effective_trusted_id,
-            on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
-            health_port=health_port,
-        )
-    else:
-        run_bots(
-            config,
-            model=model,
-            skip_permissions=skip_permissions,
-            permission_mode=permission_mode,
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            config_path=cfg_path,
-        )
+            run_bots(
+                config,
+                model=model,
+                skip_permissions=skip_permissions,
+                permission_mode=permission_mode,
+                allowed_tools=allowed,
+                disallowed_tools=disallowed,
+                config_path=cfg_path,
+            )
+    except BotError as e:
+        raise SystemExit(e.user_message) from e
 
 
 @main.command("start-manager")
