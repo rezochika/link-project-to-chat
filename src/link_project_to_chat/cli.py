@@ -14,6 +14,7 @@ from .config import (
     save_config,
     save_project_trusted_user_id,
 )
+from .logging_config import configure_logging
 
 
 @click.group()
@@ -24,12 +25,18 @@ from .config import (
     default=None,
     help="Config file path (default: ~/.link-project-to-chat/config.json)",
 )
+@click.option(
+    "--log-format",
+    "log_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Log output format",
+)
 @click.pass_context
-def main(ctx: click.Context, config_path: str | None) -> None:
+def main(ctx: click.Context, config_path: str | None, log_format: str) -> None:
     """link-project-to-chat: Chat with Claude about a project via Telegram."""
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    )
+    configure_logging(level="INFO", fmt=log_format)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = Path(config_path) if config_path else DEFAULT_CONFIG
