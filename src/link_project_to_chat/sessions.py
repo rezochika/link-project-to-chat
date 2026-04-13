@@ -14,12 +14,10 @@ import logging
 from pathlib import Path
 from typing import cast
 
+from .constants import DEFAULT_CONFIG, DEFAULT_SESSIONS, FILE_PERMISSION
 from .exceptions import SessionError
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
-DEFAULT_SESSIONS = Path.home() / ".link-project-to-chat" / "sessions.json"
 
 
 def _read_json(path: Path) -> dict[str, str]:
@@ -35,7 +33,7 @@ def _read_json(path: Path) -> dict[str, str]:
 def _write_json(path: Path, data: dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
-    path.chmod(0o600)
+    path.chmod(FILE_PERMISSION)
 
 
 def _migrate_sessions_from_config(

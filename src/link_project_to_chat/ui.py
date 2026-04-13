@@ -11,6 +11,14 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
+from .constants import (
+    ERROR_TRUNCATION,
+    FILENAME_MAX_LENGTH,
+    MAX_FINISHED_TASKS_SHOWN,
+    TASK_INPUT_TRUNCATION,
+    TASK_LOG_LIMIT,
+    TASK_NAME_TRUNCATION,
+)
 from .task_manager import Task, TaskStatus, TaskType
 
 _TASK_ICONS: dict[TaskStatus, str] = {
@@ -46,7 +54,7 @@ def parse_task_id(data: str) -> int:
     return int(data.split("_")[-1])
 
 
-def sanitize_error(error: str | None, max_length: int = 500) -> str:
+def sanitize_error(error: str | None, max_length: int = ERROR_TRUNCATION) -> str:
     """Sanitize error messages before sending to users.
 
     Strips file paths and limits length to prevent leaking internal details.
@@ -65,7 +73,7 @@ def tasks_markup(tasks: list[Task]) -> InlineKeyboardMarkup | None:
     Shows active tasks + up to 5 most recent finished tasks.
     """
     active = [t for t in tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
-    finished = [t for t in tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
+    finished = [t for t in tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:MAX_FINISHED_TASKS_SHOWN]
     visible = active + finished
     if not visible:
         return None
@@ -73,7 +81,7 @@ def tasks_markup(tasks: list[Task]) -> InlineKeyboardMarkup | None:
     for t in visible:
         icon = _TASK_ICONS.get(t.status, "?")
         elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
-        label = t.name if t.type == TaskType.COMMAND else t.input[:40]
+        label = t.name if t.type == TaskType.COMMAND else t.input[:TASK_NAME_TRUNCATION]
         btn = InlineKeyboardButton(
             f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}"
         )
@@ -84,7 +92,7 @@ def tasks_markup(tasks: list[Task]) -> InlineKeyboardMarkup | None:
 def task_info_markup(task: Task) -> tuple[str, InlineKeyboardMarkup]:
     """Build task detail view text + keyboard."""
     elapsed = f" | {task.elapsed_human}" if task.elapsed_human else ""
-    text = f"#{task.id} [{task.type.value}] {task.status.value}{elapsed}\n{task.input[:200]}"
+    text = f"#{task.id} [{task.type.value}] {task.status.value}{elapsed}\n{task.input[:TASK_INPUT_TRUNCATION]}"
     rows: list[list[InlineKeyboardButton]] = []
     if task.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
         rows.append([InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{task.id}")])
@@ -94,7 +102,7 @@ def task_info_markup(task: Task) -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(rows)
 
 
-def task_log_text(task: Task, max_length: int = 3000) -> tuple[str, InlineKeyboardMarkup]:
+def task_log_text(task: Task, max_length: int = TASK_LOG_LIMIT) -> tuple[str, InlineKeyboardMarkup]:
     """Build task log view text + back button."""
     output = task.result or task.error or "(no output)"
     if len(output) > max_length:
@@ -166,7 +174,7 @@ def format_status(
     ])
 
 
-def sanitize_filename(raw_name: str, max_length: int = 200) -> str:
+def sanitize_filename(raw_name: str, max_length: int = FILENAME_MAX_LENGTH) -> str:
     """Sanitize a filename for safe filesystem storage."""
     return "".join(
         c

@@ -10,11 +10,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config_models import ConfigModel
+from .constants import DEFAULT_CONFIG as DEFAULT_CONFIG
+from .constants import DIR_PERMISSION, FILE_PERMISSION
 from .exceptions import ConfigError
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
 
 @dataclass
@@ -81,7 +81,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    path.parent.chmod(DIR_PERMISSION)
     raw: dict[str, Any] = {}
     if path.exists():
         try:
@@ -124,7 +124,7 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
     path.write_text(json.dumps(raw, indent=2) + "\n")
-    path.chmod(0o600)
+    path.chmod(FILE_PERMISSION)
 
 
 def _patch_json(patch_fn: Callable[[dict[str, Any]], None], path: Path) -> None:
@@ -138,7 +138,7 @@ def _patch_json(patch_fn: Callable[[dict[str, Any]], None], path: Path) -> None:
             pass
     patch_fn(raw)
     path.write_text(json.dumps(raw, indent=2) + "\n")
-    path.chmod(0o600)
+    path.chmod(FILE_PERMISSION)
 
 
 def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:

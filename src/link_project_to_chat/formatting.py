@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from html import escape as _html_escape
 
+from .constants import TELEGRAM_MESSAGE_LIMIT
+
 _CODE_BLOCK_PH = "\x00CODEBLOCK{}\x00"
 _INLINE_CODE_PH = "\x00INLINE{}\x00"
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "mailto", "tg"})
@@ -122,7 +124,7 @@ def _merge_segments(segments: list[str], limit: int) -> list[str]:
     return chunks
 
 
-def split_html(html: str, limit: int = 4096) -> list[str]:
+def split_html(html: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(html) <= limit:
         return [html]
 

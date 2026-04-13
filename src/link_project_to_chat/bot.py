@@ -5,7 +5,7 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from telegram.ext import Application
@@ -30,6 +30,13 @@ from .config import (
     save_project_trusted_user_id,
     save_session,
     save_trusted_user_id,
+)
+from .constants import (
+    COMMAND_OUTPUT_LIMIT,
+    FILE_SIZE_LIMIT,
+    IMAGE_EXTENSIONS,
+    TELEGRAM_MESSAGE_LIMIT,
+    TYPING_INDICATOR_INTERVAL,
 )
 from .formatting import md_to_telegram, split_html, strip_html
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -125,7 +132,7 @@ class ProjectBot(AuthMixin):
                 if plain.strip():
                     await self._app.bot.send_message(
                         chat_id,
-                        plain[:4096] if len(plain) > 4096 else plain,
+                        plain[:TELEGRAM_MESSAGE_LIMIT] if len(plain) > TELEGRAM_MESSAGE_LIMIT else plain,
                         reply_to_message_id=reply_to,
                     )
 
@@ -155,8 +162,8 @@ class ProjectBot(AuthMixin):
 
     async def _finalize_command_task(self, task: Task) -> None:
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
-        if len(output) > 3000:
-            output = output[:3000] + "\n... (truncated, use /log)"
+        if len(output) > COMMAND_OUTPUT_LIMIT:
+            output = output[:COMMAND_OUTPUT_LIMIT] + "\n... (truncated, use /log)"
         if task.status == TaskStatus.DONE:
             await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
         else:
@@ -520,12 +527,10 @@ class ProjectBot(AuthMixin):
 
         await msg.reply_text(text)
 
-    IMAGE_EXTENSIONS: ClassVar[set[str]] = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
-
     def _is_image(self, path: str) -> bool:
         from pathlib import PurePosixPath
 
-        return PurePosixPath(path).suffix.lower() in self.IMAGE_EXTENSIONS
+        return PurePosixPath(path).suffix.lower() in IMAGE_EXTENSIONS
 
     async def _send_image(
         self, chat_id: int, file_path: str, reply_to: int | None = None
@@ -542,7 +547,7 @@ class ProjectBot(AuthMixin):
             with path.open("rb") as f:
                 data = f.read()
             assert self._app is not None
-            if suffix == ".svg" or size > 10 * 1024 * 1024:
+            if suffix == ".svg" or size > FILE_SIZE_LIMIT:
                 await self._app.bot.send_document(
                     chat_id,
                     data,
@@ -569,7 +574,7 @@ class ProjectBot(AuthMixin):
                     raise
                 except Exception:
                     logger.debug("typing indicator failed", exc_info=True)
-                await asyncio.sleep(4)
+                await asyncio.sleep(TYPING_INDICATOR_INTERVAL)
         except asyncio.CancelledError:
             pass
 
