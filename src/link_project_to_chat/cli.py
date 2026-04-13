@@ -231,6 +231,13 @@ def configure(ctx: click.Context, username: str | None, manager_token: str | Non
     default=None,
     help='Comma-separated list of disallowed tools (e.g. "Bash(rm:*),Write")',
 )
+@click.option(
+    "--health-port",
+    "health_port",
+    default=None,
+    type=int,
+    help="Port for HTTP health check endpoint (e.g. 8080)",
+)
 @click.pass_context
 def start(
     ctx: click.Context,
@@ -244,6 +251,7 @@ def start(
     permission_mode: str | None,
     allowed_tools: str | None,
     disallowed_tools: str | None,
+    health_port: int | None,
 ) -> None:
     """Start the Telegram bot.
 
@@ -270,6 +278,7 @@ def start(
             allowed_tools=allowed,
             disallowed_tools=disallowed,
             trusted_user_id=load_trusted_user_id(cfg_path),
+            health_port=health_port,
         )
         return
 
@@ -304,6 +313,7 @@ def start(
             disallowed_tools=disallowed,
             trusted_user_id=effective_trusted_id,
             on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
+            health_port=health_port,
         )
     else:
         run_bots(

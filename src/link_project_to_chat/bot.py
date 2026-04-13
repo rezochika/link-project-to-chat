@@ -40,6 +40,7 @@ from .constants import (
     TYPING_INDICATOR_INTERVAL,
 )
 from .formatting import md_to_telegram, split_html, strip_html
+from .health import HealthServer
 from .rate_limiter import RateLimiter
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
@@ -78,6 +79,7 @@ class ProjectBot:
         task_manager: TaskManager | None = None,
         authenticator: Authenticator | None = None,
         rate_limiter: RateLimiter | None = None,
+        health_port: int | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -86,6 +88,9 @@ class ProjectBot:
         self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._typing_tasks: dict[int, asyncio.Task[None]] = {}
         self._stream_text: dict[int, str] = {}
+        self._health_server: HealthServer | None = (
+            HealthServer(health_port, self._health_status) if health_port is not None else None
+        )
         self._authenticator = authenticator or Authenticator(
             allowed_username=allowed_username,
             trusted_user_id=trusted_user_id,
@@ -102,6 +107,14 @@ class ProjectBot:
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
+
+    def _health_status(self) -> dict[str, Any]:
+        st = self.task_manager.claude.status
+        return {
+            "uptime": time.monotonic() - self._started_at,
+            "tasks_running": self.task_manager.running_count,
+            "session_id": st.get("session_id"),
+        }
 
     @property
     def _allowed_username(self) -> str:
@@ -621,8 +634,12 @@ class ProjectBot:
 
     async def _post_stop(self, app: Any) -> None:
         await self.task_manager.shutdown()
+        if self._health_server:
+            self._health_server.stop()
 
     async def _post_init(self, app: Any) -> None:
+        if self._health_server:
+            self._health_server.start()
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
         await app.bot.set_my_commands(COMMANDS)
@@ -700,6 +717,7 @@ def run_bot(
     disallowed_tools: list[str] | None = None,
     trusted_user_id: int | None = None,
     on_trust: Callable[[int], None] | None = None,
+    health_port: int | None = None,
 ) -> None:
     if not username:
         raise SystemExit(
@@ -715,6 +733,7 @@ def run_bot(
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
+        health_port=health_port,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
