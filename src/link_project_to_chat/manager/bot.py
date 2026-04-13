@@ -407,7 +407,7 @@ class ManagerBot(AuthMixin):
             )
 
     @staticmethod
-    async def _post_init(app) -> None:
+    async def _post_init(app: Any) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.bot.set_my_commands(COMMANDS)
 

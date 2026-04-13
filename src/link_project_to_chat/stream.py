@@ -43,8 +43,11 @@ class Error(StreamEvent):
 def parse_stream_line(line: str) -> list[StreamEvent]:
     try:
         data = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         logger.debug("Ignoring non-JSON stream line: %s", line[:100])
+        return []
+
+    if not isinstance(data, dict):
         return []
 
     event_type = data.get("type")

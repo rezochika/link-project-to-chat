@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from link_project_to_chat.claude_client import ClaudeClient
+from link_project_to_chat.exceptions import ClaudeStreamError
 from link_project_to_chat.stream import Error
 
 
@@ -238,7 +239,9 @@ async def test_concurrent_access_raises(tmp_path: Path):
     active_proc.poll.return_value = None  # Still running
     client._proc = active_proc
 
-    with pytest.raises(RuntimeError, match="already has an active subprocess"):
+    with pytest.raises(
+        (RuntimeError, ClaudeStreamError), match="already has an active subprocess"
+    ):
         async for _ in client.chat_stream("test"):
             pass
 

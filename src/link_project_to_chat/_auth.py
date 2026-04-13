@@ -51,4 +51,14 @@ class AuthMixin:
         if len(timestamps) >= self._MAX_MESSAGES_PER_MINUTE:
             return True
         timestamps.append(now)
+        # Periodically clean up stale entries to prevent memory leak
+        self._cleanup_rate_limits(now)
         return False
+
+    def _cleanup_rate_limits(self, now: float) -> None:
+        """Evict rate limit entries for users who have been idle > 5 minutes."""
+        stale = [
+            uid for uid, ts in self._rate_limits.items() if ts and now - ts[-1] > 300
+        ]
+        for uid in stale:
+            del self._rate_limits[uid]

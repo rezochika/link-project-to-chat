@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from pydantic import ValidationError
+
+from .config_models import ConfigModel
+from .exceptions import ConfigError
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
@@ -32,26 +40,42 @@ class Config:
 
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     config = Config()
-    if path.exists():
+    if not path.exists():
+        return config
+    try:
         raw = json.loads(path.read_text())
-        config.allowed_username = raw.get("allowed_username", "").lower().lstrip("@")
-        config.trusted_user_id = raw.get("trusted_user_id")
-        # Support old name for backward compatibility
-        config.manager_telegram_bot_token = raw.get(
-            "manager_telegram_bot_token", raw.get("manager_bot_token", "")
+    except json.JSONDecodeError as e:
+        logger.warning("Corrupt config JSON at %s: %s", path, e)
+        raise ConfigError(f"Malformed config file: {e}") from e
+    except OSError as e:
+        logger.warning("Cannot read config at %s: %s", path, e)
+        raise ConfigError(f"Cannot read config file: {e}") from e
+
+    # Validate with Pydantic for type safety and clear error messages
+    try:
+        validated = ConfigModel.model_validate(raw)
+    except ValidationError as e:
+        logger.warning("Config validation failed at %s: %s", path, e)
+        raise ConfigError(f"Invalid config: {e}") from e
+
+    # Support old name for backward compatibility
+    manager_token = validated.manager_telegram_bot_token or validated.manager_bot_token
+    config.allowed_username = validated.allowed_username
+    config.trusted_user_id = validated.trusted_user_id
+    config.manager_telegram_bot_token = manager_token
+
+    for name, proj in validated.projects.items():
+        config.projects[name] = ProjectConfig(
+            path=proj.path,
+            telegram_bot_token=proj.telegram_bot_token,
+            allowed_username=proj.username,
+            trusted_user_id=proj.trusted_user_id,
+            model=proj.model,
+            permission_mode=proj.permission_mode,
+            dangerously_skip_permissions=proj.dangerously_skip_permissions,
+            session_id=proj.session_id,
+            autostart=proj.autostart,
         )
-        for name, proj in raw.get("projects", {}).items():
-            config.projects[name] = ProjectConfig(
-                path=proj["path"],
-                telegram_bot_token=proj.get("telegram_bot_token", ""),
-                allowed_username=proj.get("username", "").lower().lstrip("@"),
-                trusted_user_id=proj.get("trusted_user_id"),
-                model=proj.get("model"),
-                permission_mode=proj.get("permission_mode"),
-                dangerously_skip_permissions=proj.get("dangerously_skip_permissions", False),
-                session_id=proj.get("session_id"),
-                autostart=proj.get("autostart", False),
-            )
     return config
 
 

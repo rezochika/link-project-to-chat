@@ -25,7 +25,7 @@ from .config import (
     help="Config file path (default: ~/.link-project-to-chat/config.json)",
 )
 @click.pass_context
-def main(ctx, config_path: str | None):
+def main(ctx: click.Context, config_path: str | None) -> None:
     """link-project-to-chat: Chat with Claude about a project via Telegram."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -37,7 +37,7 @@ def main(ctx, config_path: str | None):
 
 @main.group(invoke_without_command=True)
 @click.pass_context
-def projects(ctx):
+def projects(ctx: click.Context) -> None:
     """Manage linked projects."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
@@ -45,7 +45,7 @@ def projects(ctx):
 
 @projects.command("list")
 @click.pass_context
-def projects_list(ctx):
+def projects_list(ctx: click.Context) -> None:
     """List all linked projects."""
     config = load_config(ctx.obj["config_path"])
     if not config.projects:
@@ -81,9 +81,9 @@ def projects_list(ctx):
 )
 @click.pass_context
 def projects_add(
-    ctx, name: str, project_path: str, token: str, username: str | None,
+    ctx: click.Context, name: str, project_path: str, token: str, username: str | None,
     model: str | None, permission_mode: str | None, skip_permissions: bool,
-):
+) -> None:
     """Add a project."""
     from .manager.config import load_project_configs, save_project_configs
 
@@ -107,7 +107,7 @@ def projects_add(
 @projects.command("remove")
 @click.argument("name")
 @click.pass_context
-def projects_remove(ctx, name: str):
+def projects_remove(ctx: click.Context, name: str) -> None:
     """Remove a project."""
     from .manager.config import load_project_configs, save_project_configs
 
@@ -125,7 +125,7 @@ def projects_remove(ctx, name: str):
 @click.argument("field")
 @click.argument("value")
 @click.pass_context
-def projects_edit(ctx, name: str, field: str, value: str):
+def projects_edit(ctx: click.Context, name: str, field: str, value: str) -> None:
     """Edit a project field (name, path, token, username, model, permission_mode, dangerously_skip_permissions)."""
     from .manager.config import load_project_configs, save_project_configs
 
@@ -163,7 +163,7 @@ def projects_edit(ctx, name: str, field: str, value: str):
 @click.option("--username", default=None, help="Allowed Telegram username")
 @click.option("--manager-token", default=None, help="Telegram bot token for the manager bot")
 @click.pass_context
-def configure(ctx, username: str | None, manager_token: str | None):
+def configure(ctx: click.Context, username: str | None, manager_token: str | None) -> None:
     """Configure username and/or manager bot token."""
     if not username and not manager_token:
         raise SystemExit("Provide at least one of --username or --manager-token.")
@@ -226,7 +226,7 @@ def configure(ctx, username: str | None, manager_token: str | None):
 )
 @click.pass_context
 def start(
-    ctx,
+    ctx: click.Context,
     project: str | None,
     project_path: str | None,
     token: str | None,
@@ -237,7 +237,7 @@ def start(
     permission_mode: str | None,
     allowed_tools: str | None,
     disallowed_tools: str | None,
-):
+) -> None:
     """Start the Telegram bot.
 
     Use --path and --token to run without a config file, or use config.
@@ -312,7 +312,7 @@ def start(
 
 @main.command("start-manager")
 @click.pass_context
-def start_manager(ctx):
+def start_manager(ctx: click.Context) -> None:
     """Start the manager bot."""
     from .manager.bot import ManagerBot
     from .manager.process import ProcessManager

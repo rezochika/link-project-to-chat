@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 import re
+from html import escape as _html_escape
 
 _CODE_BLOCK_PH = "\x00CODEBLOCK{}\x00"
 _INLINE_CODE_PH = "\x00INLINE{}\x00"
+_SAFE_URL_SCHEMES = frozenset({"http", "https", "mailto", "tg"})
+
+
+def _is_safe_url(url: str) -> bool:
+    """Check if a URL has a safe scheme. Rejects javascript:, data:, vbscript:, etc."""
+    url = url.strip()
+    # Extract scheme (everything before the first colon)
+    colon_pos = url.find(":")
+    if colon_pos < 0:
+        return True  # relative URL, safe
+    scheme = url[:colon_pos].lower().strip()
+    return scheme in _SAFE_URL_SCHEMES
 
 
 def md_to_telegram(text: str) -> str:
@@ -26,7 +39,8 @@ def md_to_telegram(text: str) -> str:
         lang = m.group(1) or ""
         code = _escape_html(m.group(2))
         if lang:
-            block = f'<pre><code class="language-{lang}">{code}</code></pre>'
+            safe_lang = _html_escape(lang, quote=True)
+            block = f'<pre><code class="language-{safe_lang}">{code}</code></pre>'
         else:
             block = f"<pre>{code}</pre>"
         code_blocks.append(block)
@@ -49,7 +63,13 @@ def md_to_telegram(text: str) -> str:
     text = re.sub(r"(?<!\w)\*([^*]+?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_([^_]+?)_(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    def _safe_link(m: re.Match[str]) -> str:
+        label, url = m.group(1), m.group(2)
+        if _is_safe_url(url):
+            return f'<a href="{url}">{label}</a>'
+        return label  # Strip unsafe links, keep label text
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(
         r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE
     )

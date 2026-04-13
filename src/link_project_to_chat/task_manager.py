@@ -9,9 +9,10 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol
 
 from .claude_client import ClaudeClient
+from .exceptions import TaskError
 from .stream import Error, Result, StreamEvent, TextDelta, ThinkingDelta
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,7 @@ class TaskManager:
                     elif isinstance(event, Result):
                         task.result = event.text
                     elif isinstance(event, Error):
-                        raise RuntimeError(event.message)
+                        raise TaskError(event.message)
                 if not task.result:
                     task.result = "".join(collected_text) or "".join(collected_thinking) or "[No response]"
             task.status = TaskStatus.DONE
@@ -254,12 +255,14 @@ class TaskManager:
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
 
-        def _read_stream(stream, lines: list[str]):
+        def _read_stream(stream: IO[bytes], lines: list[str]) -> None:
             for raw_line in stream:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
                 lines.append(line)
                 task._log.append(line)
 
+        assert proc.stdout is not None
+        assert proc.stderr is not None
         try:
             out_fut = asyncio.to_thread(_read_stream, proc.stdout, stdout_lines)
             err_fut = asyncio.to_thread(_read_stream, proc.stderr, stderr_lines)

@@ -9,15 +9,17 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any
 
+from .enums import DEFAULT_MODEL, EffortLevel, Model, PermissionMode
+from .exceptions import ClaudeStreamError
 from .protocols import ProcessRunner
 from .stream import Error, Result, StreamEvent, parse_stream_line
 
 logger = logging.getLogger(__name__)
 
-EFFORT_LEVELS = ("low", "medium", "high", "max")
-MODELS = ("haiku", "sonnet", "opus")
-PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
-DEFAULT_MODEL = "sonnet"
+# Backward-compatible aliases for importers that use the old tuple names
+EFFORT_LEVELS = tuple(EffortLevel)
+MODELS = tuple(Model)
+PERMISSION_MODES = tuple(PermissionMode)
 
 
 class _SubprocessRunner:
@@ -99,7 +101,7 @@ class ClaudeClient:
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
         if self._proc is not None and self._proc.poll() is None:
-            raise RuntimeError("ClaudeClient already has an active subprocess")
+            raise ClaudeStreamError("ClaudeClient already has an active subprocess")
 
         self._last_message = user_message[:80]
         started_at = time.monotonic()
@@ -124,8 +126,8 @@ class ClaudeClient:
         stdout = proc.stdout
         stderr = proc.stderr
 
-        def _read_lines():
-            lines = []
+        def _read_lines() -> list[str]:
+            lines: list[str] = []
             for raw_line in stdout:
                 lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
             return lines
@@ -155,7 +157,7 @@ class ClaudeClient:
                 self._proc = None
             logger.info("claude stream pid=%s done, code=%s", proc.pid, proc.returncode)
 
-    async def chat(self, user_message: str, on_proc=None) -> str:
+    async def chat(self, user_message: str, on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None) -> str:
         result_text = ""
         async for event in self.chat_stream(user_message, on_proc=on_proc):
             if isinstance(event, Result):

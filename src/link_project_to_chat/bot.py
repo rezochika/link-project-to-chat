@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 if TYPE_CHECKING:
     from telegram.ext import Application
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -34,26 +34,23 @@ from .config import (
 from .formatting import md_to_telegram, split_html, strip_html
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
+from .ui import (
+    CMD_HELP,
+    COMMANDS,
+    effort_markup,
+    format_status,
+    model_markup,
+    parse_task_id,
+    permissions_markup,
+    reset_markup,
+    sanitize_error,
+    sanitize_filename,
+    task_info_markup,
+    task_log_text,
+    tasks_markup,
+)
 
 logger = logging.getLogger(__name__)
-
-COMMANDS = [
-    ("run", "Run a background command"),
-    ("tasks", "List all tasks"),
-    ("model", "Set Claude model (haiku/sonnet/opus)"),
-    ("effort", "Set thinking depth (low/medium/high/max)"),
-    ("permissions", "Set permission mode"),
-    ("compact", "Compress session context"),
-    ("status", "Bot status"),
-    ("reset", "Clear Claude session"),
-    ("help", "Show available commands"),
-]
-
-_CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
-
-
-def _parse_task_id(data: str) -> int:
-    return int(data.split("_")[-1])
 
 
 class ProjectBot(AuthMixin):
@@ -144,14 +141,17 @@ class ProjectBot(AuthMixin):
         self._stream_text.pop(task.id, None)
 
         if task._compact:
-            text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
+            if task.status == TaskStatus.DONE:
+                text = "Session compacted."
+            else:
+                text = f"Compact failed: {sanitize_error(task.error)}"
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
 
         if task.status == TaskStatus.DONE:
             await self._send_to_chat(task.chat_id, f"🔹 {task.result}", reply_to=task.message_id)
         else:
-            await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+            await self._send_to_chat(task.chat_id, f"Error: {sanitize_error(task.error)}", reply_to=task.message_id)
 
     async def _finalize_command_task(self, task: Task) -> None:
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
@@ -187,7 +187,7 @@ class ProjectBot(AuthMixin):
             return
         await msg.reply_text(
             f"Project: {self.name}\nPath: {self.path}\n\n"
-            f"Send a message to chat with Claude.\n{_CMD_HELP}"
+            f"Send a message to chat with Claude.\n{CMD_HELP}"
         )
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -235,33 +235,11 @@ class ProjectBot(AuthMixin):
             command=command,
         )
 
-    _TASK_ICONS: ClassVar[dict[TaskStatus, str]] = {
-        TaskStatus.WAITING: "~",
-        TaskStatus.RUNNING: ">",
-        TaskStatus.DONE: "+",
-        TaskStatus.FAILED: "!",
-        TaskStatus.CANCELLED: "x",
-    }
-
     def _tasks_markup(self, chat_id: int) -> InlineKeyboardMarkup | None:
         all_tasks = self.task_manager.list_tasks(chat_id=chat_id, limit=100)
-        active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
-        finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
-        tasks = active + finished
-        if not tasks:
-            return None
-        buttons = []
-        for t in tasks:
-            icon = self._TASK_ICONS.get(t.status, "?")
-            elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
-            label = t.name if t.type == TaskType.COMMAND else t.input[:40]
-            btn = InlineKeyboardButton(
-                f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}"
-            )
-            buttons.append([btn])
-        return InlineKeyboardMarkup(buttons)
+        return tasks_markup(all_tasks)
 
-    async def _render_tasks(self, chat_id: int, edit_query) -> None:
+    async def _render_tasks(self, chat_id: int, edit_query) -> None:  # type: ignore[no-untyped-def]
         markup = self._tasks_markup(chat_id)
         await edit_query.edit_message_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
@@ -275,10 +253,7 @@ class ProjectBot(AuthMixin):
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
     def _model_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(m, callback_data=f"model_set_{m}")]
-            for m in MODELS
-        ])
+        return model_markup()
 
     def _current_model(self) -> str:
         return self.task_manager.claude.model_display or self.task_manager.claude.model
@@ -296,10 +271,7 @@ class ProjectBot(AuthMixin):
         )
 
     def _effort_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(e, callback_data=f"effort_set_{e}")]
-            for e in EFFORT_LEVELS
-        ])
+        return effort_markup()
 
     def _current_effort(self) -> str:
         return self.task_manager.claude.effort
@@ -316,16 +288,8 @@ class ProjectBot(AuthMixin):
             reply_markup=self._effort_markup(),
         )
 
-    _PERMISSION_OPTIONS = (
-        *PERMISSION_MODES,
-        "dangerously-skip-permissions",
-    )
-
     def _permissions_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(o, callback_data=f"permissions_set_{o}")]
-            for o in self._PERMISSION_OPTIONS
-        ])
+        return permissions_markup()
 
     def _current_permission(self) -> str:
         claude = self.task_manager.claude
@@ -366,7 +330,7 @@ class ProjectBot(AuthMixin):
         if not self._auth(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
-        await update.effective_message.reply_text(_CMD_HELP)
+        await update.effective_message.reply_text(CMD_HELP)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -374,17 +338,9 @@ class ProjectBot(AuthMixin):
         if not self._auth(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Yes, reset", callback_data="reset_confirm"),
-                    InlineKeyboardButton("Cancel", callback_data="reset_cancel"),
-                ]
-            ]
-        )
         await update.effective_message.reply_text(
             "Are you sure? This will clear the Claude session.",
-            reply_markup=keyboard,
+            reply_markup=reset_markup(),
         )
 
     async def _on_callback(
@@ -438,25 +394,18 @@ class ProjectBot(AuthMixin):
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
         elif query.data.startswith("task_info_"):
-            task_id = _parse_task_id(query.data)
+            task_id = parse_task_id(query.data)
             task = self.task_manager.get(task_id)
             if not task:
                 await query.edit_message_text(f"Task #{task_id} not found.")
                 return
-            elapsed = f" | {task.elapsed_human}" if task.elapsed_human else ""
-            text = f"#{task.id} [{task.type.value}] {task.status.value}{elapsed}\n{task.input[:200]}"
-            rows = []
-            if task.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
-                rows.append([InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{task_id}")])
-            if task.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
-                rows.append([InlineKeyboardButton("Log", callback_data=f"task_log_{task_id}")])
-            rows.append([InlineKeyboardButton("« Back", callback_data="tasks_back")])
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            text, markup = task_info_markup(task)
+            await query.edit_message_text(text, reply_markup=markup)
         elif query.data == "tasks_back":
             if query.message:
                 await self._render_tasks(query.message.chat.id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
-            task_id = _parse_task_id(query.data)
+            task_id = parse_task_id(query.data)
             if self.task_manager.cancel(task_id):
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:
@@ -465,16 +414,13 @@ class ProjectBot(AuthMixin):
             else:
                 await query.edit_message_text(f"#{task_id} not found or already finished.")
         elif query.data.startswith("task_log_"):
-            task_id = _parse_task_id(query.data)
+            task_id = parse_task_id(query.data)
             task = self.task_manager.get(task_id)
             if not task:
                 await query.edit_message_text(f"Task #{task_id} not found.")
                 return
-            output = task.result or task.error or "(no output)"
-            if len(output) > 3000:
-                output = output[:3000] + f"\n... (truncated, {len(task.result or '')} chars total)"
-            rows = [[InlineKeyboardButton("« Back", callback_data=f"task_info_{task_id}")]]
-            await query.edit_message_text(f"#{task_id} log:\n{output}", reply_markup=InlineKeyboardMarkup(rows))
+            text, markup = task_log_text(task)
+            await query.edit_message_text(text, reply_markup=markup)
 
     async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -484,22 +430,18 @@ class ProjectBot(AuthMixin):
             await msg.reply_text("Unauthorized.")
             return
 
-        uptime = time.monotonic() - self._started_at
-        h, rem = divmod(int(uptime), 3600)
-        m, s = divmod(rem, 60)
-
         st = self.task_manager.claude.status
-        lines = [
-            f"Project: {self.name}",
-            f"Path: {self.path}",
-            f"Model: {self.task_manager.claude.model_display or self.task_manager.claude.model}",
-            f"Uptime: {h}h {m}m {s}s",
-            f"Session: {st['session_id'] or 'none'}",
-            f"Claude: {'RUNNING' if st['running'] else 'idle'}",
-            f"Running tasks: {self.task_manager.running_count}",
-            f"Waiting: {self.task_manager.waiting_count}",
-        ]
-        await msg.reply_text("\n".join(lines))
+        text = format_status(
+            name=self.name,
+            path=str(self.path),
+            model=self.task_manager.claude.model_display or self.task_manager.claude.model,
+            started_at=self._started_at,
+            session_id=st["session_id"],
+            is_running=st["running"],
+            running_count=self.task_manager.running_count,
+            waiting_count=self.task_manager.waiting_count,
+        )
+        await msg.reply_text(text)
 
     async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -524,16 +466,17 @@ class ProjectBot(AuthMixin):
         elif msg.document:
             file = await msg.document.get_file()
             raw_name = msg.document.file_name or f"file_{int(time.monotonic() * 1000)}"
-            filename = "".join(
-                c
-                for c in raw_name.replace("/", "_").replace("\\", "_")
-                if c.isalnum() or c in "._- "
-            )[:200]
+            filename = sanitize_filename(raw_name)
         else:
             await msg.reply_text("Unsupported file type.")
             return
 
         dest = uploads_dir / filename
+        # Guard against path traversal after sanitization
+        if not dest.resolve().is_relative_to(uploads_dir.resolve()):
+            logger.warning("Path traversal attempt blocked: %s", filename)
+            await msg.reply_text("Invalid filename.")
+            return
         if dest.exists():
             stem = dest.stem
             suffix = dest.suffix
@@ -617,7 +560,7 @@ class ProjectBot(AuthMixin):
             logger.warning("Failed to send image %s", path, exc_info=True)
 
     @staticmethod
-    async def _keep_typing(chat) -> None:
+    async def _keep_typing(chat: Any) -> None:
         try:
             while True:
                 try:
@@ -640,7 +583,7 @@ class ProjectBot(AuthMixin):
         else:
             logger.error("Update error: %s | update=%s", ctx.error, update)
 
-    async def _post_init(self, app) -> None:
+    async def _post_init(self, app: Any) -> None:
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
         await app.bot.set_my_commands(COMMANDS)

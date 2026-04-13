@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "python-telegram-bot>=22.0",
     "click>=8.0",
+    "pydantic>=2.0",
 ]
 
 [project.urls]
@@ -44,11 +45,7 @@ link-project-to-chat = "link_project_to_chat.cli:main"
 [tool.mypy]
 packages = ["link_project_to_chat"]
 mypy_path = "src"
-warn_return_any = true
-warn_unused_configs = true
-check_untyped_defs = true
-disallow_any_generics = true
-no_implicit_reexport = true
+strict = true
 
 [[tool.mypy.overrides]]
 module = "telegram.*"
