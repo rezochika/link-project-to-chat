@@ -69,7 +69,7 @@ class GitHubClient:
     async def clone_repo(self, repo: RepoInfo, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         clone_url = repo.clone_url
-        if repo.private and self._pat:
+        if self._pat:
             clone_url = clone_url.replace("https://", f"https://{self._pat}@")
         proc = await asyncio.create_subprocess_exec(
             "git", "clone", clone_url, str(dest),
