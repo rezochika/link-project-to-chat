@@ -85,7 +85,6 @@ class ProjectBot:
         self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._typing_tasks: dict[int, asyncio.Task[None]] = {}
         self._stream_text: dict[int, str] = {}
-        self._on_trust_fn = on_trust
         self._authenticator = authenticator or Authenticator(
             allowed_username=allowed_username,
             trusted_user_id=trusted_user_id,
@@ -105,7 +104,7 @@ class ProjectBot:
 
     @property
     def _allowed_username(self) -> str:
-        return self._authenticator._allowed_username
+        return self._authenticator.allowed_username
 
     @property
     def _trusted_user_id(self) -> int | None:

@@ -30,6 +30,10 @@ class Authenticator:
         self._failed_counts: dict[int, int] = {}
 
     @property
+    def allowed_username(self) -> str:
+        return self._allowed_username
+
+    @property
     def trusted_user_id(self) -> int | None:
         return self._trusted_user_id
 
