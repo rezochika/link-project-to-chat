@@ -31,6 +31,7 @@ COMMANDS = [
     ("users", "List authorized users"),
     ("add_user", "Add an authorized user"),
     ("remove_user", "Remove an authorized user"),
+    ("setup", "Configure GitHub & Telegram API credentials"),
     ("help", "Show commands"),
 ]
 
@@ -255,6 +256,32 @@ class ManagerBot(AuthMixin):
             save_config(config, path)
         await update.effective_message.reply_text(f"Removed @{rm_user}.")
 
+    async def _on_setup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        from ..config import load_config
+        path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(path)
+
+        lines = ["Setup status:"]
+        lines.append(f"  GitHub PAT: {'configured' if config.github_pat else 'not set'}")
+        lines.append(f"  Telegram API ID: {'configured' if config.telegram_api_id else 'not set'}")
+        lines.append(f"  Telegram API Hash: {'configured' if config.telegram_api_hash else 'not set'}")
+        session_path = path.parent / "telethon.session"
+        lines.append(f"  Telethon session: {'exists' if session_path.exists() else 'not authenticated'}")
+
+        buttons = []
+        buttons.append([InlineKeyboardButton("Set GitHub Token", callback_data="setup_gh")])
+        buttons.append([InlineKeyboardButton("Set Telegram API", callback_data="setup_api")])
+        if config.telegram_api_id and config.telegram_api_hash:
+            buttons.append([InlineKeyboardButton("Authenticate Telethon", callback_data="setup_telethon")])
+        buttons.append([InlineKeyboardButton("Done", callback_data="setup_done")])
+
+        ctx.user_data["setup_config_path"] = str(path)
+        await update.effective_message.reply_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
     async def _on_edit_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
@@ -301,6 +328,12 @@ class ManagerBot(AuthMixin):
             )
 
     async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        # Handle setup text input
+        setup_awaiting = ctx.user_data.get("setup_awaiting")
+        if setup_awaiting:
+            await self._handle_setup_input(update, ctx, setup_awaiting)
+            return
+        # Existing edit logic (unchanged)
         pending = ctx.user_data.get("pending_edit")
         if not pending:
             return
@@ -308,6 +341,92 @@ class ManagerBot(AuthMixin):
             return
         ctx.user_data.pop("pending_edit")
         await self._apply_edit(update, pending["name"], pending["field"], update.message.text.strip())
+
+    async def _handle_setup_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, awaiting: str) -> None:
+        from ..config import load_config, save_config
+        text = update.message.text.strip()
+        path = Path(ctx.user_data.get("setup_config_path", str(DEFAULT_CONFIG)))
+
+        if awaiting == "github_pat":
+            ctx.user_data.pop("setup_awaiting")
+            config = load_config(path)
+            config.github_pat = text
+            save_config(config, path)
+            await update.effective_message.reply_text("GitHub PAT saved. Use /setup to continue.")
+
+        elif awaiting == "api_id":
+            try:
+                api_id = int(text)
+            except ValueError:
+                await update.effective_message.reply_text("Invalid. Enter a numeric API ID:")
+                return
+            ctx.user_data["setup_api_id"] = api_id
+            ctx.user_data["setup_awaiting"] = "api_hash"
+            await update.effective_message.reply_text("Enter your Telegram API Hash:")
+
+        elif awaiting == "api_hash":
+            api_id = ctx.user_data.pop("setup_api_id", 0)
+            ctx.user_data.pop("setup_awaiting")
+            config = load_config(path)
+            config.telegram_api_id = api_id
+            config.telegram_api_hash = text
+            save_config(config, path)
+            await update.effective_message.reply_text("Telegram API credentials saved. Use /setup to authenticate Telethon.")
+
+        elif awaiting == "phone":
+            ctx.user_data["setup_phone"] = text
+            ctx.user_data["setup_awaiting"] = "code"
+            try:
+                from ..botfather import BotFatherClient
+                config = load_config(path)
+                session_path = path.parent / "telethon.session"
+                bf = BotFatherClient(config.telegram_api_id, config.telegram_api_hash, session_path)
+                ctx.user_data["setup_bf_client"] = bf
+                client = await bf._ensure_client()
+                await client.send_code_request(text)
+                await update.effective_message.reply_text("Code sent to your Telegram. Enter the code:")
+            except Exception as e:
+                ctx.user_data.pop("setup_awaiting", None)
+                await update.effective_message.reply_text(f"Error: {e}")
+
+        elif awaiting == "code":
+            bf = ctx.user_data.get("setup_bf_client")
+            phone = ctx.user_data.get("setup_phone")
+            if not bf or not phone:
+                ctx.user_data.pop("setup_awaiting", None)
+                await update.effective_message.reply_text("Session lost. Use /setup again.")
+                return
+            try:
+                client = await bf._ensure_client()
+                await client.sign_in(phone, text)
+                ctx.user_data.pop("setup_awaiting")
+                ctx.user_data.pop("setup_bf_client", None)
+                ctx.user_data.pop("setup_phone", None)
+                await update.effective_message.reply_text("Authenticated! You can now use /create_project.")
+            except Exception as e:
+                if "Two-steps verification" in str(e) or "password" in str(e).lower():
+                    ctx.user_data["setup_awaiting"] = "2fa"
+                    await update.effective_message.reply_text("2FA is enabled. Enter your password:")
+                else:
+                    ctx.user_data.pop("setup_awaiting", None)
+                    await update.effective_message.reply_text(f"Auth failed: {e}")
+
+        elif awaiting == "2fa":
+            bf = ctx.user_data.get("setup_bf_client")
+            if not bf:
+                ctx.user_data.pop("setup_awaiting", None)
+                await update.effective_message.reply_text("Session lost. Use /setup again.")
+                return
+            try:
+                client = await bf._ensure_client()
+                await client.sign_in(password=text)
+                ctx.user_data.pop("setup_awaiting")
+                ctx.user_data.pop("setup_bf_client", None)
+                ctx.user_data.pop("setup_phone", None)
+                await update.effective_message.reply_text("Authenticated with 2FA! You can now use /create_project.")
+            except Exception as e:
+                ctx.user_data.pop("setup_awaiting", None)
+                await update.effective_message.reply_text(f"2FA auth failed: {e}")
 
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -411,6 +530,21 @@ class ManagerBot(AuthMixin):
                 self._projects_text() if markup else "No projects configured.", reply_markup=markup
             )
 
+        elif data == "setup_gh":
+            ctx.user_data["setup_awaiting"] = "github_pat"
+            await query.edit_message_text("Paste your GitHub Personal Access Token:")
+
+        elif data == "setup_api":
+            ctx.user_data["setup_awaiting"] = "api_id"
+            await query.edit_message_text("Enter your Telegram API ID (from my.telegram.org):")
+
+        elif data == "setup_telethon":
+            ctx.user_data["setup_awaiting"] = "phone"
+            await query.edit_message_text("Enter your phone number (with country code, e.g. +1234567890):")
+
+        elif data == "setup_done":
+            await query.edit_message_text("Setup complete.")
+
     @staticmethod
     async def _post_init(app) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -433,6 +567,7 @@ class ManagerBot(AuthMixin):
             "users": self._on_users,
             "add_user": self._on_add_user,
             "remove_user": self._on_remove_user,
+            "setup": self._on_setup,
         }.items():
             app.add_handler(CommandHandler(name, handler))
 
