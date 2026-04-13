@@ -32,6 +32,7 @@ COMMANDS = [
     ("add_user", "Add an authorized user"),
     ("remove_user", "Remove an authorized user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
+    ("create_project", "Create a new project (GitHub + bot)"),
     ("help", "Show commands"),
 ]
 
@@ -152,6 +153,9 @@ class ManagerBot(AuthMixin):
 
     # ConversationHandler states for /add_project
     ADD_NAME, ADD_PATH, ADD_TOKEN, ADD_USERNAME, ADD_MODEL = range(5)
+
+    # ConversationHandler states for /create_project
+    CREATE_SOURCE, CREATE_REPO_LIST, CREATE_REPO_URL, CREATE_NAME, CREATE_NAME_INPUT, CREATE_BOT, CREATE_CLONE = range(11, 18)
 
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -428,6 +432,294 @@ class ManagerBot(AuthMixin):
                 ctx.user_data.pop("setup_awaiting", None)
                 await update.effective_message.reply_text(f"2FA auth failed: {e}")
 
+    async def _on_create_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        if not await self._guard(update):
+            return ConversationHandler.END
+        try:
+            from ..github_client import GitHubClient
+            from ..botfather import BotFatherClient
+        except ImportError:
+            await update.effective_message.reply_text(
+                "Missing dependencies. Install with:\npip install link-project-to-chat[create]"
+            )
+            return ConversationHandler.END
+        from ..config import load_config
+        path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(path)
+        if not config.github_pat:
+            await update.effective_message.reply_text("GitHub PAT not configured. Run /setup first.")
+            return ConversationHandler.END
+        if not config.telegram_api_id or not config.telegram_api_hash:
+            await update.effective_message.reply_text("Telegram API not configured. Run /setup first.")
+            return ConversationHandler.END
+        session_path = path.parent / "telethon.session"
+        if not session_path.exists():
+            await update.effective_message.reply_text("Telethon not authenticated. Run /setup first.")
+            return ConversationHandler.END
+
+        ctx.user_data["create"] = {"config_path": str(path)}
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("From GitHub", callback_data="create_from_gh")],
+            [InlineKeyboardButton("Paste URL", callback_data="create_paste_url")],
+        ])
+        await update.effective_message.reply_text("Create project — choose repo source:", reply_markup=markup)
+        return self.CREATE_SOURCE
+
+    async def _create_source_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        if data == "create_from_gh":
+            return await self._show_repo_page(query, ctx, page=1)
+        elif data == "create_paste_url":
+            await query.edit_message_text("Paste the GitHub repo URL:")
+            return self.CREATE_REPO_URL
+        return ConversationHandler.END
+
+    async def _show_repo_page(self, query, ctx, page: int) -> int:
+        from ..github_client import GitHubClient
+        from ..config import load_config
+        path = Path(ctx.user_data["create"]["config_path"])
+        config = load_config(path)
+        gh = GitHubClient(pat=config.github_pat)
+        try:
+            repos, has_next = await gh.list_repos(page=page, per_page=5)
+        except Exception as e:
+            await query.edit_message_text(f"GitHub API error: {e}")
+            return ConversationHandler.END
+        finally:
+            await gh.close()
+        if not repos:
+            await query.edit_message_text("No repos found.")
+            return ConversationHandler.END
+        ctx.user_data["create"]["repos"] = {r.full_name: r.__dict__ for r in repos}
+        ctx.user_data["create"]["page"] = page
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'🔒 ' if r.private else ''}{r.name}",
+                callback_data=f"create_repo_{r.full_name}",
+            )]
+            for r in repos
+        ]
+        nav = []
+        if page > 1:
+            nav.append(InlineKeyboardButton("« Prev", callback_data=f"create_page_{page - 1}"))
+        if has_next:
+            nav.append(InlineKeyboardButton("Next »", callback_data=f"create_page_{page + 1}"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([InlineKeyboardButton("Cancel", callback_data="create_cancel")])
+        await query.edit_message_text("Select a repo:", reply_markup=InlineKeyboardMarkup(buttons))
+        return self.CREATE_REPO_LIST
+
+    async def _create_repo_list_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        if data.startswith("create_page_"):
+            page = int(data.split("_")[-1])
+            return await self._show_repo_page(query, ctx, page)
+        elif data.startswith("create_repo_"):
+            full_name = data[len("create_repo_"):]
+            repos = ctx.user_data["create"].get("repos", {})
+            if full_name not in repos:
+                await query.edit_message_text("Repo not found. Try again.")
+                return ConversationHandler.END
+            repo_data = repos[full_name]
+            ctx.user_data["create"]["repo"] = repo_data
+            suggested_name = repo_data["name"]
+            ctx.user_data["create"]["suggested_name"] = suggested_name
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
+                [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
+            ])
+            await query.edit_message_text(f"Project name?", reply_markup=markup)
+            return self.CREATE_NAME
+        elif data == "create_cancel":
+            ctx.user_data.pop("create", None)
+            await query.edit_message_text("Cancelled.")
+            return ConversationHandler.END
+        return ConversationHandler.END
+
+    async def _create_repo_url(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        url = update.message.text.strip()
+        from ..github_client import GitHubClient
+        from ..config import load_config
+        path = Path(ctx.user_data["create"]["config_path"])
+        config = load_config(path)
+        gh = GitHubClient(pat=config.github_pat)
+        try:
+            repo = await gh.validate_repo_url(url)
+        except Exception as e:
+            await update.effective_message.reply_text(f"Error: {e}\nTry again or /cancel:")
+            return self.CREATE_REPO_URL
+        finally:
+            await gh.close()
+        if not repo:
+            await update.effective_message.reply_text("Invalid or not found. Paste a valid GitHub URL:")
+            return self.CREATE_REPO_URL
+        ctx.user_data["create"]["repo"] = repo.__dict__
+        suggested_name = repo.name
+        ctx.user_data["create"]["suggested_name"] = suggested_name
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
+            [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
+        ])
+        await update.effective_message.reply_text(f"Project name?", reply_markup=markup)
+        return self.CREATE_NAME
+
+    async def _create_name_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "create_name_use":
+            name = ctx.user_data["create"]["suggested_name"]
+            projects = self._load_projects()
+            if name in projects:
+                await query.edit_message_text(f"'{name}' already exists. Enter a custom name:")
+                return self.CREATE_NAME_INPUT
+            ctx.user_data["create"]["name"] = name
+            return await self._do_create_bot(query, ctx)
+        elif query.data == "create_name_custom":
+            await query.edit_message_text("Enter the project name:")
+            return self.CREATE_NAME_INPUT
+        return ConversationHandler.END
+
+    async def _create_name_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        name = update.message.text.strip()
+        projects = self._load_projects()
+        if name in projects:
+            await update.effective_message.reply_text(f"'{name}' already exists. Try another name:")
+            return self.CREATE_NAME_INPUT
+        ctx.user_data["create"]["name"] = name
+        await update.effective_message.reply_text("Creating Telegram bot via BotFather...")
+        return await self._do_create_bot_text(update, ctx)
+
+    async def _do_create_bot(self, query, ctx) -> int:
+        await query.edit_message_text("Creating Telegram bot via BotFather...")
+        name = ctx.user_data["create"]["name"]
+        return await self._execute_bot_creation(query.message.chat_id, ctx, name)
+
+    async def _do_create_bot_text(self, update, ctx) -> int:
+        name = ctx.user_data["create"]["name"]
+        return await self._execute_bot_creation(update.effective_chat.id, ctx, name)
+
+    async def _execute_bot_creation(self, chat_id: int, ctx, name: str) -> int:
+        from ..botfather import BotFatherClient, sanitize_bot_username
+        from ..config import load_config
+        path = Path(ctx.user_data["create"]["config_path"])
+        config = load_config(path)
+        session_path = path.parent / "telethon.session"
+        bf = BotFatherClient(config.telegram_api_id, config.telegram_api_hash, session_path)
+        bot_username = sanitize_bot_username(name)
+        try:
+            token = await bf.create_bot(display_name=f"{name} Claude", username=bot_username)
+            ctx.user_data["create"]["bot_token"] = token
+            ctx.user_data["create"]["bot_username"] = bot_username
+            await self._app.bot.send_message(chat_id, f"Created @{bot_username}. Cloning repository...")
+            return await self._execute_clone(chat_id, ctx)
+        except Exception as e:
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Retry", callback_data="create_retry_bot")],
+                [InlineKeyboardButton("Enter token manually", callback_data="create_manual_token")],
+                [InlineKeyboardButton("Cancel", callback_data="create_cancel")],
+            ])
+            await self._app.bot.send_message(chat_id, f"Bot creation failed: {e}", reply_markup=markup)
+            return self.CREATE_BOT
+        finally:
+            await bf.disconnect()
+
+    async def _create_bot_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "create_retry_bot":
+            name = ctx.user_data["create"]["name"]
+            await query.edit_message_text("Retrying bot creation...")
+            return await self._execute_bot_creation(query.message.chat_id, ctx, name)
+        elif query.data == "create_manual_token":
+            await query.edit_message_text("Paste the bot token from BotFather:")
+            return self.CREATE_BOT
+        elif query.data == "create_cancel":
+            ctx.user_data.pop("create", None)
+            await query.edit_message_text("Cancelled.")
+            return ConversationHandler.END
+        return ConversationHandler.END
+
+    async def _create_bot_token_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        token = update.message.text.strip()
+        ctx.user_data["create"]["bot_token"] = token
+        ctx.user_data["create"]["bot_username"] = "(manual)"
+        await update.effective_message.reply_text("Token saved. Cloning repository...")
+        return await self._execute_clone(update.effective_chat.id, ctx)
+
+    async def _execute_clone(self, chat_id: int, ctx) -> int:
+        from ..github_client import GitHubClient, RepoInfo
+        from ..config import load_config
+        path = Path(ctx.user_data["create"]["config_path"])
+        config = load_config(path)
+        repo_data = ctx.user_data["create"]["repo"]
+        repo = RepoInfo(**repo_data)
+        name = ctx.user_data["create"]["name"]
+        dest = path.parent / "repos" / name
+        gh = GitHubClient(pat=config.github_pat)
+        try:
+            await gh.clone_repo(repo, dest)
+            ctx.user_data["create"]["clone_path"] = str(dest)
+        except Exception as e:
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Retry", callback_data="create_retry_clone")],
+                [InlineKeyboardButton("Cancel", callback_data="create_cancel")],
+            ])
+            await self._app.bot.send_message(chat_id, f"Clone failed: {e}", reply_markup=markup)
+            return self.CREATE_CLONE
+        finally:
+            await gh.close()
+        return await self._finalize_create(chat_id, ctx)
+
+    async def _create_clone_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "create_retry_clone":
+            await query.edit_message_text("Retrying clone...")
+            return await self._execute_clone(query.message.chat_id, ctx)
+        elif query.data == "create_cancel":
+            ctx.user_data.pop("create", None)
+            await query.edit_message_text("Cancelled.")
+            return ConversationHandler.END
+        return ConversationHandler.END
+
+    async def _finalize_create(self, chat_id: int, ctx) -> int:
+        create_data = ctx.user_data.pop("create", {})
+        name = create_data["name"]
+        repo = create_data["repo"]
+        clone_path = create_data["clone_path"]
+        bot_token = create_data["bot_token"]
+        bot_username = create_data.get("bot_username", "")
+        projects = self._load_projects()
+        projects[name] = {
+            "path": clone_path,
+            "telegram_bot_token": bot_token,
+            "autostart": False,
+        }
+        self._save_projects(projects)
+        summary = (
+            f"Project created!\n\n"
+            f"Name: {name}\n"
+            f"Repo: {repo['html_url']}\n"
+            f"Path: {clone_path}\n"
+            f"Bot: @{bot_username}"
+        )
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Start Project", callback_data=f"proj_start_{name}")],
+            [InlineKeyboardButton("Done", callback_data="proj_back")],
+        ])
+        await self._app.bot.send_message(chat_id, summary, reply_markup=markup)
+        return ConversationHandler.END
+
+    async def _create_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        ctx.user_data.pop("create", None)
+        await update.effective_message.reply_text("Project creation cancelled.")
+        return ConversationHandler.END
+
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data.pop("pending_edit", None)
@@ -590,6 +882,23 @@ class ManagerBot(AuthMixin):
                 ],
             },
             fallbacks=[],
+        ))
+
+        app.add_handler(ConversationHandler(
+            entry_points=[CommandHandler("create_project", self._on_create_project)],
+            states={
+                self.CREATE_SOURCE: [CallbackQueryHandler(self._create_source_callback)],
+                self.CREATE_REPO_LIST: [CallbackQueryHandler(self._create_repo_list_callback)],
+                self.CREATE_REPO_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_repo_url)],
+                self.CREATE_NAME: [CallbackQueryHandler(self._create_name_callback)],
+                self.CREATE_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_name_input)],
+                self.CREATE_BOT: [
+                    CallbackQueryHandler(self._create_bot_callback),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_bot_token_input),
+                ],
+                self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
+            },
+            fallbacks=[CommandHandler("cancel", self._create_cancel)],
         ))
 
         app.add_handler(CommandHandler("cancel", self._edit_cancel))
