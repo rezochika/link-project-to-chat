@@ -115,6 +115,9 @@ class ProjectBot(AuthMixin):
             add_trusted_user_id(user_id)
 
     async def _on_task_started(self, task: Task) -> None:
+        # Only show typing indicator for Claude tasks, not /run commands
+        if task.type == TaskType.COMMAND:
+            return
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
