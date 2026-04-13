@@ -11,8 +11,8 @@ DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 class ProjectConfig:
     path: str
     telegram_bot_token: str
-    allowed_username: str = ""  # per-project override; falls back to Config.allowed_username
-    trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
+    allowed_usernames: list[str] = field(default_factory=list)  # per-project override
+    trusted_user_ids: list[int] = field(default_factory=list)  # per-project; falls back to Config.trusted_user_ids
     model: str | None = None
     effort: str | None = None
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
@@ -22,8 +22,11 @@ class ProjectConfig:
 
 @dataclass
 class Config:
-    allowed_username: str = ""
-    trusted_user_id: int | None = None  # global fallback (also used by manager bot)
+    allowed_usernames: list[str] = field(default_factory=list)
+    trusted_user_ids: list[int] = field(default_factory=list)  # global fallback (also used by manager bot)
+    github_pat: str = ""
+    telegram_api_id: int = 0
+    telegram_api_hash: str = ""
     manager_telegram_bot_token: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
@@ -46,12 +49,35 @@ def resolve_permissions(permissions: str | None) -> tuple[bool, str | None]:
     return False, None
 
 
+def _migrate_usernames(raw: dict, list_key: str, singular_key: str) -> list[str]:
+    """Load a list of usernames, migrating from old singular key if needed."""
+    if list_key in raw:
+        return [u.lower().lstrip("@") for u in raw[list_key]]
+    singular = raw.get(singular_key, "")
+    if singular:
+        return [singular.lower().lstrip("@")]
+    return []
+
+
+def _migrate_user_ids(raw: dict, list_key: str, singular_key: str) -> list[int]:
+    """Load a list of user IDs, migrating from old singular key if needed."""
+    if list_key in raw:
+        return list(raw[list_key])
+    singular = raw.get(singular_key)
+    if singular is not None:
+        return [int(singular)]
+    return []
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     config = Config()
     if path.exists():
         raw = json.loads(path.read_text())
-        config.allowed_username = raw.get("allowed_username", "").lower().lstrip("@")
-        config.trusted_user_id = raw.get("trusted_user_id")
+        config.allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
+        config.trusted_user_ids = _migrate_user_ids(raw, "trusted_user_ids", "trusted_user_id")
+        config.github_pat = raw.get("github_pat", "")
+        config.telegram_api_id = raw.get("telegram_api_id", 0)
+        config.telegram_api_hash = raw.get("telegram_api_hash", "")
         # Support old name for backward compatibility
         config.manager_telegram_bot_token = raw.get(
             "manager_telegram_bot_token", raw.get("manager_bot_token", "")
@@ -60,8 +86,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
-                allowed_username=proj.get("username", "").lower().lstrip("@"),
-                trusted_user_id=proj.get("trusted_user_id"),
+                allowed_usernames=_migrate_usernames(proj, "allowed_usernames", "username"),
+                trusted_user_ids=_migrate_user_ids(proj, "trusted_user_ids", "trusted_user_id"),
                 model=proj.get("model"),
                 effort=proj.get("effort"),
                 permissions=_load_permissions(proj),
@@ -80,27 +106,36 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             raw = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-    raw["allowed_username"] = config.allowed_username
+    # Write new plural keys, remove old singular keys
+    raw["allowed_usernames"] = config.allowed_usernames
+    raw.pop("allowed_username", None)
+    raw["trusted_user_ids"] = config.trusted_user_ids
+    raw.pop("trusted_user_id", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
-    if config.trusted_user_id is not None:
-        raw["trusted_user_id"] = config.trusted_user_id
+    if config.github_pat:
+        raw["github_pat"] = config.github_pat
     else:
-        raw.pop("trusted_user_id", None)
+        raw.pop("github_pat", None)
+    if config.telegram_api_id:
+        raw["telegram_api_id"] = config.telegram_api_id
+    else:
+        raw.pop("telegram_api_id", None)
+    if config.telegram_api_hash:
+        raw["telegram_api_hash"] = config.telegram_api_hash
+    else:
+        raw.pop("telegram_api_hash", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
     for name, p in config.projects.items():
         proj = existing_projects.get(name, {})
         proj["path"] = p.path
         proj["telegram_bot_token"] = p.telegram_bot_token
-        if p.allowed_username:
-            proj["username"] = p.allowed_username
-        else:
-            proj.pop("username", None)
-        if p.trusted_user_id is not None:
-            proj["trusted_user_id"] = p.trusted_user_id
-        else:
-            proj.pop("trusted_user_id", None)
+        # Write new plural keys, remove old singular keys
+        proj["allowed_usernames"] = p.allowed_usernames
+        proj.pop("username", None)
+        proj["trusted_user_ids"] = p.trusted_user_ids
+        proj.pop("trusted_user_id", None)
         if p.model:
             proj["model"] = p.model
         if p.effort:
@@ -204,4 +239,25 @@ def clear_trusted_user_id(path: Path = DEFAULT_CONFIG) -> None:
     """Remove the global trusted_user_id from config.json."""
     def _patch(raw: dict) -> None:
         raw.pop("trusted_user_id", None)
+    _patch_json(_patch, path)
+
+
+def add_trusted_user_id(user_id: int, path: Path = DEFAULT_CONFIG) -> None:
+    """Append a user_id to the global trusted_user_ids list if not already present."""
+    def _patch(raw: dict) -> None:
+        ids = raw.get("trusted_user_ids", [])
+        if user_id not in ids:
+            ids.append(user_id)
+        raw["trusted_user_ids"] = ids
+    _patch_json(_patch, path)
+
+
+def add_project_trusted_user_id(project_name: str, user_id: int, path: Path = DEFAULT_CONFIG) -> None:
+    """Append a user_id to a project's trusted_user_ids list if not already present."""
+    def _patch(raw: dict) -> None:
+        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
+        ids = proj.get("trusted_user_ids", [])
+        if user_id not in ids:
+            ids.append(user_id)
+        proj["trusted_user_ids"] = ids
     _patch_json(_patch, path)

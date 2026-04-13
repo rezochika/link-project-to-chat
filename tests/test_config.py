@@ -6,6 +6,8 @@ from pathlib import Path
 from link_project_to_chat.config import (
     Config,
     ProjectConfig,
+    add_project_trusted_user_id,
+    add_trusted_user_id,
     clear_session,
     clear_trusted_user_id,
     load_config,
@@ -20,7 +22,7 @@ from link_project_to_chat.config import (
 
 def test_load_config_missing(tmp_path: Path):
     config = load_config(tmp_path / "missing.json")
-    assert config.allowed_username == ""
+    assert config.allowed_usernames == []
     assert config.projects == {}
 
 
@@ -28,20 +30,20 @@ def test_load_config_strips_at_and_lowercases(tmp_path: Path):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({"allowed_username": "@Alice", "projects": {}}))
     config = load_config(p)
-    assert config.allowed_username == "alice"
+    assert config.allowed_usernames == ["alice"]
 
 
 def test_save_and_load_config(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg = Config(
-        allowed_username="bob",
+        allowed_usernames=["bob"],
         manager_telegram_bot_token="MGR",
         projects={"proj": ProjectConfig(path="/some/path", telegram_bot_token="TOK")},
     )
     save_config(cfg, p)
     assert p.stat().st_mode & 0o777 == 0o600
     loaded = load_config(p)
-    assert loaded.allowed_username == "bob"
+    assert loaded.allowed_usernames == ["bob"]
     assert loaded.manager_telegram_bot_token == "MGR"
     assert loaded.projects["proj"].path == "/some/path"
     assert loaded.projects["proj"].telegram_bot_token == "TOK"
@@ -50,7 +52,7 @@ def test_save_and_load_config(tmp_path: Path):
 def test_save_config_preserves_unknown_keys(tmp_path: Path):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({"allowed_username": "alice", "future_key": "future_value", "projects": {}}))
-    cfg = Config(allowed_username="alice")
+    cfg = Config(allowed_usernames=["alice"])
     save_config(cfg, p)
     raw = json.loads(p.read_text())
     assert raw["future_key"] == "future_value"
@@ -63,7 +65,7 @@ def test_save_config_preserves_project_unknown_keys(tmp_path: Path):
         "projects": {"myproj": {"path": "/p", "telegram_bot_token": "T", "model": "opus"}},
     }))
     cfg = Config(
-        allowed_username="alice",
+        allowed_usernames=["alice"],
         projects={"myproj": ProjectConfig(path="/p", telegram_bot_token="T")},
     )
     save_config(cfg, p)
@@ -74,7 +76,7 @@ def test_save_config_preserves_project_unknown_keys(tmp_path: Path):
 def test_save_config_removes_deleted_projects(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg1 = Config(
-        allowed_username="alice",
+        allowed_usernames=["alice"],
         projects={
             "a": ProjectConfig(path="/a", telegram_bot_token="Ta"),
             "b": ProjectConfig(path="/b", telegram_bot_token="Tb"),
@@ -82,7 +84,7 @@ def test_save_config_removes_deleted_projects(tmp_path: Path):
     )
     save_config(cfg1, p)
     cfg2 = Config(
-        allowed_username="alice",
+        allowed_usernames=["alice"],
         projects={"a": ProjectConfig(path="/a", telegram_bot_token="Ta")},
     )
     save_config(cfg2, p)
@@ -94,32 +96,32 @@ def test_save_config_removes_deleted_projects(tmp_path: Path):
 def test_save_and_load_per_project_username(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg = Config(
-        allowed_username="global",
-        projects={"proj": ProjectConfig(path="/p", telegram_bot_token="T", allowed_username="perproject")},
+        allowed_usernames=["global"],
+        projects={"proj": ProjectConfig(path="/p", telegram_bot_token="T", allowed_usernames=["perproject"])},
     )
     save_config(cfg, p)
     loaded = load_config(p)
-    assert loaded.projects["proj"].allowed_username == "perproject"
-    assert loaded.allowed_username == "global"
+    assert loaded.projects["proj"].allowed_usernames == ["perproject"]
+    assert loaded.allowed_usernames == ["global"]
 
 
 def test_save_and_load_per_project_trusted_user_id(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg = Config(
-        allowed_username="alice",
-        projects={"proj": ProjectConfig(path="/p", telegram_bot_token="T", trusted_user_id=42)},
+        allowed_usernames=["alice"],
+        projects={"proj": ProjectConfig(path="/p", telegram_bot_token="T", trusted_user_ids=[42])},
     )
     save_config(cfg, p)
     loaded = load_config(p)
-    assert loaded.projects["proj"].trusted_user_id == 42
+    assert loaded.projects["proj"].trusted_user_ids == [42]
 
 
 def test_save_and_load_global_trusted_user_id(tmp_path: Path):
     p = tmp_path / "cfg.json"
-    cfg = Config(allowed_username="alice", trusted_user_id=99)
+    cfg = Config(allowed_usernames=["alice"], trusted_user_ids=[99])
     save_config(cfg, p)
     loaded = load_config(p)
-    assert loaded.trusted_user_id == 99
+    assert loaded.trusted_user_ids == [99]
 
 
 def test_save_session_and_load(tmp_path: Path):
@@ -202,4 +204,134 @@ def test_per_project_username_strips_at(tmp_path: Path):
         "projects": {"proj": {"path": "/p", "telegram_bot_token": "T", "username": "@Alice"}},
     }))
     loaded = load_config(p)
-    assert loaded.projects["proj"].allowed_username == "alice"
+    assert loaded.projects["proj"].allowed_usernames == ["alice"]
+
+
+# --- New multi-user tests ---
+
+def test_load_config_multi_user(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "allowed_usernames": ["alice", "bob"],
+        "trusted_user_ids": [10, 20],
+        "github_pat": "ghp_test",
+        "telegram_api_id": 12345,
+        "telegram_api_hash": "abc123",
+        "projects": {
+            "proj": {
+                "path": "/p",
+                "telegram_bot_token": "T",
+                "allowed_usernames": ["alice"],
+                "trusted_user_ids": [10],
+            }
+        },
+    }))
+    config = load_config(p)
+    assert config.allowed_usernames == ["alice", "bob"]
+    assert config.trusted_user_ids == [10, 20]
+    assert config.github_pat == "ghp_test"
+    assert config.telegram_api_id == 12345
+    assert config.telegram_api_hash == "abc123"
+    assert config.projects["proj"].allowed_usernames == ["alice"]
+    assert config.projects["proj"].trusted_user_ids == [10]
+
+
+def test_load_config_migrates_single_username(tmp_path: Path):
+    """Old single-value keys auto-migrate to lists."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "allowed_username": "alice",
+        "trusted_user_id": 42,
+        "projects": {
+            "proj": {
+                "path": "/p",
+                "telegram_bot_token": "T",
+                "username": "bob",
+                "trusted_user_id": 99,
+            }
+        },
+    }))
+    config = load_config(p)
+    assert config.allowed_usernames == ["alice"]
+    assert config.trusted_user_ids == [42]
+    assert config.projects["proj"].allowed_usernames == ["bob"]
+    assert config.projects["proj"].trusted_user_ids == [99]
+
+
+def test_load_config_empty_username_no_migration(tmp_path: Path):
+    """Empty old username should result in empty list, not ['']."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"allowed_username": "", "projects": {}}))
+    config = load_config(p)
+    assert config.allowed_usernames == []
+
+
+def test_save_config_multi_user_roundtrip(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        allowed_usernames=["alice", "bob"],
+        trusted_user_ids=[10, 20],
+        github_pat="ghp_xxx",
+        telegram_api_id=111,
+        telegram_api_hash="hash",
+        manager_telegram_bot_token="MGR",
+        projects={"proj": ProjectConfig(
+            path="/p", telegram_bot_token="T",
+            allowed_usernames=["alice"], trusted_user_ids=[10],
+        )},
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.allowed_usernames == ["alice", "bob"]
+    assert loaded.trusted_user_ids == [10, 20]
+    assert loaded.github_pat == "ghp_xxx"
+    assert loaded.telegram_api_id == 111
+    assert loaded.telegram_api_hash == "hash"
+    assert loaded.projects["proj"].allowed_usernames == ["alice"]
+    assert loaded.projects["proj"].trusted_user_ids == [10]
+
+
+def test_save_config_removes_old_singular_keys(tmp_path: Path):
+    """After save, old singular keys should not be in the JSON."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "allowed_username": "alice",
+        "trusted_user_id": 42,
+        "projects": {"proj": {"path": "/p", "telegram_bot_token": "T", "username": "bob"}},
+    }))
+    cfg = load_config(p)
+    save_config(cfg, p)
+    raw = json.loads(p.read_text())
+    assert "allowed_username" not in raw
+    assert "trusted_user_id" not in raw
+    assert "username" not in raw["projects"]["proj"]
+
+
+def test_add_trusted_user_id(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    add_trusted_user_id(10, p)
+    raw = json.loads(p.read_text())
+    assert raw["trusted_user_ids"] == [10]
+    # Adding again should not duplicate
+    add_trusted_user_id(10, p)
+    raw = json.loads(p.read_text())
+    assert raw["trusted_user_ids"] == [10]
+    # Adding a different id
+    add_trusted_user_id(20, p)
+    raw = json.loads(p.read_text())
+    assert raw["trusted_user_ids"] == [10, 20]
+
+
+def test_add_project_trusted_user_id(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    add_project_trusted_user_id("proj", 10, p)
+    raw = json.loads(p.read_text())
+    assert raw["projects"]["proj"]["trusted_user_ids"] == [10]
+    # Adding again should not duplicate
+    add_project_trusted_user_id("proj", 10, p)
+    raw = json.loads(p.read_text())
+    assert raw["projects"]["proj"]["trusted_user_ids"] == [10]
+    # Adding a different id
+    add_project_trusted_user_id("proj", 20, p)
+    raw = json.loads(p.read_text())
+    assert raw["projects"]["proj"]["trusted_user_ids"] == [10, 20]
