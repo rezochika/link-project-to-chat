@@ -47,6 +47,11 @@ COMMANDS = [
     ("reset", "Clear Claude session"),
     ("version", "Show version"),
     ("help", "Show available commands"),
+    ("skills", "List available skills"),
+    ("use", "Activate a skill"),
+    ("stop_skill", "Deactivate current skill"),
+    ("create_skill", "Create a new skill"),
+    ("delete_skill", "Delete a skill"),
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
@@ -91,6 +96,7 @@ class ProjectBot(AuthMixin):
         self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking
         self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
+        self._active_skill: str | None = None
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -214,6 +220,12 @@ class ProjectBot(AuthMixin):
         if self._rate_limited(update.effective_user.id):
             return await msg.reply_text("Rate limited. Try again shortly.")
 
+        pending_skill = ctx.user_data.pop("pending_skill_name", None) if ctx.user_data else None
+        if pending_skill:
+            from .skills import save_skill
+            save_skill(pending_skill, msg.text, self.path)
+            return await msg.reply_text(f"Skill '{pending_skill}' created. Use /use {pending_skill} to activate.")
+
         for prev in self.task_manager.find_by_message(msg.message_id):
             self.task_manager.cancel(prev.id)
             typing = self._typing_tasks.pop(prev.id, None)
@@ -223,6 +235,11 @@ class ProjectBot(AuthMixin):
         prompt = msg.text
         if msg.reply_to_message and msg.reply_to_message.text:
             prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
+        if self._active_skill:
+            from .skills import load_skill, format_skill_prompt
+            skill = load_skill(self._active_skill, self.path)
+            if skill:
+                prompt = format_skill_prompt(skill, prompt)
         self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
@@ -378,6 +395,74 @@ class ProjectBot(AuthMixin):
             reply_markup=keyboard,
         )
 
+    async def _on_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        from .skills import load_skills
+        skills = load_skills(self.path)
+        if not skills:
+            return await update.effective_message.reply_text("No skills available.\nCreate one with /create_skill <name>")
+        lines = ["Available skills:"]
+        for name, skill in sorted(skills.items()):
+            icon = "\U0001f4c1" if skill.source == "project" else "\U0001f310"
+            lines.append(f"  {icon} {name} ({skill.source})")
+        if self._active_skill:
+            lines.append(f"\nActive: {self._active_skill}")
+        else:
+            lines.append(f"\nNo active skill. Use /use <name> to activate.")
+        await update.effective_message.reply_text("\n".join(lines))
+
+    async def _on_use(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            if self._active_skill:
+                return await update.effective_message.reply_text(f"Active skill: {self._active_skill}\nUse /stop_skill to deactivate.")
+            return await update.effective_message.reply_text("Usage: /use <skill_name>\nSee /skills for available skills.")
+        name = ctx.args[0].lower()
+        from .skills import load_skill
+        skill = load_skill(name, self.path)
+        if not skill:
+            return await update.effective_message.reply_text(f"Skill '{name}' not found. See /skills for available skills.")
+        self._active_skill = name
+        await update.effective_message.reply_text(f"Skill '{name}' activated. All messages will use this skill.\nUse /stop_skill to deactivate.")
+
+    async def _on_stop_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not self._active_skill:
+            return await update.effective_message.reply_text("No active skill.")
+        old = self._active_skill
+        self._active_skill = None
+        await update.effective_message.reply_text(f"Skill '{old}' deactivated.")
+
+    async def _on_create_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /create_skill <name>")
+        name = ctx.args[0].lower()
+        ctx.user_data["pending_skill_name"] = name
+        await update.effective_message.reply_text(f"Send the content for skill '{name}':")
+
+    async def _on_delete_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /delete_skill <name>")
+        name = ctx.args[0].lower()
+        from .skills import load_skill
+        skill = load_skill(name, self.path)
+        if not skill or skill.source != "project":
+            return await update.effective_message.reply_text(f"Project skill '{name}' not found. Can only delete project skills.")
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Delete", callback_data=f"skill_delete_confirm_{name}"),
+                InlineKeyboardButton("Cancel", callback_data="skill_delete_cancel"),
+            ]
+        ])
+        await update.effective_message.reply_text(f"Delete skill '{name}'?", reply_markup=keyboard)
+
     async def _on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -425,10 +510,20 @@ class ProjectBot(AuthMixin):
         elif query.data == "reset_confirm":
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
+            self._active_skill = None
             clear_session(self.name)
             await query.edit_message_text("Session reset.")
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
+        elif query.data.startswith("skill_delete_confirm_"):
+            name = query.data[len("skill_delete_confirm_"):]
+            from .skills import delete_skill as _delete_skill
+            _delete_skill(name, self.path)
+            if self._active_skill == name:
+                self._active_skill = None
+            await query.edit_message_text(f"Skill '{name}' deleted.")
+        elif query.data == "skill_delete_cancel":
+            await query.edit_message_text("Cancelled.")
         elif query.data.startswith("task_info_"):
             task_id = _parse_task_id(query.data)
             task = self.task_manager.get(task_id)
@@ -498,6 +593,7 @@ class ProjectBot(AuthMixin):
             f"Claude: {'RUNNING' if st['running'] else 'idle'}",
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
+            f"Skill: {self._active_skill or 'none'}",
         ]
         await update.effective_message.reply_text("\n".join(lines))
 
@@ -667,6 +763,11 @@ class ProjectBot(AuthMixin):
             "status": self._on_status,
             "version": self._on_version,
             "help": self._on_help,
+            "skills": self._on_skills,
+            "use": self._on_use,
+            "stop_skill": self._on_stop_skill,
+            "create_skill": self._on_create_skill,
+            "delete_skill": self._on_delete_skill,
         }
         private = filters.ChatType.PRIVATE
         for name, handler in handlers.items():
