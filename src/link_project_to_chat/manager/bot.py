@@ -444,7 +444,7 @@ class ManagerBot(AuthMixin):
         if not await self._guard(update):
             return ConversationHandler.END
         try:
-            from ..github_client import GitHubClient
+            from ..github_client import GitHubClient, _gh_available
             from ..botfather import BotFatherClient
         except ImportError:
             await update.effective_message.reply_text(
@@ -454,8 +454,8 @@ class ManagerBot(AuthMixin):
         from ..config import load_config
         path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(path)
-        if not config.github_pat:
-            await update.effective_message.reply_text("GitHub PAT not configured. Run /setup first.")
+        if not config.github_pat and not _gh_available():
+            await update.effective_message.reply_text("GitHub not configured. Run /setup to set a PAT, or install gh CLI.")
             return ConversationHandler.END
         if not config.telegram_api_id or not config.telegram_api_hash:
             await update.effective_message.reply_text("Telegram API not configured. Run /setup first.")

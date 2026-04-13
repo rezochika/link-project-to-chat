@@ -10,7 +10,9 @@ from link_project_to_chat.github_client import GitHubClient, RepoInfo
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Force API mode (not gh CLI) for tests
+    monkeypatch.setattr("link_project_to_chat.github_client._gh_available", lambda: False)
     return GitHubClient(pat="ghp_test123")
 
 
