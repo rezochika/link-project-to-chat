@@ -7,12 +7,10 @@ import click
 
 from .config import (
     DEFAULT_CONFIG,
-    clear_trusted_user_id,
+    add_project_trusted_user_id,
     load_config,
-    load_trusted_user_id,
     resolve_permissions,
     save_config,
-    save_project_trusted_user_id,
 )
 
 
@@ -51,7 +49,8 @@ def projects_list(ctx):
     if not config.projects:
         return click.echo("No projects linked.")
     for name, proj in config.projects.items():
-        click.echo(f"  {name}: {proj.path}")
+        users = ", ".join(proj.allowed_usernames) if proj.allowed_usernames else "(global)"
+        click.echo(f"  {name}: {proj.path}  [{users}]")
 
 
 @projects.command("add")
@@ -157,22 +156,28 @@ def projects_edit(ctx, name: str, field: str, value: str):
 
 
 @main.command()
-@click.option("--username", default=None, help="Allowed Telegram username")
+@click.option("--username", default=None, help="Add an allowed Telegram username")
+@click.option("--remove-username", default=None, help="Remove an allowed Telegram username")
 @click.option("--manager-token", default=None, help="Telegram bot token for the manager bot")
 @click.pass_context
-def configure(ctx, username: str | None, manager_token: str | None):
+def configure(ctx, username: str | None, remove_username: str | None, manager_token: str | None):
     """Configure username and/or manager bot token."""
-    if not username and not manager_token:
-        raise SystemExit("Provide at least one of --username or --manager-token.")
+    if not username and not remove_username and not manager_token:
+        raise SystemExit("Provide at least one of --username, --remove-username, or --manager-token.")
     cfg_path = ctx.obj["config_path"]
     config = load_config(cfg_path)
     if username:
         new_username = username.lower().lstrip("@")
-        if new_username != config.allowed_username:
-            clear_trusted_user_id(cfg_path)
-            click.echo("Trusted user ID cleared (username changed).")
-        config.allowed_username = new_username
-        click.echo(f"Configured username: @{new_username}")
+        if new_username not in config.allowed_usernames:
+            config.allowed_usernames.append(new_username)
+        click.echo(f"Added username: @{new_username}")
+    if remove_username:
+        rm = remove_username.lower().lstrip("@")
+        if rm in config.allowed_usernames:
+            config.allowed_usernames.remove(rm)
+            click.echo(f"Removed username: @{rm}")
+        else:
+            click.echo(f"Username @{rm} not found.")
     if manager_token:
         config.manager_telegram_bot_token = manager_token
         click.echo(f"Configured manager token: ***{manager_token[-4:]}")
@@ -252,20 +257,17 @@ def start(
             name=p.name,
             path=p,
             token=token,
-            username=(username or "").lower().lstrip("@"),
+            allowed_usernames=[username.lower().lstrip("@")] if username else [],
             session_id=session_id,
             model=model,
             skip_permissions=skip_permissions,
             permission_mode=permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
-            trusted_user_id=load_trusted_user_id(cfg_path),
         )
         return
 
     config = load_config(cfg_path)
-    if username:
-        config.allowed_username = username.lower().lstrip("@")
 
     if not config.projects:
         raise SystemExit(
@@ -276,17 +278,15 @@ def start(
         if project not in config.projects:
             raise SystemExit(f"Project '{project}' not found.")
         proj = config.projects[project]
-        effective_username = proj.allowed_username or config.allowed_username
-        if proj.allowed_username:
-            effective_trusted_id = proj.trusted_user_id
-        else:
-            effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
+        effective_usernames = proj.allowed_usernames or config.allowed_usernames
+        effective_trusted_ids = proj.trusted_user_ids or config.trusted_user_ids
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             project,
             Path(proj.path),
             proj.telegram_bot_token,
-            effective_username,
+            allowed_usernames=effective_usernames if not username else [username.lower().lstrip("@")],
+            trusted_user_ids=effective_trusted_ids,
             session_id=session_id,
             model=model or proj.model,
             effort=proj.effort,
@@ -294,8 +294,7 @@ def start(
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
-            trusted_user_id=effective_trusted_id,
-            on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
+            on_trust=lambda uid: add_project_trusted_user_id(project, uid, cfg_path),
         )
     else:
         run_bots(
@@ -322,7 +321,7 @@ def start_manager(ctx):
     token = main_config.manager_telegram_bot_token
     if not token:
         raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
-    if not main_config.allowed_username:
+    if not main_config.allowed_usernames:
         raise SystemExit("No username configured. Run 'configure --username USER' first.")
 
     pm = ProcessManager(project_config_path=cfg_path)
@@ -330,6 +329,11 @@ def start_manager(ctx):
     if restored:
         click.echo(f"Autostarted {restored} project(s).")
 
-    bot = ManagerBot(token, pm, allowed_username=main_config.allowed_username, trusted_user_id=main_config.trusted_user_id, project_config_path=cfg_path)
+    bot = ManagerBot(
+        token, pm,
+        allowed_usernames=main_config.allowed_usernames,
+        trusted_user_ids=main_config.trusted_user_ids,
+        project_config_path=cfg_path,
+    )
     click.echo("Manager bot started.")
     bot.build().run_polling()
