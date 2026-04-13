@@ -242,6 +242,20 @@ def configure(ctx: click.Context, username: str | None, manager_token: str | Non
     type=int,
     help="Port for HTTP health check endpoint (e.g. 8080)",
 )
+@click.option(
+    "--webhook-url",
+    "webhook_url",
+    default=None,
+    help="Public HTTPS URL where Telegram sends updates (enables webhook mode)",
+)
+@click.option(
+    "--webhook-port",
+    "webhook_port",
+    default=8443,
+    type=int,
+    show_default=True,
+    help="Local port to listen on in webhook mode",
+)
 @click.pass_context
 def start(
     ctx: click.Context,
@@ -256,6 +270,8 @@ def start(
     allowed_tools: str | None,
     disallowed_tools: str | None,
     health_port: int | None,
+    webhook_url: str | None,
+    webhook_port: int,
 ) -> None:
     """Start the Telegram bot.
 
@@ -284,6 +300,8 @@ def start(
                 disallowed_tools=disallowed,
                 trusted_user_id=load_trusted_user_id(cfg_path),
                 health_port=health_port,
+                webhook_url=webhook_url,
+                webhook_port=webhook_port,
             )
             return
 
@@ -321,6 +339,8 @@ def start(
                 trusted_user_id=effective_trusted_id,
                 on_trust=lambda uid: save_project_trusted_user_id(project, uid, cfg_path),
                 health_port=health_port,
+                webhook_url=webhook_url,
+                webhook_port=webhook_port,
             )
         else:
             run_bots(

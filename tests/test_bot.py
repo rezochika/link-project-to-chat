@@ -702,6 +702,50 @@ class TestCompactCommand:
         )
 
 
+# ---------------------------------------------------------------------------
+# Task 4.2: Test webhook configuration
+# ---------------------------------------------------------------------------
+
+class TestWebhookConfig:
+    def test_webhook_url_defaults_to_none(self, tmp_path: Path) -> None:
+        bot = ProjectBot(
+            name="test",
+            path=tmp_path,
+            token="TOKEN",
+            allowed_username="alice",
+        )
+        assert bot.webhook_url is None
+
+    def test_webhook_port_defaults_to_8443(self, tmp_path: Path) -> None:
+        bot = ProjectBot(
+            name="test",
+            path=tmp_path,
+            token="TOKEN",
+            allowed_username="alice",
+        )
+        assert bot.webhook_port == 8443
+
+    def test_webhook_url_stored(self, tmp_path: Path) -> None:
+        bot = ProjectBot(
+            name="test",
+            path=tmp_path,
+            token="TOKEN",
+            allowed_username="alice",
+            webhook_url="https://example.com",
+        )
+        assert bot.webhook_url == "https://example.com"
+
+    def test_webhook_port_stored(self, tmp_path: Path) -> None:
+        bot = ProjectBot(
+            name="test",
+            path=tmp_path,
+            token="TOKEN",
+            allowed_username="alice",
+            webhook_port=443,
+        )
+        assert bot.webhook_port == 443
+
+
 class TestTasksCommand:
     @pytest.mark.asyncio
     async def test_tasks_no_tasks(self, bot: ProjectBot) -> None:

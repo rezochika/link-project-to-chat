@@ -82,10 +82,14 @@ class ProjectBot:
         authenticator: Authenticator | None = None,
         rate_limiter: RateLimiter | None = None,
         health_port: int | None = None,
+        webhook_url: str | None = None,
+        webhook_port: int = 8443,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
+        self.webhook_url = webhook_url
+        self.webhook_port = webhook_port
         self._started_at = time.monotonic()
         self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._typing_tasks: dict[int, asyncio.Task[None]] = {}
@@ -745,6 +749,8 @@ def run_bot(
     trusted_user_id: int | None = None,
     on_trust: Callable[[int], None] | None = None,
     health_port: int | None = None,
+    webhook_url: str | None = None,
+    webhook_port: int = 8443,
 ) -> None:
     if not username:
         raise SystemExit(
@@ -761,6 +767,8 @@ def run_bot(
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
         health_port=health_port,
+        webhook_url=webhook_url,
+        webhook_port=webhook_port,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -769,7 +777,15 @@ def run_bot(
     logger.info(
         "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
     )
-    app.run_polling()
+    if bot.webhook_url:
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=bot.webhook_port,
+            url_path=bot.token,
+            webhook_url=f"{bot.webhook_url}/{bot.token}",
+        )
+    else:
+        app.run_polling(drop_pending_updates=True)
 
 
 def run_bots(
