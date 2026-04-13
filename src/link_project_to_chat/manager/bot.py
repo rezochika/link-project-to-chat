@@ -33,6 +33,7 @@ COMMANDS = [
     ("remove_user", "Remove an authorized user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
+    ("version", "Show version"),
     ("help", "Show commands"),
 ]
 
@@ -143,6 +144,12 @@ class ManagerBot(AuthMixin):
             return
         count = self._pm.stop_all()
         await update.effective_message.reply_text(f"Stopped {count} project(s).")
+
+    async def _on_version(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        from .. import __version__
+        await update.effective_message.reply_text(f"link-project-to-chat v{__version__}")
 
     async def _on_help(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -854,6 +861,7 @@ class ManagerBot(AuthMixin):
             "projects": self._on_projects,
             "start_all": self._on_start_all,
             "stop_all": self._on_stop_all,
+            "version": self._on_version,
             "help": self._on_help,
             "edit_project": self._on_edit_project,
             "users": self._on_users,

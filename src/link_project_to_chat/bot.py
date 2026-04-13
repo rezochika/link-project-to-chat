@@ -45,6 +45,7 @@ COMMANDS = [
     ("compact", "Compress session context"),
     ("status", "Bot status"),
     ("reset", "Clear Claude session"),
+    ("version", "Show version"),
     ("help", "Show available commands"),
 ]
 
@@ -343,6 +344,14 @@ class ProjectBot(AuthMixin):
             chat_id=update.effective_chat.id,
             message_id=update.effective_message.message_id,
         )
+
+    async def _on_version(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_message:
+            return
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        from . import __version__
+        await update.effective_message.reply_text(f"link-project-to-chat v{__version__}")
 
     async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -656,6 +665,7 @@ class ProjectBot(AuthMixin):
             "compact": self._on_compact,
             "reset": self._on_reset,
             "status": self._on_status,
+            "version": self._on_version,
             "help": self._on_help,
         }
         private = filters.ChatType.PRIVATE
