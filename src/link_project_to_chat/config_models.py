@@ -12,6 +12,10 @@ from pydantic import BaseModel, field_validator
 from .enums import EffortLevel, Model, PermissionMode
 
 
+def _normalize_username(v: str) -> str:
+    return v.lower().lstrip("@")
+
+
 class ProjectConfigModel(BaseModel):
     """Pydantic model for per-project configuration validation."""
 
@@ -53,7 +57,7 @@ class ProjectConfigModel(BaseModel):
     @field_validator("username")
     @classmethod
     def normalize_username(cls, v: str) -> str:
-        return v.lower().lstrip("@") if v else ""
+        return _normalize_username(v) if v else ""
 
 
 class ConfigModel(BaseModel):
@@ -71,7 +75,7 @@ class ConfigModel(BaseModel):
     @field_validator("allowed_username")
     @classmethod
     def normalize_username(cls, v: str) -> str:
-        return v.lower().lstrip("@") if v else ""
+        return _normalize_username(v) if v else ""
 
 
 class AppSettings(BaseModel):
