@@ -37,6 +37,7 @@ COMMANDS = [
     ("permissions", "Set permission mode"),
     ("compact", "Compress session context"),
     ("status", "Bot status"),
+    ("history", "Show recent conversation history"),
     ("reset", "Clear Claude session"),
     ("help", "Show available commands"),
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -41,6 +42,7 @@ from .constants import (
 )
 from .formatting import md_to_telegram, split_html, strip_html
 from .health import HealthServer
+from .history import History
 from .rate_limiter import RateLimiter
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
@@ -97,6 +99,7 @@ class ProjectBot:
             on_trust=on_trust or self._default_on_trust,
         )
         self._rate_limiter = rate_limiter or RateLimiter()
+        self._history = History()
         self.task_manager = task_manager or TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -200,6 +203,7 @@ class ProjectBot:
             return
 
         if task.status == TaskStatus.DONE:
+            self._history.add("assistant", task.result or "", task_id=task.id)
             await self._send_to_chat(task.chat_id, f"🔹 {task.result}", reply_to=task.message_id)
         else:
             await self._send_to_chat(task.chat_id, f"Error: {sanitize_error(task.error)}", reply_to=task.message_id)
@@ -263,11 +267,12 @@ class ProjectBot:
         prompt = msg.text or ""
         if msg.reply_to_message and msg.reply_to_message.text:
             prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
-        self.task_manager.submit_claude(
+        task = self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
             prompt=prompt,
         )
+        self._history.add("user", prompt, task_id=task.id)
 
     async def _on_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -382,6 +387,27 @@ class ProjectBot:
             await update.effective_message.reply_text("Unauthorized.")
             return
         await update.effective_message.reply_text(CMD_HELP)
+
+    async def _on_history(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
+        if not self._authenticator.authenticate(update.effective_user):
+            await msg.reply_text("Unauthorized.")
+            return
+        entries = self._history.recent(10)
+        if not entries:
+            await msg.reply_text("No conversation history yet.")
+            return
+        lines = []
+        for entry in entries:
+            dt = datetime.datetime.fromtimestamp(
+                entry.timestamp - time.monotonic() + time.time()
+            )
+            hhmm = dt.strftime("%H:%M")
+            icon = "👤 User" if entry.role == "user" else "🤖 Assistant"
+            lines.append(f"🕐 {hhmm}  {icon}: {entry.text}")
+        await msg.reply_text("\n".join(lines))
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -672,6 +698,7 @@ class ProjectBot:
             "compact": self._on_compact,
             "reset": self._on_reset,
             "status": self._on_status,
+            "history": self._on_history,
             "help": self._on_help,
         }
         private = filters.ChatType.PRIVATE
