@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from ._auth import AuthMixin
+from .auth import Authenticator
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
 from .config import (
     Config,
@@ -39,6 +39,7 @@ from .constants import (
     TYPING_INDICATOR_INTERVAL,
 )
 from .formatting import md_to_telegram, split_html, strip_html
+from .rate_limiter import RateLimiter
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 from .ui import (
@@ -60,7 +61,7 @@ from .ui import (
 logger = logging.getLogger(__name__)
 
 
-class ProjectBot(AuthMixin):
+class ProjectBot:
     def __init__(
         self,
         name: str,
@@ -74,18 +75,23 @@ class ProjectBot(AuthMixin):
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         task_manager: TaskManager | None = None,
+        authenticator: Authenticator | None = None,
+        rate_limiter: RateLimiter | None = None,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
-        self._allowed_username = allowed_username
-        self._trusted_user_id = trusted_user_id
-        self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
         self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._typing_tasks: dict[int, asyncio.Task[None]] = {}
         self._stream_text: dict[int, str] = {}
-        self._init_auth()
+        self._on_trust_fn = on_trust
+        self._authenticator = authenticator or Authenticator(
+            allowed_username=allowed_username,
+            trusted_user_id=trusted_user_id,
+            on_trust=on_trust or self._default_on_trust,
+        )
+        self._rate_limiter = rate_limiter or RateLimiter()
         self.task_manager = task_manager or TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -97,11 +103,16 @@ class ProjectBot(AuthMixin):
             disallowed_tools=disallowed_tools,
         )
 
-    def _on_trust(self, user_id: int) -> None:
-        if self._on_trust_fn:
-            self._on_trust_fn(user_id)
-        else:
-            save_trusted_user_id(user_id)
+    @property
+    def _allowed_username(self) -> str:
+        return self._authenticator._allowed_username
+
+    @property
+    def _trusted_user_id(self) -> int | None:
+        return self._authenticator.trusted_user_id
+
+    def _default_on_trust(self, user_id: int) -> None:
+        save_trusted_user_id(user_id)
 
     async def _on_task_started(self, task: Task) -> None:
         assert self._app is not None
@@ -189,7 +200,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         await msg.reply_text(
@@ -202,11 +213,11 @@ class ProjectBot(AuthMixin):
         if not msg or not update.effective_chat:
             return
         user = update.effective_user
-        if not self._auth(user):
+        if not self._authenticator.authenticate(user):
             await msg.reply_text("Unauthorized.")
             return
         assert user is not None
-        if self._rate_limited(user.id):
+        if self._rate_limiter.is_limited(user.id):
             await msg.reply_text("Rate limited. Try again shortly.")
             return
 
@@ -229,7 +240,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg or not update.effective_chat:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         if not ctx.args:
@@ -253,7 +264,7 @@ class ProjectBot(AuthMixin):
     async def _on_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message or not update.effective_chat:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
         markup = self._tasks_markup(update.effective_chat.id)
@@ -269,7 +280,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         await msg.reply_text(
@@ -287,7 +298,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         await msg.reply_text(
@@ -308,7 +319,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         await msg.reply_text(
@@ -320,7 +331,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg or not update.effective_chat:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
         if not self.task_manager.claude.session_id:
@@ -334,7 +345,7 @@ class ProjectBot(AuthMixin):
     async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
         await update.effective_message.reply_text(CMD_HELP)
@@ -342,7 +353,7 @@ class ProjectBot(AuthMixin):
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
         await update.effective_message.reply_text(
@@ -359,7 +370,7 @@ class ProjectBot(AuthMixin):
         if query.message and query.message.chat and query.message.chat.type != "private":
             await query.answer("Only available in private chats.")
             return
-        if not self._auth(query.from_user):
+        if not self._authenticator.authenticate(query.from_user):
             await query.answer("Unauthorized.")
             return
         await query.answer()
@@ -433,7 +444,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
 
@@ -455,11 +466,11 @@ class ProjectBot(AuthMixin):
         if not msg or not update.effective_chat:
             return
         user = update.effective_user
-        if not self._auth(user):
+        if not self._authenticator.authenticate(user):
             await msg.reply_text("Unauthorized.")
             return
         assert user is not None
-        if self._rate_limited(user.id):
+        if self._rate_limiter.is_limited(user.id):
             await msg.reply_text("Rate limited. Try again shortly.")
             return
 
@@ -512,7 +523,7 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
 

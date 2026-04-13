@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 
-from link_project_to_chat._auth import AuthMixin
 from link_project_to_chat.auth import Authenticator
 from link_project_to_chat.formatting import md_to_telegram
 from link_project_to_chat.rate_limiter import RateLimiter
@@ -136,24 +135,18 @@ class TestAuthenticator:
         assert auth.authenticate(bad) is False
 
 
-# --- AuthMixin rate limit memory cleanup ---
+# --- RateLimiter memory cleanup ---
 
 
-class TestAuthMixinCleanup:
+class TestRateLimiterCleanup:
     def test_stale_entries_cleaned(self) -> None:
-        class _Bot(AuthMixin):
-            def __init__(self) -> None:
-                self._allowed_username = "alice"
-                self._trusted_user_id = None
-                self._init_auth()
-
-        bot = _Bot()
-        bot._rate_limited(1)
+        rl = RateLimiter(max_per_minute=30)
+        rl.is_limited(1)
         # Age the entry
-        for ts in bot._rate_limits.values():
+        for ts in rl._timestamps.values():
             while ts:
                 ts.popleft()
             ts.append(time.monotonic() - 400)
         # Trigger cleanup via another user
-        bot._rate_limited(2)
-        assert 1 not in bot._rate_limits
+        rl.is_limited(2)
+        assert 1 not in rl._timestamps

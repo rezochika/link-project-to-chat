@@ -16,8 +16,9 @@ from telegram.ext import (
     filters,
 )
 
-from .._auth import AuthMixin
+from ..auth import Authenticator
 from ..config import DEFAULT_CONFIG, save_trusted_user_id
+from ..rate_limiter import RateLimiter
 from .config import load_project_configs, save_project_configs, set_project_autostart
 from .process import ProcessManager
 
@@ -50,9 +51,7 @@ def _parse_edit_callback(data: str) -> tuple[str, str] | None:
     return None
 
 
-class ManagerBot(AuthMixin):
-    _MAX_MESSAGES_PER_MINUTE = 20
-
+class ManagerBot:
     def __init__(
         self,
         token: str,
@@ -60,17 +59,22 @@ class ManagerBot(AuthMixin):
         allowed_username: str,
         trusted_user_id: int | None = None,
         project_config_path: Path | None = None,
+        authenticator: Authenticator | None = None,
+        rate_limiter: RateLimiter | None = None,
     ):
         self._token = token
         self._pm = process_manager
-        self._allowed_username = allowed_username
-        self._trusted_user_id = trusted_user_id
         self._started_at = time.monotonic()
         self._app: Application[Any, Any, Any, Any, Any, Any] | None = None
         self._project_config_path = project_config_path
-        self._init_auth()
+        self._authenticator = authenticator or Authenticator(
+            allowed_username=allowed_username,
+            trusted_user_id=trusted_user_id,
+            on_trust=self._default_on_trust,
+        )
+        self._rate_limiter = rate_limiter or RateLimiter(max_per_minute=20)
 
-    def _on_trust(self, user_id: int) -> None:
+    def _default_on_trust(self, user_id: int) -> None:
         path = self._project_config_path or DEFAULT_CONFIG
         save_trusted_user_id(user_id, path)
 
@@ -91,10 +95,10 @@ class ManagerBot(AuthMixin):
         if not msg:
             return False
         user = update.effective_user
-        if not user or not self._auth(user):
+        if not user or not self._authenticator.authenticate(user):
             await msg.reply_text("Unauthorized.")
             return False
-        if self._rate_limited(user.id):
+        if self._rate_limiter.is_limited(user.id):
             await msg.reply_text("Rate limited. Try again shortly.")
             return False
         return True
@@ -289,7 +293,7 @@ class ManagerBot(AuthMixin):
         pending = ctx.user_data.get("pending_edit")
         if not pending:
             return
-        if not self._auth(update.effective_user):
+        if not self._authenticator.authenticate(update.effective_user):
             return
         if not update.message or not update.message.text:
             return
@@ -320,7 +324,7 @@ class ManagerBot(AuthMixin):
         query = update.callback_query
         if not query or not query.data:
             return
-        if not self._auth(query.from_user):
+        if not self._authenticator.authenticate(query.from_user):
             await query.answer("Unauthorized.")
             return
         await query.answer()
