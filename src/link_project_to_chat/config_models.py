@@ -16,6 +16,26 @@ def _normalize_username(v: str) -> str:
     return v.lower().lstrip("@")
 
 
+class _UserEntry(BaseModel):
+    """A single entry in the allowed_users list."""
+
+    username: str
+    role: str = "viewer"
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, v: str) -> str:
+        return _normalize_username(v) if v else ""
+
+    @field_validator("role")
+    @classmethod
+    def role_must_be_valid(cls, v: str) -> str:
+        valid = {"admin", "developer", "viewer"}
+        if v not in valid:
+            raise ValueError(f"Invalid role '{v}'. Must be one of: {', '.join(sorted(valid))}")
+        return v
+
+
 class ProjectConfigModel(BaseModel):
     """Pydantic model for per-project configuration validation."""
 
@@ -23,6 +43,7 @@ class ProjectConfigModel(BaseModel):
     telegram_bot_token: str = ""
     username: str = ""
     trusted_user_id: int | None = None
+    allowed_users: list[_UserEntry] | None = None
     model: str | None = None
     permission_mode: str | None = None
     dangerously_skip_permissions: bool = False
@@ -65,6 +86,7 @@ class ConfigModel(BaseModel):
 
     allowed_username: str = ""
     trusted_user_id: int | None = None
+    allowed_users: list[_UserEntry] | None = None
     manager_telegram_bot_token: str = ""
     # Backward compat: old name for manager token
     manager_bot_token: str = ""

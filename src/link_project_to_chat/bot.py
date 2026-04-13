@@ -44,6 +44,7 @@ from .formatting import md_to_telegram, split_html, strip_html
 from .health import HealthServer
 from .history import History
 from .rate_limiter import RateLimiter
+from .roles import COMMAND_ROLES, has_permission
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 from .ui import (
@@ -84,6 +85,7 @@ class ProjectBot:
         health_port: int | None = None,
         webhook_url: str | None = None,
         webhook_port: int = 8443,
+        allowed_users: list[dict[str, str]] | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -101,6 +103,7 @@ class ProjectBot:
             allowed_username=allowed_username,
             trusted_user_id=trusted_user_id,
             on_trust=on_trust or self._default_on_trust,
+            allowed_users=allowed_users,
         )
         self._rate_limiter = rate_limiter or RateLimiter()
         self._history = History()
@@ -130,6 +133,16 @@ class ProjectBot:
     @property
     def _trusted_user_id(self) -> int | None:
         return self._authenticator.trusted_user_id
+
+    def _check_role(self, user_id: int, command: str) -> bool:
+        """Return True if user's role permits the given command."""
+        required = COMMAND_ROLES.get(command)
+        if required is None:
+            return True  # unmapped commands are allowed
+        role = self._authenticator.get_role(user_id)
+        if role is None:
+            return True  # single-user mode: no role stored yet means admin
+        return has_permission(role, required)
 
     def _default_on_trust(self, user_id: int) -> None:
         save_trusted_user_id(user_id)
@@ -285,6 +298,9 @@ class ProjectBot:
         if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
+        if not self._check_role(update.effective_user.id, "run"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires developer role or higher.")
+            return
         if not ctx.args:
             await msg.reply_text("Usage: /run <command>")
             return
@@ -309,6 +325,9 @@ class ProjectBot:
         if not self._authenticator.authenticate(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
             return
+        if not self._check_role(update.effective_user.id, "tasks"):  # type: ignore[union-attr]
+            await update.effective_message.reply_text("Permission denied. Requires developer role or higher.")
+            return
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
@@ -324,6 +343,9 @@ class ProjectBot:
             return
         if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
+            return
+        if not self._check_role(update.effective_user.id, "model"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires developer role or higher.")
             return
         await msg.reply_text(
             f"Current: {self._current_model()}",
@@ -342,6 +364,9 @@ class ProjectBot:
             return
         if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
+            return
+        if not self._check_role(update.effective_user.id, "effort"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires developer role or higher.")
             return
         await msg.reply_text(
             f"Current: {self._current_effort()}",
@@ -364,6 +389,9 @@ class ProjectBot:
         if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
             return
+        if not self._check_role(update.effective_user.id, "permissions"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires admin role.")
+            return
         await msg.reply_text(
             f"Current: {self._current_permission()}",
             reply_markup=self._permissions_markup(),
@@ -375,6 +403,9 @@ class ProjectBot:
             return
         if not self._authenticator.authenticate(update.effective_user):
             await msg.reply_text("Unauthorized.")
+            return
+        if not self._check_role(update.effective_user.id, "compact"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires admin role.")
             return
         if not self.task_manager.claude.session_id:
             await msg.reply_text("No active session.")
@@ -418,6 +449,9 @@ class ProjectBot:
             return
         if not self._authenticator.authenticate(update.effective_user):
             await update.effective_message.reply_text("Unauthorized.")
+            return
+        if not self._check_role(update.effective_user.id, "reset"):  # type: ignore[union-attr]
+            await update.effective_message.reply_text("Permission denied. Requires admin role.")
             return
         await update.effective_message.reply_text(
             "Are you sure? This will clear the Claude session.",
@@ -751,8 +785,9 @@ def run_bot(
     health_port: int | None = None,
     webhook_url: str | None = None,
     webhook_port: int = 8443,
+    allowed_users: list[dict[str, str]] | None = None,
 ) -> None:
-    if not username:
+    if not username and not allowed_users:
         raise SystemExit(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
@@ -769,6 +804,7 @@ def run_bot(
         health_port=health_port,
         webhook_url=webhook_url,
         webhook_port=webhook_port,
+        allowed_users=allowed_users,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -799,6 +835,8 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
+        # allowed_users: per-project takes precedence, then global
+        effective_allowed_users = proj.allowed_users or config.allowed_users
         effective_username = proj.allowed_username or config.allowed_username
         if proj.allowed_username:
             effective_trusted_id = proj.trusted_user_id
@@ -823,6 +861,7 @@ def run_bots(
             disallowed_tools=disallowed_tools,
             trusted_user_id=effective_trusted_id,
             on_trust=on_trust,
+            allowed_users=effective_allowed_users,
         )
     else:
         names = ", ".join(config.projects.keys())

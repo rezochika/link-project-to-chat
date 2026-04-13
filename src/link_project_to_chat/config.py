@@ -23,6 +23,7 @@ class ProjectConfig:
     telegram_bot_token: str
     allowed_username: str = ""  # per-project override; falls back to Config.allowed_username
     trusted_user_id: int | None = None  # per-project; falls back to Config.trusted_user_id
+    allowed_users: list[dict[str, str]] | None = None  # multi-user RBAC
     model: str | None = None
     permission_mode: str | None = None
     dangerously_skip_permissions: bool = False
@@ -34,6 +35,7 @@ class ProjectConfig:
 class Config:
     allowed_username: str = ""
     trusted_user_id: int | None = None  # global fallback (also used by manager bot)
+    allowed_users: list[dict[str, str]] | None = None  # global multi-user RBAC
     manager_telegram_bot_token: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
@@ -62,14 +64,25 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     manager_token = validated.manager_telegram_bot_token or validated.manager_bot_token
     config.allowed_username = validated.allowed_username
     config.trusted_user_id = validated.trusted_user_id
+    config.allowed_users = (
+        [{"username": u.username, "role": u.role} for u in validated.allowed_users]
+        if validated.allowed_users is not None
+        else None
+    )
     config.manager_telegram_bot_token = manager_token
 
     for name, proj in validated.projects.items():
+        proj_allowed_users = (
+            [{"username": u.username, "role": u.role} for u in proj.allowed_users]
+            if proj.allowed_users is not None
+            else None
+        )
         config.projects[name] = ProjectConfig(
             path=proj.path,
             telegram_bot_token=proj.telegram_bot_token,
             allowed_username=proj.username,
             trusted_user_id=proj.trusted_user_id,
+            allowed_users=proj_allowed_users,
             model=proj.model,
             permission_mode=proj.permission_mode,
             dangerously_skip_permissions=proj.dangerously_skip_permissions,
@@ -89,6 +102,10 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
         except (json.JSONDecodeError, OSError):
             pass
     raw["allowed_username"] = config.allowed_username
+    if config.allowed_users is not None:
+        raw["allowed_users"] = config.allowed_users
+    else:
+        raw.pop("allowed_users", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.trusted_user_id is not None:
@@ -109,6 +126,10 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
             proj["trusted_user_id"] = p.trusted_user_id
         else:
             proj.pop("trusted_user_id", None)
+        if p.allowed_users is not None:
+            proj["allowed_users"] = p.allowed_users
+        else:
+            proj.pop("allowed_users", None)
         if p.model:
             proj["model"] = p.model
         if p.permission_mode:
