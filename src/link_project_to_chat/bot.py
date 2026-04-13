@@ -25,8 +25,8 @@ from .config import (
     patch_project,
     resolve_permissions,
     save_session,
-    save_project_trusted_user_id,
-    save_trusted_user_id,
+    add_trusted_user_id,
+    add_project_trusted_user_id,
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
@@ -61,19 +61,27 @@ class ProjectBot(AuthMixin):
         name: str,
         path: Path,
         token: str,
-        allowed_username: str,
+        allowed_username: str = "",
         trusted_user_id: int | None = None,
         on_trust: Callable[[int], None] | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
+        allowed_usernames: list[str] | None = None,
+        trusted_user_ids: list[int] | None = None,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
-        self._allowed_username = allowed_username
-        self._trusted_user_id = trusted_user_id
+        if allowed_usernames is not None:
+            self._allowed_usernames = allowed_usernames
+        else:
+            self._allowed_username = allowed_username
+        if trusted_user_ids is not None:
+            self._trusted_user_ids = trusted_user_ids
+        else:
+            self._trusted_user_id = trusted_user_id
         self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
         self._app = None
@@ -97,7 +105,7 @@ class ProjectBot(AuthMixin):
         if self._on_trust_fn:
             self._on_trust_fn(user_id)
         else:
-            save_trusted_user_id(user_id)
+            add_trusted_user_id(user_id)
 
     async def _on_task_started(self, task: Task) -> None:
         chat = await self._app.bot.get_chat(task.chat_id)
@@ -620,14 +628,14 @@ class ProjectBot(AuthMixin):
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
         await app.bot.set_my_commands(COMMANDS)
-        if self._trusted_user_id:
+        for uid in self._get_trusted_user_ids():
             try:
                 await app.bot.send_message(
-                    self._trusted_user_id,
+                    uid,
                     f"Bot started.\nProject: {self.name}\nPath: {self.path}",
                 )
             except Exception:
-                logger.error("Failed to send startup message", exc_info=True)
+                logger.error("Failed to send startup message to %d", uid, exc_info=True)
 
     def build(self):
         app = (
@@ -684,7 +692,7 @@ def run_bot(
     name: str,
     path: Path,
     token: str,
-    username: str,
+    username: str = "",
     session_id: str | None = None,
     model: str | None = None,
     effort: str | None = None,
@@ -694,16 +702,20 @@ def run_bot(
     disallowed_tools: list[str] | None = None,
     trusted_user_id: int | None = None,
     on_trust: Callable[[int], None] | None = None,
+    allowed_usernames: list[str] | None = None,
+    trusted_user_ids: list[int] | None = None,
 ) -> None:
-    if not username:
+    effective_usernames = allowed_usernames or ([username] if username else [])
+    if not effective_usernames:
         raise SystemExit(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
     if session_id:
         save_session(name, session_id)
     bot = ProjectBot(
-        name, path, token, username,
-        trusted_user_id=trusted_user_id,
+        name, path, token,
+        allowed_usernames=effective_usernames,
+        trusted_user_ids=trusted_user_ids or ([trusted_user_id] if trusted_user_id else []),
         on_trust=on_trust,
         skip_permissions=skip_permissions,
         permission_mode=permission_mode,
@@ -733,30 +745,27 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        effective_username = proj.allowed_username or config.allowed_username
-        if proj.allowed_username:
-            effective_trusted_id = proj.trusted_user_id
-        else:
-            effective_trusted_id = proj.trusted_user_id if proj.trusted_user_id is not None else config.trusted_user_id
+        effective_usernames = proj.allowed_usernames or config.allowed_usernames
+        effective_trusted_ids = proj.trusted_user_ids or config.trusted_user_ids
         on_trust = None
         if config_path:
             _name = name
             _path = config_path
-            on_trust = lambda uid: save_project_trusted_user_id(_name, uid, _path)
+            on_trust = lambda uid: add_project_trusted_user_id(_name, uid, _path)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             name,
             Path(proj.path),
             proj.telegram_bot_token,
-            effective_username,
             model=model or proj.model,
             effort=proj.effort,
             skip_permissions=skip_permissions or proj_skip,
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
-            trusted_user_id=effective_trusted_id,
             on_trust=on_trust,
+            allowed_usernames=effective_usernames,
+            trusted_user_ids=effective_trusted_ids,
         )
     else:
         names = ", ".join(config.projects.keys())

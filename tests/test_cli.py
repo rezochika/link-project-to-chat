@@ -189,8 +189,8 @@ def test_configure_manager_token(runner, cfg):
     assert "OKEN" in result.output
     data = json.loads(p.read_text())
     assert data["manager_telegram_bot_token"] == "MGR_TOKEN"
-    # existing keys preserved
-    assert data["allowed_username"] == "alice"
+    # existing keys preserved (migrated from allowed_username to allowed_usernames)
+    assert data["allowed_usernames"] == ["alice"]
     assert "projects" in data
 
 
