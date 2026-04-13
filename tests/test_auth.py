@@ -128,6 +128,14 @@ def test_multi_user_trusted_id_wrong_user():
 
 
 def test_multi_user_untrusted_id_denied():
+    """An unknown username is denied even if other users are trusted."""
     bot = _MultiBot(usernames=["alice"], trusted_ids=[42])
-    assert bot._auth(_make_user(99, "alice")) is False
+    assert bot._auth(_make_user(99, "mallory")) is False
     assert bot._failed_auth_counts[99] == 1
+
+
+def test_multi_user_new_allowed_user_joins_existing_trusted():
+    """An allowed username can join even when other trusted IDs already exist."""
+    bot = _MultiBot(usernames=["alice", "bob"], trusted_ids=[42])
+    assert bot._auth(_make_user(99, "bob")) is True
+    assert 99 in bot._trusted_user_ids

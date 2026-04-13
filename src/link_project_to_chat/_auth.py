@@ -24,13 +24,6 @@ class AuthMixin:
     def _init_auth(self) -> None:
         self._rate_limits: dict[int, collections.deque] = {}
         self._failed_auth_counts: dict[int, int] = {}
-        # Track how many trusted IDs existed at startup (before any auth calls).
-        # When > 0, the trusted list is considered "sealed" and new usernames cannot
-        # be added dynamically — only pre-seeded IDs are accepted.
-        if '_trusted_user_ids' in self.__dict__:
-            self._initial_trusted_count = len(self._trusted_user_ids)
-        else:
-            self._initial_trusted_count = 0
 
     def _get_allowed_usernames(self) -> list[str]:
         """Return the effective list of allowed usernames."""
@@ -74,24 +67,9 @@ class AuthMixin:
         if self._failed_auth_counts.get(user.id, 0) >= 5:
             return False
         trusted = self._get_trusted_user_ids()
-        if trusted:
-            if user.id in trusted:
-                return True
-            # When the trusted list was pre-seeded at startup, it is sealed —
-            # only those exact IDs are accepted; new usernames cannot join.
-            if self._initial_trusted_count > 0:
-                self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
-                return False
-            # Trusted list grew dynamically: allow new allowed usernames to join.
-            username = (user.username or "").lower()
-            if username in allowed:
-                self._trust_user(user.id)
-                self._on_trust(user.id)
-                logger.info("Trusted user_id %d saved", user.id)
-                return True
-            self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
-            return False
-        # No trusted IDs yet — trust on first contact
+        if trusted and user.id in trusted:
+            return True
+        # Allow any allowed username to get trusted (even if other IDs exist)
         username = (user.username or "").lower()
         if username in allowed:
             self._trust_user(user.id)
