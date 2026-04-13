@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from telegram.ext import Application
 
+import telegram.error
 from telegram import InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -129,11 +130,31 @@ class ProjectBot:
                 task.chat_id, event.path, reply_to=task.message_id
             )
 
+    async def _send_with_retry(
+        self,
+        send_fn: Callable[..., Awaitable[Any]],
+        *args: Any,
+        max_retries: int = 3,
+        **kwargs: Any,
+    ) -> Any:
+        for attempt in range(max_retries):
+            try:
+                return await send_fn(*args, **kwargs)
+            except telegram.error.RetryAfter as e:
+                delay = e.retry_after
+                await asyncio.sleep(delay.total_seconds() if hasattr(delay, "total_seconds") else float(delay))
+            except telegram.error.TimedOut:
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(1)
+        return None
+
     async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None) -> None:
         assert self._app is not None
         for chunk in split_html(html):
             try:
-                await self._app.bot.send_message(
+                await self._send_with_retry(
+                    self._app.bot.send_message,
                     chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to
                 )
             except Exception:

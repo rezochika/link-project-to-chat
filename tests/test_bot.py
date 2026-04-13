@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import telegram.error
 
 from link_project_to_chat.auth import Authenticator
 from link_project_to_chat.bot import ProjectBot
@@ -710,3 +711,76 @@ class TestTasksCommand:
         update.effective_message.reply_text.assert_called_once()
         text = update.effective_message.reply_text.call_args[0][0]
         assert "No tasks" in text
+
+
+# ---------------------------------------------------------------------------
+# Task 3.4: Test retry logic for transient Telegram API errors
+# ---------------------------------------------------------------------------
+
+class TestSendWithRetry:
+    @pytest.mark.asyncio
+    async def test_retry_after_retries_after_delay(self, bot: ProjectBot) -> None:
+        """RetryAfter causes a sleep then a retry."""
+        retry_exc = telegram.error.RetryAfter(0.05)
+        call_count = 0
+
+        async def mock_send(*args: object, **kwargs: object) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise retry_exc
+            return "ok"
+
+        result = await bot._send_with_retry(mock_send, max_retries=3)
+        assert result == "ok"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_timed_out_retried_up_to_max(self, bot: ProjectBot) -> None:
+        """TimedOut is retried up to max_retries times."""
+        call_count = 0
+
+        async def mock_send(*args: object, **kwargs: object) -> str:
+            nonlocal call_count
+            call_count += 1
+            raise telegram.error.TimedOut("timeout")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(telegram.error.TimedOut):
+            await bot._send_with_retry(mock_send, max_retries=3)
+
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_timed_out_propagates_on_final_attempt(self, bot: ProjectBot) -> None:
+        """TimedOut on the final attempt propagates the exception."""
+        async def always_timeout(*args: object, **kwargs: object) -> None:
+            raise telegram.error.TimedOut("timeout")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(telegram.error.TimedOut):
+            await bot._send_with_retry(always_timeout, max_retries=2)
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt(self, bot: ProjectBot) -> None:
+        """No retries needed when first attempt succeeds."""
+        async def mock_send(*args: object, **kwargs: object) -> str:
+            return "success"
+
+        result = await bot._send_with_retry(mock_send)
+        assert result == "success"
+
+    @pytest.mark.asyncio
+    async def test_send_html_uses_retry(self, bot: ProjectBot) -> None:
+        """_send_html wraps send_message with retry logic."""
+        retry_exc = telegram.error.RetryAfter(0.01)
+        call_count = 0
+
+        async def mock_send(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise retry_exc
+            return MagicMock()
+
+        bot._app.bot.send_message = mock_send  # type: ignore[assignment]
+        await bot._send_html(100, "<b>hello</b>")
+        assert call_count == 2
