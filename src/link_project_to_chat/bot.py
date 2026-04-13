@@ -43,6 +43,7 @@ from .constants import (
 from .formatting import md_to_telegram, split_html, strip_html
 from .health import HealthServer
 from .history import History
+from .hooks import BotHook, HookManager
 from .rate_limiter import RateLimiter
 from .roles import COMMAND_ROLES, has_permission
 from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -86,6 +87,7 @@ class ProjectBot:
         webhook_url: str | None = None,
         webhook_port: int = 8443,
         allowed_users: list[dict[str, str]] | None = None,
+        hook_manager: HookManager | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -106,6 +108,7 @@ class ProjectBot:
             allowed_users=allowed_users,
         )
         self._rate_limiter = rate_limiter or RateLimiter()
+        self._hook_manager = hook_manager if hook_manager is not None else HookManager()
         self._history = History()
         self.task_manager = task_manager or TaskManager(
             project_path=self.path,
@@ -143,6 +146,10 @@ class ProjectBot:
         if role is None:
             return True  # single-user mode: no role stored yet means admin
         return has_permission(role, required)
+
+    def register_hook(self, hook: BotHook) -> None:
+        """Register a hook to extend bot behavior."""
+        self._hook_manager.register(hook)
 
     def _default_on_trust(self, user_id: int) -> None:
         save_trusted_user_id(user_id)
@@ -220,8 +227,9 @@ class ProjectBot:
             return
 
         if task.status == TaskStatus.DONE:
-            self._history.add("assistant", task.result or "", task_id=task.id)
-            await self._send_to_chat(task.chat_id, f"🔹 {task.result}", reply_to=task.message_id)
+            text = await self._hook_manager.process_response(task.result or "", task.chat_id)
+            self._history.add("assistant", text, task_id=task.id)
+            await self._send_to_chat(task.chat_id, f"🔹 {text}", reply_to=task.message_id)
         else:
             await self._send_to_chat(task.chat_id, f"Error: {sanitize_error(task.error)}", reply_to=task.message_id)
 
@@ -284,6 +292,7 @@ class ProjectBot:
         prompt = msg.text or ""
         if msg.reply_to_message and msg.reply_to_message.text:
             prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
+        prompt = await self._hook_manager.process_message(prompt, user.id)
         task = self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
