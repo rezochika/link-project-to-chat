@@ -244,24 +244,21 @@ class TaskManager:
             cwd=str(self.project_path),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
         task._proc = proc
         logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
 
-        stdout_lines: list[str] = []
-        stderr_lines: list[str] = []
+        all_lines: list[str] = []
 
-        def _read_stream(stream, lines: list[str]):
-            for raw_line in stream:
+        def _read_output():
+            for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
-                lines.append(line)
+                all_lines.append(line)
                 task._log.append(line)
 
         try:
-            out_fut = asyncio.to_thread(_read_stream, proc.stdout, stdout_lines)
-            err_fut = asyncio.to_thread(_read_stream, proc.stderr, stderr_lines)
-            await asyncio.gather(out_fut, err_fut)
+            await asyncio.to_thread(_read_output)
             await asyncio.to_thread(proc.wait)
         except asyncio.CancelledError:
             if proc.poll() is None:
@@ -277,8 +274,8 @@ class TaskManager:
         if task.status == TaskStatus.CANCELLED:
             return
 
-        task.result = "\n".join(stdout_lines)
-        task.error = "\n".join(stderr_lines) or None
+        task.result = "\n".join(all_lines)
+        task.error = None
         task.exit_code = proc.returncode
         task.status = TaskStatus.DONE if proc.returncode == 0 else TaskStatus.FAILED
         logger.info(
