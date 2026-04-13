@@ -9,6 +9,23 @@ _CODE_BLOCK_PH = "\x00CODEBLOCK{}\x00"
 _INLINE_CODE_PH = "\x00INLINE{}\x00"
 _SAFE_URL_SCHEMES = frozenset({"http", "https", "mailto", "tg"})
 
+# Compiled regex patterns
+_RE_TABLE = re.compile(r"(?:^\|.+\|[ \t]*\n){2,}", re.MULTILINE)
+_RE_CODE_BLOCK = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+_RE_INLINE_CODE = re.compile(r"`([^`]+)`")
+_RE_HEADING = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+_RE_BOLD_STAR = re.compile(r"\*\*(.+?)\*\*")
+_RE_BOLD_UNDER = re.compile(r"__(.+?)__")
+_RE_ITALIC_STAR = re.compile(r"(?<!\w)\*([^*]+?)\*(?!\w)")
+_RE_ITALIC_UNDER = re.compile(r"(?<!\w)_([^_]+?)_(?!\w)")
+_RE_STRIKETHROUGH = re.compile(r"~~(.+?)~~")
+_RE_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_RE_BLOCKQUOTE = re.compile(r"^&gt;\s?(.+)$", re.MULTILINE)
+_RE_PRE_BLOCK = re.compile(r"(<pre(?:\s[^>]*)?>.*?</pre>)", re.DOTALL)
+_RE_PRE_MATCH = re.compile(r"(<pre[^>]*>)(.*)(</pre>)", re.DOTALL)
+_RE_STRIP_TAGS = re.compile(r"<[^>]+>")
+_RE_TABLE_SEPARATOR = re.compile(r":?-+:?")
+
 
 def _is_safe_url(url: str) -> bool:
     """Check if a URL has a safe scheme. Rejects javascript:, data:, vbscript:, etc."""
@@ -30,12 +47,7 @@ def md_to_telegram(text: str) -> str:
         code_blocks.append(block)
         return _CODE_BLOCK_PH.format(len(code_blocks) - 1)
 
-    text = re.sub(
-        r"(?:^\|.+\|[ \t]*\n){2,}",
-        _save_table,
-        text,
-        flags=re.MULTILINE,
-    )
+    text = _RE_TABLE.sub(_save_table, text)
 
     def _save_block(m: re.Match[str]) -> str:
         lang = m.group(1) or ""
@@ -48,33 +60,32 @@ def md_to_telegram(text: str) -> str:
         code_blocks.append(block)
         return _CODE_BLOCK_PH.format(len(code_blocks) - 1)
 
-    text = re.sub(r"```(\w*)\n(.*?)```", _save_block, text, flags=re.DOTALL)
+    text = _RE_CODE_BLOCK.sub(_save_block, text)
 
     def _save_inline(m: re.Match[str]) -> str:
         code = _escape_html(m.group(1))
         inline_codes.append(f"<code>{code}</code>")
         return _INLINE_CODE_PH.format(len(inline_codes) - 1)
 
-    text = re.sub(r"`([^`]+)`", _save_inline, text)
+    text = _RE_INLINE_CODE.sub(_save_inline, text)
 
     text = _escape_html(text)
 
-    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\w)\*([^*]+?)\*(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!\w)_([^_]+?)_(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = _RE_HEADING.sub(r"<b>\1</b>", text)
+    text = _RE_BOLD_STAR.sub(r"<b>\1</b>", text)
+    text = _RE_BOLD_UNDER.sub(r"<b>\1</b>", text)
+    text = _RE_ITALIC_STAR.sub(r"<i>\1</i>", text)
+    text = _RE_ITALIC_UNDER.sub(r"<i>\1</i>", text)
+    text = _RE_STRIKETHROUGH.sub(r"<s>\1</s>", text)
+
     def _safe_link(m: re.Match[str]) -> str:
         label, url = m.group(1), m.group(2)
         if _is_safe_url(url):
             return f'<a href="{url}">{label}</a>'
         return label  # Strip unsafe links, keep label text
 
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
-    text = re.sub(
-        r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE
-    )
+    text = _RE_LINK.sub(_safe_link, text)
+    text = _RE_BLOCKQUOTE.sub(r"<blockquote>\1</blockquote>", text)
 
     for i, block in enumerate(code_blocks):
         text = text.replace(_escape_html(_CODE_BLOCK_PH.format(i)), block)
@@ -85,7 +96,7 @@ def md_to_telegram(text: str) -> str:
 
 
 def _split_pre_block(part: str, limit: int) -> list[str]:
-    m = re.match(r"(<pre[^>]*>)(.*)(</pre>)", part, re.DOTALL)
+    m = _RE_PRE_MATCH.match(part)
     if not m:
         return [part]
     open_tag, content, close_tag = m.group(1), m.group(2), m.group(3)
@@ -129,7 +140,7 @@ def split_html(html: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
         return [html]
 
     segments: list[str] = []
-    parts = re.split(r"(<pre(?:\s[^>]*)?>.*?</pre>)", html, flags=re.DOTALL)
+    parts = _RE_PRE_BLOCK.split(html)
     for part in parts:
         if not part:
             continue
@@ -145,7 +156,7 @@ def split_html(html: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
 
 
 def strip_html(html: str) -> str:
-    text = re.sub(r"<[^>]+>", "", html)
+    text = _RE_STRIP_TAGS.sub("", html)
     return text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
 
 
@@ -153,7 +164,7 @@ def _render_table(table_text: str) -> str:
     rows: list[list[str]] = []
     for line in table_text.strip().splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if all(re.fullmatch(r":?-+:?", c) for c in cells):
+        if all(_RE_TABLE_SEPARATOR.fullmatch(c) for c in cells):
             continue
         rows.append(cells)
     if not rows:
