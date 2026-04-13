@@ -15,7 +15,7 @@ def client():
 
 
 def _mock_response(status_code: int, json_data, headers=None):
-    resp = AsyncMock()
+    resp = MagicMock()
     resp.status_code = status_code
     resp.json.return_value = json_data
     resp.headers = headers or {}

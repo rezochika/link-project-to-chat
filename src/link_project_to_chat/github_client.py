@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,13 +44,12 @@ class GitHubClient:
 
     async def list_repos(self, page: int = 1, per_page: int = 5) -> tuple[list[RepoInfo], bool]:
         resp = await self._client.get("/user/repos", params={"sort": "updated", "page": page, "per_page": per_page})
-        data = await resp.json() if inspect.iscoroutinefunction(resp.json) else resp.json()
         if resp.status_code != 200:
-            raise Exception(f"GitHub API error {resp.status_code}: {data.get('message', '')}")
+            raise Exception(f"GitHub API error {resp.status_code}: {resp.json().get('message', '')}")
         repos = [
             RepoInfo(name=r["name"], full_name=r["full_name"], html_url=r["html_url"],
                      clone_url=r["clone_url"], description=r.get("description") or "", private=r["private"])
-            for r in data
+            for r in resp.json()
         ]
         has_next = 'rel="next"' in resp.headers.get("link", "")
         return repos, has_next
@@ -64,7 +62,7 @@ class GitHubClient:
         resp = await self._client.get(f"/repos/{owner}/{repo}")
         if resp.status_code != 200:
             return None
-        r = await resp.json() if inspect.iscoroutinefunction(resp.json) else resp.json()
+        r = resp.json()
         return RepoInfo(name=r["name"], full_name=r["full_name"], html_url=r["html_url"],
                         clone_url=r["clone_url"], description=r.get("description") or "", private=r["private"])
 
