@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  bot:
+    build: .
+    volumes:
+      - ./config:/root/.link-project-to-chat
+      - ./project:/project
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    restart: unless-stopped
