@@ -30,6 +30,9 @@ dependencies = [
     "click>=8.0",
 ]
 
+[project.optional-dependencies]
+create = ["httpx>=0.27", "telethon>=1.36"]
+
 [project.urls]
 Homepage = "https://github.com/rimnadze/link-project-to-chat"
 Repository = "https://github.com/rimnadze/link-project-to-chat"
