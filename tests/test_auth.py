@@ -83,3 +83,51 @@ def test_rate_limit_independent_per_user():
         bot._rate_limited(1)
     # User 2 should not be affected
     assert bot._rate_limited(2) is False
+
+
+class _MultiBot(AuthMixin):
+    def __init__(self, usernames: list[str] = None, trusted_ids: list[int] = None):
+        self._allowed_usernames = usernames or []
+        self._trusted_user_ids = trusted_ids or []
+        self._init_auth()
+
+
+def test_multi_user_fail_closed_empty_list():
+    bot = _MultiBot(usernames=[])
+    assert bot._auth(_make_user(1, "alice")) is False
+
+
+def test_multi_user_first_contact_trusts():
+    bot = _MultiBot(usernames=["alice", "bob"])
+    user = _make_user(10, "Alice")
+    assert bot._auth(user) is True
+    assert 10 in bot._trusted_user_ids
+
+
+def test_multi_user_second_user_trusts():
+    bot = _MultiBot(usernames=["alice", "bob"])
+    assert bot._auth(_make_user(10, "alice")) is True
+    assert bot._auth(_make_user(20, "bob")) is True
+    assert bot._trusted_user_ids == [10, 20]
+
+
+def test_multi_user_trusted_by_id():
+    bot = _MultiBot(usernames=["alice"], trusted_ids=[42])
+    assert bot._auth(_make_user(42, "alice")) is True
+
+
+def test_multi_user_wrong_username_denied():
+    bot = _MultiBot(usernames=["alice"])
+    assert bot._auth(_make_user(5, "mallory")) is False
+
+
+def test_multi_user_trusted_id_wrong_user():
+    """A trusted ID that doesn't belong to any allowed username still works (by design)."""
+    bot = _MultiBot(usernames=["alice"], trusted_ids=[42])
+    assert bot._auth(_make_user(42, "different")) is True
+
+
+def test_multi_user_untrusted_id_denied():
+    bot = _MultiBot(usernames=["alice"], trusted_ids=[42])
+    assert bot._auth(_make_user(99, "alice")) is False
+    assert bot._failed_auth_counts[99] == 1
