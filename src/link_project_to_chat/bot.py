@@ -598,6 +598,9 @@ class ProjectBot:
         else:
             logger.error("Update error: %s | update=%s", ctx.error, update)
 
+    async def _post_stop(self, app: Any) -> None:
+        await self.task_manager.shutdown()
+
     async def _post_init(self, app: Any) -> None:
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
@@ -617,6 +620,7 @@ class ProjectBot:
             .token(self.token)
             .concurrent_updates(True)
             .post_init(self._post_init)
+            .post_stop(self._post_stop)
             .build()
         )
         self._app = app

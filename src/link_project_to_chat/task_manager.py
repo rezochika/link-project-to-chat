@@ -371,3 +371,10 @@ class TaskManager:
     @property
     def waiting_count(self) -> int:
         return sum(1 for t in self._tasks.values() if t.status == TaskStatus.WAITING)
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        """Cancel all tasks and wait for them to finish."""
+        self.cancel_all()
+        deadline = time.monotonic() + timeout
+        while self.running_count > 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)

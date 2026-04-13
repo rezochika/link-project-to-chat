@@ -246,3 +246,61 @@ async def test_run_command_timeout_error_message(tmp_path):
     assert task.error is not None
     assert "timed out" in task.error
     assert "0.5s" in task.error
+
+
+# --- Shutdown tests ---
+
+@pytest.mark.asyncio
+async def test_shutdown_no_tasks(tmp_path):
+    """shutdown() returns immediately when no tasks are running."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    # Should return quickly with no tasks
+    await asyncio.wait_for(tm.shutdown(timeout=5.0), timeout=2.0)
+    assert tm.running_count == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_running_tasks(tmp_path):
+    """shutdown() cancels all running tasks."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    task1 = tm.run_command(chat_id=1, message_id=1, command="sleep 30")
+    task2 = tm.run_command(chat_id=1, message_id=2, command="sleep 30")
+    await asyncio.sleep(0.1)  # Let tasks start
+
+    await asyncio.wait_for(tm.shutdown(timeout=5.0), timeout=5.0)
+
+    assert task1.status == TaskStatus.CANCELLED
+    assert task2.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_shutdown_respects_timeout(tmp_path):
+    """shutdown() returns after timeout even if tasks are still listed as running."""
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+
+    # Add a fake task that stays in RUNNING even after cancel() (simulates stuck task)
+    fake_task = Task(id=99, chat_id=1, message_id=1, type=TaskType.COMMAND, input="x", name="x")
+    fake_task.status = TaskStatus.RUNNING
+    tm._tasks[99] = fake_task
+
+    # Patch cancel_all to NOT change the status, so running_count stays > 0
+    def stubbed_cancel_all() -> int:
+        return 0  # do nothing — task stays RUNNING
+
+    tm.cancel_all = stubbed_cancel_all  # type: ignore[method-assign]
+
+    start = time.monotonic()
+    await asyncio.wait_for(tm.shutdown(timeout=0.3), timeout=2.0)
+    elapsed = time.monotonic() - start
+
+    # Should have waited approximately the timeout duration
+    assert elapsed >= 0.3
