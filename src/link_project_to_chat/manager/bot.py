@@ -17,7 +17,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import DEFAULT_CONFIG, save_trusted_user_id
+from ..config import DEFAULT_CONFIG
 from .._auth import AuthMixin
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,9 @@ COMMANDS = [
     ("stop_all", "Stop all projects"),
     ("add_project", "Add a new project"),
     ("edit_project", "Edit a project"),
+    ("users", "List authorized users"),
+    ("add_user", "Add an authorized user"),
+    ("remove_user", "Remove an authorized user"),
     ("help", "Show commands"),
 ]
 
@@ -53,22 +56,31 @@ class ManagerBot(AuthMixin):
         self,
         token: str,
         process_manager: ProcessManager,
-        allowed_username: str,
+        allowed_username: str = "",
+        allowed_usernames: list[str] | None = None,
         trusted_user_id: int | None = None,
+        trusted_user_ids: list[int] | None = None,
         project_config_path: Path | None = None,
     ):
         self._token = token
         self._pm = process_manager
-        self._allowed_username = allowed_username
-        self._trusted_user_id = trusted_user_id
+        if allowed_usernames:
+            self._allowed_usernames = allowed_usernames
+        else:
+            self._allowed_username = allowed_username
+        if trusted_user_ids:
+            self._trusted_user_ids = trusted_user_ids
+        else:
+            self._trusted_user_id = trusted_user_id
         self._started_at = time.monotonic()
         self._app = None
         self._project_config_path = project_config_path
         self._init_auth()
 
     def _on_trust(self, user_id: int) -> None:
+        from ..config import add_trusted_user_id
         path = self._project_config_path or DEFAULT_CONFIG
-        save_trusted_user_id(user_id, path)
+        add_trusted_user_id(user_id, path)
 
     def _load_projects(self) -> dict[str, dict]:
         path = self._project_config_path
@@ -193,6 +205,55 @@ class ManagerBot(AuthMixin):
         self._save_projects(projects)
         await update.effective_message.reply_text(f"Added project '{name}'.")
         return ConversationHandler.END
+
+    async def _on_users(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        usernames = self._get_allowed_usernames()
+        if not usernames:
+            return await update.effective_message.reply_text("No authorized users.")
+        text = "Authorized users:\n" + "\n".join(f"  @{u}" for u in usernames)
+        await update.effective_message.reply_text(text)
+
+    async def _on_add_user(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /add_user <username>")
+        new_user = ctx.args[0].lower().lstrip("@")
+        usernames = self._get_allowed_usernames()
+        if new_user in usernames:
+            return await update.effective_message.reply_text(f"@{new_user} is already authorized.")
+        if not self._allowed_usernames:
+            self._allowed_usernames = list(usernames)
+        self._allowed_usernames.append(new_user)
+        from ..config import load_config, save_config
+        path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(path)
+        if new_user not in config.allowed_usernames:
+            config.allowed_usernames.append(new_user)
+            save_config(config, path)
+        await update.effective_message.reply_text(f"Added @{new_user}.")
+
+    async def _on_remove_user(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /remove_user <username>")
+        rm_user = ctx.args[0].lower().lstrip("@")
+        usernames = self._get_allowed_usernames()
+        if rm_user not in usernames:
+            return await update.effective_message.reply_text(f"@{rm_user} is not authorized.")
+        if not self._allowed_usernames:
+            self._allowed_usernames = list(usernames)
+        self._allowed_usernames.remove(rm_user)
+        from ..config import load_config, save_config
+        path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(path)
+        if rm_user in config.allowed_usernames:
+            config.allowed_usernames.remove(rm_user)
+            save_config(config, path)
+        await update.effective_message.reply_text(f"Removed @{rm_user}.")
 
     async def _on_edit_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -369,6 +430,9 @@ class ManagerBot(AuthMixin):
             "stop_all": self._on_stop_all,
             "help": self._on_help,
             "edit_project": self._on_edit_project,
+            "users": self._on_users,
+            "add_user": self._on_add_user,
+            "remove_user": self._on_remove_user,
         }.items():
             app.add_handler(CommandHandler(name, handler))
 
