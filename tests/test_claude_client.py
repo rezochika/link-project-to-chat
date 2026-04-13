@@ -391,3 +391,43 @@ def test_status_timeout_none_by_default(tmp_path: Path):
     """status property should show None when no timeout is configured."""
     client = ClaudeClient(project_path=tmp_path)
     assert client.status["timeout"] is None
+
+
+# --- System prompt tests ---
+
+@pytest.mark.asyncio
+async def test_command_includes_system_prompt(tmp_path: Path):
+    """system_prompt should be passed as --system-prompt flag when set."""
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, system_prompt="You are a helpful assistant.", runner=runner)
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--system-prompt" in runner.last_cmd
+    idx = runner.last_cmd.index("--system-prompt")
+    assert runner.last_cmd[idx + 1] == "You are a helpful assistant."
+
+
+@pytest.mark.asyncio
+async def test_command_omits_system_prompt_when_none(tmp_path: Path):
+    """--system-prompt should NOT appear in command when system_prompt is None."""
+    runner = FakeRunner(stdout_lines=[_result_line()])
+    client = ClaudeClient(project_path=tmp_path, system_prompt=None, runner=runner)
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert "--system-prompt" not in runner.last_cmd
+
+
+def test_status_includes_system_prompt(tmp_path: Path):
+    """status property should expose the configured system_prompt."""
+    client = ClaudeClient(project_path=tmp_path, system_prompt="Be concise.")
+    assert client.status["system_prompt"] == "Be concise."
+
+
+def test_status_system_prompt_none_by_default(tmp_path: Path):
+    """status property should show None when no system_prompt is configured."""
+    client = ClaudeClient(project_path=tmp_path)
+    assert client.status["system_prompt"] is None

@@ -87,10 +87,12 @@ def projects_list(ctx: click.Context) -> None:
     default=False,
     help="Allow Claude to skip all permission checks",
 )
+@click.option("--system-prompt", "system_prompt", default=None, help="Custom system prompt for Claude")
 @click.pass_context
 def projects_add(
     ctx: click.Context, name: str, project_path: str, token: str, username: str | None,
     model: str | None, permission_mode: str | None, skip_permissions: bool,
+    system_prompt: str | None,
 ) -> None:
     """Add a project."""
     from .manager.config import load_project_configs, save_project_configs
@@ -108,6 +110,8 @@ def projects_add(
         entry["permission_mode"] = permission_mode
     if skip_permissions:
         entry["dangerously_skip_permissions"] = True
+    if system_prompt:
+        entry["system_prompt"] = system_prompt
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")
 
@@ -134,10 +138,17 @@ def projects_remove(ctx: click.Context, name: str) -> None:
 @click.argument("value")
 @click.pass_context
 def projects_edit(ctx: click.Context, name: str, field: str, value: str) -> None:
-    """Edit a project field (name, path, token, username, model, permission_mode, dangerously_skip_permissions)."""
+    """Edit a project field.
+
+    Valid fields: name, path, token, username, model, permission_mode,
+    dangerously_skip_permissions, system_prompt.
+    """
     from .manager.config import load_project_configs, save_project_configs
 
-    _EDITABLE = ("name", "path", "token", "username", "model", "permission_mode", "dangerously_skip_permissions")
+    _EDITABLE = (
+        "name", "path", "token", "username", "model",
+        "permission_mode", "dangerously_skip_permissions", "system_prompt",
+    )
     cfg_path = ctx.obj["config_path"]
     projects = load_project_configs(cfg_path)
     if name not in projects:
@@ -159,7 +170,7 @@ def projects_edit(ctx: click.Context, name: str, field: str, value: str) -> None
         projects[name]["telegram_bot_token"] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' token.")
-    elif field in ("username", "model", "permission_mode", "dangerously_skip_permissions"):
+    elif field in ("username", "model", "permission_mode", "dangerously_skip_permissions", "system_prompt"):
         projects[name][field] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' {field} to {value}.")
@@ -256,6 +267,12 @@ def configure(ctx: click.Context, username: str | None, manager_token: str | Non
     show_default=True,
     help="Local port to listen on in webhook mode",
 )
+@click.option(
+    "--system-prompt",
+    "system_prompt",
+    default=None,
+    help="Custom system prompt for Claude (overrides config)",
+)
 @click.pass_context
 def start(
     ctx: click.Context,
@@ -272,6 +289,7 @@ def start(
     health_port: int | None,
     webhook_url: str | None,
     webhook_port: int,
+    system_prompt: str | None,
 ) -> None:
     """Start the Telegram bot.
 
@@ -302,6 +320,7 @@ def start(
                 health_port=health_port,
                 webhook_url=webhook_url,
                 webhook_port=webhook_port,
+                system_prompt=system_prompt,
             )
             return
 
@@ -341,6 +360,7 @@ def start(
                 health_port=health_port,
                 webhook_url=webhook_url,
                 webhook_port=webhook_port,
+                system_prompt=system_prompt or proj.system_prompt,
             )
         else:
             run_bots(
@@ -351,6 +371,7 @@ def start(
                 allowed_tools=allowed,
                 disallowed_tools=disallowed,
                 config_path=cfg_path,
+                system_prompt=system_prompt,
             )
     except BotError as e:
         raise SystemExit(e.user_message) from e

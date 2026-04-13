@@ -88,6 +88,7 @@ class ProjectBot:
         webhook_port: int = 8443,
         allowed_users: list[dict[str, str]] | None = None,
         hook_manager: HookManager | None = None,
+        system_prompt: str | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -119,6 +120,7 @@ class ProjectBot:
             permission_mode=permission_mode,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
+            system_prompt=system_prompt,
         )
 
     def _health_status(self) -> dict[str, Any]:
@@ -423,6 +425,31 @@ class ProjectBot:
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
         )
+
+    async def _on_system(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg:
+            return
+        if not self._authenticator.authenticate(update.effective_user):
+            await msg.reply_text("Unauthorized.")
+            return
+        if not self._check_role(update.effective_user.id, "system"):  # type: ignore[union-attr]
+            await msg.reply_text("Permission denied. Requires developer role or higher.")
+            return
+        args = ctx.args or []
+        if not args:
+            prompt = self.task_manager.claude.system_prompt
+            if prompt:
+                await msg.reply_text(f"System prompt:\n{prompt}")
+            else:
+                await msg.reply_text("No system prompt set.")
+        elif args[0] == "clear":
+            self.task_manager.claude.system_prompt = None
+            await msg.reply_text("System prompt cleared.")
+        else:
+            new_prompt = " ".join(args)
+            self.task_manager.claude.system_prompt = new_prompt
+            await msg.reply_text(f"System prompt set:\n{new_prompt}")
 
     async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -746,6 +773,7 @@ class ProjectBot:
             "reset": self._on_reset,
             "status": self._on_status,
             "history": self._on_history,
+            "system": self._on_system,
             "help": self._on_help,
         }
         private = filters.ChatType.PRIVATE
@@ -795,6 +823,7 @@ def run_bot(
     webhook_url: str | None = None,
     webhook_port: int = 8443,
     allowed_users: list[dict[str, str]] | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     if not username and not allowed_users:
         raise SystemExit(
@@ -814,6 +843,7 @@ def run_bot(
         webhook_url=webhook_url,
         webhook_port=webhook_port,
         allowed_users=allowed_users,
+        system_prompt=system_prompt,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -841,6 +871,7 @@ def run_bots(
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     config_path: Path | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
@@ -871,6 +902,7 @@ def run_bots(
             trusted_user_id=effective_trusted_id,
             on_trust=on_trust,
             allowed_users=effective_allowed_users,
+            system_prompt=system_prompt or proj.system_prompt,
         )
     else:
         names = ", ".join(config.projects.keys())

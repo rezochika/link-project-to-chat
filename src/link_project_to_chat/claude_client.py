@@ -46,6 +46,7 @@ class ClaudeClient:
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         runner: ProcessRunner | None = None,
+        system_prompt: str | None = None,
     ):
         self.model = model
         self.model_display: str | None = None
@@ -55,6 +56,7 @@ class ClaudeClient:
         self.permission_mode: str | None = permission_mode
         self.allowed_tools: list[str] = allowed_tools or []
         self.disallowed_tools: list[str] = disallowed_tools or []
+        self.system_prompt: str | None = system_prompt
         self.session_id: str | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._started_at: float | None = None
@@ -95,6 +97,9 @@ class ClaudeClient:
 
         if self.session_id:
             cmd.extend(["--resume", self.session_id])
+
+        if self.system_prompt:
+            cmd.extend(["--system-prompt", self.system_prompt])
 
         cmd.extend(["--", user_message])
 
@@ -205,6 +210,7 @@ class ClaudeClient:
             if self._last_duration
             else None,
             "timeout": self._timeout,
+            "system_prompt": self.system_prompt,
         }
         if running and self._started_at:
             info["elapsed"] = round(time.monotonic() - self._started_at, 1)

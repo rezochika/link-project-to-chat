@@ -24,6 +24,7 @@ COMMAND_ROLES: dict[str, Role] = {
     "permissions": Role.ADMIN,
     "compact": Role.ADMIN,
     "reset": Role.ADMIN,
+    "system": Role.DEVELOPER,
 }
 
 # Role hierarchy: admin > developer > viewer

@@ -112,6 +112,7 @@ class TaskManager:
         disallowed_tools: list[str] | None = None,
         claude: ClaudeClient | None = None,
         command_timeout: float | None = None,  # seconds, None = no timeout
+        system_prompt: str | None = None,
     ):
         self.project_path = project_path
         self._on_complete = on_complete
@@ -126,6 +127,7 @@ class TaskManager:
             permission_mode=permission_mode,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
+            system_prompt=system_prompt,
         )
 
     @property

@@ -29,6 +29,7 @@ class ProjectConfig:
     dangerously_skip_permissions: bool = False
     session_id: str | None = None
     autostart: bool = False
+    system_prompt: str | None = None
 
 
 @dataclass
@@ -88,6 +89,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             dangerously_skip_permissions=proj.dangerously_skip_permissions,
             session_id=proj.session_id,
             autostart=proj.autostart,
+            system_prompt=proj.system_prompt,
         )
     return config
 
@@ -141,6 +143,10 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
         else:
             proj.pop("session_id", None)
         proj["autostart"] = p.autostart
+        if p.system_prompt:
+            proj["system_prompt"] = p.system_prompt
+        else:
+            proj.pop("system_prompt", None)
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}

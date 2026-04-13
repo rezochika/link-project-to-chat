@@ -49,6 +49,7 @@ class ProjectConfigModel(BaseModel):
     dangerously_skip_permissions: bool = False
     session_id: str | None = None
     autostart: bool = False
+    system_prompt: str | None = None
 
     model_config = {"extra": "allow"}  # Preserve unknown keys for forward compat
 

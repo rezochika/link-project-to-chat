@@ -36,6 +36,7 @@ COMMANDS = [
     ("effort", "Set thinking depth (low/medium/high/max)"),
     ("permissions", "Set permission mode"),
     ("compact", "Compress session context"),
+    ("system", "View/set/clear system prompt"),
     ("status", "Bot status"),
     ("history", "Show recent conversation history"),
     ("reset", "Clear Claude session"),
