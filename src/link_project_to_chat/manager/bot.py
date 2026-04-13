@@ -907,6 +907,7 @@ class ManagerBot(AuthMixin):
                 self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
             },
             fallbacks=[CommandHandler("cancel", self._create_cancel)],
+            per_message=True,
         ))
 
         app.add_handler(CommandHandler("cancel", self._edit_cancel))
