@@ -40,6 +40,7 @@ class ClaudeClient:
         self,
         project_path: Path,
         model: str = DEFAULT_MODEL,
+        timeout: float | None = None,
         skip_permissions: bool = True,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
@@ -60,6 +61,7 @@ class ClaudeClient:
         self._last_message: str | None = None
         self._last_duration: float | None = None
         self._total_requests: int = 0
+        self._timeout: float | None = timeout
         self._runner: ProcessRunner = runner or _SubprocessRunner()
 
     async def chat_stream(
@@ -132,8 +134,30 @@ class ClaudeClient:
                 lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
             return lines
 
+        timed_out = False
         try:
-            all_lines = await asyncio.to_thread(_read_lines)
+            read_task = asyncio.ensure_future(asyncio.to_thread(_read_lines))
+            try:
+                all_lines = await asyncio.wait_for(
+                    asyncio.shield(read_task),
+                    timeout=self._timeout,
+                )
+            except TimeoutError:
+                timed_out = True
+                read_task.cancel()
+                try:
+                    await read_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                proc.kill()
+                logger.warning(
+                    "claude stream pid=%s timed out after %ss", proc.pid, self._timeout
+                )
+                yield Error(
+                    message=f"Claude request timed out after {self._timeout}s"
+                )
+                return
+
             for line in all_lines:
                 if not line.strip():
                     continue
@@ -155,6 +179,8 @@ class ClaudeClient:
             if self._proc is proc:
                 self._started_at = None
                 self._proc = None
+            if not timed_out and proc.poll() is None:
+                proc.kill()
             logger.info("claude stream pid=%s done, code=%s", proc.pid, proc.returncode)
 
     async def chat(self, user_message: str, on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None) -> str:
@@ -178,6 +204,7 @@ class ClaudeClient:
             "last_duration": round(self._last_duration, 1)
             if self._last_duration
             else None,
+            "timeout": self._timeout,
         }
         if running and self._started_at:
             info["elapsed"] = round(time.monotonic() - self._started_at, 1)

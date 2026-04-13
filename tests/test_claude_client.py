@@ -281,3 +281,113 @@ def test_status_idle(tmp_path: Path):
 def test_cancel_no_proc(tmp_path: Path):
     client = ClaudeClient(project_path=tmp_path)
     assert client.cancel() is False
+
+
+# --- Timeout ---
+
+class SlowRunner:
+    """A runner that blocks stdout iteration until killed, simulating a slow subprocess."""
+
+    def __init__(self, block_seconds: float = 10.0):
+        self._block_seconds = block_seconds
+        self.was_killed = False
+
+    def run(
+        self,
+        cmd: list[str],
+        cwd: str,
+        env: dict[str, str],
+        stdin: int,
+        stdout: int,
+        stderr: int,
+    ) -> subprocess.Popen[bytes]:
+        import os
+
+        # A real OS pipe: reading from r_fd blocks until data arrives or w_fd is closed.
+        r_fd, w_fd = os.pipe()
+
+        proc = MagicMock(spec=subprocess.Popen)
+        proc.pid = 99999
+        proc.returncode = None
+        proc.poll.return_value = None
+
+        runner_ref = self
+
+        def _kill() -> None:
+            runner_ref.was_killed = True
+            proc.returncode = -9
+            proc.poll.return_value = -9
+            # Closing the write end unblocks the read end
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+
+        proc.kill = _kill
+
+        # Wrap the read fd as a buffered binary file so iteration works normally.
+        # Iterating over it will call readline() internally, which blocks until
+        # data or EOF (write end closed via kill()).
+        proc.stdout = os.fdopen(r_fd, "rb")
+        proc.stderr = io.BytesIO(b"")
+        proc.wait.return_value = -9
+        return proc
+
+
+@pytest.mark.asyncio
+async def test_timeout_none_does_not_affect_behavior(tmp_path: Path):
+    """timeout=None (default) should work normally without any timeout."""
+    runner = FakeRunner(stdout_lines=[_result_line("answer")])
+    client = ClaudeClient(project_path=tmp_path, timeout=None, runner=runner)
+
+    events: list[Any] = []
+    async for event in client.chat_stream("test"):
+        events.append(event)
+
+    from link_project_to_chat.stream import Result
+    assert any(isinstance(e, Result) for e in events)
+    assert not any(
+        isinstance(e, Error) and "timed out" in e.message for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_timeout_kills_slow_process(tmp_path: Path):
+    """A subprocess that takes too long should be killed and yield an Error."""
+    slow_runner = SlowRunner(block_seconds=10.0)
+    client = ClaudeClient(project_path=tmp_path, timeout=0.2, runner=slow_runner)
+
+    events: list[Any] = []
+    async for event in client.chat_stream("test"):
+        events.append(event)
+
+    assert len(events) == 1
+    assert isinstance(events[0], Error)
+    assert "timed out" in events[0].message
+    assert "0.2s" in events[0].message
+    assert slow_runner.was_killed is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_cleans_up_proc_reference(tmp_path: Path):
+    """After a timeout, _proc should be cleared so the client can be reused."""
+    slow_runner = SlowRunner(block_seconds=10.0)
+    client = ClaudeClient(project_path=tmp_path, timeout=0.2, runner=slow_runner)
+
+    async for _ in client.chat_stream("test"):
+        pass
+
+    assert client._proc is None
+    assert client._started_at is None
+
+
+def test_status_includes_timeout(tmp_path: Path):
+    """status property should expose the configured timeout."""
+    client = ClaudeClient(project_path=tmp_path, timeout=30.0)
+    assert client.status["timeout"] == 30.0
+
+
+def test_status_timeout_none_by_default(tmp_path: Path):
+    """status property should show None when no timeout is configured."""
+    client = ClaudeClient(project_path=tmp_path)
+    assert client.status["timeout"] is None
