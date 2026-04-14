@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 create = ["httpx>=0.27", "telethon>=1.36"]
+voice = ["openai>=1.30"]
+all = ["httpx>=0.27", "telethon>=1.36", "openai>=1.30"]
 
 [project.urls]
 Homepage = "https://github.com/rimnadze/link-project-to-chat"
