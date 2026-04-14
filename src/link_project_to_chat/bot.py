@@ -695,6 +695,14 @@ class ProjectBot(AuthMixin):
         if not voice:
             return await msg.reply_text("Could not read voice message.")
 
+        # Telegram Bot API caps file downloads at 20 MB.
+        MAX_VOICE_BYTES = 20 * 1024 * 1024
+        if voice.file_size and voice.file_size > MAX_VOICE_BYTES:
+            size_mb = voice.file_size // (1024 * 1024)
+            return await msg.reply_text(
+                f"Audio too large ({size_mb} MB). Telegram Bot API limit is 20 MB."
+            )
+
         status_msg = await msg.reply_text("🎤 Transcribing...")
 
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "voice"
@@ -736,7 +744,10 @@ class ProjectBot(AuthMixin):
 
         except Exception as e:
             logger.exception("Voice transcription failed")
-            await status_msg.edit_text(f"Transcription failed: {e}")
+            # Sanitize: only the first line, hard-truncated, to avoid leaking
+            # API keys or full request payloads in SDK error messages.
+            error_summary = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+            await status_msg.edit_text(f"Transcription failed: {error_summary}")
         finally:
             if ogg_path.exists():
                 try:
