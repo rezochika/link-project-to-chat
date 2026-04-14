@@ -28,6 +28,10 @@ class Config:
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
     manager_telegram_bot_token: str = ""
+    stt_backend: str = ""            # "whisper-api" or "whisper-cli" or "" (disabled)
+    openai_api_key: str = ""
+    whisper_model: str = "whisper-1" # OpenAI model name or local whisper.cpp model size
+    whisper_language: str = ""       # ISO 639-1 code (e.g. "en", "ka"), empty = auto-detect
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -82,6 +86,10 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.manager_telegram_bot_token = raw.get(
             "manager_telegram_bot_token", raw.get("manager_bot_token", "")
         )
+        config.stt_backend = raw.get("stt_backend", "")
+        config.openai_api_key = raw.get("openai_api_key", "")
+        config.whisper_model = raw.get("whisper_model", "whisper-1")
+        config.whisper_language = raw.get("whisper_language", "")
         for name, proj in raw.get("projects", {}).items():
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
@@ -125,6 +133,23 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
         raw["telegram_api_hash"] = config.telegram_api_hash
     else:
         raw.pop("telegram_api_hash", None)
+    if config.stt_backend:
+        raw["stt_backend"] = config.stt_backend
+    else:
+        raw.pop("stt_backend", None)
+    if config.openai_api_key:
+        raw["openai_api_key"] = config.openai_api_key
+    else:
+        raw.pop("openai_api_key", None)
+    # Only omit whisper_model when it's the default "whisper-1" (keeps JSON clean).
+    if config.whisper_model and config.whisper_model != "whisper-1":
+        raw["whisper_model"] = config.whisper_model
+    else:
+        raw.pop("whisper_model", None)
+    if config.whisper_language:
+        raw["whisper_language"] = config.whisper_language
+    else:
+        raw.pop("whisper_language", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
     for name, p in config.projects.items():

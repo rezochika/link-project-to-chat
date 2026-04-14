@@ -335,3 +335,68 @@ def test_add_project_trusted_user_id(tmp_path: Path):
     add_project_trusted_user_id("proj", 20, p)
     raw = json.loads(p.read_text())
     assert raw["projects"]["proj"]["trusted_user_ids"] == [10, 20]
+
+
+def test_load_config_voice_fields(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "allowed_usernames": ["alice"],
+        "stt_backend": "whisper-api",
+        "openai_api_key": "sk-test123",
+        "whisper_model": "whisper-1",
+        "whisper_language": "en",
+        "projects": {},
+    }))
+    config = load_config(p)
+    assert config.stt_backend == "whisper-api"
+    assert config.openai_api_key == "sk-test123"
+    assert config.whisper_model == "whisper-1"
+    assert config.whisper_language == "en"
+
+
+def test_load_config_voice_defaults(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"allowed_usernames": ["alice"], "projects": {}}))
+    config = load_config(p)
+    assert config.stt_backend == ""
+    assert config.openai_api_key == ""
+    assert config.whisper_model == "whisper-1"
+    assert config.whisper_language == ""
+
+
+def test_save_config_voice_roundtrip(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        allowed_usernames=["alice"],
+        stt_backend="whisper-api",
+        openai_api_key="sk-xxx",
+        whisper_model="small",
+        whisper_language="ka",
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.stt_backend == "whisper-api"
+    assert loaded.openai_api_key == "sk-xxx"
+    assert loaded.whisper_model == "small"
+    assert loaded.whisper_language == "ka"
+
+
+def test_save_config_omits_empty_voice_fields(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(allowed_usernames=["alice"])
+    save_config(cfg, p)
+    raw = json.loads(p.read_text())
+    assert "stt_backend" not in raw
+    assert "openai_api_key" not in raw
+    assert "whisper_language" not in raw
+    # whisper_model defaults to "whisper-1" and is omitted when at default
+    assert "whisper_model" not in raw
+
+
+def test_save_config_persists_non_default_model(tmp_path: Path):
+    """Non-default whisper_model must round-trip."""
+    p = tmp_path / "cfg.json"
+    cfg = Config(allowed_usernames=["alice"], whisper_model="small")
+    save_config(cfg, p)
+    assert json.loads(p.read_text())["whisper_model"] == "small"
+    assert load_config(p).whisper_model == "small"
