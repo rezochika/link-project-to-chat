@@ -253,6 +253,10 @@ def start(
 
     if project_path and token:
         p = Path(project_path).resolve()
+        # Ad-hoc --path/--token runs bypass config loading entirely, so voice
+        # STT is unavailable on this path. Users who want voice should either
+        # configure a project in the global config and use --project, or rely
+        # on the default (no --path, no --token) startup flow.
         run_bot(
             name=p.name,
             path=p,
@@ -281,7 +285,7 @@ def start(
                 whisper_language=config.whisper_language,
             )
         except (ImportError, ValueError) as e:
-            click.echo(f"Warning: Voice disabled — {e}")
+            click.echo(f"Warning: Voice disabled — {e}", err=True)
 
     if not config.projects:
         raise SystemExit(
@@ -414,6 +418,17 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
     # --- Voice STT ---
     config = load_config(cfg_path)  # reload in case previous blocks saved
     voice_changed = False
+
+    # If voice-related flags are passed without --stt-backend, reuse the already
+    # configured backend. This supports workflows like rotating an API key
+    # (`setup --openai-api-key sk-new`) without re-selecting the backend.
+    if stt_backend is None and any(v is not None for v in [openai_api_key, whisper_model, whisper_language]):
+        if not config.stt_backend:
+            raise click.UsageError(
+                "--openai-api-key, --whisper-model, and --whisper-language "
+                "require --stt-backend or a previously configured backend."
+            )
+        stt_backend = config.stt_backend
 
     if stt_backend is not None or (interactive and click.confirm(
         "Configure voice transcription?",
