@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from pathlib import Path
 from typing import Protocol
 
@@ -9,8 +8,6 @@ try:
     import openai
 except ImportError:
     openai = None  # type: ignore[assignment]
-
-logger = logging.getLogger(__name__)
 
 
 class Transcriber(Protocol):

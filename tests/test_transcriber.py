@@ -114,21 +114,33 @@ async def test_whisper_api_transcribe_with_language(tmp_path):
 
 
 async def test_whisper_api_transcribe_closes_file_on_error(tmp_path):
-    """File handle is closed even when the API call throws."""
+    """File handle is closed even when the API call throws.
+
+    Captures the file-object passed into the mocked client and asserts
+    its `.closed` attribute is True after the exception propagates. This
+    would fail if a future refactor moved `open()` outside the `with` block.
+    """
     ogg = tmp_path / "voice.ogg"
     ogg.write_bytes(b"fake")
 
+    captured: dict = {}
+
+    def capturing_create(**kw):
+        captured["f"] = kw["file"]
+        assert not captured["f"].closed  # open at call time
+        raise RuntimeError("API down")
+
     mock_client = MagicMock()
-    mock_client.audio.transcriptions.create = MagicMock(side_effect=RuntimeError("API down"))
+    mock_client.audio.transcriptions.create = MagicMock(side_effect=capturing_create)
 
     transcriber = WhisperAPITranscriber(api_key="sk-test", model="whisper-1")
     transcriber._client = mock_client
 
     with pytest.raises(RuntimeError, match="API down"):
         await transcriber.transcribe(ogg)
-    # File should still be accessible (no leaked handle holding it open on Windows).
-    assert ogg.exists()
-    ogg.read_bytes()
+
+    assert "f" in captured, "API mock was not called"
+    assert captured["f"].closed, "file handle leaked after API error"
 
 
 async def test_whisper_cli_transcribe(tmp_path):
