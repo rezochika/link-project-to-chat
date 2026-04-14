@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "link-project-to-chat"
-version = "0.11.0"
+version = "0.12.0"
 description = "Link a project directory to a Telegram bot that chats with Claude"
 readme = "README.md"
 license = "MIT"
@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 create = ["httpx>=0.27", "telethon>=1.36"]
+voice = ["openai>=1.30"]
+all = ["httpx>=0.27", "telethon>=1.36", "openai>=1.30"]
 
 [project.urls]
 Homepage = "https://github.com/rimnadze/link-project-to-chat"

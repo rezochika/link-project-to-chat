@@ -78,6 +78,7 @@ Claude messages and `/run` commands execute in **parallel** — they don't block
 | `/permissions <mode>` | Set permission mode |
 | `/skills` | List available skills |
 | `/use <skill>` | Activate a skill (prepends instructions to messages) |
+| `/voice` | Show voice transcription status |
 | `/stop_skill` | Deactivate current skill |
 | `/create_skill <name>` | Create a new skill |
 | `/delete_skill <name>` | Delete a skill |
@@ -104,6 +105,38 @@ and performance problems. Be direct and concise.
 ```
 
 Then `/use reviewer` to activate.
+
+## Voice messages
+
+Send voice messages in Telegram and they'll be transcribed and sent to Claude as text.
+
+### Setup with OpenAI Whisper API (recommended)
+
+```bash
+link-project-to-chat setup --stt-backend whisper-api --openai-api-key YOUR_KEY
+```
+
+### Setup with local whisper.cpp
+
+Requires [whisper.cpp](https://github.com/ggerganov/whisper.cpp) and `ffmpeg` installed:
+
+```bash
+link-project-to-chat setup --stt-backend whisper-cli --whisper-model base
+```
+
+### Language hint
+
+For better accuracy with non-English audio:
+
+```bash
+link-project-to-chat setup --whisper-language ka
+```
+
+### Install with voice extra
+
+```bash
+pipx install "link-project-to-chat[voice]"
+```
 
 ## Multi-user support
 
@@ -219,7 +252,7 @@ sudo systemctl enable --now link-project-to-chat
 ## Planned features
 
 - **Discord support** — same interface over Discord instead of Telegram
-- **Voice commands** — transcribe voice messages via a speech-to-text service
+- ~~**Voice commands**~~ — ✓ done
 - **Other coding agents** — pluggable backend for agents beyond Claude Code
 
 Contributions welcome.

@@ -253,6 +253,10 @@ def start(
 
     if project_path and token:
         p = Path(project_path).resolve()
+        # Ad-hoc --path/--token runs bypass config loading entirely, so voice
+        # STT is unavailable on this path. Users who want voice should either
+        # configure a project in the global config and use --project, or rely
+        # on the default (no --path, no --token) startup flow.
         run_bot(
             name=p.name,
             path=p,
@@ -268,6 +272,20 @@ def start(
         return
 
     config = load_config(cfg_path)
+
+    from .transcriber import create_transcriber
+
+    transcriber = None
+    if config.stt_backend:
+        try:
+            transcriber = create_transcriber(
+                config.stt_backend,
+                openai_api_key=config.openai_api_key,
+                whisper_model=config.whisper_model,
+                whisper_language=config.whisper_language,
+            )
+        except (ImportError, ValueError) as e:
+            click.echo(f"Warning: Voice disabled — {e}", err=True)
 
     if not config.projects:
         raise SystemExit(
@@ -295,6 +313,7 @@ def start(
             allowed_tools=allowed,
             disallowed_tools=disallowed,
             on_trust=lambda uid: add_project_trusted_user_id(project, uid, cfg_path),
+            transcriber=transcriber,
         )
     else:
         run_bots(
@@ -305,6 +324,7 @@ def start(
             allowed_tools=allowed,
             disallowed_tools=disallowed,
             config_path=cfg_path,
+            transcriber=transcriber,
         )
 
 
@@ -313,8 +333,14 @@ def start(
 @click.option("--telegram-api-id", default=None, type=int, help="Telegram API ID (from my.telegram.org)")
 @click.option("--telegram-api-hash", default=None, help="Telegram API Hash")
 @click.option("--phone", default=None, help="Phone number for Telethon auth (e.g. +995511166693)")
+@click.option("--stt-backend", default=None, type=click.Choice(["whisper-api", "whisper-cli", "off"]),
+              help="Speech-to-text backend")
+@click.option("--openai-api-key", default=None, help="OpenAI API key (for whisper-api)")
+@click.option("--whisper-model", default=None, help="Whisper model (default: whisper-1)")
+@click.option("--whisper-language", default=None,
+              help="Language code (e.g. en, ka). Pass '' to reset to auto-detect.")
 @click.pass_context
-def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api_hash: str | None, phone: str | None):
+def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api_hash: str | None, phone: str | None, stt_backend: str | None, openai_api_key: str | None, whisper_model: str | None, whisper_language: str | None):
     """Set up GitHub PAT, Telegram API credentials, and Telethon authentication.
 
     Run without arguments for interactive setup. Or pass individual options.
@@ -323,8 +349,14 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
     config = load_config(cfg_path)
     changed = False
 
-    # Interactive mode if no args provided
-    interactive = not any([github_pat, telegram_api_id, telegram_api_hash, phone])
+    # Interactive mode ONLY when no flags are provided at all.
+    # Passing --stt-backend alone must not trigger GitHub/Telegram prompts.
+    # Use `is not None` rather than truthiness so `--whisper-language ""` still
+    # counts as an explicit flag (user requesting auto-detect reset).
+    interactive = all(v is None for v in [
+        github_pat, telegram_api_id, telegram_api_hash, phone,
+        stt_backend, openai_api_key, whisper_model, whisper_language,
+    ])
 
     # GitHub PAT
     if github_pat or (interactive and click.confirm("Configure GitHub PAT?", default=not config.github_pat)):
@@ -346,6 +378,70 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
         click.echo("Telegram API credentials saved.")
 
     if changed:
+        save_config(config, cfg_path)
+
+    # --- Voice STT ---
+    config = load_config(cfg_path)  # reload in case previous blocks saved
+    voice_changed = False
+
+    # If voice-related flags are passed without --stt-backend, reuse the already
+    # configured backend. This supports workflows like rotating an API key
+    # (`setup --openai-api-key sk-new`) without re-selecting the backend.
+    if stt_backend is None and any(v is not None for v in [openai_api_key, whisper_model, whisper_language]):
+        if not config.stt_backend:
+            raise click.UsageError(
+                "--openai-api-key, --whisper-model, and --whisper-language "
+                "require --stt-backend or a previously configured backend."
+            )
+        stt_backend = config.stt_backend
+
+    if stt_backend is not None or (interactive and click.confirm(
+        "Configure voice transcription?",
+        default=not config.stt_backend,
+    )):
+        if stt_backend is None:
+            stt_backend = click.prompt(
+                "STT backend",
+                type=click.Choice(["whisper-api", "whisper-cli", "off"]),
+                default=config.stt_backend or "whisper-api",
+            )
+        if stt_backend == "off":
+            config.stt_backend = ""
+            voice_changed = True
+            click.echo("Voice transcription disabled.")
+        else:
+            config.stt_backend = stt_backend
+            voice_changed = True
+            if stt_backend == "whisper-api":
+                if not openai_api_key:
+                    openai_api_key = click.prompt(
+                        "OpenAI API key",
+                        default=config.openai_api_key or "",
+                    )
+                if openai_api_key:
+                    config.openai_api_key = openai_api_key
+            if whisper_model:
+                config.whisper_model = whisper_model
+            elif interactive:
+                default_model = "whisper-1" if stt_backend == "whisper-api" else "base"
+                config.whisper_model = click.prompt(
+                    "Whisper model",
+                    default=config.whisper_model or default_model,
+                )
+            # Semantics: `--whisper-language ""` explicitly resets to auto-detect.
+            #            `--whisper-language en` sets "en".
+            #            omitted flag + interactive = prompt.
+            #            omitted flag + non-interactive = leave unchanged.
+            if whisper_language is not None:
+                config.whisper_language = whisper_language
+            elif interactive:
+                config.whisper_language = click.prompt(
+                    "Language (ISO code, empty = auto-detect)",
+                    default=config.whisper_language or "",
+                )
+            click.echo(f"Voice: {stt_backend} configured.")
+
+    if voice_changed:
         save_config(config, cfg_path)
 
     # Telethon authentication
@@ -384,12 +480,14 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
             client.disconnect()
 
     # Show status
+    config = load_config(cfg_path)
     click.echo("\nSetup status:")
     click.echo(f"  GitHub PAT: {'configured' if config.github_pat else 'not set'}")
     click.echo(f"  Telegram API ID: {'configured' if config.telegram_api_id else 'not set'}")
     click.echo(f"  Telegram API Hash: {'configured' if config.telegram_api_hash else 'not set'}")
     session_path = cfg_path.parent / "telethon.session"
     click.echo(f"  Telethon session: {'authenticated' if session_path.exists() else 'not authenticated'}")
+    click.echo(f"  Voice STT: {config.stt_backend or 'disabled'}")
 
 
 @main.command("start-manager")

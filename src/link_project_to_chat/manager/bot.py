@@ -281,12 +281,14 @@ class ManagerBot(AuthMixin):
         lines.append(f"  Telegram API Hash: {'configured' if config.telegram_api_hash else 'not set'}")
         session_path = path.parent / "telethon.session"
         lines.append(f"  Telethon session: {'exists' if session_path.exists() else 'not authenticated'}")
+        lines.append(f"  Voice STT: {config.stt_backend or 'disabled'}")
 
         buttons = []
         buttons.append([InlineKeyboardButton("Set GitHub Token", callback_data="setup_gh")])
         buttons.append([InlineKeyboardButton("Set Telegram API", callback_data="setup_api")])
         if config.telegram_api_id and config.telegram_api_hash:
             buttons.append([InlineKeyboardButton("Authenticate Telethon", callback_data="setup_telethon")])
+        buttons.append([InlineKeyboardButton("Set Voice STT", callback_data="setup_voice")])
         buttons.append([InlineKeyboardButton("Done", callback_data="setup_done")])
 
         ctx.user_data["setup_config_path"] = str(path)
@@ -439,6 +441,39 @@ class ManagerBot(AuthMixin):
             except Exception as e:
                 ctx.user_data.pop("setup_awaiting", None)
                 await update.effective_message.reply_text(f"2FA auth failed: {e}")
+
+        elif awaiting == "stt_backend":
+            choice = text.strip().lower()
+            if choice == "off":
+                config = load_config(path)
+                config.stt_backend = ""
+                save_config(config, path)
+                ctx.user_data.pop("setup_awaiting")
+                await update.effective_message.reply_text("Voice disabled. Use /setup to continue.")
+            elif choice in ("whisper-api", "whisper-cli"):
+                config = load_config(path)
+                config.stt_backend = choice
+                save_config(config, path)
+                if choice == "whisper-api":
+                    ctx.user_data["setup_awaiting"] = "openai_api_key"
+                    await update.effective_message.reply_text("Enter your OpenAI API key:")
+                else:
+                    ctx.user_data.pop("setup_awaiting")
+                    await update.effective_message.reply_text(
+                        "whisper-cli configured. Make sure `whisper` is on PATH.\n"
+                        "Use /setup to continue."
+                    )
+            else:
+                await update.effective_message.reply_text(
+                    "Invalid. Type: whisper-api, whisper-cli, or off"
+                )
+
+        elif awaiting == "openai_api_key":
+            ctx.user_data.pop("setup_awaiting")
+            config = load_config(path)
+            config.openai_api_key = text.strip()
+            save_config(config, path)
+            await update.effective_message.reply_text("OpenAI API key saved. Use /setup to continue.")
 
     async def _on_create_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -841,6 +876,16 @@ class ManagerBot(AuthMixin):
         elif data == "setup_telethon":
             ctx.user_data["setup_awaiting"] = "phone"
             await query.edit_message_text("Enter your phone number (with country code, e.g. +1234567890):")
+
+        elif data == "setup_voice":
+            ctx.user_data["setup_awaiting"] = "stt_backend"
+            await query.edit_message_text(
+                "Choose STT backend:\n"
+                "• whisper-api — OpenAI Whisper API (recommended)\n"
+                "• whisper-cli — Local whisper.cpp\n"
+                "• off — Disable voice\n\n"
+                "Type your choice:"
+            )
 
         elif data == "setup_done":
             await query.edit_message_text("Setup complete.")

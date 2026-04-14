@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .transcriber import Transcriber
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -52,6 +58,7 @@ COMMANDS = [
     ("stop_skill", "Deactivate current skill"),
     ("create_skill", "Create a new skill"),
     ("delete_skill", "Delete a skill"),
+    ("voice", "Show voice transcription status"),
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
@@ -76,6 +83,7 @@ class ProjectBot(AuthMixin):
         disallowed_tools: list[str] | None = None,
         allowed_usernames: list[str] | None = None,
         trusted_user_ids: list[int] | None = None,
+        transcriber: "Transcriber | None" = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -97,6 +105,7 @@ class ProjectBot(AuthMixin):
         self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
+        self._transcriber = transcriber
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -466,6 +475,18 @@ class ProjectBot(AuthMixin):
         ])
         await update.effective_message.reply_text(f"Delete skill '{name}'?", reply_markup=keyboard)
 
+    async def _on_voice_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if self._transcriber:
+            backend = type(self._transcriber).__name__
+            await update.effective_message.reply_text(f"Voice: enabled ({backend})")
+        else:
+            await update.effective_message.reply_text(
+                "Voice: disabled\n"
+                "Configure with: link-project-to-chat setup"
+            )
+
     async def _on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -654,17 +675,95 @@ class ProjectBot(AuthMixin):
             prompt=prompt,
         )
 
-    async def _on_unsupported(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
+    async def _on_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle voice messages and audio files."""
+        msg = update.effective_message
+        if not msg or not update.effective_chat:
+            return
+        if not self._auth(update.effective_user):
+            return await msg.reply_text("Unauthorized.")
+        if self._rate_limited(update.effective_user.id):
+            return await msg.reply_text("Rate limited. Try again shortly.")
+
+        if not self._transcriber:
+            return await msg.reply_text(
+                "Voice messages aren't configured. "
+                "Set up STT with: link-project-to-chat setup --stt-backend whisper-api"
+            )
+
+        voice = msg.voice or msg.audio
+        if not voice:
+            return await msg.reply_text("Could not read voice message.")
+
+        # Telegram Bot API caps file downloads at 20 MB.
+        MAX_VOICE_BYTES = 20 * 1024 * 1024
+        if voice.file_size and voice.file_size > MAX_VOICE_BYTES:
+            size_mb = voice.file_size // (1024 * 1024)
+            return await msg.reply_text(
+                f"Audio too large ({size_mb} MB). Telegram Bot API limit is 20 MB."
+            )
+
+        status_msg = await msg.reply_text("🎤 Transcribing...")
+
+        voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "voice"
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        ogg_path = voice_dir / f"voice_{uuid.uuid4().hex}.ogg"
+
+        try:
+            file = await voice.get_file()
+            await file.download_to_drive(str(ogg_path))
+
+            text = await self._transcriber.transcribe(ogg_path)
+
+            if not text or not text.strip():
+                await status_msg.edit_text("Could not transcribe the voice message (empty result).")
+                return
+
+            # Show the transcript (truncated for status display)
+            display = text if len(text) <= 200 else text[:200] + "..."
+            await status_msg.edit_text(f'🎤 "{display}"')
+
+            # Build prompt with optional reply context
+            prompt = text
+            if msg.reply_to_message and msg.reply_to_message.text:
+                prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
+
+            # Apply active skill if any
+            if self._active_skill:
+                from .skills import load_skill, format_skill_prompt
+                skill = load_skill(self._active_skill, self.path)
+                if skill:
+                    prompt = format_skill_prompt(skill, prompt)
+
+            self.task_manager.submit_claude(
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                prompt=prompt,
+            )
+
+        except Exception as e:
+            logger.exception("Voice transcription failed")
+            # Sanitize: only the first line, hard-truncated, to avoid leaking
+            # API keys or full request payloads in SDK error messages.
+            error_summary = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+            await status_msg.edit_text(f"Transcription failed: {error_summary}")
+        finally:
+            if ogg_path.exists():
+                try:
+                    ogg_path.unlink()
+                except OSError:
+                    pass
+
+    async def _on_unsupported(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         if not msg:
             return
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
 
-        if msg.voice or msg.video_note:
-            text = "Voice messages aren't supported yet. Please type your message."
+        if msg.video_note:
+            text = "Video notes aren't supported yet. Please type your message or send a voice message."
         elif msg.sticker:
             text = "Stickers aren't supported. Please type your message."
         elif msg.video:
@@ -775,6 +874,7 @@ class ProjectBot(AuthMixin):
             "stop_skill": self._on_stop_skill,
             "create_skill": self._on_create_skill,
             "delete_skill": self._on_delete_skill,
+            "voice": self._on_voice_status,
         }
         private = filters.ChatType.PRIVATE
         for name, handler in handlers.items():
@@ -790,14 +890,15 @@ class ProjectBot(AuthMixin):
         file_filter = private & (filters.Document.ALL | filters.PHOTO)
         app.add_handler(MessageHandler(file_filter, self._on_file))
 
+        voice_filter = private & (filters.VOICE | filters.AUDIO)
+        app.add_handler(MessageHandler(voice_filter, self._on_voice))
+
         unsupported_filter = private & (
-            filters.VOICE
-            | filters.VIDEO_NOTE
+            filters.VIDEO_NOTE
             | filters.Sticker.ALL
             | filters.VIDEO
             | filters.LOCATION
             | filters.CONTACT
-            | filters.AUDIO
         )
         app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
@@ -822,6 +923,7 @@ def run_bot(
     on_trust: Callable[[int], None] | None = None,
     allowed_usernames: list[str] | None = None,
     trusted_user_ids: list[int] | None = None,
+    transcriber: "Transcriber | None" = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -839,6 +941,7 @@ def run_bot(
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
+        transcriber=transcriber,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -860,6 +963,7 @@ def run_bots(
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     config_path: Path | None = None,
+    transcriber: "Transcriber | None" = None,
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
@@ -884,6 +988,7 @@ def run_bots(
             on_trust=on_trust,
             allowed_usernames=effective_usernames,
             trusted_user_ids=effective_trusted_ids,
+            transcriber=transcriber,
         )
     else:
         names = ", ".join(config.projects.keys())
