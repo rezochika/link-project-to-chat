@@ -380,41 +380,6 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
     if changed:
         save_config(config, cfg_path)
 
-    # Telethon authentication
-    api_id = config.telegram_api_id
-    api_hash = config.telegram_api_hash
-    if not api_id or not api_hash:
-        if phone or (interactive and click.confirm("Authenticate Telethon?")):
-            raise SystemExit("Telegram API ID and Hash must be configured first.")
-        return
-
-    session_path = cfg_path.parent / "telethon.session"
-    if phone or (interactive and click.confirm(
-        "Authenticate Telethon?" if not session_path.exists() else "Re-authenticate Telethon?",
-        default=not session_path.exists(),
-    )):
-        try:
-            from .botfather import BotFatherClient  # noqa: F811
-        except ImportError:
-            raise SystemExit("telethon not installed. Run: pip install link-project-to-chat[create]")
-
-        if not phone:
-            phone = click.prompt("Phone number (with country code, e.g. +995511166693)")
-
-        from telethon.sync import TelegramClient
-        client = TelegramClient(
-            str(session_path), api_id, api_hash,
-            device_model="Desktop", system_version="macOS", app_version="1.0",
-        )
-        try:
-            client.start(phone=phone)
-            session_path.chmod(0o600)
-            click.echo("Telethon authenticated successfully!")
-        except Exception as e:
-            raise SystemExit(f"Authentication failed: {e}")
-        finally:
-            client.disconnect()
-
     # --- Voice STT ---
     config = load_config(cfg_path)  # reload in case previous blocks saved
     voice_changed = False
@@ -478,6 +443,41 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
 
     if voice_changed:
         save_config(config, cfg_path)
+
+    # Telethon authentication
+    api_id = config.telegram_api_id
+    api_hash = config.telegram_api_hash
+    if not api_id or not api_hash:
+        if phone or (interactive and click.confirm("Authenticate Telethon?")):
+            raise SystemExit("Telegram API ID and Hash must be configured first.")
+        return
+
+    session_path = cfg_path.parent / "telethon.session"
+    if phone or (interactive and click.confirm(
+        "Authenticate Telethon?" if not session_path.exists() else "Re-authenticate Telethon?",
+        default=not session_path.exists(),
+    )):
+        try:
+            from .botfather import BotFatherClient  # noqa: F811
+        except ImportError:
+            raise SystemExit("telethon not installed. Run: pip install link-project-to-chat[create]")
+
+        if not phone:
+            phone = click.prompt("Phone number (with country code, e.g. +995511166693)")
+
+        from telethon.sync import TelegramClient
+        client = TelegramClient(
+            str(session_path), api_id, api_hash,
+            device_model="Desktop", system_version="macOS", app_version="1.0",
+        )
+        try:
+            client.start(phone=phone)
+            session_path.chmod(0o600)
+            click.echo("Telethon authenticated successfully!")
+        except Exception as e:
+            raise SystemExit(f"Authentication failed: {e}")
+        finally:
+            client.disconnect()
 
     # Show status
     config = load_config(cfg_path)
