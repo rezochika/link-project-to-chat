@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from link_project_to_chat.config import (
+    _atomic_write,
     Config,
     ProjectConfig,
     add_project_trusted_user_id,
@@ -400,3 +402,22 @@ def test_save_config_persists_non_default_model(tmp_path: Path):
     save_config(cfg, p)
     assert json.loads(p.read_text())["whisper_model"] == "small"
     assert load_config(p).whisper_model == "small"
+
+
+class TestAtomicWrite:
+    def test_writes_file_correctly(self, tmp_path):
+        target = tmp_path / "test.json"
+        _atomic_write(target, '{"key": "value"}\n')
+        assert target.read_text() == '{"key": "value"}\n'
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+    def test_cleans_up_on_rename_failure(self, tmp_path):
+        target = tmp_path / "test.json"
+        with patch("os.rename", side_effect=OSError("rename failed")):
+            try:
+                _atomic_write(target, "data")
+            except OSError:
+                pass
+        temps = list(tmp_path.glob("*.tmp"))
+        assert len(temps) == 0
+        assert not target.exists()

@@ -219,13 +219,16 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
 def _atomic_write(path: Path, data: str) -> None:
     """Write data to path atomically via tempfile + rename."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    closed = False
     try:
         os.write(fd, data.encode())
         os.fchmod(fd, 0o600)
         os.close(fd)
+        closed = True
         os.rename(tmp, path)
     except BaseException:
-        os.close(fd) if not os.get_inheritable(fd) else None
+        if not closed:
+            os.close(fd)
         try:
             os.unlink(tmp)
         except OSError:
