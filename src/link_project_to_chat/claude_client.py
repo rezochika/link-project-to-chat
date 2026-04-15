@@ -36,6 +36,7 @@ class ClaudeClient:
         self.permission_mode: str | None = permission_mode
         self.allowed_tools: list[str] = allowed_tools or []
         self.disallowed_tools: list[str] = disallowed_tools or []
+        self.append_system_prompt: str | None = None
         self.session_id: str | None = None
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
@@ -71,6 +72,9 @@ class ClaudeClient:
 
         if self.disallowed_tools:
             cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
+
+        if self.append_system_prompt:
+            cmd.extend(["--append-system-prompt", self.append_system_prompt])
 
         if self.session_id:
             cmd.extend(["--resume", self.session_id])

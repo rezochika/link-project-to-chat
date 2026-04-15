@@ -92,6 +92,65 @@ def test_empty_file_ignored(tmp_path: Path):
     assert "whitespace" not in skills
 
 
+def test_save_skill_global(tmp_path: Path, monkeypatch):
+    global_dir = tmp_path / "global_skills"
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_SKILLS_DIR", global_dir)
+    path = save_skill("myskill", "Global content.", tmp_path, scope="global")
+    assert path.exists()
+    assert path.read_text() == "Global content."
+    assert path.parent == global_dir
+
+
+def test_delete_skill_global(tmp_path: Path, monkeypatch):
+    global_dir = tmp_path / "global_skills"
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_SKILLS_DIR", global_dir)
+    save_skill("todelete", "content", tmp_path, scope="global")
+    assert delete_skill("todelete", tmp_path, scope="global") is True
+    assert not (global_dir / "todelete.md").exists()
+
+
+def test_delete_skill_global_not_found(tmp_path: Path, monkeypatch):
+    global_dir = tmp_path / "global_skills"
+    global_dir.mkdir()
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_SKILLS_DIR", global_dir)
+    assert delete_skill("nope", tmp_path, scope="global") is False
+
+
+def test_load_skills_claude_user(tmp_path: Path, monkeypatch):
+    claude_dir = tmp_path / "claude_skills"
+    claude_dir.mkdir()
+    (claude_dir / "helper.md").write_text("You are a helper.")
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", claude_dir)
+    skills = load_skills(tmp_path / "project")
+    assert "helper" in skills
+    assert skills["helper"].source == "claude"
+
+
+def test_claude_skill_overridden_by_global(tmp_path: Path, monkeypatch):
+    claude_dir = tmp_path / "claude_skills"
+    claude_dir.mkdir()
+    (claude_dir / "reviewer.md").write_text("Claude reviewer.")
+    global_dir = tmp_path / "global_skills"
+    global_dir.mkdir()
+    (global_dir / "reviewer.md").write_text("App global reviewer.")
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", claude_dir)
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_SKILLS_DIR", global_dir)
+    skills = load_skills(tmp_path / "project")
+    assert skills["reviewer"].source == "global"
+    assert skills["reviewer"].content == "App global reviewer."
+
+
+def test_load_skill_falls_back_to_claude(tmp_path: Path, monkeypatch):
+    claude_dir = tmp_path / "claude_skills"
+    claude_dir.mkdir()
+    (claude_dir / "helper.md").write_text("Claude helper.")
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", claude_dir)
+    skill = load_skill("helper", tmp_path / "project")
+    assert skill is not None
+    assert skill.source == "claude"
+    assert skill.content == "Claude helper."
+
+
 def test_format_skill_prompt():
     skill = Skill(name="reviewer", content="Review code.", source="project", path=Path("/fake"))
     result = format_skill_prompt(skill, "Check this function")

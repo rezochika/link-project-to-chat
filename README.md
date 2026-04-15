@@ -77,26 +77,37 @@ Claude messages and `/run` commands execute in **parallel** — they don't block
 | `/effort low/medium/high/max` | Set Claude thinking depth |
 | `/permissions <mode>` | Set permission mode |
 | `/skills` | List available skills |
-| `/use <skill>` | Activate a skill (prepends instructions to messages) |
-| `/voice` | Show voice transcription status |
-| `/stop_skill` | Deactivate current skill |
-| `/create_skill <name>` | Create a new skill |
+| `/use [skill]` | Activate a skill (system prompt) — or pick from list |
+| `/persona [skill]` | Activate a persona (per-message) — or pick from list |
+| `/stop_skill` | Deactivate current skill/persona |
+| `/create_skill <name>` | Create a new skill (project or global) |
 | `/delete_skill <name>` | Delete a skill |
+| `/voice` | Show voice transcription status |
 | `/compact` | Compress session context |
 | `/reset` | Clear the Claude session |
 | `/status` | Show bot status |
 | `/version` | Show version |
 | `/help` | Show available commands |
 
-## Skills
+## Skills & Personas
 
-Skills are markdown files with instructions that get prepended to every message when active. Use them to give Claude a specific role (reviewer, translator, debugger, etc.).
+Skills are markdown files with instructions. They can be activated in two modes:
 
-**Locations:**
-- Per-project: `<project_path>/.claude/skills/<name>.md`
-- Global: `~/.link-project-to-chat/skills/<name>.md`
+- **🧠 Skill** (`/use`) — passed as a system prompt via `--append-system-prompt`. Claude sees it once as background context, like Claude Code's native skill handling.
+- **💬 Persona** (`/persona`) — prepended to every message. Claude sees it with each message, good for enforcing a specific voice or role.
 
-Per-project skills override global skills with the same name.
+Both commands work with or without a name — `/use` or `/persona` alone shows an inline picker with all available skills.
+
+**Locations (highest priority first):**
+1. Per-project: `<project_path>/.claude/skills/<name>.md`
+2. App global: `~/.link-project-to-chat/skills/<name>.md`
+3. Claude Code user skills: `~/.claude/skills/<name>.md`
+
+Higher-priority skills override lower ones with the same name. Claude Code user skills are automatically available in the bot.
+
+**Creating skills:**
+
+Use `/create_skill <name>` in the bot — you'll be asked to choose project or global scope, then send the content.
 
 **Example:** Create `~/.link-project-to-chat/skills/reviewer.md`:
 ```markdown
@@ -104,7 +115,7 @@ You are a senior code reviewer. Focus on bugs, security issues,
 and performance problems. Be direct and concise.
 ```
 
-Then `/use reviewer` to activate.
+Then `/use reviewer` for background instructions, or `/persona reviewer` to enforce the role per-message.
 
 ## Voice messages
 
