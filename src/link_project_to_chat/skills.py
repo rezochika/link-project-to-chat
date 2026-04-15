@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _VALID_NAME_RE = re.compile(r"^[\w][\w-]*$")
+_MAX_NAME_LEN = 100
 
 
 def _sanitize_name(name: str, kind: str = "skill") -> str:
@@ -13,6 +14,11 @@ def _sanitize_name(name: str, kind: str = "skill") -> str:
         raise ValueError(
             f"Invalid {kind} name: '{name}'. "
             "Use only letters, digits, underscores, and hyphens."
+        )
+    if len(name) > _MAX_NAME_LEN:
+        raise ValueError(
+            f"Invalid {kind} name: '{name}'. "
+            f"Name must be {_MAX_NAME_LEN} characters or fewer."
         )
     return name
 

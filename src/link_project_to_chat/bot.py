@@ -575,6 +575,11 @@ class ProjectBot(AuthMixin):
         if not ctx.args:
             return await update.effective_message.reply_text("Usage: /create_skill <name>")
         name = ctx.args[0].lower()
+        from .skills import _sanitize_name
+        try:
+            name = _sanitize_name(name, "skill")
+        except ValueError as e:
+            return await update.effective_message.reply_text(str(e))
         ctx.user_data["pending_skill_name"] = name
         keyboard = InlineKeyboardMarkup([
             [
@@ -641,6 +646,11 @@ class ProjectBot(AuthMixin):
         if not ctx.args:
             return await update.effective_message.reply_text("Usage: /create_persona <name>")
         name = ctx.args[0].lower()
+        from .skills import _sanitize_name
+        try:
+            name = _sanitize_name(name, "persona")
+        except ValueError as e:
+            return await update.effective_message.reply_text(str(e))
         ctx.user_data["pending_persona_name"] = name
         keyboard = InlineKeyboardMarkup([
             [

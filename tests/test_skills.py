@@ -274,17 +274,23 @@ class TestSkillNameSanitization:
         with pytest.raises(ValueError, match="Invalid skill name"):
             save_skill(bad_name, "content", tmp_path)
 
-    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar", ".hidden"])
+    @pytest.mark.parametrize("bad_name", [
+        "../evil", "../../etc/cron.d/evil", "foo/bar", "foo\\bar", ".hidden", "", "   ",
+    ])
     def test_save_persona_rejects_bad_names(self, tmp_path, bad_name):
         with pytest.raises(ValueError, match="Invalid persona name"):
             save_persona(bad_name, "content", tmp_path)
 
-    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar"])
+    @pytest.mark.parametrize("bad_name", [
+        "../evil", "../../etc/cron.d/evil", "foo/bar", "foo\\bar", ".hidden", "", "   ",
+    ])
     def test_delete_skill_rejects_bad_names(self, tmp_path, bad_name):
         with pytest.raises(ValueError, match="Invalid skill name"):
             delete_skill(bad_name, tmp_path)
 
-    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar"])
+    @pytest.mark.parametrize("bad_name", [
+        "../evil", "../../etc/cron.d/evil", "foo/bar", "foo\\bar", ".hidden", "", "   ",
+    ])
     def test_delete_persona_rejects_bad_names(self, tmp_path, bad_name):
         with pytest.raises(ValueError, match="Invalid persona name"):
             delete_persona(bad_name, tmp_path)
