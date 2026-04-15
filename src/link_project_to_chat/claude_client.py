@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from collections.abc import AsyncGenerator, Callable
@@ -12,6 +13,25 @@ from pathlib import Path
 from .stream import Error, Result, StreamEvent, parse_stream_line
 
 logger = logging.getLogger(__name__)
+
+
+_API_KEY_RE = re.compile(r"(sk-[a-zA-Z]+-)\S+")
+_MAX_ERROR_LEN = 200
+
+
+def _sanitize_error(text: str) -> str:
+    """Return a safe, single-line summary of a subprocess stderr string."""
+    if not text or not text.strip():
+        return "Unknown error"
+    # Keep only the first line — subsequent lines may contain paths / env vars.
+    first_line = text.splitlines()[0].strip()
+    # Redact API key patterns.
+    first_line = _API_KEY_RE.sub(r"\1***", first_line)
+    # Truncate to avoid flooding the user.
+    if len(first_line) > _MAX_ERROR_LEN:
+        first_line = first_line[:_MAX_ERROR_LEN] + "..."
+    return first_line
+
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
 MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
@@ -209,7 +229,7 @@ class ClaudeClient:
         await asyncio.to_thread(proc.wait)
         if proc.returncode != 0:
             err = stderr_bytes.decode("utf-8", errors="replace").strip()
-            yield Error(message=err or f"exit code {proc.returncode}")
+            yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
         # Clean up reference
         if self._proc is proc:
             self._proc = None
