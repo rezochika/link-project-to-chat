@@ -1,7 +1,20 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+_VALID_NAME_RE = re.compile(r"^[\w][\w-]*$")
+
+
+def _sanitize_name(name: str, kind: str = "skill") -> str:
+    name = name.strip()
+    if not name or not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid {kind} name: '{name}'. "
+            "Use only letters, digits, underscores, and hyphens."
+        )
+    return name
 
 GLOBAL_SKILLS_DIR = Path.home() / ".link-project-to-chat" / "skills"
 GLOBAL_PERSONAS_DIR = Path.home() / ".link-project-to-chat" / "personas"
@@ -58,6 +71,9 @@ def load_skills(project_path: Path) -> dict[str, Skill]:
 
 def load_skill(name: str, project_path: Path) -> Skill | None:
     """Load a single skill by name. Project checked first, then global, then Claude Code user."""
+    name = name.strip()
+    if not _VALID_NAME_RE.match(name):
+        return None
     for directory, source in (
         (project_skills_dir(project_path), "project"),
         (GLOBAL_SKILLS_DIR, "global"),
@@ -80,6 +96,7 @@ def load_skill(name: str, project_path: Path) -> Skill | None:
 
 def save_skill(name: str, content: str, project_path: Path, *, scope: str = "project") -> Path:
     """Save a skill. *scope* is ``'project'`` or ``'global'``. Returns the file path."""
+    name = _sanitize_name(name, "skill")
     d = GLOBAL_SKILLS_DIR if scope == "global" else project_skills_dir(project_path)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
@@ -89,6 +106,7 @@ def save_skill(name: str, content: str, project_path: Path, *, scope: str = "pro
 
 def delete_skill(name: str, project_path: Path, *, scope: str = "project") -> bool:
     """Delete a skill. *scope* is ``'project'`` or ``'global'``. Returns True if deleted."""
+    name = _sanitize_name(name, "skill")
     d = GLOBAL_SKILLS_DIR if scope == "global" else project_skills_dir(project_path)
     p = d / f"{name}.md"
     if p.is_file():
@@ -108,6 +126,9 @@ def load_personas(project_path: Path) -> dict[str, Skill]:
 
 def load_persona(name: str, project_path: Path) -> Skill | None:
     """Load a single persona by name. Project checked first, then global."""
+    name = name.strip()
+    if not _VALID_NAME_RE.match(name):
+        return None
     for directory, source in (
         (project_personas_dir(project_path), "project"),
         (GLOBAL_PERSONAS_DIR, "global"),
@@ -122,6 +143,7 @@ def load_persona(name: str, project_path: Path) -> Skill | None:
 
 def save_persona(name: str, content: str, project_path: Path, *, scope: str = "project") -> Path:
     """Save a persona. *scope* is ``'project'`` or ``'global'``. Returns the file path."""
+    name = _sanitize_name(name, "persona")
     d = GLOBAL_PERSONAS_DIR if scope == "global" else project_personas_dir(project_path)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
@@ -131,6 +153,7 @@ def save_persona(name: str, content: str, project_path: Path, *, scope: str = "p
 
 def delete_persona(name: str, project_path: Path, *, scope: str = "project") -> bool:
     """Delete a persona. *scope* is ``'project'`` or ``'global'``. Returns True if deleted."""
+    name = _sanitize_name(name, "persona")
     d = GLOBAL_PERSONAS_DIR if scope == "global" else project_personas_dir(project_path)
     p = d / f"{name}.md"
     if p.is_file():

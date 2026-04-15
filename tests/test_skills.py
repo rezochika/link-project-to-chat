@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from link_project_to_chat.skills import (
     Skill,
     delete_persona,
@@ -262,3 +264,39 @@ def test_format_persona_prompt():
     assert "Be a teacher." in result
     assert "[END PERSONA]" in result
     assert "Explain this" in result
+
+
+class TestSkillNameSanitization:
+    @pytest.mark.parametrize("bad_name", [
+        "../evil", "../../etc/cron.d/evil", "foo/bar", "foo\\bar", ".hidden", "", "   ",
+    ])
+    def test_save_skill_rejects_bad_names(self, tmp_path, bad_name):
+        with pytest.raises(ValueError, match="Invalid skill name"):
+            save_skill(bad_name, "content", tmp_path)
+
+    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar", ".hidden"])
+    def test_save_persona_rejects_bad_names(self, tmp_path, bad_name):
+        with pytest.raises(ValueError, match="Invalid persona name"):
+            save_persona(bad_name, "content", tmp_path)
+
+    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar"])
+    def test_delete_skill_rejects_bad_names(self, tmp_path, bad_name):
+        with pytest.raises(ValueError, match="Invalid skill name"):
+            delete_skill(bad_name, tmp_path)
+
+    @pytest.mark.parametrize("bad_name", ["../evil", "foo/bar"])
+    def test_delete_persona_rejects_bad_names(self, tmp_path, bad_name):
+        with pytest.raises(ValueError, match="Invalid persona name"):
+            delete_persona(bad_name, tmp_path)
+
+    def test_save_skill_accepts_valid_names(self, tmp_path):
+        save_skill("my-skill_v2", "content", tmp_path)
+        skill = load_skill("my-skill_v2", tmp_path)
+        assert skill is not None
+        assert skill.content == "content"
+
+    def test_save_persona_accepts_valid_names(self, tmp_path):
+        save_persona("friendly-bot", "content", tmp_path)
+        persona = load_persona("friendly-bot", tmp_path)
+        assert persona is not None
+        assert persona.content == "content"
