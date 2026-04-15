@@ -4,3 +4,14 @@ dist/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Config (contains API keys)
+config.json
+*.lock
