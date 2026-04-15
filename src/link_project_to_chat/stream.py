@@ -35,6 +35,25 @@ class Result(StreamEvent):
 
 
 @dataclass
+class QuestionOption:
+    label: str
+    description: str
+
+
+@dataclass
+class Question:
+    question: str
+    header: str
+    options: list[QuestionOption]
+    multi_select: bool = False
+
+
+@dataclass
+class AskQuestion(StreamEvent):
+    questions: list[Question]
+
+
+@dataclass
 class Error(StreamEvent):
     message: str
 
@@ -78,8 +97,30 @@ def parse_stream_line(line: str) -> list[StreamEvent]:
             elif item_type == "tool_use":
                 tool_name = item.get("name", "unknown")
                 tool_input = item.get("input", {})
-                file_path = tool_input.get("file_path")
-                events.append(ToolUse(tool=tool_name, path=file_path))
+                if tool_name == "AskUserQuestion":
+                    raw_qs = tool_input.get("questions", [])
+                    questions = []
+                    for rq in raw_qs:
+                        opts = [
+                            QuestionOption(
+                                label=o.get("label", ""),
+                                description=o.get("description", ""),
+                            )
+                            for o in rq.get("options", [])
+                        ]
+                        questions.append(
+                            Question(
+                                question=rq.get("question", ""),
+                                header=rq.get("header", ""),
+                                options=opts,
+                                multi_select=rq.get("multiSelect", False),
+                            )
+                        )
+                    if questions:
+                        events.append(AskQuestion(questions=questions))
+                else:
+                    file_path = tool_input.get("file_path")
+                    events.append(ToolUse(tool=tool_name, path=file_path))
         return events
 
     return []

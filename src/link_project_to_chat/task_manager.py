@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .claude_client import ClaudeClient
-from .stream import Error, Result, StreamEvent, TextDelta, ThinkingDelta
+from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta, ThinkingDelta
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,7 @@ class TaskType(enum.Enum):
 class TaskStatus(enum.Enum):
     WAITING = "waiting"
     RUNNING = "running"
+    WAITING_INPUT = "waiting_input"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -44,6 +45,7 @@ class Task:
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
     finished_at: float | None = None
+    pending_questions: list[Question] = field(default_factory=list)
     _compact: bool = field(default=False, repr=False)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
     _asyncio_task: asyncio.Task | None = field(default=None, repr=False)
@@ -80,7 +82,7 @@ class Task:
             self.status = TaskStatus.CANCELLED
             self.finished_at = time.monotonic()
             return True
-        if self.status == TaskStatus.RUNNING:
+        if self.status in (TaskStatus.RUNNING, TaskStatus.WAITING_INPUT):
             if self._proc and self._proc.poll() is None:
                 self._proc.kill()
             self.status = TaskStatus.CANCELLED
@@ -172,6 +174,10 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_command(task))
         return task
 
+    # ------------------------------------------------------------------
+    # Claude task execution
+    # ------------------------------------------------------------------
+
     async def _exec_claude(self, task: Task) -> None:
         task.status = TaskStatus.RUNNING
         task.started_at = time.monotonic()
@@ -180,42 +186,101 @@ class TaskManager:
             if task._compact:
                 task.result = await self._do_compact()
             else:
-                collected_text: list[str] = []
-                collected_thinking: list[str] = []
-                async for event in self._claude.chat_stream(
-                    task.input,
-                    on_proc=lambda p: setattr(task, "_proc", p),
-                ):
-                    if self._on_stream_event:
-                        try:
-                            await self._on_stream_event(task, event)
-                        except Exception:
-                            logger.exception(
-                                "stream event callback failed for task #%d", task.id
-                            )
-                    if isinstance(event, TextDelta):
-                        collected_text.append(event.text)
-                    elif isinstance(event, ThinkingDelta):
-                        collected_thinking.append(event.text)
-                    elif isinstance(event, Result):
-                        task.result = event.text
-                    elif isinstance(event, Error):
-                        raise RuntimeError(event.message)
-                if not task.result:
-                    task.result = "".join(collected_text) or "".join(collected_thinking) or "[No response]"
+                await self._run_claude_turn(task)
+
+            if task.pending_questions:
+                task.status = TaskStatus.WAITING_INPUT
+                # Don't close interactive process; wait for user answer
+                return
             task.status = TaskStatus.DONE
+            self._claude.close_interactive()
         except asyncio.CancelledError:
             if task._proc and task._proc.poll() is None:
                 task._proc.kill()
             task.status = TaskStatus.CANCELLED
+            self._claude.close_interactive()
         except Exception as e:
             logger.exception("Claude task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
+            self._claude.close_interactive()
         finally:
-            task.finished_at = time.monotonic()
-        if task.status != TaskStatus.CANCELLED:
+            if task.status != TaskStatus.WAITING_INPUT:
+                task.finished_at = time.monotonic()
+
+        if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
+
+    async def _run_claude_turn(self, task: Task) -> None:
+        """Run one turn of Claude conversation, collecting events."""
+        collected_text: list[str] = []
+        task.pending_questions = []
+
+        async for event in self._claude.chat_stream(
+            task.input,
+            on_proc=lambda p: setattr(task, "_proc", p),
+        ):
+            if self._on_stream_event:
+                try:
+                    await self._on_stream_event(task, event)
+                except Exception:
+                    logger.exception(
+                        "stream event callback failed for task #%d", task.id
+                    )
+            if isinstance(event, TextDelta):
+                collected_text.append(event.text)
+            elif isinstance(event, AskQuestion):
+                task.pending_questions.extend(event.questions)
+            elif isinstance(event, Result):
+                task.result = event.text
+            elif isinstance(event, Error):
+                raise RuntimeError(event.message)
+
+        if not task.result:
+            task.result = "".join(collected_text) or "[No response]"
+
+    async def answer_question(self, task_id: int, answer: str) -> None:
+        """Send the user's answer to a WAITING_INPUT task and continue."""
+        task = self._tasks.get(task_id)
+        if not task or task.status != TaskStatus.WAITING_INPUT:
+            return
+
+        task.status = TaskStatus.RUNNING
+        task.input = answer  # set input for _run_claude_turn
+
+        try:
+            await self._run_claude_turn(task)
+
+            if task.pending_questions:
+                task.status = TaskStatus.WAITING_INPUT
+                return
+            task.status = TaskStatus.DONE
+            self._claude.close_interactive()
+        except asyncio.CancelledError:
+            task.status = TaskStatus.CANCELLED
+            self._claude.close_interactive()
+        except Exception as e:
+            logger.exception("Claude answer task #%d failed", task.id)
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            self._claude.close_interactive()
+        finally:
+            if task.status != TaskStatus.WAITING_INPUT:
+                task.finished_at = time.monotonic()
+
+        if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
+            await self._safe_callback(self._on_complete, task)
+
+    def waiting_input_task(self, chat_id: int) -> Task | None:
+        """Return the WAITING_INPUT task for a chat, if any."""
+        for t in self._tasks.values():
+            if t.chat_id == chat_id and t.status == TaskStatus.WAITING_INPUT:
+                return t
+        return None
+
+    # ------------------------------------------------------------------
+    # Compact
+    # ------------------------------------------------------------------
 
     COMPACT_PROMPT = (
         "Summarize our entire conversation concisely. Include:\n"
@@ -235,6 +300,10 @@ class TaskManager:
             f"Continue from this context summary of our previous session:\n\n{summary}"
         )
         return summary
+
+    # ------------------------------------------------------------------
+    # Shell command execution
+    # ------------------------------------------------------------------
 
     async def _exec_command(self, task: Task) -> None:
         await self._safe_callback(self._on_task_started, task)
@@ -287,6 +356,10 @@ class TaskManager:
         )
 
         await self._safe_callback(self._on_complete, task)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     async def _safe_callback(self, cb: OnTaskEvent, task: Task) -> None:
         try:

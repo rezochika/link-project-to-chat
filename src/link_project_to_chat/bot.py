@@ -53,12 +53,14 @@ COMMANDS = [
     ("reset", "Clear Claude session"),
     ("version", "Show version"),
     ("help", "Show available commands"),
-    ("skills", "List available skills"),
-    ("use", "Activate a skill (system prompt)"),
-    ("persona", "Activate a persona (per-message)"),
-    ("stop_skill", "Deactivate current skill/persona"),
+    ("skills", "List skills or activate one"),
+    ("stop_skill", "Deactivate current skill"),
     ("create_skill", "Create a new skill"),
     ("delete_skill", "Delete a skill"),
+    ("persona", "Activate a persona (per-message)"),
+    ("stop_persona", "Deactivate current persona"),
+    ("create_persona", "Create a new persona"),
+    ("delete_persona", "Delete a persona"),
     ("voice", "Show voice transcription status"),
 ]
 
@@ -106,7 +108,7 @@ class ProjectBot(AuthMixin):
         self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
-        self._active_skill_mode: str = "skill"  # "skill" or "persona"
+        self._active_persona: str | None = None
         self._transcriber = transcriber
         self.task_manager = TaskManager(
             project_path=self.path,
@@ -242,8 +244,18 @@ class ProjectBot(AuthMixin):
             icon = "🌐" if pending_scope == "global" else "📁"
             return await msg.reply_text(f"{icon} Skill '{pending_skill}' created ({pending_scope}). Use /use {pending_skill} to activate.")
         if pending_skill:
-            # Scope not yet chosen — put name back and wait
             ctx.user_data["pending_skill_name"] = pending_skill
+            return
+
+        pending_persona = ctx.user_data.pop("pending_persona_name", None) if ctx.user_data else None
+        pending_persona_scope = ctx.user_data.pop("pending_persona_scope", None) if ctx.user_data else None
+        if pending_persona and pending_persona_scope:
+            from .skills import save_persona
+            save_persona(pending_persona, msg.text, self.path, scope=pending_persona_scope)
+            icon = "🌐" if pending_persona_scope == "global" else "📁"
+            return await msg.reply_text(f"{icon} Persona '{pending_persona}' created ({pending_persona_scope}). Use /persona {pending_persona} to activate.")
+        if pending_persona:
+            ctx.user_data["pending_persona_name"] = pending_persona
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
@@ -255,11 +267,11 @@ class ProjectBot(AuthMixin):
         prompt = msg.text
         if msg.reply_to_message and msg.reply_to_message.text:
             prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
-        if self._active_skill and self._active_skill_mode == "persona":
-            from .skills import load_skill, format_skill_prompt
-            skill = load_skill(self._active_skill, self.path)
-            if skill:
-                prompt = format_skill_prompt(skill, prompt)
+        if self._active_persona:
+            from .skills import load_persona, format_persona_prompt
+            persona = load_persona(self._active_persona, self.path)
+            if persona:
+                prompt = format_persona_prompt(persona, prompt)
         self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
@@ -415,9 +427,28 @@ class ProjectBot(AuthMixin):
             reply_markup=keyboard,
         )
 
+    def _picker_markup(self, items: dict, prefix: str) -> InlineKeyboardMarkup | None:
+        if not items:
+            return None
+        buttons = [
+            InlineKeyboardButton(name, callback_data=f"{prefix}_{name}")
+            for name in sorted(items)
+        ]
+        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        return InlineKeyboardMarkup(rows)
+
     async def _on_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
+        if ctx.args:
+            name = ctx.args[0].lower()
+            from .skills import load_skill
+            skill = load_skill(name, self.path)
+            if not skill:
+                return await update.effective_message.reply_text(f"Skill '{name}' not found.")
+            self.task_manager.claude.append_system_prompt = skill.content
+            self._active_skill = name
+            return await update.effective_message.reply_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
         from .skills import load_skills
         skills = load_skills(self.path)
         if not skills:
@@ -427,71 +458,9 @@ class ProjectBot(AuthMixin):
             icon = "\U0001f4c1" if skill.source == "project" else "\U0001f310" if skill.source == "global" else "\U0001f916"
             lines.append(f"  {icon} {name} ({skill.source})")
         if self._active_skill:
-            mode_label = "💬 persona" if self._active_skill_mode == "persona" else "🧠 skill"
-            lines.append(f"\nActive: {self._active_skill} ({mode_label})")
-        else:
-            lines.append(f"\nNo active skill. Use /use <name> to activate.")
-        await update.effective_message.reply_text("\n".join(lines))
-
-    def _activate_skill(self, name: str, mode: str, content: str) -> None:
-        """Activate a skill/persona. Clears previous if needed."""
-        if self._active_skill_mode == "skill":
-            self.task_manager.claude.append_system_prompt = None
-        self._active_skill = name
-        self._active_skill_mode = mode
-        if mode == "skill":
-            self.task_manager.claude.append_system_prompt = content
-
-    def _skill_picker_markup(self, mode: str) -> InlineKeyboardMarkup | None:
-        """Build inline keyboard with available skills for the given mode."""
-        from .skills import load_skills
-        skills = load_skills(self.path)
-        if not skills:
-            return None
-        buttons = [
-            InlineKeyboardButton(name, callback_data=f"pick_{mode}_{name}")
-            for name in sorted(skills)
-        ]
-        # Arrange in rows of 3
-        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-        return InlineKeyboardMarkup(rows)
-
-    async def _on_use(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            if self._active_skill:
-                mode_label = "persona" if self._active_skill_mode == "persona" else "skill"
-                return await update.effective_message.reply_text(f"Active: {self._active_skill} ({mode_label})\nUse /stop_skill to deactivate.")
-            markup = self._skill_picker_markup("skill")
-            if not markup:
-                return await update.effective_message.reply_text("No skills available.\nCreate one with /create_skill <name>")
-            return await update.effective_message.reply_text("Pick a skill to activate:", reply_markup=markup)
-        name = ctx.args[0].lower()
-        from .skills import load_skill
-        skill = load_skill(name, self.path)
-        if not skill:
-            return await update.effective_message.reply_text(f"Skill '{name}' not found. See /skills for available skills.")
-        self._activate_skill(name, "skill", skill.content)
-        await update.effective_message.reply_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
-
-    async def _on_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            if self._active_skill and self._active_skill_mode == "persona":
-                return await update.effective_message.reply_text(f"Active persona: {self._active_skill}\nUse /stop_skill to deactivate.")
-            markup = self._skill_picker_markup("persona")
-            if not markup:
-                return await update.effective_message.reply_text("No skills available.\nCreate one with /create_skill <name>")
-            return await update.effective_message.reply_text("Pick a persona to activate:", reply_markup=markup)
-        name = ctx.args[0].lower()
-        from .skills import load_skill
-        skill = load_skill(name, self.path)
-        if not skill:
-            return await update.effective_message.reply_text(f"Skill '{name}' not found. See /skills for available skills.")
-        self._activate_skill(name, "persona", skill.content)
-        await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_skill to deactivate.")
+            lines.append(f"\nActive: {self._active_skill}")
+        markup = self._picker_markup(skills, "pick_skill")
+        await update.effective_message.reply_text("\n".join(lines), reply_markup=markup)
 
     async def _on_stop_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -500,9 +469,7 @@ class ProjectBot(AuthMixin):
             return await update.effective_message.reply_text("No active skill.")
         old = self._active_skill
         self._active_skill = None
-        if self._active_skill_mode == "skill":
-            self.task_manager.claude.append_system_prompt = None
-        self._active_skill_mode = "skill"
+        self.task_manager.claude.append_system_prompt = None
         await update.effective_message.reply_text(f"Skill '{old}' deactivated.")
 
     async def _on_create_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -540,6 +507,72 @@ class ProjectBot(AuthMixin):
             ]
         ])
         await update.effective_message.reply_text(f"Delete {icon} {skill.source} skill '{name}'?", reply_markup=keyboard)
+
+    # --- Persona handlers ---
+
+    async def _on_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            if self._active_persona:
+                return await update.effective_message.reply_text(f"Active persona: {self._active_persona}\nUse /stop_persona to deactivate.")
+            from .skills import load_personas
+            markup = self._picker_markup(load_personas(self.path), "pick_persona")
+            if not markup:
+                return await update.effective_message.reply_text("No personas available.\nCreate one with /create_persona <name>")
+            return await update.effective_message.reply_text("Pick a persona to activate:", reply_markup=markup)
+        name = ctx.args[0].lower()
+        from .skills import load_persona
+        persona = load_persona(name, self.path)
+        if not persona:
+            return await update.effective_message.reply_text(f"Persona '{name}' not found.")
+        self._active_persona = name
+        await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
+
+    async def _on_stop_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not self._active_persona:
+            return await update.effective_message.reply_text("No active persona.")
+        old = self._active_persona
+        self._active_persona = None
+        await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
+
+    async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /create_persona <name>")
+        name = ctx.args[0].lower()
+        ctx.user_data["pending_persona_name"] = name
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📁 Project", callback_data=f"persona_scope_project_{name}"),
+                InlineKeyboardButton("🌐 Global", callback_data=f"persona_scope_global_{name}"),
+            ]
+        ])
+        await update.effective_message.reply_text(
+            f"Where should persona '{name}' be saved?", reply_markup=keyboard,
+        )
+
+    async def _on_delete_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not ctx.args:
+            return await update.effective_message.reply_text("Usage: /delete_persona <name>")
+        name = ctx.args[0].lower()
+        from .skills import load_persona
+        persona = load_persona(name, self.path)
+        if not persona:
+            return await update.effective_message.reply_text(f"Persona '{name}' not found.")
+        icon = "🌐" if persona.source == "global" else "📁"
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Delete", callback_data=f"persona_delete_confirm_{persona.source}_{name}"),
+                InlineKeyboardButton("Cancel", callback_data="persona_delete_cancel"),
+            ]
+        ])
+        await update.effective_message.reply_text(f"Delete {icon} {persona.source} persona '{name}'?", reply_markup=keyboard)
 
     async def _on_voice_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -601,12 +634,13 @@ class ProjectBot(AuthMixin):
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             self._active_skill = None
-            self._active_skill_mode = "skill"
+            self._active_persona = None
             self.task_manager.claude.append_system_prompt = None
             clear_session(self.name)
             await query.edit_message_text("Session reset.")
         elif query.data == "reset_cancel":
             await query.edit_message_text("Reset cancelled.")
+        # Skill callbacks
         elif query.data.startswith("skill_delete_confirm_"):
             rest = query.data[len("skill_delete_confirm_"):]
             scope, _, name = rest.partition("_")
@@ -614,9 +648,7 @@ class ProjectBot(AuthMixin):
             _delete_skill(name, self.path, scope=scope)
             if self._active_skill == name:
                 self._active_skill = None
-                if self._active_skill_mode == "skill":
-                    self.task_manager.claude.append_system_prompt = None
-                self._active_skill_mode = "skill"
+                self.task_manager.claude.append_system_prompt = None
             await query.edit_message_text(f"Skill '{name}' deleted.")
         elif query.data == "skill_delete_cancel":
             await query.edit_message_text("Cancelled.")
@@ -626,18 +658,40 @@ class ProjectBot(AuthMixin):
             ctx.user_data["pending_skill_name"] = name
             ctx.user_data["pending_skill_scope"] = scope
             await query.edit_message_text(f"Send the content for skill '{name}':")
-        elif query.data.startswith("pick_"):
-            rest = query.data[len("pick_"):]
-            mode, _, name = rest.partition("_")
+        elif query.data.startswith("pick_skill_"):
+            name = query.data[len("pick_skill_"):]
             from .skills import load_skill
             skill = load_skill(name, self.path)
             if not skill:
                 return await query.edit_message_text(f"Skill '{name}' not found.")
-            self._activate_skill(name, mode, skill.content)
-            if mode == "persona":
-                await query.edit_message_text(f"💬 Persona '{name}' activated.\nUse /stop_skill to deactivate.")
-            else:
-                await query.edit_message_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
+            self.task_manager.claude.append_system_prompt = skill.content
+            self._active_skill = name
+            await query.edit_message_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
+        # Persona callbacks
+        elif query.data.startswith("persona_delete_confirm_"):
+            rest = query.data[len("persona_delete_confirm_"):]
+            scope, _, name = rest.partition("_")
+            from .skills import delete_persona as _delete_persona
+            _delete_persona(name, self.path, scope=scope)
+            if self._active_persona == name:
+                self._active_persona = None
+            await query.edit_message_text(f"Persona '{name}' deleted.")
+        elif query.data == "persona_delete_cancel":
+            await query.edit_message_text("Cancelled.")
+        elif query.data.startswith("persona_scope_"):
+            rest = query.data[len("persona_scope_"):]
+            scope, _, name = rest.partition("_")
+            ctx.user_data["pending_persona_name"] = name
+            ctx.user_data["pending_persona_scope"] = scope
+            await query.edit_message_text(f"Send the content for persona '{name}':")
+        elif query.data.startswith("pick_persona_"):
+            name = query.data[len("pick_persona_"):]
+            from .skills import load_persona
+            persona = load_persona(name, self.path)
+            if not persona:
+                return await query.edit_message_text(f"Persona '{name}' not found.")
+            self._active_persona = name
+            await query.edit_message_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
         elif query.data.startswith("task_info_"):
             task_id = _parse_task_id(query.data)
             task = self.task_manager.get(task_id)
@@ -712,6 +766,7 @@ class ProjectBot(AuthMixin):
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
             f"Skill: {self._active_skill or 'none'}",
+            f"Persona: {self._active_persona or 'none'}",
         ]
         await update.effective_message.reply_text("\n".join(lines))
 
@@ -796,7 +851,7 @@ class ProjectBot(AuthMixin):
         status_msg = await msg.reply_text("🎤 Transcribing...")
 
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "voice"
-        voice_dir.mkdir(parents=True, exist_ok=True)
+        voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         ogg_path = voice_dir / f"voice_{uuid.uuid4().hex}.ogg"
 
@@ -819,12 +874,12 @@ class ProjectBot(AuthMixin):
             if msg.reply_to_message and msg.reply_to_message.text:
                 prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
 
-            # Apply active skill if in persona mode only
-            if self._active_skill and self._active_skill_mode == "persona":
-                from .skills import load_skill, format_skill_prompt
-                skill = load_skill(self._active_skill, self.path)
-                if skill:
-                    prompt = format_skill_prompt(skill, prompt)
+            # Apply active persona
+            if self._active_persona:
+                from .skills import load_persona, format_persona_prompt
+                persona = load_persona(self._active_persona, self.path)
+                if persona:
+                    prompt = format_persona_prompt(persona, prompt)
 
             self.task_manager.submit_claude(
                 chat_id=update.effective_chat.id,
@@ -876,6 +931,14 @@ class ProjectBot(AuthMixin):
         path = (
             self.path / file_path if not file_path.startswith("/") else Path(file_path)
         )
+        try:
+            resolved = path.resolve()
+        except (OSError, ValueError):
+            logger.warning("Invalid image path: %s", file_path)
+            return
+        if not str(resolved).startswith(str(self.path.resolve())):
+            logger.warning("Image path traversal blocked: %s", file_path)
+            return
         if not path.exists():
             logger.warning("Image file not found: %s", path)
             return
@@ -960,11 +1023,13 @@ class ProjectBot(AuthMixin):
             "version": self._on_version,
             "help": self._on_help,
             "skills": self._on_skills,
-            "use": self._on_use,
-            "persona": self._on_persona,
             "stop_skill": self._on_stop_skill,
             "create_skill": self._on_create_skill,
             "delete_skill": self._on_delete_skill,
+            "persona": self._on_persona,
+            "stop_persona": self._on_stop_persona,
+            "create_persona": self._on_create_persona,
+            "delete_persona": self._on_delete_persona,
             "voice": self._on_voice_status,
         }
         private = filters.ChatType.PRIVATE

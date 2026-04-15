@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,6 +111,13 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
+    lock = path.with_suffix(".lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        _save_config_unlocked(config, path)
+
+
+def _save_config_unlocked(config: Config, path: Path) -> None:
     raw: dict = {}
     if path.exists():
         try:
@@ -179,22 +189,40 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
-    path.write_text(json.dumps(raw, indent=2) + "\n")
-    path.chmod(0o600)
+    _atomic_write(path, json.dumps(raw, indent=2) + "\n")
+
+
+def _atomic_write(path: Path, data: str) -> None:
+    """Write data to path atomically via tempfile + rename."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.write(fd, data.encode())
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        os.rename(tmp, path)
+    except BaseException:
+        os.close(fd) if not os.get_inheritable(fd) else None
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _patch_json(patch_fn, path: Path) -> None:
-    """Read-modify-write config JSON via a mutating function."""
+    """Read-modify-write config JSON with file locking."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    raw: dict = {}
-    if path.exists():
-        try:
-            raw = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    patch_fn(raw)
-    path.write_text(json.dumps(raw, indent=2) + "\n")
-    path.chmod(0o600)
+    lock = path.with_suffix(".lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        raw: dict = {}
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+        patch_fn(raw)
+        _atomic_write(path, json.dumps(raw, indent=2) + "\n")
 
 
 def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:

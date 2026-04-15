@@ -4,15 +4,23 @@ from pathlib import Path
 
 from link_project_to_chat.skills import (
     Skill,
+    delete_persona,
     delete_skill,
-    format_skill_prompt,
+    format_persona_prompt,
+    load_persona,
+    load_personas,
     load_skill,
     load_skills,
+    save_persona,
     save_skill,
 )
 
 
-def test_load_skills_empty(tmp_path: Path):
+# --- Skills ---
+
+def test_load_skills_empty(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", tmp_path / "empty")
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_SKILLS_DIR", tmp_path / "empty")
     skills = load_skills(tmp_path)
     assert skills == {}
 
@@ -126,6 +134,37 @@ def test_load_skills_claude_user(tmp_path: Path, monkeypatch):
     assert skills["helper"].source == "claude"
 
 
+def test_load_skills_directory_format(tmp_path: Path, monkeypatch):
+    claude_dir = tmp_path / "claude_skills"
+    (claude_dir / "reviewer").mkdir(parents=True)
+    (claude_dir / "reviewer" / "SKILL.md").write_text("Review code carefully.")
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", claude_dir)
+    skills = load_skills(tmp_path / "project")
+    assert "reviewer" in skills
+    assert skills["reviewer"].content == "Review code carefully."
+    assert skills["reviewer"].source == "claude"
+
+
+def test_load_skill_directory_format(tmp_path: Path, monkeypatch):
+    claude_dir = tmp_path / "claude_skills"
+    (claude_dir / "reviewer").mkdir(parents=True)
+    (claude_dir / "reviewer" / "SKILL.md").write_text("Review code.")
+    monkeypatch.setattr("link_project_to_chat.skills.CLAUDE_USER_SKILLS_DIR", claude_dir)
+    skill = load_skill("reviewer", tmp_path / "project")
+    assert skill is not None
+    assert skill.content == "Review code."
+
+
+def test_flat_file_overrides_directory(tmp_path: Path):
+    d = tmp_path / ".claude" / "skills"
+    d.mkdir(parents=True)
+    (d / "reviewer.md").write_text("Flat reviewer.")
+    (d / "reviewer").mkdir()
+    (d / "reviewer" / "SKILL.md").write_text("Dir reviewer.")
+    skills = load_skills(tmp_path)
+    assert skills["reviewer"].content == "Flat reviewer."
+
+
 def test_claude_skill_overridden_by_global(tmp_path: Path, monkeypatch):
     claude_dir = tmp_path / "claude_skills"
     claude_dir.mkdir()
@@ -151,10 +190,75 @@ def test_load_skill_falls_back_to_claude(tmp_path: Path, monkeypatch):
     assert skill.content == "Claude helper."
 
 
-def test_format_skill_prompt():
-    skill = Skill(name="reviewer", content="Review code.", source="project", path=Path("/fake"))
-    result = format_skill_prompt(skill, "Check this function")
-    assert "[SKILL: reviewer]" in result
-    assert "Review code." in result
-    assert "[END SKILL]" in result
-    assert "Check this function" in result
+# --- Personas ---
+
+def test_load_personas_empty(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_PERSONAS_DIR", tmp_path / "empty")
+    personas = load_personas(tmp_path)
+    assert personas == {}
+
+
+def test_load_personas_from_project(tmp_path: Path):
+    d = tmp_path / ".claude" / "personas"
+    d.mkdir(parents=True)
+    (d / "teacher.md").write_text("You are a patient teacher.")
+    personas = load_personas(tmp_path)
+    assert "teacher" in personas
+    assert personas["teacher"].source == "project"
+
+
+def test_load_personas_global(tmp_path: Path, monkeypatch):
+    global_dir = tmp_path / "global_personas"
+    global_dir.mkdir()
+    (global_dir / "mentor.md").write_text("You are a mentor.")
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_PERSONAS_DIR", global_dir)
+    personas = load_personas(tmp_path / "project")
+    assert "mentor" in personas
+    assert personas["mentor"].source == "global"
+
+
+def test_load_persona_single(tmp_path: Path):
+    d = tmp_path / ".claude" / "personas"
+    d.mkdir(parents=True)
+    (d / "teacher.md").write_text("You are a teacher.")
+    persona = load_persona("teacher", tmp_path)
+    assert persona is not None
+    assert persona.content == "You are a teacher."
+
+
+def test_load_persona_not_found(tmp_path: Path):
+    assert load_persona("nonexistent", tmp_path) is None
+
+
+def test_save_persona(tmp_path: Path):
+    path = save_persona("mypersona", "Persona content.", tmp_path)
+    assert path.exists()
+    assert path.read_text() == "Persona content."
+    assert path.parent == tmp_path / ".claude" / "personas"
+
+
+def test_save_persona_global(tmp_path: Path, monkeypatch):
+    global_dir = tmp_path / "global_personas"
+    monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_PERSONAS_DIR", global_dir)
+    path = save_persona("mypersona", "Global persona.", tmp_path, scope="global")
+    assert path.exists()
+    assert path.parent == global_dir
+
+
+def test_delete_persona(tmp_path: Path):
+    save_persona("todelete", "content", tmp_path)
+    assert delete_persona("todelete", tmp_path) is True
+    assert not (tmp_path / ".claude" / "personas" / "todelete.md").exists()
+
+
+def test_delete_persona_not_found(tmp_path: Path):
+    assert delete_persona("nope", tmp_path) is False
+
+
+def test_format_persona_prompt():
+    persona = Skill(name="teacher", content="Be a teacher.", source="project", path=Path("/fake"))
+    result = format_persona_prompt(persona, "Explain this")
+    assert "[PERSONA: teacher]" in result
+    assert "Be a teacher." in result
+    assert "[END PERSONA]" in result
+    assert "Explain this" in result

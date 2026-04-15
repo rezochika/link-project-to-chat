@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -16,6 +17,13 @@ EFFORT_LEVELS = ("low", "medium", "high", "max")
 MODELS = ("haiku", "sonnet", "opus")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
+
+# Appended when interactive mode is used so Claude handles dismissed AskUserQuestion gracefully.
+_ASK_DISMISSED_HINT = (
+    "If your AskUserQuestion tool call is dismissed with an error, do NOT retry it. "
+    "Instead, output the question clearly as text and wait. "
+    "The user's answer will arrive as a follow-up message."
+)
 
 
 class ClaudeClient:
@@ -44,11 +52,11 @@ class ClaudeClient:
         self._last_duration: float | None = None
         self._total_requests: int = 0
 
-    async def chat_stream(
-        self,
-        user_message: str,
-        on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
-    ) -> AsyncGenerator[StreamEvent, None]:
+    # ------------------------------------------------------------------
+    # Command building
+    # ------------------------------------------------------------------
+
+    def _build_cmd(self) -> list[str]:
         cmd = [
             "claude",
             "-p",
@@ -59,6 +67,8 @@ class ClaudeClient:
             "--verbose",
             "--effort",
             self.effort,
+            "--input-format",
+            "stream-json",
         ]
 
         if self.skip_permissions:
@@ -73,66 +83,57 @@ class ClaudeClient:
         if self.disallowed_tools:
             cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
+        # Combine user system prompt with the AskUserQuestion hint
+        parts = [_ASK_DISMISSED_HINT]
         if self.append_system_prompt:
-            cmd.extend(["--append-system-prompt", self.append_system_prompt])
+            parts.append(self.append_system_prompt)
+        cmd.extend(["--append-system-prompt", "\n\n".join(parts)])
 
         if self.session_id:
             cmd.extend(["--resume", self.session_id])
 
-        cmd.extend(["--", user_message])
+        return cmd
 
-        env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
-        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # ------------------------------------------------------------------
+    # Streaming — primary API
+    # ------------------------------------------------------------------
+
+    async def chat_stream(
+        self,
+        user_message: str,
+        on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Send a message and yield stream events.
+
+        If there is already a live interactive process (from a previous turn
+        that ended with an AskQuestion), the message is sent on its stdin.
+        Otherwise a new subprocess is spawned.
+        """
+        reuse = self._proc is not None and self._proc.poll() is None
+
+        if reuse:
+            proc = self._proc
+            self._send_stdin(proc, user_message)
+        else:
+            proc = self._start_proc(user_message, on_proc)
 
         self._last_message = user_message[:80]
         started_at = time.monotonic()
         self._started_at = started_at
         self._total_requests += 1
 
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(self.project_path),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-        self._proc = proc
-        if on_proc:
-            on_proc(proc)
-        logger.info("claude stream subprocess started pid=%s", proc.pid)
-
-        def _read_lines():
-            lines = []
-            for raw_line in proc.stdout:
-                lines.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
-            return lines
-
         try:
-            all_lines = await asyncio.to_thread(_read_lines)
-            for line in all_lines:
-                if not line.strip():
-                    continue
-                for event in parse_stream_line(line):
-                    if isinstance(event, Result):
-                        self.session_id = event.session_id or self.session_id
-                        if event.model:
-                            self.model_display = event.model
-                    yield event
-
-            stderr_bytes = await asyncio.to_thread(proc.stderr.read)
-            await asyncio.to_thread(proc.wait)
-
-            if proc.returncode != 0:
-                err = stderr_bytes.decode("utf-8", errors="replace").strip()
-                yield Error(message=err or f"exit code {proc.returncode}")
+            async for event in self._read_events(proc):
+                yield event
         finally:
             self._last_duration = time.monotonic() - started_at
             if self._proc is proc:
                 self._started_at = None
-                self._proc = None
-            logger.info("claude stream pid=%s done, code=%s", proc.pid, proc.returncode)
+            logger.info(
+                "claude stream pid=%s turn done, alive=%s",
+                proc.pid,
+                proc.poll() is None,
+            )
 
     async def chat(self, user_message: str, on_proc=None) -> str:
         result_text = ""
@@ -142,6 +143,97 @@ class ClaudeClient:
             elif isinstance(event, Error):
                 return f"Error: {event.message}"
         return result_text or "[No response]"
+
+    # ------------------------------------------------------------------
+    # Interactive process management
+    # ------------------------------------------------------------------
+
+    def _start_proc(
+        self,
+        user_message: str,
+        on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    ) -> subprocess.Popen:
+        cmd = self._build_cmd()
+
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(self.project_path),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self._proc = proc
+        if on_proc:
+            on_proc(proc)
+        logger.info("claude stream subprocess started pid=%s", proc.pid)
+
+        self._send_stdin(proc, user_message)
+        return proc
+
+    @staticmethod
+    def _send_stdin(proc: subprocess.Popen, message: str) -> None:
+        msg = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": message},
+        })
+        proc.stdin.write((msg + "\n").encode())
+        proc.stdin.flush()
+
+    async def _read_events(
+        self, proc: subprocess.Popen
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Read stdout line-by-line, yielding events until a Result is seen."""
+        while True:
+            raw_line = await asyncio.to_thread(proc.stdout.readline)
+            if not raw_line:
+                break  # EOF — process exited
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            if not line.strip():
+                continue
+            for event in parse_stream_line(line):
+                if isinstance(event, Result):
+                    self.session_id = event.session_id or self.session_id
+                    if event.model:
+                        self.model_display = event.model
+                yield event
+                if isinstance(event, Result):
+                    return  # Turn finished; process stays alive for follow-ups
+
+        # stdout EOF without a Result → process died
+        stderr_bytes = await asyncio.to_thread(proc.stderr.read)
+        await asyncio.to_thread(proc.wait)
+        if proc.returncode != 0:
+            err = stderr_bytes.decode("utf-8", errors="replace").strip()
+            yield Error(message=err or f"exit code {proc.returncode}")
+        # Clean up reference
+        if self._proc is proc:
+            self._proc = None
+
+    def close_interactive(self) -> None:
+        """Shut down the interactive subprocess (close stdin → EOF)."""
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if self._proc is proc:
+            self._proc = None
+            self._started_at = None
+
+    # ------------------------------------------------------------------
+    # Status / control
+    # ------------------------------------------------------------------
 
     @property
     def status(self) -> dict:
