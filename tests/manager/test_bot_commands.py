@@ -274,19 +274,20 @@ async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
 
-    # Clicking the "model" field button stores pending_edit and prompts
+    # Clicking the "model" field button shows a model picker (not pending_edit)
     update, ctx, query = _make_callback("proj_efld_model_myproj")
     ctx.user_data = {}
     await bot._on_callback(update, ctx)
-    assert ctx.user_data["pending_edit"] == {"name": "myproj", "field": "model"}
+    assert "pending_edit" not in ctx.user_data
     query.edit_message_text.assert_called_once()
+    call_text = query.edit_message_text.call_args[0][0]
+    assert "Select model" in call_text
 
-    # Sending the new value saves it
-    save_update, save_ctx = _make_update(text="claude-opus-4-5")
-    save_ctx.user_data = ctx.user_data
-    await bot._edit_field_save(save_update, save_ctx)
-    assert json.loads(proj_cfg.read_text())["projects"]["myproj"].get("model") == "claude-opus-4-5"
-    assert "pending_edit" not in save_ctx.user_data
+    # Clicking a model option saves it
+    update2, ctx2, query2 = _make_callback("proj_model_opus_myproj")
+    ctx2.user_data = {}
+    await bot._on_callback(update2, ctx2)
+    assert json.loads(proj_cfg.read_text())["projects"]["myproj"].get("model") == "opus"
 
 
 @pytest.mark.asyncio
@@ -319,8 +320,8 @@ async def test_button_click_cancels_pending_edit(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
 
-    # Start an edit
-    update, ctx, query = _make_callback("proj_efld_model_myproj")
+    # Start a non-model edit (e.g. "name") — this still uses pending_edit
+    update, ctx, query = _make_callback("proj_efld_name_myproj")
     ctx.user_data = {}
     await bot._on_callback(update, ctx)
     assert "pending_edit" in ctx.user_data

@@ -76,6 +76,7 @@ def _make_bot(tmp_path: Path, transcriber=None) -> ProjectBot:
     )
     bot.task_manager = MagicMock()
     bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.waiting_input_task = MagicMock(return_value=None)
     return bot
 
 
@@ -194,16 +195,15 @@ async def test_on_voice_with_reply_context(tmp_path):
     assert "My voice reply" in prompt
 
 
-async def test_on_voice_with_active_skill(tmp_path):
-    """Active skill should be prepended to voice transcript."""
+async def test_on_voice_with_active_persona(tmp_path):
+    """Active persona should be prepended to voice transcript."""
     transcriber = _FakeTranscriber(result="Review this code")
     bot = _make_bot(tmp_path, transcriber=transcriber)
-    bot._active_skill = "reviewer"
+    bot._active_persona = "reviewer"
 
-    # project_skills_dir(path) == path / ".claude" / "skills"
-    skill_dir = tmp_path / ".claude" / "skills"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "reviewer.md").write_text("You are a code reviewer.")
+    persona_dir = tmp_path / ".claude" / "personas"
+    persona_dir.mkdir(parents=True)
+    (persona_dir / "reviewer.md").write_text("You are a code reviewer.")
 
     update, status_msg = _make_voice_update()
     ctx = MagicMock()
@@ -211,8 +211,7 @@ async def test_on_voice_with_active_skill(tmp_path):
     await bot._on_voice(update, ctx)
 
     prompt = bot.task_manager.submit_claude.call_args[1]["prompt"]
-    # format_skill_prompt: f"[SKILL: {name}]\n{content}\n[END SKILL]\n\n{user}"
-    assert "[SKILL: reviewer]" in prompt
+    assert "[PERSONA: reviewer]" in prompt
     assert "You are a code reviewer." in prompt
     assert "Review this code" in prompt
 
