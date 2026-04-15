@@ -103,6 +103,7 @@ class TaskManager:
         on_complete: OnTaskEvent,
         on_task_started: OnTaskEvent,
         on_stream_event: Callable[[Task, StreamEvent], Awaitable[None]] | None = None,
+        on_waiting_input: OnTaskEvent | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
@@ -112,6 +113,7 @@ class TaskManager:
         self._on_complete = on_complete
         self._on_task_started = on_task_started
         self._on_stream_event = on_stream_event
+        self._on_waiting_input = on_waiting_input
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._claude = ClaudeClient(
@@ -191,6 +193,8 @@ class TaskManager:
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT
                 # Don't close interactive process; wait for user answer
+                if self._on_waiting_input:
+                    await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
             self._claude.close_interactive()
@@ -253,6 +257,8 @@ class TaskManager:
 
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT
+                if self._on_waiting_input:
+                    await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
             self._claude.close_interactive()
@@ -270,6 +276,19 @@ class TaskManager:
 
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
+
+    def submit_answer(self, task_id: int, answer: str) -> bool:
+        """Schedule answer_question as a background asyncio task.
+
+        Returns True if the task was found and is waiting for input. The
+        resulting coroutine is attached to ``task._asyncio_task`` so cancel
+        continues to work.
+        """
+        task = self._tasks.get(task_id)
+        if not task or task.status != TaskStatus.WAITING_INPUT:
+            return False
+        task._asyncio_task = asyncio.create_task(self.answer_question(task_id, answer))
+        return True
 
     def waiting_input_task(self, chat_id: int) -> Task | None:
         """Return the WAITING_INPUT task for a chat, if any."""

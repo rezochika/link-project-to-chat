@@ -37,7 +37,7 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
-from .stream import StreamEvent, TextDelta, ThinkingDelta, ToolUse
+from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,7 @@ class ProjectBot(AuthMixin):
             on_complete=self._on_task_complete,
             on_task_started=self._on_task_started,
             on_stream_event=self._on_stream_event,
+            on_waiting_input=self._on_waiting_input,
             skip_permissions=skip_permissions,
             permission_mode=permission_mode,
             allowed_tools=allowed_tools,
@@ -219,6 +220,51 @@ class ProjectBot(AuthMixin):
         else:
             await self._finalize_command_task(task)
 
+    def _question_markup(self, task_id: int, q_idx: int, question: Question) -> InlineKeyboardMarkup:
+        buttons = []
+        for opt_idx, opt in enumerate(question.options):
+            label = opt.label[:64] or f"Option {opt_idx + 1}"
+            buttons.append([
+                InlineKeyboardButton(label, callback_data=f"ask_{task_id}_{q_idx}_{opt_idx}")
+            ])
+        return InlineKeyboardMarkup(buttons)
+
+    async def _on_waiting_input(self, task: Task) -> None:
+        """Render pending questions as Telegram messages with option buttons."""
+        typing = self._typing_tasks.pop(task.id, None)
+        if typing:
+            typing.cancel()
+
+        # Flush any accompanying text Claude produced alongside the question
+        accompanying = task.result or self._stream_text.pop(task.id, "")
+        if accompanying and accompanying.strip():
+            await self._send_to_chat(task.chat_id, accompanying, reply_to=task.message_id)
+        self._stream_text.pop(task.id, None)
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        for q_idx, question in enumerate(task.pending_questions):
+            header = question.header.strip() if question.header else ""
+            body = question.question.strip() or "(question)"
+            lines = []
+            if header:
+                lines.append(f"<b>{_esc(header)}</b>")
+            lines.append(_esc(body))
+            if question.multi_select:
+                lines.append("<i>(Multi-select: tap an option or reply with comma-separated values.)</i>")
+            else:
+                lines.append("<i>(Tap an option or reply with free text.)</i>")
+            for opt in question.options:
+                if opt.description:
+                    lines.append(f"• <b>{_esc(opt.label)}</b> — {_esc(opt.description)}")
+            await self._send_html(
+                task.chat_id,
+                "\n".join(lines),
+                reply_to=task.message_id,
+                reply_markup=self._question_markup(task.id, q_idx, question),
+            )
+
     async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
@@ -256,6 +302,13 @@ class ProjectBot(AuthMixin):
             return await msg.reply_text(f"{icon} Persona '{pending_persona}' created ({pending_persona_scope}). Use /persona {pending_persona} to activate.")
         if pending_persona:
             ctx.user_data["pending_persona_name"] = pending_persona
+            return
+
+        # If Claude is currently waiting on a question in this chat, route
+        # this message as the answer instead of starting a new turn.
+        waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
+        if waiting:
+            self.task_manager.submit_answer(waiting.id, msg.text)
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
@@ -692,6 +745,46 @@ class ProjectBot(AuthMixin):
                 return await query.edit_message_text(f"Persona '{name}' not found.")
             self._active_persona = name
             await query.edit_message_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
+        elif query.data.startswith("ask_"):
+            # Format: ask_{task_id}_{q_idx}_{opt_idx}
+            parts = query.data.split("_")
+            if len(parts) != 4:
+                await query.answer("Invalid option.")
+                return
+            try:
+                task_id = int(parts[1])
+                q_idx = int(parts[2])
+                opt_idx = int(parts[3])
+            except ValueError:
+                await query.answer("Invalid option.")
+                return
+            task = self.task_manager.get(task_id)
+            if not task or task.status != TaskStatus.WAITING_INPUT:
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.answer("No longer waiting on input.")
+                return
+            if q_idx >= len(task.pending_questions):
+                await query.answer("Question no longer active.")
+                return
+            question = task.pending_questions[q_idx]
+            if opt_idx >= len(question.options):
+                await query.answer("Option no longer available.")
+                return
+            label = question.options[opt_idx].label
+            if self.task_manager.submit_answer(task_id, label):
+                await query.edit_message_reply_markup(reply_markup=None)
+                # Append selection to the message so the user sees what they chose
+                try:
+                    original = query.message.text_html or query.message.text or ""
+                    escaped = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    await query.edit_message_text(
+                        f"{original}\n\n<i>Selected:</i> {escaped}",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    logger.debug("could not annotate selected option", exc_info=True)
+            else:
+                await query.answer("Could not send answer.")
         elif query.data.startswith("task_info_"):
             task_id = _parse_task_id(query.data)
             task = self.task_manager.get(task_id)
@@ -814,6 +907,11 @@ class ProjectBot(AuthMixin):
         if caption:
             prompt += f"\n\n{caption}"
 
+        waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
+        if waiting:
+            self.task_manager.submit_answer(waiting.id, prompt)
+            return
+
         self.task_manager.submit_claude(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
@@ -868,6 +966,12 @@ class ProjectBot(AuthMixin):
             # Show the transcript (truncated for status display)
             display = text if len(text) <= 200 else text[:200] + "..."
             await status_msg.edit_text(f'🎤 "{display}"')
+
+            # If Claude is waiting on a question, route transcript as the answer.
+            waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
+            if waiting:
+                self.task_manager.submit_answer(waiting.id, text)
+                return
 
             # Build prompt with optional reply context
             prompt = text
