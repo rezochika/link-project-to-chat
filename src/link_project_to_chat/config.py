@@ -38,6 +38,7 @@ class Config:
     tts_backend: str = ""            # "openai" or "" (disabled)
     tts_model: str = "tts-1"        # OpenAI TTS model
     tts_voice: str = "alloy"        # OpenAI TTS voice
+    default_model: str = ""          # global default model for all projects
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -99,6 +100,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.tts_backend = raw.get("tts_backend", "")
         config.tts_model = raw.get("tts_model", "tts-1")
         config.tts_voice = raw.get("tts_voice", "alloy")
+        config.default_model = raw.get("default_model", "")
         for name, proj in raw.get("projects", {}).items():
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
@@ -178,6 +180,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw["tts_voice"] = config.tts_voice
     else:
         raw.pop("tts_voice", None)
+    if config.default_model:
+        raw["default_model"] = config.default_model
+    else:
+        raw.pop("default_model", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
     for name, p in config.projects.items():

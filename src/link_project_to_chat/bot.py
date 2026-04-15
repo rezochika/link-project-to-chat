@@ -408,20 +408,34 @@ class ProjectBot(AuthMixin):
         markup = self._tasks_markup(update.effective_chat.id)
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
+    MODEL_OPTIONS = [
+        ("opus[1m]", "Opus 4.6 1M", "Most capable, 1M context"),
+        ("opus", "Opus 4.6", "Most capable"),
+        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context"),
+        ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
+        ("haiku", "Haiku 4.5", "Fastest for quick answers"),
+    ]
+
     def _model_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(m, callback_data=f"model_set_{m}")]
-            for m in MODELS
-        ])
+        current = self.task_manager.claude.model
+        rows = []
+        for model_id, label, _ in self.MODEL_OPTIONS:
+            prefix = "● " if current == model_id else ""
+            rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"model_set_{model_id}")])
+        return InlineKeyboardMarkup(rows)
 
     def _current_model(self) -> str:
-        return self.task_manager.claude.model_display or self.task_manager.claude.model
+        raw = self.task_manager.claude.model
+        for model_id, label, desc in self.MODEL_OPTIONS:
+            if model_id == raw:
+                return f"{label} — {desc}"
+        return self.task_manager.claude.model_display or raw
 
     async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(
-            f"Current: {self._current_model()}",
+            f"Select model\nCurrent: {self._current_model()}",
             reply_markup=self._model_markup(),
         )
 
@@ -725,12 +739,13 @@ class ProjectBot(AuthMixin):
 
         if query.data.startswith("model_set_"):
             name = query.data[len("model_set_"):]
-            if name in MODELS:
+            valid = {m[0] for m in self.MODEL_OPTIONS}
+            if name in valid:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
                 patch_project(self.name, {"model": name})
             await query.edit_message_text(
-                f"Model: {self._current_model()}",
+                f"Select model\nCurrent: {self._current_model()}",
                 reply_markup=self._model_markup(),
             )
         elif query.data.startswith("effort_set_"):

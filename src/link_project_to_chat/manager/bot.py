@@ -34,13 +34,21 @@ COMMANDS = [
     ("remove_user", "Remove an authorized user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
+    ("model", "Set default model for all projects"),
     ("version", "Show version"),
     ("help", "Show commands"),
 ]
 
 _EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions")
-# Fields shown as edit buttons (subset — simpler types only)
 _BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions")
+
+MODEL_OPTIONS = [
+    ("opus[1m]", "Opus 4.6 1M"),
+    ("opus", "Opus 4.6"),
+    ("sonnet[1m]", "Sonnet 4.6 1M"),
+    ("sonnet", "Sonnet 4.6"),
+    ("haiku", "Haiku 4.5"),
+]
 
 
 def _parse_edit_callback(data: str) -> tuple[str, str] | None:
@@ -145,6 +153,26 @@ class ManagerBot(AuthMixin):
             return
         count = self._pm.stop_all()
         await update.effective_message.reply_text(f"Stopped {count} project(s).")
+
+    def _global_model_markup(self) -> InlineKeyboardMarkup:
+        from ..config import load_config
+        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
+        rows = []
+        for model_id, label in MODEL_OPTIONS:
+            prefix = "● " if current == model_id else ""
+            rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"global_model_{model_id}")])
+        return InlineKeyboardMarkup(rows)
+
+    async def _on_model(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._guard(update):
+            return
+        from ..config import load_config
+        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
+        label = next((l for m, l in MODEL_OPTIONS if m == current), current or "not set")
+        await update.effective_message.reply_text(
+            f"Default model: {label}\nApplies to projects without a per-project model override.",
+            reply_markup=self._global_model_markup(),
+        )
 
     async def _on_version(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -848,9 +876,64 @@ class ManagerBot(AuthMixin):
             parsed = _parse_edit_callback(data)
             if parsed:
                 field, name = parsed
-                ctx.user_data["pending_edit"] = {"name": name, "field": field}
+                if field == "model":
+                    projects = self._load_projects()
+                    current = projects.get(name, {}).get("model", "")
+                    rows = []
+                    for model_id, label in MODEL_OPTIONS:
+                        prefix = "● " if current == model_id else ""
+                        rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"proj_model_{model_id}_{name}")])
+                    rows.append([InlineKeyboardButton("« Back", callback_data=f"proj_edit_{name}")])
+                    await query.edit_message_text(
+                        f"Select model for '{name}':\nCurrent: {current or 'default'}",
+                        reply_markup=InlineKeyboardMarkup(rows),
+                    )
+                else:
+                    ctx.user_data["pending_edit"] = {"name": name, "field": field}
+                    await query.edit_message_text(
+                        f"Enter new value for {field} of '{name}':\n(/cancel to abort)"
+                    )
+
+        elif data.startswith("proj_model_"):
+            rest = data[len("proj_model_"):]
+            valid_ids = {m[0] for m in MODEL_OPTIONS}
+            model_id = None
+            name = None
+            for mid in valid_ids:
+                if rest.startswith(mid + "_"):
+                    model_id = mid
+                    name = rest[len(mid) + 1:]
+                    break
+            if model_id and name:
+                projects = self._load_projects()
+                if name in projects:
+                    projects[name]["model"] = model_id
+                    self._save_projects(projects)
+                current = model_id
+                rows = []
+                for mid, label in MODEL_OPTIONS:
+                    prefix = "● " if current == mid else ""
+                    rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"proj_model_{mid}_{name}")])
+                rows.append([InlineKeyboardButton("« Back", callback_data=f"proj_edit_{name}")])
+                label = next((l for m, l in MODEL_OPTIONS if m == model_id), model_id)
                 await query.edit_message_text(
-                    f"Enter new value for {field} of '{name}':\n(/cancel to abort)"
+                    f"Model for '{name}' set to: {label}\nRestart the project to apply.",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+
+        elif data.startswith("global_model_"):
+            model_id = data[len("global_model_"):]
+            valid_ids = {m[0] for m in MODEL_OPTIONS}
+            if model_id in valid_ids:
+                from ..config import load_config, save_config
+                cfg_path = self._project_config_path or DEFAULT_CONFIG
+                cfg = load_config(cfg_path)
+                cfg.default_model = model_id
+                save_config(cfg, cfg_path)
+                label = next((l for m, l in MODEL_OPTIONS if m == model_id), model_id)
+                await query.edit_message_text(
+                    f"Default model set to: {label}\nRestart projects to apply.",
+                    reply_markup=self._global_model_markup(),
                 )
 
         elif data.startswith("proj_remove_"):
@@ -907,6 +990,7 @@ class ManagerBot(AuthMixin):
             "projects": self._on_projects,
             "start_all": self._on_start_all,
             "stop_all": self._on_stop_all,
+            "model": self._on_model,
             "version": self._on_version,
             "help": self._on_help,
             "edit_project": self._on_edit_project,

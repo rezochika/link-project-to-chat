@@ -14,7 +14,7 @@ from .stream import Error, Result, StreamEvent, parse_stream_line
 logger = logging.getLogger(__name__)
 
 EFFORT_LEVELS = ("low", "medium", "high", "max")
-MODELS = ("haiku", "sonnet", "opus")
+MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
 

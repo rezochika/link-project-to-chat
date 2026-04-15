@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .config import load_project_configs, set_project_autostart
+from ..config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ def _default_command_builder(project_name: str, project_config: dict) -> list[st
         cmd.append("--dangerously-skip-permissions")
     elif permissions and permissions != "default":
         cmd.extend(["--permission-mode", permissions])
-    model = project_config.get("model")
+    model = project_config.get("model") or load_config().default_model
     if model:
         cmd.extend(["--model", model])
     return cmd
