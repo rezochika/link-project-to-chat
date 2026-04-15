@@ -62,6 +62,7 @@ COMMANDS = [
     ("create_persona", "Create a new persona"),
     ("delete_persona", "Delete a persona"),
     ("voice", "Show voice transcription status"),
+    ("lang", "Switch voice message language"),
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
@@ -668,6 +669,46 @@ class ProjectBot(AuthMixin):
                 "Configure with: link-project-to-chat setup"
             )
 
+    LANGUAGES = [
+        ("auto", "Auto-detect"),
+        ("en", "English"),
+        ("ka", "Georgian"),
+        ("ru", "Russian"),
+        ("de", "German"),
+        ("fr", "French"),
+        ("es", "Spanish"),
+        ("tr", "Turkish"),
+        ("uk", "Ukrainian"),
+        ("ja", "Japanese"),
+        ("zh", "Chinese"),
+    ]
+
+    async def _on_lang(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        if not self._transcriber:
+            return await update.effective_message.reply_text("Voice is not configured.")
+        if ctx.args:
+            code = ctx.args[0].lower()
+            if code == "auto":
+                code = ""
+            self._transcriber._language = code
+            label = code or "auto-detect"
+            return await update.effective_message.reply_text(f"Voice language set to: {label}")
+        current = getattr(self._transcriber, "_language", "") or "auto-detect"
+        buttons = [
+            InlineKeyboardButton(
+                f"{'● ' if (code or '') == getattr(self._transcriber, '_language', '') else ''}{label}",
+                callback_data=f"lang_set_{code}",
+            )
+            for code, label in self.LANGUAGES
+        ]
+        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        await update.effective_message.reply_text(
+            f"Current language: {current}\nSelect voice language:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
     async def _on_callback(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -711,6 +752,25 @@ class ProjectBot(AuthMixin):
             await query.edit_message_text(
                 f"Permissions: {self._current_permission()}",
                 reply_markup=self._permissions_markup(),
+            )
+        elif query.data.startswith("lang_set_"):
+            code = query.data[len("lang_set_"):]
+            if code == "auto":
+                code = ""
+            if self._transcriber:
+                self._transcriber._language = code
+            label = code or "auto-detect"
+            buttons = [
+                InlineKeyboardButton(
+                    f"{'● ' if (c or '') == code else ''}{l}",
+                    callback_data=f"lang_set_{c}",
+                )
+                for c, l in self.LANGUAGES
+            ]
+            rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+            await query.edit_message_text(
+                f"Voice language set to: {label}",
+                reply_markup=InlineKeyboardMarkup(rows),
             )
         elif query.data == "reset_confirm":
             self.task_manager.cancel_all()
@@ -1166,6 +1226,7 @@ class ProjectBot(AuthMixin):
             "create_persona": self._on_create_persona,
             "delete_persona": self._on_delete_persona,
             "voice": self._on_voice_status,
+            "lang": self._on_lang,
         }
         private = filters.ChatType.PRIVATE
         for name, handler in handlers.items():
