@@ -110,11 +110,12 @@ class WhisperCLITranscriber:
                     text = txt_path.read_text().strip()
             return text
         finally:
-            if wav_path.exists():
-                try:
-                    wav_path.unlink()
-                except OSError:
-                    pass
+            for cleanup_path in [wav_path, wav_path.with_suffix(".wav.txt")]:
+                if cleanup_path.exists():
+                    try:
+                        cleanup_path.unlink()
+                    except OSError:
+                        pass
 
 
 def create_transcriber(
