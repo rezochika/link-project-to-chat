@@ -35,6 +35,9 @@ class Config:
     openai_api_key: str = ""
     whisper_model: str = "whisper-1" # OpenAI model name or local whisper.cpp model size
     whisper_language: str = ""       # ISO 639-1 code (e.g. "en", "ka"), empty = auto-detect
+    tts_backend: str = ""            # "openai" or "" (disabled)
+    tts_model: str = "tts-1"        # OpenAI TTS model
+    tts_voice: str = "alloy"        # OpenAI TTS voice
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
 
 
@@ -93,6 +96,9 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.openai_api_key = raw.get("openai_api_key", "")
         config.whisper_model = raw.get("whisper_model", "whisper-1")
         config.whisper_language = raw.get("whisper_language", "")
+        config.tts_backend = raw.get("tts_backend", "")
+        config.tts_model = raw.get("tts_model", "tts-1")
+        config.tts_voice = raw.get("tts_voice", "alloy")
         for name, proj in raw.get("projects", {}).items():
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
@@ -160,6 +166,18 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw["whisper_language"] = config.whisper_language
     else:
         raw.pop("whisper_language", None)
+    if config.tts_backend:
+        raw["tts_backend"] = config.tts_backend
+    else:
+        raw.pop("tts_backend", None)
+    if config.tts_model and config.tts_model != "tts-1":
+        raw["tts_model"] = config.tts_model
+    else:
+        raw.pop("tts_model", None)
+    if config.tts_voice and config.tts_voice != "alloy":
+        raw["tts_voice"] = config.tts_voice
+    else:
+        raw.pop("tts_voice", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
     for name, p in config.projects.items():

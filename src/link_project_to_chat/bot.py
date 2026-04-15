@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .transcriber import Transcriber
+    from .transcriber import Synthesizer, Transcriber
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -87,6 +87,7 @@ class ProjectBot(AuthMixin):
         allowed_usernames: list[str] | None = None,
         trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
+        synthesizer: "Synthesizer | None" = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -110,6 +111,8 @@ class ProjectBot(AuthMixin):
         self._active_skill: str | None = None
         self._active_persona: str | None = None
         self._transcriber = transcriber
+        self._synthesizer = synthesizer
+        self._voice_tasks: set[int] = set()
         self.task_manager = TaskManager(
             project_path=self.path,
             on_complete=self._on_task_complete,
@@ -186,6 +189,8 @@ class ProjectBot(AuthMixin):
     async def _finalize_claude_task(self, task: Task) -> None:
         self._stream_text.pop(task.id, None)
         thinking = self._thinking_buf.pop(task.id, None)
+        is_voice = task.id in self._voice_tasks
+        self._voice_tasks.discard(task.id)
 
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
@@ -196,8 +201,32 @@ class ProjectBot(AuthMixin):
             if thinking:
                 self._thinking_store[task.id] = thinking
             await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+            if is_voice and self._synthesizer and task.result:
+                await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
             await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+
+    async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+        voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
+        voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Strip markdown formatting for cleaner speech
+        plain = strip_html(md_to_telegram(text))
+        # OpenAI TTS has a 4096 char limit per request
+        if len(plain) > 4096:
+            plain = plain[:4093] + "..."
+        out_path = voice_dir / f"tts_{uuid.uuid4().hex}.opus"
+        try:
+            await self._synthesizer.synthesize(plain, out_path)
+            with out_path.open("rb") as f:
+                await self._app.bot.send_voice(chat_id, f, reply_to_message_id=reply_to)
+        except Exception:
+            logger.warning("TTS failed", exc_info=True)
+        finally:
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
 
     async def _finalize_command_task(self, task: Task) -> None:
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
@@ -985,11 +1014,13 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
-            self.task_manager.submit_claude(
+            task = self.task_manager.submit_claude(
                 chat_id=update.effective_chat.id,
                 message_id=msg.message_id,
                 prompt=prompt,
             )
+            if self._synthesizer:
+                self._voice_tasks.add(task.id)
 
         except Exception as e:
             logger.exception("Voice transcription failed")
@@ -1184,6 +1215,7 @@ def run_bot(
     allowed_usernames: list[str] | None = None,
     trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
+    synthesizer: "Synthesizer | None" = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1202,6 +1234,7 @@ def run_bot(
         allowed_tools=allowed_tools,
         disallowed_tools=disallowed_tools,
         transcriber=transcriber,
+        synthesizer=synthesizer,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -1224,6 +1257,7 @@ def run_bots(
     disallowed_tools: list[str] | None = None,
     config_path: Path | None = None,
     transcriber: "Transcriber | None" = None,
+    synthesizer: "Synthesizer | None" = None,
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
@@ -1249,6 +1283,7 @@ def run_bots(
             allowed_usernames=effective_usernames,
             trusted_user_ids=effective_trusted_ids,
             transcriber=transcriber,
+            synthesizer=synthesizer,
         )
     else:
         names = ", ".join(config.projects.keys())

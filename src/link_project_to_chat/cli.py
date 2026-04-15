@@ -273,7 +273,7 @@ def start(
 
     config = load_config(cfg_path)
 
-    from .transcriber import create_transcriber
+    from .transcriber import create_transcriber, create_synthesizer
 
     transcriber = None
     if config.stt_backend:
@@ -286,6 +286,18 @@ def start(
             )
         except (ImportError, ValueError) as e:
             click.echo(f"Warning: Voice disabled — {e}", err=True)
+
+    synthesizer = None
+    if config.tts_backend:
+        try:
+            synthesizer = create_synthesizer(
+                config.tts_backend,
+                openai_api_key=config.openai_api_key,
+                tts_model=config.tts_model,
+                tts_voice=config.tts_voice,
+            )
+        except (ImportError, ValueError) as e:
+            click.echo(f"Warning: TTS disabled — {e}", err=True)
 
     if not config.projects:
         raise SystemExit(
@@ -314,6 +326,7 @@ def start(
             disallowed_tools=disallowed,
             on_trust=lambda uid: add_project_trusted_user_id(project, uid, cfg_path),
             transcriber=transcriber,
+            synthesizer=synthesizer,
         )
     else:
         run_bots(
@@ -325,6 +338,7 @@ def start(
             disallowed_tools=disallowed,
             config_path=cfg_path,
             transcriber=transcriber,
+            synthesizer=synthesizer,
         )
 
 
@@ -339,8 +353,11 @@ def start(
 @click.option("--whisper-model", default=None, help="Whisper model (default: whisper-1)")
 @click.option("--whisper-language", default=None,
               help="Language code (e.g. en, ka). Pass '' to reset to auto-detect.")
+@click.option("--tts-backend", default=None, type=click.Choice(["openai", "off"]),
+              help="Text-to-speech backend for voice responses")
+@click.option("--tts-voice", default=None, help="TTS voice (alloy, ash, ballad, coral, echo, fable, nova, onyx, sage, shimmer)")
 @click.pass_context
-def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api_hash: str | None, phone: str | None, stt_backend: str | None, openai_api_key: str | None, whisper_model: str | None, whisper_language: str | None):
+def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api_hash: str | None, phone: str | None, stt_backend: str | None, openai_api_key: str | None, whisper_model: str | None, whisper_language: str | None, tts_backend: str | None, tts_voice: str | None):
     """Set up GitHub PAT, Telegram API credentials, and Telethon authentication.
 
     Run without arguments for interactive setup. Or pass individual options.
@@ -356,6 +373,7 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
     interactive = all(v is None for v in [
         github_pat, telegram_api_id, telegram_api_hash, phone,
         stt_backend, openai_api_key, whisper_model, whisper_language,
+        tts_backend, tts_voice,
     ])
 
     # GitHub PAT
@@ -441,7 +459,45 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
                 )
             click.echo(f"Voice: {stt_backend} configured.")
 
-    if voice_changed:
+    # TTS (text-to-speech) — reuses the OpenAI API key from STT config
+    tts_changed = False
+    if tts_voice is not None and tts_backend is None:
+        if not config.tts_backend:
+            raise click.UsageError("--tts-voice requires --tts-backend or a previously configured backend.")
+        tts_backend = config.tts_backend
+
+    if tts_backend is not None or (interactive and click.confirm(
+        "Configure voice responses (TTS)?",
+        default=not config.tts_backend,
+    )):
+        if tts_backend is None:
+            tts_backend = click.prompt(
+                "TTS backend",
+                type=click.Choice(["openai", "off"]),
+                default=config.tts_backend or "openai",
+            )
+        if tts_backend == "off":
+            config.tts_backend = ""
+            tts_changed = True
+            click.echo("Voice responses disabled.")
+        else:
+            config.tts_backend = tts_backend
+            tts_changed = True
+            if not config.openai_api_key:
+                key = click.prompt("OpenAI API key (shared with STT)", default="")
+                if key:
+                    config.openai_api_key = key
+            if tts_voice:
+                config.tts_voice = tts_voice
+            elif interactive:
+                from .transcriber import TTS_VOICES
+                config.tts_voice = click.prompt(
+                    f"TTS voice ({', '.join(TTS_VOICES)})",
+                    default=config.tts_voice or "alloy",
+                )
+            click.echo(f"TTS: {tts_backend} configured (voice: {config.tts_voice}).")
+
+    if voice_changed or tts_changed:
         save_config(config, cfg_path)
 
     # Telethon authentication
@@ -488,6 +544,7 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
     session_path = cfg_path.parent / "telethon.session"
     click.echo(f"  Telethon session: {'authenticated' if session_path.exists() else 'not authenticated'}")
     click.echo(f"  Voice STT: {config.stt_backend or 'disabled'}")
+    click.echo(f"  Voice TTS: {config.tts_backend or 'disabled'}{f' ({config.tts_voice})' if config.tts_backend else ''}")
 
 
 @main.command("start-manager")

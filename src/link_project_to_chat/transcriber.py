@@ -18,6 +18,14 @@ class Transcriber(Protocol):
         ...
 
 
+class Synthesizer(Protocol):
+    """Protocol for text-to-speech backends."""
+
+    async def synthesize(self, text: str, output_path: Path) -> Path:
+        """Synthesize text to an audio file. Returns the output path."""
+        ...
+
+
 async def convert_ogg_to_wav(ogg_path: Path, wav_path: Path) -> Path:
     """Convert .ogg to 16kHz mono .wav using ffmpeg."""
     proc = await asyncio.create_subprocess_exec(
@@ -140,3 +148,58 @@ def create_transcriber(
         )
 
     raise ValueError(f"Unknown STT backend: '{backend}'. Use 'whisper-api' or 'whisper-cli'.")
+
+
+# ---------------------------------------------------------------------------
+# Text-to-speech
+# ---------------------------------------------------------------------------
+
+TTS_VOICES = ("alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer")
+
+
+class OpenAITTSSynthesizer:
+    """OpenAI TTS API synthesizer."""
+
+    def __init__(self, api_key: str, model: str = "tts-1", voice: str = "alloy"):
+        if openai is None:
+            raise ImportError(
+                "openai is required for TTS. "
+                "Install with: pip install link-project-to-chat[voice]"
+            )
+        self._model = model
+        self._voice = voice
+        self._client = openai.OpenAI(api_key=api_key)
+
+    async def synthesize(self, text: str, output_path: Path) -> Path:
+        def _call() -> Path:
+            response = self._client.audio.speech.create(
+                model=self._model,
+                voice=self._voice,
+                input=text,
+                response_format="opus",
+            )
+            response.stream_to_file(str(output_path))
+            return output_path
+
+        return await asyncio.to_thread(_call)
+
+
+def create_synthesizer(
+    backend: str,
+    openai_api_key: str = "",
+    tts_model: str = "tts-1",
+    tts_voice: str = "alloy",
+) -> Synthesizer | None:
+    if not backend:
+        return None
+
+    if backend == "openai":
+        if not openai_api_key:
+            raise ValueError("openai_api_key required for OpenAI TTS backend")
+        return OpenAITTSSynthesizer(
+            api_key=openai_api_key,
+            model=tts_model,
+            voice=tts_voice,
+        )
+
+    raise ValueError(f"Unknown TTS backend: '{backend}'. Use 'openai'.")
