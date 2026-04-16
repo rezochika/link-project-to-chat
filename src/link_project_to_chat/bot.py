@@ -409,8 +409,8 @@ class ProjectBot(AuthMixin):
         await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
 
     MODEL_OPTIONS = [
-        ("opus[1m]", "Opus 4.6 1M", "Most capable, 1M context"),
-        ("opus", "Opus 4.6", "Most capable"),
+        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context"),
+        ("opus", "Opus 4.7", "Most capable"),
         ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context"),
         ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
         ("haiku", "Haiku 4.5", "Fastest for quick answers"),

@@ -43,8 +43,8 @@ _EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions")
 _BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions")
 
 MODEL_OPTIONS = [
-    ("opus[1m]", "Opus 4.6 1M"),
-    ("opus", "Opus 4.6"),
+    ("opus[1m]", "Opus 4.7 1M"),
+    ("opus", "Opus 4.7"),
     ("sonnet[1m]", "Sonnet 4.6 1M"),
     ("sonnet", "Sonnet 4.6"),
     ("haiku", "Haiku 4.5"),

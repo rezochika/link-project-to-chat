@@ -33,7 +33,7 @@ def _sanitize_error(text: str) -> str:
     return first_line
 
 
-EFFORT_LEVELS = ("low", "medium", "high", "max")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
