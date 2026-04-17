@@ -421,3 +421,39 @@ class TestAtomicWrite:
         temps = list(tmp_path.glob("*.tmp"))
         assert len(temps) == 0
         assert not target.exists()
+
+
+def test_project_config_group_fields_default_false_none(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({
+        "projects": {
+            "p1": {"path": str(tmp_path), "telegram_bot_token": "t"}
+        }
+    }))
+    config = load_config(cfg_path)
+    p = config.projects["p1"]
+    assert p.group_mode is False
+    assert p.group_chat_id is None
+    assert p.role is None
+    assert p.active_persona is None
+
+
+def test_project_config_group_fields_roundtrip(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.parent.mkdir(exist_ok=True)
+    config = Config()
+    config.projects["acme_mgr"] = ProjectConfig(
+        path=str(tmp_path / "acme"),
+        telegram_bot_token="token",
+        group_mode=True,
+        group_chat_id=-100123456,
+        role="manager",
+        active_persona="software_manager",
+    )
+    save_config(config, cfg_path)
+    reloaded = load_config(cfg_path)
+    p = reloaded.projects["acme_mgr"]
+    assert p.group_mode is True
+    assert p.group_chat_id == -100123456
+    assert p.role == "manager"
+    assert p.active_persona == "software_manager"
