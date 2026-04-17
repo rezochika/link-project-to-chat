@@ -43,6 +43,9 @@ Issues = "https://github.com/rimnadze/link-project-to-chat/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/link_project_to_chat"]
 
+[tool.setuptools.package-data]
+"link_project_to_chat" = ["personas/*.md"]
+
 [project.scripts]
 link-project-to-chat = "link_project_to_chat.cli:main"
 
