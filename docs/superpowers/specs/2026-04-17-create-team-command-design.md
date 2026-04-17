@@ -42,7 +42,7 @@ Outcomes of the brainstorming Q&A on 2026-04-17:
 | 5 | Role labels | Keep `"manager"` / `"dev"` — load-bearing for @mention routing |
 | 6 | Auto-start | Yes, both bots auto-start when the conversation completes |
 | 7 | Code structure | Dedicated module `manager/telegram_group.py` + progressive status message edits |
-| 8 | Config shape | New top-level `teams` namespace; solo `projects` untouched. `ProjectConfig` loses its now-unused group-mode fields |
+| 8 | Config shape | New top-level `teams` namespace; solo `projects` untouched. `ProjectConfig` loses `group_mode`/`group_chat_id`/`role` (dead for solo bots). `active_persona` stays — still used for solo-bot `/persona` persistence |
 
 ## 4. User flow
 
@@ -201,9 +201,10 @@ Delete the following fields from `ProjectConfig` (added by dual-agent-team, now 
 - `group_mode`
 - `group_chat_id`
 - `role`
-- `active_persona`
 
 Loader no longer reads them; saver no longer writes them. No runtime migration — dual-agent-team is unreleased.
+
+**`active_persona` stays on `ProjectConfig`.** It's load-bearing for the solo-bot `/persona` command which persists the selected persona to config via `patch_project` ([bot.py:643](src/link_project_to_chat/bot.py:643)); removing it would regress that feature. `TeamConfig` has its own `active_persona` per bot-role, set at team creation.
 
 ### 6.4 New helpers in `config.py`
 
