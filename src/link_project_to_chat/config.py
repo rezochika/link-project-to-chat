@@ -12,6 +12,7 @@ except ImportError:  # Windows
 
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,7 +136,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    if sys.platform != "win32":
+        path.parent.chmod(0o700)
     lock = path.with_suffix(".lock")
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
@@ -252,10 +254,11 @@ def _atomic_write(path: Path, data: str) -> None:
     closed = False
     try:
         os.write(fd, data.encode())
-        os.fchmod(fd, 0o600)
+        if sys.platform != "win32":
+            os.fchmod(fd, 0o600)
         os.close(fd)
         closed = True
-        os.rename(tmp, path)
+        os.replace(tmp, path)
     except BaseException:
         if not closed:
             os.close(fd)

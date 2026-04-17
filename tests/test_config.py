@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,7 +44,8 @@ def test_save_and_load_config(tmp_path: Path):
         projects={"proj": ProjectConfig(path="/some/path", telegram_bot_token="TOK")},
     )
     save_config(cfg, p)
-    assert p.stat().st_mode & 0o777 == 0o600
+    if sys.platform != "win32":
+        assert p.stat().st_mode & 0o777 == 0o600
     loaded = load_config(p)
     assert loaded.allowed_usernames == ["bob"]
     assert loaded.manager_telegram_bot_token == "MGR"
@@ -129,7 +131,8 @@ def test_save_and_load_global_trusted_user_id(tmp_path: Path):
 def test_save_session_and_load(tmp_path: Path):
     p = tmp_path / "sessions.json"
     save_session("myproj", "sess-abc", p)
-    assert p.stat().st_mode & 0o777 == 0o600
+    if sys.platform != "win32":
+        assert p.stat().st_mode & 0o777 == 0o600
     sessions = load_sessions(p)
     assert sessions["myproj"] == "sess-abc"
 
@@ -409,11 +412,12 @@ class TestAtomicWrite:
         target = tmp_path / "test.json"
         _atomic_write(target, '{"key": "value"}\n')
         assert target.read_text() == '{"key": "value"}\n'
-        assert oct(target.stat().st_mode & 0o777) == "0o600"
+        if sys.platform != "win32":
+            assert oct(target.stat().st_mode & 0o777) == "0o600"
 
     def test_cleans_up_on_rename_failure(self, tmp_path):
         target = tmp_path / "test.json"
-        with patch("os.rename", side_effect=OSError("rename failed")):
+        with patch("os.replace", side_effect=OSError("rename failed")):
             try:
                 _atomic_write(target, "data")
             except OSError:
