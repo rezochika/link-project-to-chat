@@ -89,3 +89,15 @@ def test_mention_match_is_case_insensitive():
     mention = MagicMock(type="mention")
     msg = _msg(text="@Acme_Dev_Bot hi", entities={mention: "@Acme_Dev_Bot"})
     assert is_directed_at_me(msg, "acme_dev_bot") is True
+
+
+def test_directed_at_me_when_human_mentions_bot():
+    """A human user @mentioning the bot should still be detected as directed."""
+    mention = MagicMock(type="mention")
+    msg = _msg(
+        text="@acme_dev_bot help me out",
+        from_username="alice",
+        from_is_bot=False,
+        entities={mention: "@acme_dev_bot"},
+    )
+    assert is_directed_at_me(msg, "acme_dev_bot") is True

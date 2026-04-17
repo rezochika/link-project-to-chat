@@ -27,7 +27,12 @@ def is_from_other_bot(msg, my_username: str) -> bool:
 def mentions_bot(msg, bot_username: str) -> bool:
     """True when the message's text contains an @mention entity matching bot_username."""
     target = "@" + bot_username.lower()
-    entities = msg.parse_entities(["mention"]) if msg.text else {}
+    if not msg.text:
+        return False
+    try:
+        entities = msg.parse_entities(["mention"])
+    except Exception:
+        return False
     for entity, text in entities.items():
         if getattr(entity, "type", None) == "mention" and text.lower() == target:
             return True
