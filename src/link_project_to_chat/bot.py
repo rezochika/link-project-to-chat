@@ -89,6 +89,7 @@ class ProjectBot(AuthMixin):
         trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
+        active_persona: str | None = None,
         group_mode: bool = False,
     ):
         self.name = name
@@ -111,7 +112,7 @@ class ProjectBot(AuthMixin):
         self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
-        self._active_persona: str | None = None
+        self._active_persona = active_persona
         self._transcriber = transcriber
         self._synthesizer = synthesizer
         self._voice_tasks: set[int] = set()
@@ -638,6 +639,8 @@ class ProjectBot(AuthMixin):
         if not persona:
             return await update.effective_message.reply_text(f"Persona '{name}' not found.")
         self._active_persona = name
+        from .config import patch_project
+        patch_project(self.name, {"active_persona": name})
         await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
 
     async def _on_stop_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -647,6 +650,8 @@ class ProjectBot(AuthMixin):
             return await update.effective_message.reply_text("No active persona.")
         old = self._active_persona
         self._active_persona = None
+        from .config import patch_project
+        patch_project(self.name, {"active_persona": None})
         await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
 
     async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1333,6 +1338,7 @@ def run_bot(
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
     group_mode: bool = False,
+    active_persona: str | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1352,6 +1358,7 @@ def run_bot(
         disallowed_tools=disallowed_tools,
         transcriber=transcriber,
         synthesizer=synthesizer,
+        active_persona=active_persona,
         group_mode=group_mode,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
@@ -1403,6 +1410,7 @@ def run_bots(
             transcriber=transcriber,
             synthesizer=synthesizer,
             group_mode=proj.group_mode,
+            active_persona=proj.active_persona,
         )
     else:
         names = ", ".join(config.projects.keys())
