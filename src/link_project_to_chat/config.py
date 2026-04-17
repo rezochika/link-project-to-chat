@@ -3,8 +3,6 @@ from __future__ import annotations
 try:
     import fcntl
 except ImportError:  # Windows
-    import msvcrt as _msvcrt
-
     class fcntl:  # type: ignore[no-redef]
         LOCK_EX = 2
 
