@@ -1220,8 +1220,16 @@ class ProjectBot(AuthMixin):
     async def _post_init(self, app) -> None:
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
-        me = await app.bot.get_me()
-        self.bot_username = (me.username or "").lower()
+        try:
+            me = await app.bot.get_me()
+            self.bot_username = (me.username or "").lower()
+        except Exception:
+            logger.error("get_me() failed at startup", exc_info=True)
+            if self.group_mode:
+                raise RuntimeError(
+                    "group_mode=True requires a reachable Telegram API at startup "
+                    "to fetch bot username; aborting."
+                )
         await app.bot.set_my_commands(COMMANDS)
         for uid in self._get_trusted_user_ids():
             try:
