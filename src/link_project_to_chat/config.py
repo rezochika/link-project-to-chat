@@ -355,6 +355,47 @@ def patch_project(project_name: str, fields: dict, path: Path = DEFAULT_CONFIG) 
     _patch_json(_patch, path)
 
 
+def patch_team(team_name: str, fields: dict, path: Path = DEFAULT_CONFIG) -> None:
+    """Update specific fields on a team entry. None values remove the key.
+
+    Top-level replacement only: passing {"bots": {...}} replaces the entire
+    `bots` dict (not a deep merge). Callers that need to update one bot must
+    read the current team, modify the bots dict, and write it back whole.
+    """
+    def _patch(raw: dict) -> None:
+        team = raw.setdefault("teams", {}).setdefault(team_name, {})
+        for k, v in fields.items():
+            if v is None:
+                team.pop(k, None)
+            else:
+                team[k] = v
+    _patch_json(_patch, path)
+
+
+def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
+    """Load all team entries. Returns empty dict if the file is missing or invalid."""
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+            return {
+                name: TeamConfig(
+                    path=team["path"],
+                    group_chat_id=team["group_chat_id"],
+                    bots={
+                        role: TeamBotConfig(
+                            telegram_bot_token=b.get("telegram_bot_token", ""),
+                            active_persona=b.get("active_persona"),
+                        )
+                        for role, b in team.get("bots", {}).items()
+                    },
+                )
+                for name, team in raw.get("teams", {}).items()
+            }
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+    return {}
+
+
 def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:
     def _patch(raw: dict) -> None:
         raw.setdefault("projects", {}).setdefault(project_name, {})["session_id"] = session_id

@@ -17,7 +17,9 @@ from link_project_to_chat.config import (
     clear_trusted_user_id,
     load_config,
     load_sessions,
+    load_teams,
     load_trusted_user_id,
+    patch_team,
     save_config,
     save_project_trusted_user_id,
     save_session,
@@ -561,3 +563,57 @@ def test_save_config_removes_deleted_teams(tmp_path: Path):
     loaded = load_config(p)
     assert "acme" in loaded.teams
     assert "beta" not in loaded.teams
+
+
+def test_patch_team_creates_entry(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team(
+        "acme",
+        {
+            "path": "/home/user/acme",
+            "group_chat_id": -1001,
+            "bots": {"manager": {"telegram_bot_token": "t1"}},
+        },
+        p,
+    )
+    raw = json.loads(p.read_text())
+    assert raw["teams"]["acme"]["path"] == "/home/user/acme"
+    assert raw["teams"]["acme"]["group_chat_id"] == -1001
+    assert raw["teams"]["acme"]["bots"]["manager"]["telegram_bot_token"] == "t1"
+
+
+def test_patch_team_replaces_at_top_level(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team("acme", {"path": "/a", "group_chat_id": -1, "bots": {"manager": {"telegram_bot_token": "t1"}}}, p)
+    patch_team("acme", {"bots": {"dev": {"telegram_bot_token": "t2"}}}, p)
+    raw = json.loads(p.read_text())
+    # Entire bots dict replaced; path and group_chat_id preserved from first call
+    assert raw["teams"]["acme"]["bots"] == {"dev": {"telegram_bot_token": "t2"}}
+    assert raw["teams"]["acme"]["path"] == "/a"
+
+
+def test_patch_team_none_removes_key(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team("acme", {"path": "/a", "group_chat_id": -1}, p)
+    patch_team("acme", {"path": None}, p)
+    raw = json.loads(p.read_text())
+    assert "path" not in raw["teams"]["acme"]
+
+
+def test_load_teams_helper(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team(
+        "acme",
+        {
+            "path": "/a",
+            "group_chat_id": -1,
+            "bots": {"manager": {"telegram_bot_token": "t1", "active_persona": "developer"}},
+        },
+        p,
+    )
+    teams = load_teams(p)
+    assert teams["acme"].bots["manager"].active_persona == "developer"
+
+
+def test_load_teams_missing_file_returns_empty(tmp_path: Path):
+    assert load_teams(tmp_path / "nope.json") == {}
