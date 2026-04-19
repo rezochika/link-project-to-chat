@@ -219,7 +219,35 @@ class ProjectBot(AuthMixin):
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
+            if (task.error or "").startswith("USAGE_CAP:") and self.group_mode:
+                self._group_state.halt(task.chat_id)
+                await self._send_to_chat(
+                    task.chat_id,
+                    "Hit Max usage cap. Pausing until reset. Will retry every 30 min.",
+                    reply_to=task.message_id,
+                )
+                self._schedule_cap_probe(task.chat_id)
+                return
             await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+
+    def _schedule_cap_probe(self, chat_id: int, interval_s: int = 1800) -> None:
+        """Probe Claude every `interval_s` seconds; on success, resume the group."""
+        async def _probe() -> None:
+            from .claude_client import ClaudeClient
+            while self._group_state.get(chat_id).halted:
+                await asyncio.sleep(interval_s)
+                if not self._group_state.get(chat_id).halted:
+                    return  # user manually resumed
+                try:
+                    probe = ClaudeClient(project_path=self.path)
+                    result = await probe.chat("ping")
+                    if not result.startswith("Error:") and not result.startswith("USAGE_CAP:"):
+                        self._group_state.resume(chat_id)
+                        await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
+                        return
+                except Exception:
+                    logger.warning("cap probe failed", exc_info=True)
+        asyncio.create_task(_probe())
 
     async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"

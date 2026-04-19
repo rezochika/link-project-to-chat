@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from link_project_to_chat.bot import ProjectBot
+from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
+
+
+def _mk_task(chat_id: int, error: str) -> Task:
+    """Build a finalized Task in error state with the given error message."""
+    t = MagicMock(spec=Task)
+    t.id = 1
+    t.chat_id = chat_id
+    t.message_id = 100
+    t.status = TaskStatus.FAILED
+    t.error = error
+    t.result = ""
+    t.type = TaskType.CLAUDE
+    t._compact = False
+    return t
+
+
+@pytest.mark.asyncio
+async def test_cap_marker_halts_group_and_announces(tmp_path):
+    """When a Claude task fails with USAGE_CAP: marker, the bot halts the group and posts a pause message."""
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot._send_to_chat = AsyncMock()
+    bot._schedule_cap_probe = MagicMock()  # don't actually start a probe
+    task = _mk_task(chat_id=-100_111, error="USAGE_CAP: Rate limit exceeded.")
+    await bot._finalize_claude_task(task)
+    # Group is halted
+    assert bot._group_state.get(-100_111).halted is True
+    # Pause message sent
+    bot._send_to_chat.assert_called_once()
+    sent_text = bot._send_to_chat.call_args[0][1]
+    assert "usage cap" in sent_text.lower() or "pausing" in sent_text.lower()
+    # Probe scheduled
+    bot._schedule_cap_probe.assert_called_once_with(-100_111)
+
+
+@pytest.mark.asyncio
+async def test_cap_marker_in_solo_mode_falls_through_to_normal_error(tmp_path):
+    """In solo (non-team) mode, the cap marker is treated as a normal error (no halt, no probe)."""
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    bot._send_to_chat = AsyncMock()
+    bot._schedule_cap_probe = MagicMock()
+    task = _mk_task(chat_id=12345, error="USAGE_CAP: Rate limit exceeded.")
+    await bot._finalize_claude_task(task)
+    # No halt (no group_state for solo bot interaction)
+    bot._send_to_chat.assert_called_once()
+    sent_text = bot._send_to_chat.call_args[0][1]
+    assert sent_text.startswith("Error:")
+    bot._schedule_cap_probe.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_error_falls_through_normally(tmp_path):
+    """Non-cap errors should follow the existing 'Error: ...' path."""
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot._send_to_chat = AsyncMock()
+    bot._schedule_cap_probe = MagicMock()
+    task = _mk_task(chat_id=-100_111, error="Something else broke")
+    await bot._finalize_claude_task(task)
+    assert bot._group_state.get(-100_111).halted is False
+    bot._send_to_chat.assert_called_once()
+    sent_text = bot._send_to_chat.call_args[0][1]
+    assert sent_text.startswith("Error:")
+    bot._schedule_cap_probe.assert_not_called()
