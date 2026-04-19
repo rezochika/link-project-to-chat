@@ -69,6 +69,23 @@ class ProcessManager:
         self._set_autostart(project_name, True)
         return True
 
+    def _team_command_builder(self, team_name: str, role: str) -> list[str]:
+        return ["link-project-to-chat", "start", "--team", team_name, "--role", role]
+
+    def start_team(self, team_name: str, role: str) -> bool:
+        key = f"team:{team_name}:{role}"
+        if key in self._processes and self._processes[key].poll() is None:
+            return False
+        cmd = self._team_command_builder(team_name, role)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        self._processes[key] = proc
+        self._logs[key] = collections.deque(maxlen=200)
+        thread = threading.Thread(target=self._capture_output, args=(key, proc), daemon=True)
+        thread.start()
+        self._log_threads[key] = thread
+        logger.info("Started team %s/%s (pid=%d)", team_name, role, proc.pid)
+        return True
+
     def stop(self, project_name: str) -> bool:
         proc = self._processes.get(project_name)
         if not proc or proc.poll() is not None:
