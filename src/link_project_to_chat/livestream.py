@@ -27,6 +27,11 @@ class LiveMessage:
         throttle: float = _DEFAULT_THROTTLE,
         max_chars: int = _DEFAULT_MAX_CHARS,
     ) -> None:
+        if len(prefix) >= max_chars:
+            raise ValueError(
+                f"LiveMessage prefix ({len(prefix)} chars) must be shorter than max_chars "
+                f"({max_chars}); otherwise overflow rotation cannot make progress."
+            )
         self._bot = bot
         self.chat_id = chat_id
         self._reply_to = reply_to_message_id

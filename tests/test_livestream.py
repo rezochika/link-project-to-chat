@@ -179,12 +179,25 @@ async def test_overflow_rotates_to_new_message():
     live = LiveMessage(bot=bot, chat_id=1, throttle=0.05, max_chars=50)
     await live.start()
     first_mid = live.message_id
-    # 60 chars, well above the 50-char cap.
+    # 60 chars, above the 50-char cap.
     await live.append("x" * 60)
-    await asyncio.sleep(0.12)
-    # The buffer should have rotated: a new message was sent after the seal.
-    assert len(bot.sent) == 2
-    assert live.message_id != first_mid
-    # The first message was sealed with the prefix of the overflowed content
-    # (content may have been split); the new message_id becomes the active one.
+    await asyncio.sleep(0.15)
+    # Rotation produced: placeholder send, seal-edit on first msg, new send with tail.
+    assert len(bot.sent) == 2, f"expected 2 sends, got {len(bot.sent)}"
     assert bot.sent[1]["chat_id"] == 1
+    assert live.message_id != first_mid
+    # Seal-edit lands on the first message with exactly max_chars worth of data.
+    seal_edits = [e for e in bot.edits if e["message_id"] == first_mid]
+    assert seal_edits, "expected at least one edit on the original message"
+    assert seal_edits[-1]["text"] == "x" * 50
+    # New message starts with the 10-char tail.
+    assert bot.sent[1]["text"] == "x" * 10
+    # Buffer reflects only the tail now.
+    assert live._buffer == "x" * 10
+
+
+@pytest.mark.asyncio
+async def test_prefix_longer_than_max_chars_raises():
+    bot = FakeBot()
+    with pytest.raises(ValueError):
+        LiveMessage(bot=bot, chat_id=1, prefix="💭 very long prefix", max_chars=5)
