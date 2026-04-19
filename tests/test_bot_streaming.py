@@ -190,3 +190,11 @@ async def test_waiting_input_seals_live_text():
 
     # Live text was finalised and popped.
     assert task.id not in bot._live_text
+
+
+@pytest.mark.asyncio
+async def test_thinking_command_handlers_exist_and_register():
+    # Sanity check that the ProjectBot class exposes the new command handler.
+    from link_project_to_chat.bot import ProjectBot, COMMANDS
+    assert any(c[0] == "thinking" for c in COMMANDS)
+    assert hasattr(ProjectBot, "_on_thinking")

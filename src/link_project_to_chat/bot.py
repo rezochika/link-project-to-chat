@@ -48,6 +48,7 @@ COMMANDS = [
     ("tasks", "List all tasks"),
     ("model", "Set Claude model (haiku/sonnet/opus)"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
+    ("thinking", "Toggle live thinking display (on/off)"),
     ("permissions", "Set permission mode"),
     ("compact", "Compress session context"),
     ("status", "Bot status"),
@@ -511,6 +512,37 @@ class ProjectBot(AuthMixin):
             reply_markup=self._effort_markup(),
         )
 
+    def _thinking_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("On", callback_data="thinking_set_on"),
+                InlineKeyboardButton("Off", callback_data="thinking_set_off"),
+            ]
+        ])
+
+    def _current_thinking(self) -> str:
+        return "on" if self.show_thinking else "off"
+
+    async def _on_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        args = (ctx.args or []) if ctx else []
+        if args:
+            arg = args[0].lower()
+            if arg in ("on", "off"):
+                self.show_thinking = arg == "on"
+                patch_project(self.name, {"show_thinking": self.show_thinking})
+                return await update.effective_message.reply_text(
+                    f"Live thinking: {self._current_thinking()}"
+                )
+            return await update.effective_message.reply_text(
+                "Usage: /thinking on|off"
+            )
+        await update.effective_message.reply_text(
+            f"Live thinking: {self._current_thinking()}",
+            reply_markup=self._thinking_markup(),
+        )
+
     _PERMISSION_OPTIONS = (
         *PERMISSION_MODES,
         "dangerously-skip-permissions",
@@ -825,6 +857,15 @@ class ProjectBot(AuthMixin):
             await query.edit_message_text(
                 f"Effort: {self._current_effort()}",
                 reply_markup=self._effort_markup(),
+            )
+        elif query.data.startswith("thinking_set_"):
+            value = query.data[len("thinking_set_"):]
+            if value in ("on", "off"):
+                self.show_thinking = value == "on"
+                patch_project(self.name, {"show_thinking": self.show_thinking})
+            await query.edit_message_text(
+                f"Live thinking: {self._current_thinking()}",
+                reply_markup=self._thinking_markup(),
             )
         elif query.data.startswith("permissions_set_"):
             mode = query.data[len("permissions_set_"):]
@@ -1305,6 +1346,7 @@ class ProjectBot(AuthMixin):
             "tasks": self._on_tasks,
             "model": self._on_model,
             "effort": self._on_effort,
+            "thinking": self._on_thinking,
             "permissions": self._on_permissions,
             "compact": self._on_compact,
             "reset": self._on_reset,
