@@ -104,3 +104,53 @@ async def test_on_text_human_message_resumes_halted_group(tmp_path):
     await bot._on_text(u, c)
     assert bot._group_state.get(-100_111).halted is False
     assert bot._group_state.get(-100_111).bot_to_bot_rounds == 0
+
+
+@pytest.mark.asyncio
+async def test_halt_command_sets_halted_in_registry(tmp_path):
+    bot = _mk_bot(tmp_path, max_rounds=20)
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_chat = MagicMock(id=-100_111)
+    update.effective_user = MagicMock(id=12345)
+    update.effective_message.reply_text = AsyncMock()
+    # Stub auth to allow this user
+    bot._auth = MagicMock(return_value=True)
+    await bot._on_halt(update, MagicMock())
+    assert bot._group_state.get(-100_111).halted is True
+    update.effective_message.reply_text.assert_called_once()
+    assert "Halted" in update.effective_message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_resume_command_clears_halt(tmp_path):
+    bot = _mk_bot(tmp_path, max_rounds=20)
+    bot._group_state.halt(-100_111)
+    bot._group_state.get(-100_111).bot_to_bot_rounds = 5
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_chat = MagicMock(id=-100_111)
+    update.effective_user = MagicMock(id=12345)
+    update.effective_message.reply_text = AsyncMock()
+    bot._auth = MagicMock(return_value=True)
+    await bot._on_resume(update, MagicMock())
+    s = bot._group_state.get(-100_111)
+    assert s.halted is False
+    assert s.bot_to_bot_rounds == 0
+    update.effective_message.reply_text.assert_called_once()
+    assert "Resumed" in update.effective_message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_halt_in_solo_mode_rejects(tmp_path):
+    """Solo (non-team) bots should reject /halt with a helpful message."""
+    from link_project_to_chat.bot import ProjectBot
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")  # no team_name → group_mode=False
+    bot._auth = MagicMock(return_value=True)
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(id=12345)
+    await bot._on_halt(update, MagicMock())
+    update.effective_message.reply_text.assert_called_once()
+    assert "group mode" in update.effective_message.reply_text.call_args[0][0]

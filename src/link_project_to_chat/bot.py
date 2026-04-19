@@ -63,6 +63,8 @@ COMMANDS = [
     ("delete_persona", "Delete a persona"),
     ("voice", "Show voice transcription status"),
     ("lang", "Switch voice message language"),
+    ("halt", "Pause bot-to-bot iteration (group only)"),
+    ("resume", "Resume bot-to-bot iteration (group only)"),
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
@@ -679,6 +681,22 @@ class ProjectBot(AuthMixin):
         from .config import patch_project
         patch_project(self.name, {"active_persona": None})
         await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
+
+    async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.group_mode:
+            return await update.effective_message.reply_text("/halt is only available in group mode.")
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        self._group_state.halt(update.effective_chat.id)
+        await update.effective_message.reply_text("Halted. Use /resume to continue.")
+
+    async def _on_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.group_mode:
+            return await update.effective_message.reply_text("/resume is only available in group mode.")
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        self._group_state.resume(update.effective_chat.id)
+        await update.effective_message.reply_text("Resumed.")
 
     async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -1302,6 +1320,8 @@ class ProjectBot(AuthMixin):
             "delete_persona": self._on_delete_persona,
             "voice": self._on_voice_status,
             "lang": self._on_lang,
+            "halt": self._on_halt,
+            "resume": self._on_resume,
         }
         if self.group_mode:
             # Group mode: accept commands and text from groups/supergroups only.
