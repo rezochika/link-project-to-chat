@@ -29,6 +29,7 @@ from .config import (
     clear_session,
     load_sessions,
     patch_project,
+    patch_team,
     resolve_permissions,
     save_session,
     add_trusted_user_id,
@@ -357,7 +358,6 @@ class ProjectBot(AuthMixin):
             # write this group's chat_id into the team config and update in-memory state.
             if self.group_chat_id in (0, None):
                 if self._auth(update.effective_user) and self.team_name:
-                    from .config import patch_team
                     new_chat_id = msg.chat_id
                     patch_team(self.team_name, {"group_chat_id": new_chat_id})
                     self.group_chat_id = new_chat_id
