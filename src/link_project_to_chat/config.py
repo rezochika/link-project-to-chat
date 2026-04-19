@@ -38,6 +38,19 @@ class ProjectConfig:
 
 
 @dataclass
+class TeamBotConfig:
+    telegram_bot_token: str
+    active_persona: str | None = None
+
+
+@dataclass
+class TeamConfig:
+    path: str
+    group_chat_id: int
+    bots: dict[str, TeamBotConfig] = field(default_factory=dict)
+
+
+@dataclass
 class Config:
     allowed_usernames: list[str] = field(default_factory=list)
     trusted_user_ids: list[int] = field(default_factory=list)  # global fallback (also used by manager bot)
@@ -54,6 +67,7 @@ class Config:
     tts_voice: str = "alloy"        # OpenAI TTS voice
     default_model: str = ""          # global default model for all projects
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    teams: dict[str, TeamConfig] = field(default_factory=dict)
 
 
 def _load_permissions(proj: dict) -> str | None:

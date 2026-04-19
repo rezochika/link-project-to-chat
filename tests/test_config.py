@@ -9,6 +9,8 @@ from link_project_to_chat.config import (
     _atomic_write,
     Config,
     ProjectConfig,
+    TeamBotConfig,
+    TeamConfig,
     add_project_trusted_user_id,
     add_trusted_user_id,
     clear_session,
@@ -461,3 +463,10 @@ def test_project_config_group_fields_roundtrip(tmp_path):
     assert p.group_chat_id == -100123456
     assert p.role == "manager"
     assert p.active_persona == "software_manager"
+
+
+def test_team_config_default_empty_dict(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"projects": {}}))
+    config = load_config(p)
+    assert config.teams == {}
