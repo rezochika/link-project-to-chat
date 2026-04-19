@@ -997,6 +997,7 @@ class ManagerBot(AuthMixin):
         )
 
         completed: dict[str, str] = {}
+        config_committed = False
         try:
             # --- Bot 1 (manager) ---
             mgr_base = sanitize_bot_username(f"{prefix}_mgr")
@@ -1030,6 +1031,9 @@ class ManagerBot(AuthMixin):
             finally:
                 await gh.close()
             completed["repo"] = str(dest)
+            # Scaffold the dual-agent layout (idempotent — exist_ok=True).
+            for sub in ("docs", "src", "tests"):
+                (dest / sub).mkdir(parents=True, exist_ok=True)
             await edit(f'✓ Cloned | ⟳ Creating group "{prefix} team"...')
 
             # --- Group ---
@@ -1060,6 +1064,7 @@ class ManagerBot(AuthMixin):
                 },
                 cfg_path,
             )
+            config_committed = True
 
             # --- Post-commit (all non-fatal) ---
             for username in (mgr_username, dev_username):
@@ -1081,7 +1086,9 @@ class ManagerBot(AuthMixin):
             await edit(f'✓ Team ready. Open the "{prefix} team" group to start chatting.')
 
         except Exception as exc:
-            await self._send_partial_failure_report(chat.id, exc, completed)
+            await self._send_partial_failure_report(
+                chat.id, exc, completed, config_committed=config_committed
+            )
         finally:
             try:
                 await bfc.disconnect()
@@ -1091,7 +1098,11 @@ class ManagerBot(AuthMixin):
         return ConversationHandler.END
 
     async def _send_partial_failure_report(
-        self, chat_id: int, exc: Exception, completed: dict[str, str]
+        self,
+        chat_id: int,
+        exc: Exception,
+        completed: dict[str, str],
+        config_committed: bool = False,
     ) -> None:
         """Send a human-readable report of what was completed before the failure."""
         lines = [
@@ -1117,7 +1128,12 @@ class ManagerBot(AuthMixin):
                     f"  - Group {completed['group']} (delete via Telegram)"
                 )
             lines.append("")
-        lines.append("Config not saved. Safe to retry with a different prefix.")
+        if config_committed:
+            lines.append(
+                "⚠ Team config WAS saved. Use /delete_team to clean up before retrying."
+            )
+        else:
+            lines.append("Config not saved. Safe to retry with a different prefix.")
         await self._app.bot.send_message(chat_id, "\n".join(lines))
 
     @staticmethod

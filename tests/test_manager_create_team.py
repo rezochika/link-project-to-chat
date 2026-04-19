@@ -228,3 +228,56 @@ async def test_create_team_execute_partial_failure_report(tmp_path):
         args for args in sent_args if any("failed" in str(a).lower() for a in args)
     ]
     assert failure_msgs, f"Expected a failure report, got: {sent_args}"
+
+
+@pytest.mark.asyncio
+async def test_create_team_execute_partial_failure_after_bot1(tmp_path):
+    """Verify the failure report includes bot1 details when failure happens AFTER bot1 succeeds."""
+    from link_project_to_chat.manager.bot import ManagerBot
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
+    mb._pm = MagicMock()
+
+    update = MagicMock()
+    update.effective_chat = MagicMock(id=1)
+    update.effective_user = MagicMock(username="alice")
+    ctx = MagicMock()
+    ctx.user_data = {
+        "create_team": {
+            "project_prefix": "acme",
+            "persona_mgr": "developer",
+            "persona_dev": "tester",
+            "repo": MagicMock(),
+        }
+    }
+
+    # Bot1 succeeds with FAKE_TOKEN; bot2's first attempt raises.
+    call_count = {"n": 0}
+    async def fake_create_bot(display_name, username):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return "BOT1_TOKEN"
+        raise Exception("simulated bot2 failure")
+
+    with patch(
+        "link_project_to_chat.botfather.BotFatherClient.create_bot",
+        side_effect=fake_create_bot,
+    ):
+        result = await mb._create_team_execute(update, ctx)
+
+    from telegram.ext import ConversationHandler
+    assert result == ConversationHandler.END
+    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
+    failure_msg = next((m for m in sent if "failed" in m.lower()), None)
+    assert failure_msg is not None
+    assert "Bot @" in failure_msg  # bot1 was completed; should appear in cleanup list
+    assert "Safe to retry" in failure_msg  # config NOT committed
