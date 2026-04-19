@@ -29,13 +29,21 @@ async def test_add_bot_invokes_invite_to_channel():
     from telethon.tl.functions.channels import InviteToChannelRequest
 
     bot_entity = MagicMock()
+    channel_entity = MagicMock(name="channel")
     client = AsyncMock()
+    # Differentiate get_entity (bot) from get_input_entity (channel)
     client.get_entity = AsyncMock(return_value=bot_entity)
+    client.get_input_entity = AsyncMock(return_value=channel_entity)
 
     await add_bot(client, -1001, "acme_mgr_claude_bot")
 
+    client.get_input_entity.assert_awaited_once_with(-1001)
     call_args = client.call_args_list
-    assert any(isinstance(call.args[0], InviteToChannelRequest) for call in call_args)
+    invite_calls = [c for c in call_args if isinstance(c.args[0], InviteToChannelRequest)]
+    assert invite_calls, "InviteToChannelRequest must be issued"
+    request = invite_calls[0].args[0]
+    assert request.channel is channel_entity
+    assert request.users == [bot_entity]
 
 
 @pytest.mark.asyncio
@@ -44,15 +52,20 @@ async def test_promote_admin_sets_correct_rights():
     from telethon.tl.functions.channels import EditAdminRequest
 
     bot_entity = MagicMock()
+    channel_entity = MagicMock(name="channel")
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=bot_entity)
+    client.get_input_entity = AsyncMock(return_value=channel_entity)
 
     await promote_admin(client, -1001, "acme_mgr_claude_bot")
 
+    client.get_input_entity.assert_awaited_once_with(-1001)
     call_args = client.call_args_list
     admin_calls = [c for c in call_args if isinstance(c.args[0], EditAdminRequest)]
     assert admin_calls, "EditAdminRequest must be issued"
     request = admin_calls[0].args[0]
+    assert request.channel is channel_entity
+    assert request.user_id is bot_entity
     assert request.admin_rights.post_messages is True
     assert request.admin_rights.delete_messages is True
     assert request.admin_rights.invite_users is True
@@ -64,10 +77,17 @@ async def test_invite_user_uses_invite_to_channel():
     from telethon.tl.functions.channels import InviteToChannelRequest
 
     user_entity = MagicMock()
+    channel_entity = MagicMock(name="channel")
     client = AsyncMock()
     client.get_entity = AsyncMock(return_value=user_entity)
+    client.get_input_entity = AsyncMock(return_value=channel_entity)
 
     await invite_user(client, -1001, "alice")
 
+    client.get_input_entity.assert_awaited_once_with(-1001)
     call_args = client.call_args_list
-    assert any(isinstance(call.args[0], InviteToChannelRequest) for call in call_args)
+    invite_calls = [c for c in call_args if isinstance(c.args[0], InviteToChannelRequest)]
+    assert invite_calls, "InviteToChannelRequest must be issued"
+    request = invite_calls[0].args[0]
+    assert request.channel is channel_entity
+    assert request.users == [user_entity]

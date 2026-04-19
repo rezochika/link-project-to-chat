@@ -41,15 +41,17 @@ async def create_supergroup(client, title: str) -> int:
 
 async def add_bot(client, chat_id: int, bot_username: str) -> None:
     """Invite a bot to the group."""
+    channel = await client.get_input_entity(chat_id)
     bot_entity = await client.get_entity(bot_username)
     await _call_with_flood_retry(
         client,
-        InviteToChannelRequest(channel=chat_id, users=[bot_entity]),
+        InviteToChannelRequest(channel=channel, users=[bot_entity]),
     )
 
 
 async def promote_admin(client, chat_id: int, bot_username: str) -> None:
     """Promote a user/bot to admin with the rights group-mode bots need."""
+    channel = await client.get_input_entity(chat_id)
     entity = await client.get_entity(bot_username)
     rights = ChatAdminRights(
         change_info=False,
@@ -66,14 +68,15 @@ async def promote_admin(client, chat_id: int, bot_username: str) -> None:
     )
     await _call_with_flood_retry(
         client,
-        EditAdminRequest(channel=chat_id, user_id=entity, admin_rights=rights, rank=""),
+        EditAdminRequest(channel=channel, user_id=entity, admin_rights=rights, rank=""),
     )
 
 
 async def invite_user(client, chat_id: int, username: str) -> None:
     """Invite a user (by @username, no @ prefix) to the group."""
+    channel = await client.get_input_entity(chat_id)
     user_entity = await client.get_entity(username)
     await _call_with_flood_retry(
         client,
-        InviteToChannelRequest(channel=chat_id, users=[user_entity]),
+        InviteToChannelRequest(channel=channel, users=[user_entity]),
     )
