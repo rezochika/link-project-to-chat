@@ -113,3 +113,61 @@ async def test_append_during_flush_is_not_stranded():
     assert any(e["text"] == "firstsecond" for e in bot.edits), (
         f"'second' delta was stranded; edits were: {[e['text'] for e in bot.edits]}"
     )
+
+
+@pytest.mark.asyncio
+async def test_finalize_plain_keeps_buffer_when_final_is_none():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.append("streamed body")
+    await live.finalize(None, render=False)
+    # Last edit should carry the streamed body.
+    assert bot.edits[-1]["text"] == "streamed body"
+    # No parse_mode when render=False.
+    assert bot.edits[-1].get("parse_mode") in (None, )
+
+
+@pytest.mark.asyncio
+async def test_finalize_overrides_buffer_with_final_text():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.append("partial")
+    await live.finalize("the full answer", render=False)
+    assert bot.edits[-1]["text"] == "the full answer"
+
+
+@pytest.mark.asyncio
+async def test_finalize_render_true_applies_html():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.finalize("**bold**", render=True)
+    edit = bot.edits[-1]
+    assert edit.get("parse_mode") == "HTML"
+    # md_to_telegram turns **bold** into <b>bold</b>
+    assert "<b>bold</b>" in edit["text"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_is_idempotent():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.finalize("done", render=False)
+    count_before = len(bot.edits)
+    await live.finalize("done", render=False)
+    assert len(bot.edits) == count_before
+
+
+@pytest.mark.asyncio
+async def test_append_after_finalize_is_ignored():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.finalize("done", render=False)
+    edits_after_finalize = len(bot.edits)
+    await live.append("late delta")
+    await asyncio.sleep(0.12)
+    assert len(bot.edits) == edits_after_finalize

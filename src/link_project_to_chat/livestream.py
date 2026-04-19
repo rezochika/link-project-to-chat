@@ -5,6 +5,8 @@ import logging
 import time
 from typing import Any
 
+from .formatting import md_to_telegram
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_THROTTLE = 1.2  # seconds between edits per message
@@ -89,3 +91,61 @@ class LiveMessage:
             )
             self._last_rendered = text
             self._last_edit_ts = time.monotonic()
+
+    async def finalize(
+        self,
+        final_text: str | None = None,
+        *,
+        render: bool = True,
+    ) -> None:
+        if self._finalized or self.message_id is None:
+            return
+        # Mark finalized first so any racing _flush_soon reschedule is suppressed
+        # by the post-edit guard. Then cancel any pending throttled flush.
+        self._finalized = True
+        if self._pending is not None and not self._pending.done():
+            self._pending.cancel()
+            try:
+                await self._pending
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._pending = None
+
+        if final_text is not None and final_text != "":
+            self._buffer = final_text
+
+        text = self._prefix + self._buffer
+        if not text.strip():
+            return
+
+        parse_mode: str | None = None
+        rendered = text
+        if render:
+            rendered = self._prefix + md_to_telegram(self._buffer)
+            parse_mode = "HTML"
+
+        if rendered != self._last_rendered:
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=rendered,
+                    parse_mode=parse_mode,
+                )
+                self._last_rendered = rendered
+            except Exception:
+                logger.warning(
+                    "LiveMessage.finalize edit failed (mid=%s); falling back to plain",
+                    self.message_id,
+                    exc_info=True,
+                )
+                # Final HTML edit failed (bad tags mid-stream etc). Retry plain.
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=self.chat_id,
+                        message_id=self.message_id,
+                        text=text,
+                    )
+                    self._last_rendered = text
+                except Exception:
+                    logger.exception("LiveMessage.finalize plain fallback failed")
