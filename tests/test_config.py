@@ -470,3 +470,27 @@ def test_team_config_default_empty_dict(tmp_path: Path):
     p.write_text(json.dumps({"projects": {}}))
     config = load_config(p)
     assert config.teams == {}
+
+
+def test_load_config_teams(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {},
+        "teams": {
+            "acme": {
+                "path": "/home/user/acme",
+                "group_chat_id": -1001234567890,
+                "bots": {
+                    "manager": {"telegram_bot_token": "t1", "active_persona": "software_manager"},
+                    "dev":     {"telegram_bot_token": "t2", "active_persona": "software_dev"},
+                },
+            }
+        },
+    }))
+    config = load_config(p)
+    team = config.teams["acme"]
+    assert team.path == "/home/user/acme"
+    assert team.group_chat_id == -1001234567890
+    assert team.bots["manager"].telegram_bot_token == "t1"
+    assert team.bots["manager"].active_persona == "software_manager"
+    assert team.bots["dev"].telegram_bot_token == "t2"

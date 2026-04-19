@@ -145,6 +145,18 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 role=proj.get("role"),
                 active_persona=proj.get("active_persona"),
             )
+        for name, team in raw.get("teams", {}).items():
+            config.teams[name] = TeamConfig(
+                path=team["path"],
+                group_chat_id=team["group_chat_id"],
+                bots={
+                    role: TeamBotConfig(
+                        telegram_bot_token=b.get("telegram_bot_token", ""),
+                        active_persona=b.get("active_persona"),
+                    )
+                    for role, b in team.get("bots", {}).items()
+                },
+            )
     return config
 
 
