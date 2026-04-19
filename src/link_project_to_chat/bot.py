@@ -1238,7 +1238,7 @@ class ProjectBot(AuthMixin):
             logger.error("get_me() failed at startup", exc_info=True)
             if self.group_mode:
                 raise RuntimeError(
-                    "group_mode=True requires a reachable Telegram API at startup "
+                    "team mode requires a reachable Telegram API at startup "
                     "to fetch bot username; aborting."
                 )
         await app.bot.set_my_commands(COMMANDS)
