@@ -37,6 +37,7 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
+from .livestream import LiveMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -91,6 +92,7 @@ class ProjectBot(AuthMixin):
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
         group_mode: bool = False,
+        show_thinking: bool = False,
     ):
         self.name = name
         self.path = path.resolve()
@@ -107,12 +109,14 @@ class ProjectBot(AuthMixin):
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._stream_text: dict[int, str] = {}
-        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking
-        self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
+        self._live_text: dict[int, LiveMessage] = {}
+        self._live_thinking: dict[int, LiveMessage] = {}
+        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking (toggle-off path)
+        self._thinking_store: dict[int, str] = {}  # task_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
         self._active_persona = active_persona
+        self.show_thinking = show_thinking
         self._transcriber = transcriber
         self._synthesizer = synthesizer
         self._voice_tasks: set[int] = set()
@@ -144,14 +148,34 @@ class ProjectBot(AuthMixin):
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
-        if isinstance(event, ThinkingDelta):
-            self._thinking_buf.setdefault(task.id, "")
-            if self._thinking_buf[task.id]:
-                self._thinking_buf[task.id] += "\n\n"
-            self._thinking_buf[task.id] += event.text
-        elif isinstance(event, TextDelta):
-            self._stream_text.setdefault(task.id, "")
-            self._stream_text[task.id] += event.text
+        if isinstance(event, TextDelta):
+            live = self._live_text.get(task.id)
+            if live is None:
+                live = LiveMessage(
+                    bot=self._app.bot,
+                    chat_id=task.chat_id,
+                    reply_to_message_id=task.message_id,
+                )
+                self._live_text[task.id] = live
+                await live.start()
+            await live.append(event.text)
+        elif isinstance(event, ThinkingDelta):
+            if self.show_thinking:
+                live = self._live_thinking.get(task.id)
+                if live is None:
+                    live = LiveMessage(
+                        bot=self._app.bot,
+                        chat_id=task.chat_id,
+                        reply_to_message_id=task.message_id,
+                        prefix="💭 ",
+                    )
+                    self._live_thinking[task.id] = live
+                    await live.start()
+                await live.append(event.text)
+            else:
+                buf = self._thinking_buf.setdefault(task.id, "")
+                sep = "\n\n" if buf else ""
+                self._thinking_buf[task.id] = buf + sep + event.text
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(
