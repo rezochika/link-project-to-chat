@@ -173,3 +173,58 @@ async def test_create_bot_with_retry_fails_after_5_tries():
 
     with pytest.raises(RuntimeError, match="5 attempts"):
         await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_claude_bot")
+
+
+@pytest.mark.asyncio
+async def test_create_team_execute_partial_failure_report(tmp_path):
+    """When orchestration aborts mid-flight, a partial-failure report is sent."""
+    from unittest.mock import patch
+
+    from link_project_to_chat.manager.bot import ManagerBot
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path
+    )
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    # Bypass __init__ to isolate the orchestrator from auth/process-manager wiring.
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock(
+        return_value=MagicMock(edit_text=AsyncMock())
+    )
+    mb._pm = MagicMock()
+
+    update = MagicMock()
+    update.effective_chat = MagicMock(id=1)
+    update.effective_user = MagicMock(username="alice")
+    ctx = MagicMock()
+    ctx.user_data = {
+        "create_team": {
+            "project_prefix": "acme",
+            "persona_mgr": "developer",
+            "persona_dev": "tester",
+            "repo": MagicMock(),
+        }
+    }
+
+    # Force BotFatherClient.create_bot to fail (simulates auth missing / API error).
+    with patch(
+        "link_project_to_chat.botfather.BotFatherClient.create_bot",
+        new=AsyncMock(side_effect=Exception("simulated failure")),
+    ):
+        result = await mb._create_team_execute(update, ctx)
+
+    from telegram.ext import ConversationHandler
+
+    assert result == ConversationHandler.END
+    # The first send_message is the progress status; subsequent send_message calls
+    # include the failure report.
+    sent_args = [c.args for c in mb._app.bot.send_message.call_args_list]
+    failure_msgs = [
+        args for args in sent_args if any("failed" in str(a).lower() for a in args)
+    ]
+    assert failure_msgs, f"Expected a failure report, got: {sent_args}"

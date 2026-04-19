@@ -954,20 +954,171 @@ class ManagerBot(AuthMixin):
         return await self._create_team_execute(update, ctx)
 
     async def _create_team_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        """Placeholder — F7 implements the real orchestrator."""
-        state = ctx.user_data.get("create_team", {})
-        msg = (
-            f"All inputs captured (orchestrator not yet implemented):\n"
-            f"  prefix: {state.get('project_prefix')}\n"
-            f"  source: {state.get('source')}\n"
-            f"  manager persona: {state.get('persona_mgr')}\n"
-            f"  dev persona: {state.get('persona_dev')}"
+        """F7 orchestrator: create both bots, clone repo, build group, commit config, spawn."""
+        from ..config import load_config, patch_team
+        from ..botfather import BotFatherClient, sanitize_bot_username
+        from ..github_client import GitHubClient, RepoInfo
+        from .telegram_group import (
+            create_supergroup,
+            add_bot,
+            promote_admin,
+            invite_user,
         )
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg)
+
+        data = ctx.user_data["create_team"]
+        prefix = data["project_prefix"]
+        mgr_persona = data["persona_mgr"]
+        dev_persona = data["persona_dev"]
+        repo_data = data["repo"]
+        # Repo is stored as a dict (RepoInfo.__dict__) by _create_repo_list_callback;
+        # reconstitute the dataclass for clone_repo. If it's already a RepoInfo
+        # (e.g. from a test), use it directly.
+        if isinstance(repo_data, dict):
+            repo = RepoInfo(**repo_data)
         else:
-            await update.effective_message.reply_text(msg)
+            repo = repo_data
+
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(cfg_path)
+        chat = update.effective_chat
+
+        status = await self._app.bot.send_message(chat.id, "⟳ Creating bot 1...")
+
+        async def edit(text: str) -> None:
+            try:
+                await status.edit_text(text)
+            except Exception:
+                pass
+
+        bfc = BotFatherClient(
+            api_id=config.telegram_api_id,
+            api_hash=config.telegram_api_hash,
+            session_path=cfg_path.parent / "telethon.session",
+        )
+
+        completed: dict[str, str] = {}
+        try:
+            # --- Bot 1 (manager) ---
+            mgr_base = sanitize_bot_username(f"{prefix}_mgr")
+            mgr_token, mgr_username = await _create_bot_with_retry(
+                bfc, f"{prefix} Manager", mgr_base
+            )
+            completed["bot1"] = f"@{mgr_username}"
+            await edit(f"✓ Bot 1 (@{mgr_username}) | ⟳ Creating bot 2...")
+
+            # --- Bot 2 (dev) ---
+            dev_base = sanitize_bot_username(f"{prefix}_dev")
+            dev_token, dev_username = await _create_bot_with_retry(
+                bfc, f"{prefix} Dev", dev_base
+            )
+            completed["bot2"] = f"@{dev_username}"
+            await edit("✓ Bots | ⟳ Disabling privacy mode...")
+
+            # --- Privacy disable (non-fatal) ---
+            for username in (mgr_username, dev_username):
+                try:
+                    await bfc.disable_privacy(username)
+                except Exception as exc:
+                    logger.warning("Privacy disable failed for %s: %s", username, exc)
+            await edit("✓ Bots ready | ⟳ Cloning repo...")
+
+            # --- Clone ---
+            dest = cfg_path.parent / "repos" / prefix
+            gh = GitHubClient(pat=config.github_pat)
+            try:
+                await gh.clone_repo(repo, dest)
+            finally:
+                await gh.close()
+            completed["repo"] = str(dest)
+            await edit(f'✓ Cloned | ⟳ Creating group "{prefix} team"...')
+
+            # --- Group ---
+            client = await bfc._ensure_client()  # reuse authenticated Telethon client
+            group_id = await create_supergroup(client, f"{prefix} team")
+            completed["group"] = str(group_id)
+            await edit("✓ Group | ⟳ Adding + promoting bots...")
+
+            await add_bot(client, group_id, mgr_username)
+            await add_bot(client, group_id, dev_username)
+
+            # --- COMMIT config (point of no return) ---
+            patch_team(
+                prefix,
+                {
+                    "path": str(dest),
+                    "group_chat_id": group_id,
+                    "bots": {
+                        "manager": {
+                            "telegram_bot_token": mgr_token,
+                            "active_persona": mgr_persona,
+                        },
+                        "dev": {
+                            "telegram_bot_token": dev_token,
+                            "active_persona": dev_persona,
+                        },
+                    },
+                },
+                cfg_path,
+            )
+
+            # --- Post-commit (all non-fatal) ---
+            for username in (mgr_username, dev_username):
+                try:
+                    await promote_admin(client, group_id, username)
+                except Exception as exc:
+                    logger.warning("Promote admin failed for %s: %s", username, exc)
+
+            requester = update.effective_user.username if update.effective_user else None
+            if requester:
+                try:
+                    await invite_user(client, group_id, requester)
+                except Exception as exc:
+                    logger.warning("Invite requester %s failed: %s", requester, exc)
+
+            await edit("✓ Group wired | ⟳ Starting both bots...")
+            self._pm.start_team(prefix, "manager")
+            self._pm.start_team(prefix, "dev")
+            await edit(f'✓ Team ready. Open the "{prefix} team" group to start chatting.')
+
+        except Exception as exc:
+            await self._send_partial_failure_report(chat.id, exc, completed)
+        finally:
+            try:
+                await bfc.disconnect()
+            except Exception:
+                pass
+
         return ConversationHandler.END
+
+    async def _send_partial_failure_report(
+        self, chat_id: int, exc: Exception, completed: dict[str, str]
+    ) -> None:
+        """Send a human-readable report of what was completed before the failure."""
+        lines = [
+            f"✗ Team creation failed: {type(exc).__name__}: {exc}",
+            "",
+        ]
+        if completed:
+            lines.append("Completed (needs manual cleanup):")
+            if "bot1" in completed:
+                lines.append(
+                    f"  - Bot {completed['bot1']} (delete via BotFather /deletebot)"
+                )
+            if "bot2" in completed:
+                lines.append(
+                    f"  - Bot {completed['bot2']} (delete via BotFather /deletebot)"
+                )
+            if "repo" in completed:
+                lines.append(
+                    f"  - Directory {completed['repo']} (remove if not needed)"
+                )
+            if "group" in completed:
+                lines.append(
+                    f"  - Group {completed['group']} (delete via Telegram)"
+                )
+            lines.append("")
+        lines.append("Config not saved. Safe to retry with a different prefix.")
+        await self._app.bot.send_message(chat_id, "\n".join(lines))
 
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
