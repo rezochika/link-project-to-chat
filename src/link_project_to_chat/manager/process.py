@@ -73,6 +73,15 @@ class ProcessManager:
         return ["link-project-to-chat", "start", "--team", team_name, "--role", role]
 
     def start_team(self, team_name: str, role: str) -> bool:
+        config = load_config(self._project_config_path) if self._project_config_path else load_config()
+        if team_name not in config.teams:
+            logger.error("Team %s not found in config", team_name)
+            return False
+        if role not in config.teams[team_name].bots:
+            logger.error("Role %s not in team %s", role, team_name)
+            return False
+        # NOTE: no _set_autostart call here — team bots are not tracked in the projects
+        # config, so per-team autostart isn't persisted (deferred to a future task).
         key = f"team:{team_name}:{role}"
         if key in self._processes and self._processes[key].poll() is None:
             return False
