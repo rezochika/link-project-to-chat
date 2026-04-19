@@ -78,3 +78,38 @@ async def test_append_skips_edit_when_buffer_unchanged():
     await asyncio.sleep(0.12)
     await asyncio.sleep(0.12)  # second window with no new delta
     assert len(bot.edits) == 1
+
+
+@dataclass
+class SlowBot(FakeBot):
+    edit_delay: float = 0.05
+
+    async def edit_message_text(self, chat_id, message_id, text, **kw):
+        # Simulate a slow network edit so that new deltas can land during the
+        # in-flight edit_message_text await.
+        await asyncio.sleep(self.edit_delay)
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kw})
+
+
+@pytest.mark.asyncio
+async def test_append_during_flush_is_not_stranded():
+    bot = SlowBot(edit_delay=0.05)
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.02)
+    await live.start()
+    # First append triggers a flush; after the throttle wait it starts the
+    # (slow) edit_message_text await.
+    await live.append("first")
+    # Give the flush task time to hit edit_message_text (past the throttle wait
+    # but still inside the slow edit's sleep).
+    await asyncio.sleep(0.05)
+    # This append lands while the first edit is still in flight; _pending is
+    # not yet done, so nothing new gets scheduled to drain it.
+    asyncio.create_task(live.append("second"))
+    # Allow plenty of time for both the in-flight edit to finish and any
+    # follow-up flush to drain the tail.
+    await asyncio.sleep(0.3)
+    assert bot.edits, "expected at least one edit"
+    # Some edit must eventually carry the full accumulated buffer.
+    assert any(e["text"] == "firstsecond" for e in bot.edits), (
+        f"'second' delta was stranded; edits were: {[e['text'] for e in bot.edits]}"
+    )

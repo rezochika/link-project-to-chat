@@ -65,6 +65,9 @@ class LiveMessage:
             if wait > 0:
                 await asyncio.sleep(wait)
             await self._edit_current()
+            # If new deltas landed during the edit, schedule another flush to drain them.
+            if self._prefix + self._buffer != self._last_rendered and not self._finalized:
+                self._pending = asyncio.create_task(self._flush_soon())
         except asyncio.CancelledError:
             raise
         except Exception:
