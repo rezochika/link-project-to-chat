@@ -49,6 +49,18 @@ def _detect_usage_cap(stderr: str) -> bool:
     return any(p in lowered for p in _USAGE_CAP_PATTERNS)
 
 
+def is_usage_cap_error(message: str | None) -> bool:
+    """Return True if `message` was produced as a USAGE_CAP-marked error.
+
+    Single source of truth for "is this string a usage-cap signal?" — used by
+    both `_finalize_claude_task` (to branch on the marker) and the cap probe
+    (to confirm a probe response is not still capped).
+    """
+    if not message:
+        return False
+    return message.startswith("USAGE_CAP:") or _detect_usage_cap(message)
+
+
 class ClaudeUsageCapError(Exception):
     """Reserved exception type for Claude usage-cap / rate-limit signals.
 

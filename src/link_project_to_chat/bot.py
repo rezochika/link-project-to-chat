@@ -36,7 +36,7 @@ from .config import (
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -139,6 +139,7 @@ class ProjectBot(AuthMixin):
         self.bot_username: str = ""  # populated in _post_init via get_me()
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
+        self._probe_tasks: set[asyncio.Task] = set()
 
     def _on_trust(self, user_id: int) -> None:
         if self._on_trust_fn:
@@ -219,7 +220,7 @@ class ProjectBot(AuthMixin):
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
-            if (task.error or "").startswith("USAGE_CAP:") and self.group_mode:
+            if is_usage_cap_error(task.error) and self.group_mode:
                 self._group_state.halt(task.chat_id)
                 await self._send_to_chat(
                     task.chat_id,
@@ -241,13 +242,15 @@ class ProjectBot(AuthMixin):
                 try:
                     probe = ClaudeClient(project_path=self.path)
                     result = await probe.chat("ping")
-                    if not result.startswith("Error:") and not result.startswith("USAGE_CAP:"):
+                    if not result.startswith("Error:") and not is_usage_cap_error(result):
                         self._group_state.resume(chat_id)
                         await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
                         return
                 except Exception:
                     logger.warning("cap probe failed", exc_info=True)
-        asyncio.create_task(_probe())
+        task = asyncio.create_task(_probe())
+        self._probe_tasks.add(task)
+        task.add_done_callback(self._probe_tasks.discard)
 
     async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
