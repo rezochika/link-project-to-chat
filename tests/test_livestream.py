@@ -267,3 +267,19 @@ async def test_double_retry_after_does_not_strand_buffer(monkeypatch):
     # Even after two RetryAfter hits, the dirty-buffer reschedule eventually lands the edit.
     assert any(e["text"] == "payload" for e in bot.edits), \
         f"buffer was stranded after double RetryAfter; edits={bot.edits}"
+
+
+@pytest.mark.asyncio
+async def test_cancel_appends_note_and_seals():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.append("partial answer")
+    await live.cancel()
+    # Final edit carries a cancellation marker.
+    assert "(cancelled)" in bot.edits[-1]["text"]
+    # Subsequent appends are dropped.
+    edits_before = len(bot.edits)
+    await live.append("late")
+    await asyncio.sleep(0.15)
+    assert len(bot.edits) == edits_before

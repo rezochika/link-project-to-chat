@@ -217,3 +217,9 @@ class LiveMessage:
                     self._last_rendered = text
                 except Exception:
                     logger.exception("LiveMessage.finalize plain fallback failed")
+
+    async def cancel(self, note: str = "(cancelled)") -> None:
+        if self._finalized:
+            return
+        suffix = f"\n_{note}_" if self._buffer else note
+        await self.finalize(self._buffer + suffix, render=False)
