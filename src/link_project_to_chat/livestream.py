@@ -73,29 +73,33 @@ class LiveMessage:
 
     async def _flush_soon(self) -> None:
         try:
-            # Sleep until we're allowed to edit again.
             wait = self._effective_throttle - (time.monotonic() - self._last_edit_ts)
             if wait > 0:
                 await asyncio.sleep(wait)
             try:
                 await self._edit_current()
             except RetryAfter as e:
-                backoff = min(
-                    max(float(getattr(e, "retry_after", 1.0)), self._throttle) * 2,
-                    _MAX_THROTTLE,
-                )
-                self._effective_throttle = backoff
+                hint = float(getattr(e, "retry_after", 1.0))
+                # Sleep exactly as long as Telegram asked (but not less than our
+                # own throttle). Do NOT cap this — we must honour the API's hint.
+                sleep_for = max(hint, self._throttle)
+                # Future cadence gets capped so a transient flood-wait doesn't
+                # permanently slow the stream.
+                self._effective_throttle = min(sleep_for, _MAX_THROTTLE)
                 logger.warning(
-                    "Telegram RetryAfter; backing off to %.2fs (mid=%s)",
-                    backoff,
-                    self.message_id,
+                    "Telegram RetryAfter; sleeping %.2fs, cadence now %.2fs (mid=%s)",
+                    sleep_for, self._effective_throttle, self.message_id,
                 )
-                # Re-schedule another flush after the backoff window.
-                await asyncio.sleep(backoff)
-                await self._edit_current()
-                # Decay back toward the normal throttle on success.
-                self._effective_throttle = self._throttle
-            # If new deltas landed during the edit, schedule another flush to drain them.
+                await asyncio.sleep(sleep_for)
+                try:
+                    await self._edit_current()
+                except Exception:
+                    logger.exception(
+                        "LiveMessage retry edit failed (mid=%s); leaving dirty-buffer "
+                        "reschedule to pick up", self.message_id,
+                    )
+            # If new deltas landed during the edit (or the retry failed), schedule
+            # another flush to drain them.
             if self._prefix + self._buffer != self._last_rendered and not self._finalized:
                 self._pending = asyncio.create_task(self._flush_soon())
         except asyncio.CancelledError:
@@ -122,6 +126,8 @@ class LiveMessage:
             )
             self._last_rendered = text
             self._last_edit_ts = time.monotonic()
+            # Decay throttle back to the normal cadence on any successful edit.
+            self._effective_throttle = self._throttle
 
     async def _rotate_once(self) -> None:
         """Seal the current message at the max-char boundary and open a new one."""
@@ -151,6 +157,8 @@ class LiveMessage:
         self._buffer = tail
         self._last_rendered = self._prefix + initial
         self._last_edit_ts = time.monotonic()
+        # Decay throttle back to the normal cadence on any successful edit.
+        self._effective_throttle = self._throttle
 
     async def finalize(
         self,

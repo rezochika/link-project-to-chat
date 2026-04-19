@@ -234,5 +234,36 @@ async def test_retry_after_backs_off_then_succeeds(monkeypatch):
     await live.append("hello")
     # Wait for initial flush (which fails) + retry after backoff.
     await asyncio.sleep(0.4)
-    # A successful edit eventually lands.
-    assert any(e["text"] == "hello" for e in bot.edits)
+    # Exactly one successful edit of "hello" lands — not two or more accidental flushes.
+    hello_edits = [e for e in bot.edits if e["text"] == "hello"]
+    assert len(hello_edits) == 1, f"expected exactly one 'hello' edit; got edits={bot.edits}"
+    # After the retry succeeded, the elevated throttle decayed back to normal.
+    assert live._effective_throttle == live._throttle
+
+
+@dataclass
+class VeryFlakeyBot(FakeBot):
+    fail_first_edits: int = 2
+    _edit_fail_count: int = 0
+
+    async def edit_message_text(self, chat_id, message_id, text, **kw):
+        if self._edit_fail_count < self.fail_first_edits:
+            self._edit_fail_count += 1
+            raise FakeRetryAfter(retry_after=0.02)
+        return await super().edit_message_text(chat_id, message_id, text, **kw)
+
+
+@pytest.mark.asyncio
+async def test_double_retry_after_does_not_strand_buffer(monkeypatch):
+    import link_project_to_chat.livestream as ls_mod
+    monkeypatch.setattr(ls_mod, "RetryAfter", FakeRetryAfter, raising=False)
+
+    bot = VeryFlakeyBot(fail_first_edits=2)
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.02)
+    await live.start()
+    await live.append("payload")
+    # Two 0.02s backoffs + subsequent dirty-buffer reschedule — give it headroom.
+    await asyncio.sleep(0.6)
+    # Even after two RetryAfter hits, the dirty-buffer reschedule eventually lands the edit.
+    assert any(e["text"] == "payload" for e in bot.edits), \
+        f"buffer was stranded after double RetryAfter; edits={bot.edits}"
