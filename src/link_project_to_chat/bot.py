@@ -135,6 +135,8 @@ class ProjectBot(AuthMixin):
         self.group_chat_id = group_chat_id
         self.role = role
         self.bot_username: str = ""  # populated in _post_init via get_me()
+        from .group_state import GroupStateRegistry
+        self._group_state = GroupStateRegistry(max_bot_rounds=20)
 
     def _on_trust(self, user_id: int) -> None:
         if self._on_trust_fn:
@@ -320,11 +322,27 @@ class ProjectBot(AuthMixin):
         if self.group_mode:
             if self.group_chat_id is not None and msg.chat_id != self.group_chat_id:
                 return  # message from a different group — silently ignore
-            from .group_filters import is_from_self, is_directed_at_me
+            from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
             if is_from_self(msg, self.bot_username):
                 return  # self-silence
             if not is_directed_at_me(msg, self.bot_username):
                 return  # not addressed to this bot
+            chat_id = msg.chat_id
+            if is_from_other_bot(msg, self.bot_username):
+                # Bot-to-bot message: check halt before acting.
+                if self._group_state.get(chat_id).halted:
+                    return
+                self._group_state.note_bot_to_bot(chat_id)
+                if self._group_state.get(chat_id).halted:
+                    # Cap tripped by this very message.
+                    await msg.reply_text(
+                        f"Auto-paused after {self._group_state.max_bot_rounds} bot-to-bot rounds. "
+                        "Send any message to resume."
+                    )
+                    return
+            else:
+                # Human (trusted user) message — reset the round counter and clear any halt.
+                self._group_state.resume(chat_id)
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
         if self._rate_limited(update.effective_user.id):
