@@ -226,7 +226,7 @@ def test_start_team_and_role_invokes_run_bot_with_team_primitives(tmp_path, monk
     def fake_run_bot(*args, **kwargs):
         calls.append((args, kwargs))
 
-    monkeypatch.setattr(cli, "run_bot", fake_run_bot)
+    monkeypatch.setattr("link_project_to_chat.bot.run_bot", fake_run_bot)
 
     from click.testing import CliRunner
     runner = CliRunner()
@@ -241,3 +241,41 @@ def test_start_team_and_role_invokes_run_bot_with_team_primitives(tmp_path, monk
     assert kwargs.get("active_persona") == "developer"
     assert kwargs.get("group_chat_id") == -1001
     assert kwargs.get("role") == "manager"
+
+
+def test_start_team_missing_role_errors(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config
+    cfg_path = tmp_path / "config.json"
+    config = Config(teams={"acme": TeamConfig(path=str(tmp_path), group_chat_id=-1,
+        bots={"manager": TeamBotConfig(telegram_bot_token="t1")})})
+    save_config(config, cfg_path)
+    from click.testing import CliRunner
+    result = CliRunner().invoke(cli.main, ["--config", str(cfg_path), "start", "--team", "acme"])
+    assert result.exit_code != 0
+    assert "--role is required" in (result.output or str(result.exception))
+
+
+def test_start_team_unknown_team_errors(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, save_config
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(), cfg_path)
+    from click.testing import CliRunner
+    result = CliRunner().invoke(cli.main, ["--config", str(cfg_path), "start", "--team", "ghost", "--role", "manager"])
+    assert result.exit_code != 0
+    assert "not found" in (result.output or str(result.exception))
+
+
+def test_start_team_wrong_role_errors(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config
+    cfg_path = tmp_path / "config.json"
+    config = Config(teams={"acme": TeamConfig(path=str(tmp_path), group_chat_id=-1,
+        bots={"manager": TeamBotConfig(telegram_bot_token="t1")})})
+    save_config(config, cfg_path)
+    from click.testing import CliRunner
+    result = CliRunner().invoke(cli.main, ["--config", str(cfg_path), "start", "--team", "acme", "--role", "dev"])
+    assert result.exit_code != 0
+    # dev is a valid click.Choice value, so the error is from our "Role not in team" guard
+    assert "not in team" in (result.output or str(result.exception)) or "dev" in (result.output or str(result.exception))

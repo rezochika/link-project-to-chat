@@ -13,12 +13,6 @@ from .config import (
     save_config,
 )
 
-# Lazily-populated references to .bot functions. Kept at module scope so
-# tests can monkeypatch `cli.run_bot` / `cli.run_bots` directly, and so the
-# heavy `python-telegram-bot` import only occurs when `start` is invoked.
-run_bot = None
-run_bots = None
-
 
 @click.group()
 @click.option(
@@ -258,13 +252,7 @@ def start(
 
     Use --path and --token to run without a config file, or use config.
     """
-    global run_bot, run_bots
-    if run_bot is None or run_bots is None:
-        from . import bot as _bot_module
-        if run_bot is None:
-            run_bot = _bot_module.run_bot
-        if run_bots is None:
-            run_bots = _bot_module.run_bots
+    from .bot import run_bot, run_bots
 
     allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else None
     disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else None
