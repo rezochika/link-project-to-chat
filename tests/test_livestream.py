@@ -278,6 +278,8 @@ async def test_cancel_appends_note_and_seals():
     await live.cancel()
     # Final edit carries a cancellation marker.
     assert "(cancelled)" in bot.edits[-1]["text"]
+    # No literal markdown underscores leak through (finalize runs render=False).
+    assert "_(cancelled)_" not in bot.edits[-1]["text"]
     # Subsequent appends are dropped.
     edits_before = len(bot.edits)
     await live.append("late")

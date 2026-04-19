@@ -198,3 +198,22 @@ async def test_thinking_command_handlers_exist_and_register():
     from link_project_to_chat.bot import ProjectBot, COMMANDS
     assert any(c[0] == "thinking" for c in COMMANDS)
     assert hasattr(ProjectBot, "_on_thinking")
+
+
+@pytest.mark.asyncio
+async def test_cancel_live_for_seals_both_messages():
+    bot = await _stub_bot(show_thinking=True)
+    task = _fake_task(task_id=30)
+    # Create both a live-text and a live-thinking message by feeding deltas.
+    await bot._on_stream_event(task, TextDelta(text="answer so far"))
+    await bot._on_stream_event(task, ThinkingDelta(text="reasoning"))
+    assert task.id in bot._live_text
+    assert task.id in bot._live_thinking
+
+    await bot._cancel_live_for(task.id, "(cancelled)")
+
+    assert task.id not in bot._live_text
+    assert task.id not in bot._live_thinking
+    # Both messages received a final edit containing the cancellation note.
+    cancel_texts = [e["text"] for e in bot._app.bot.edits if "(cancelled)" in e["text"]]
+    assert len(cancel_texts) >= 2, f"expected 2 cancel edits, got edits={bot._app.bot.edits}"

@@ -216,6 +216,21 @@ class ProjectBot(AuthMixin):
         escaped = (text or "[No output]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
 
+    async def _cancel_live_for(self, task_id: int, note: str = "(cancelled)") -> None:
+        """Seal any live text/thinking messages for this task with a cancellation marker."""
+        live_text = self._live_text.pop(task_id, None)
+        if live_text is not None:
+            try:
+                await live_text.cancel(note)
+            except Exception:
+                logger.warning("Failed to cancel live text for task %d", task_id, exc_info=True)
+        live_thinking = self._live_thinking.pop(task_id, None)
+        if live_thinking is not None:
+            try:
+                await live_thinking.cancel(note)
+            except Exception:
+                logger.warning("Failed to cancel live thinking for task %d", task_id, exc_info=True)
+
     async def _finalize_claude_task(self, task: Task) -> None:
         live_text = self._live_text.pop(task.id, None)
         live_thinking = self._live_thinking.pop(task.id, None)
@@ -398,6 +413,7 @@ class ProjectBot(AuthMixin):
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
+            await self._cancel_live_for(prev.id, "(superseded)")
             self.task_manager.cancel(prev.id)
             typing = self._typing_tasks.pop(prev.id, None)
             if typing:
@@ -898,6 +914,9 @@ class ProjectBot(AuthMixin):
                 reply_markup=InlineKeyboardMarkup(rows),
             )
         elif query.data == "reset_confirm":
+            live_task_ids = list({*self._live_text.keys(), *self._live_thinking.keys()})
+            for tid in live_task_ids:
+                await self._cancel_live_for(tid)
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             self._active_skill = None
@@ -1020,6 +1039,7 @@ class ProjectBot(AuthMixin):
             await self._render_tasks(query.message.chat_id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
             task_id = _parse_task_id(query.data)
+            await self._cancel_live_for(task_id)
             if self.task_manager.cancel(task_id):
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:

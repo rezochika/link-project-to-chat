@@ -221,5 +221,5 @@ class LiveMessage:
     async def cancel(self, note: str = "(cancelled)") -> None:
         if self._finalized:
             return
-        suffix = f"\n_{note}_" if self._buffer else note
+        suffix = f"\n{note}" if self._buffer else note
         await self.finalize(self._buffer + suffix, render=False)
