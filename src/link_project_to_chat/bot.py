@@ -685,6 +685,8 @@ class ProjectBot(AuthMixin):
     async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.group_mode:
             return await update.effective_message.reply_text("/halt is only available in group mode.")
+        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            return  # silently ignore — wrong group
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         self._group_state.halt(update.effective_chat.id)
@@ -693,6 +695,8 @@ class ProjectBot(AuthMixin):
     async def _on_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.group_mode:
             return await update.effective_message.reply_text("/resume is only available in group mode.")
+        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            return  # silently ignore — wrong group
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         self._group_state.resume(update.effective_chat.id)

@@ -154,3 +154,52 @@ async def test_halt_in_solo_mode_rejects(tmp_path):
     await bot._on_halt(update, MagicMock())
     update.effective_message.reply_text.assert_called_once()
     assert "group mode" in update.effective_message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_resume_in_solo_mode_rejects(tmp_path):
+    """Solo (non-team) bots should reject /resume with a helpful message."""
+    from link_project_to_chat.bot import ProjectBot
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    bot._auth = MagicMock(return_value=True)
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(id=12345)
+    await bot._on_resume(update, MagicMock())
+    update.effective_message.reply_text.assert_called_once()
+    assert "group mode" in update.effective_message.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_halt_from_wrong_group_silently_ignored(tmp_path):
+    """A /halt sent from a chat_id != self.group_chat_id should be silently ignored."""
+    bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
+    bot._auth = MagicMock(return_value=True)
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_chat = MagicMock(id=-100_222)  # wrong group
+    update.effective_user = MagicMock(id=12345)
+    await bot._on_halt(update, MagicMock())
+    # Should NOT have set halt; should NOT have replied
+    assert bot._group_state.get(-100_111).halted is False
+    assert bot._group_state.get(-100_222).halted is False
+    update.effective_message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resume_from_wrong_group_silently_ignored(tmp_path):
+    """A /resume sent from wrong chat_id should be silently ignored."""
+    bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
+    bot._auth = MagicMock(return_value=True)
+    bot._group_state.halt(-100_111)  # halt the correct group first
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_chat = MagicMock(id=-100_222)
+    update.effective_user = MagicMock(id=12345)
+    await bot._on_resume(update, MagicMock())
+    # The correct group's halt should still be set; no reply
+    assert bot._group_state.get(-100_111).halted is True
+    update.effective_message.reply_text.assert_not_called()
