@@ -535,3 +535,29 @@ def test_teams_coexist_with_projects(tmp_path: Path):
     loaded = load_config(p)
     assert "solo" in loaded.projects
     assert "acme" in loaded.teams
+
+
+def test_save_config_removes_deleted_teams(tmp_path: Path):
+    """Saving a config where a team was dropped from config.teams removes it from the JSON too."""
+    p = tmp_path / "cfg.json"
+    # First save: two teams
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/a", group_chat_id=-100,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            ),
+            "beta": TeamConfig(
+                path="/b", group_chat_id=-200,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t2")},
+            ),
+        }
+    )
+    save_config(cfg, p)
+    # Second save: drop "beta"
+    cfg.teams.pop("beta")
+    save_config(cfg, p)
+    # Reload: only "acme" should remain
+    loaded = load_config(p)
+    assert "acme" in loaded.teams
+    assert "beta" not in loaded.teams
