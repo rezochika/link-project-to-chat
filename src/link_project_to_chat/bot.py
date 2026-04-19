@@ -91,6 +91,8 @@ class ProjectBot(AuthMixin):
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
         group_mode: bool = False,
+        group_chat_id: int | None = None,
+        role: str | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -128,6 +130,9 @@ class ProjectBot(AuthMixin):
             disallowed_tools=disallowed_tools,
         )
         self.group_mode = group_mode
+        # Team-mode fields — stored now, wired into behavior in later tasks (B3/B4).
+        self.group_chat_id = group_chat_id
+        self.role = role
         self.bot_username: str = ""  # populated in _post_init via get_me()
 
     def _on_trust(self, user_id: int) -> None:
@@ -1339,6 +1344,8 @@ def run_bot(
     synthesizer: "Synthesizer | None" = None,
     group_mode: bool = False,
     active_persona: str | None = None,
+    group_chat_id: int | None = None,
+    role: str | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1360,6 +1367,8 @@ def run_bot(
         synthesizer=synthesizer,
         active_persona=active_persona,
         group_mode=group_mode,
+        group_chat_id=group_chat_id,
+        role=role,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:

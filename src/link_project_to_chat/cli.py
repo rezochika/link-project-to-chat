@@ -13,6 +13,12 @@ from .config import (
     save_config,
 )
 
+# Lazily-populated references to .bot functions. Kept at module scope so
+# tests can monkeypatch `cli.run_bot` / `cli.run_bots` directly, and so the
+# heavy `python-telegram-bot` import only occurs when `start` is invoked.
+run_bot = None
+run_bots = None
+
 
 @click.group()
 @click.option(
@@ -189,6 +195,12 @@ def configure(ctx, username: str | None, remove_username: str | None, manager_to
     "--project", default=None, help="Project name (if multiple are configured)"
 )
 @click.option(
+    "--team", default=None, help="Start a team bot (mutually exclusive with --project)"
+)
+@click.option(
+    "--role", default=None, type=click.Choice(["manager", "dev"]), help="Which team bot role to start"
+)
+@click.option(
     "--path",
     "project_path",
     type=click.Path(exists=True, file_okay=False, resolve_path=True),
@@ -230,6 +242,8 @@ def configure(ctx, username: str | None, remove_username: str | None, manager_to
 def start(
     ctx,
     project: str | None,
+    team: str | None,
+    role: str | None,
     project_path: str | None,
     token: str | None,
     username: str | None,
@@ -244,7 +258,13 @@ def start(
 
     Use --path and --token to run without a config file, or use config.
     """
-    from .bot import run_bot, run_bots
+    global run_bot, run_bots
+    if run_bot is None or run_bots is None:
+        from . import bot as _bot_module
+        if run_bot is None:
+            run_bot = _bot_module.run_bot
+        if run_bots is None:
+            run_bots = _bot_module.run_bots
 
     allowed = [t.strip() for t in allowed_tools.split(",") if t.strip()] if allowed_tools else None
     disallowed = [t.strip() for t in disallowed_tools.split(",") if t.strip()] if disallowed_tools else None
@@ -298,6 +318,32 @@ def start(
             )
         except (ImportError, ValueError) as e:
             click.echo(f"Warning: TTS disabled — {e}", err=True)
+
+    if team:
+        if not role:
+            raise SystemExit("--role is required when --team is given")
+        if team not in config.teams:
+            raise SystemExit(f"Team '{team}' not found in config.")
+        t = config.teams[team]
+        if role not in t.bots:
+            raise SystemExit(f"Role '{role}' not in team '{team}'. Known roles: {list(t.bots)}")
+        bot_cfg = t.bots[role]
+        effective_usernames = config.allowed_usernames
+        effective_trusted_ids = config.trusted_user_ids
+        run_bot(
+            f"{team}_{role}",
+            Path(t.path),
+            bot_cfg.telegram_bot_token,
+            allowed_usernames=effective_usernames,
+            trusted_user_ids=effective_trusted_ids,
+            transcriber=transcriber,
+            synthesizer=synthesizer,
+            group_mode=True,
+            group_chat_id=t.group_chat_id,
+            role=role,
+            active_persona=bot_cfg.active_persona,
+        )
+        return
 
     if not config.projects:
         raise SystemExit(

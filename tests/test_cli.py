@@ -198,3 +198,46 @@ def test_configure_no_args_fails(runner, cfg):
     p, _ = cfg
     result = runner.invoke(main, ["--config", str(p), "configure"])
     assert result.exit_code != 0
+
+
+# --- start --team / --role ---
+
+
+def test_start_team_and_role_invokes_run_bot_with_team_primitives(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(
+        teams={
+            "acme": TeamConfig(
+                path=str(tmp_path),
+                group_chat_id=-1001,
+                bots={
+                    "manager": TeamBotConfig(telegram_bot_token="t1", active_persona="developer"),
+                    "dev":     TeamBotConfig(telegram_bot_token="t2", active_persona="tester"),
+                },
+            )
+        }
+    )
+    save_config(config, cfg_path)
+
+    calls = []
+    def fake_run_bot(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(cli, "run_bot", fake_run_bot)
+
+    from click.testing import CliRunner
+    runner = CliRunner()
+    result = runner.invoke(cli.main, ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"])
+    assert result.exit_code == 0, result.output
+    assert calls, "run_bot should have been called"
+    args, kwargs = calls[0]
+    # Token could be positional (3rd) or keyword — accept either shape
+    token = kwargs.get("token") or (args[2] if len(args) > 2 else None)
+    assert token == "t1"
+    assert kwargs.get("group_mode") is True
+    assert kwargs.get("active_persona") == "developer"
+    assert kwargs.get("group_chat_id") == -1001
+    assert kwargs.get("role") == "manager"
