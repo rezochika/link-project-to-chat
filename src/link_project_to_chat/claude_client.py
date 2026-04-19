@@ -50,7 +50,14 @@ def _detect_usage_cap(stderr: str) -> bool:
 
 
 class ClaudeUsageCapError(Exception):
-    """Raised when Claude CLI signals that the usage cap / rate limit has been hit."""
+    """Reserved exception type for Claude usage-cap / rate-limit signals.
+
+    Currently the cap signal flows through the existing stream contract as
+    ``Error(message="USAGE_CAP:" + ...)`` rather than as a raised exception
+    (preserves the AsyncGenerator yield semantics in `_read_events`). The class
+    is exported so consumers can isinstance-check if a future revision starts
+    raising it directly.
+    """
 
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
