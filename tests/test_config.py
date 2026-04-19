@@ -461,3 +461,28 @@ def test_project_config_group_fields_roundtrip(tmp_path):
     assert p.group_chat_id == -100123456
     assert p.role == "manager"
     assert p.active_persona == "software_manager"
+
+
+def test_project_show_thinking_roundtrip(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        projects={
+            "proj": ProjectConfig(
+                path="/x",
+                telegram_bot_token="T",
+                show_thinking=True,
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.projects["proj"].show_thinking is True
+
+
+def test_project_show_thinking_defaults_false(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {"proj": {"path": "/x", "telegram_bot_token": "T"}}
+    }))
+    loaded = load_config(p)
+    assert loaded.projects["proj"].show_thinking is False

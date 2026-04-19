@@ -35,6 +35,7 @@ class ProjectConfig:
     group_chat_id: int | None = None
     role: str | None = None  # "manager" or "dev" when group_mode=true
     active_persona: str | None = None
+    show_thinking: bool = False
 
 
 @dataclass
@@ -130,6 +131,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 group_chat_id=proj.get("group_chat_id"),
                 role=proj.get("role"),
                 active_persona=proj.get("active_persona"),
+                show_thinking=proj.get("show_thinking", False),
             )
     return config
 
@@ -242,6 +244,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             proj["active_persona"] = p.active_persona
         else:
             proj.pop("active_persona", None)
+        if p.show_thinking:
+            proj["show_thinking"] = True
+        else:
+            proj.pop("show_thinking", None)
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
