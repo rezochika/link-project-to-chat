@@ -33,6 +33,26 @@ def _sanitize_error(text: str) -> str:
     return first_line
 
 
+_USAGE_CAP_PATTERNS = (
+    "usage limit",
+    "rate_limit_error",
+    "anthropic-ratelimit",
+    "you've reached your usage",
+)
+
+
+def _detect_usage_cap(stderr: str) -> bool:
+    """Return True if the stderr text looks like a Claude usage-cap or rate-limit error."""
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return any(p in lowered for p in _USAGE_CAP_PATTERNS)
+
+
+class ClaudeUsageCapError(Exception):
+    """Raised when Claude CLI signals that the usage cap / rate limit has been hit."""
+
+
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
@@ -254,7 +274,10 @@ class ClaudeClient:
         await asyncio.to_thread(proc.wait)
         if proc.returncode != 0:
             err = stderr_bytes.decode("utf-8", errors="replace").strip()
-            yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
+            if _detect_usage_cap(err):
+                yield Error(message="USAGE_CAP:" + _sanitize_error(err))
+            else:
+                yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
         # Clean up reference
         if self._proc is proc:
             self._proc = None
