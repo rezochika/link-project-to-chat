@@ -329,6 +329,7 @@ def start(
             synthesizer=synthesizer,
             group_mode=proj.group_mode,
             active_persona=proj.active_persona,
+            show_thinking=proj.show_thinking,
         )
     else:
         run_bots(

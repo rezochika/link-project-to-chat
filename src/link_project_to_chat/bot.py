@@ -1426,6 +1426,7 @@ def run_bot(
     synthesizer: "Synthesizer | None" = None,
     group_mode: bool = False,
     active_persona: str | None = None,
+    show_thinking: bool = False,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1447,6 +1448,7 @@ def run_bot(
         synthesizer=synthesizer,
         active_persona=active_persona,
         group_mode=group_mode,
+        show_thinking=show_thinking,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -1498,6 +1500,7 @@ def run_bots(
             synthesizer=synthesizer,
             group_mode=proj.group_mode,
             active_persona=proj.active_persona,
+            show_thinking=proj.show_thinking,
         )
     else:
         names = ", ".join(config.projects.keys())
