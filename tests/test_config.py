@@ -494,3 +494,44 @@ def test_load_config_teams(tmp_path: Path):
     assert team.bots["manager"].telegram_bot_token == "t1"
     assert team.bots["manager"].active_persona == "software_manager"
     assert team.bots["dev"].telegram_bot_token == "t2"
+
+
+def test_save_and_load_team(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/home/user/acme",
+                group_chat_id=-1001234567890,
+                bots={
+                    "manager": TeamBotConfig(telegram_bot_token="t1", active_persona="developer"),
+                    "dev": TeamBotConfig(telegram_bot_token="t2", active_persona="tester"),
+                },
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    team = loaded.teams["acme"]
+    assert team.path == "/home/user/acme"
+    assert team.group_chat_id == -1001234567890
+    assert team.bots["manager"].telegram_bot_token == "t1"
+    assert team.bots["dev"].active_persona == "tester"
+
+
+def test_teams_coexist_with_projects(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        projects={"solo": ProjectConfig(path="/a", telegram_bot_token="tx")},
+        teams={
+            "acme": TeamConfig(
+                path="/b",
+                group_chat_id=-100,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        },
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert "solo" in loaded.projects
+    assert "acme" in loaded.teams

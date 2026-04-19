@@ -269,6 +269,23 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         else:
             proj.pop("active_persona", None)
         existing_projects[name] = proj
+    # Merge teams
+    existing_teams: dict = raw.get("teams", {})
+    for name, team in config.teams.items():
+        entry = existing_teams.get(name, {})
+        entry["path"] = team.path
+        entry["group_chat_id"] = team.group_chat_id
+        entry["bots"] = {
+            role: {
+                "telegram_bot_token": b.telegram_bot_token,
+                **({"active_persona": b.active_persona} if b.active_persona else {}),
+            }
+            for role, b in team.bots.items()
+        }
+        existing_teams[name] = entry
+    raw["teams"] = {k: v for k, v in existing_teams.items() if k in config.teams}
+    if not raw["teams"]:
+        raw.pop("teams", None)
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
     _atomic_write(path, json.dumps(raw, indent=2) + "\n")
