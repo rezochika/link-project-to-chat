@@ -171,3 +171,20 @@ async def test_append_after_finalize_is_ignored():
     await live.append("late delta")
     await asyncio.sleep(0.12)
     assert len(bot.edits) == edits_after_finalize
+
+
+@pytest.mark.asyncio
+async def test_overflow_rotates_to_new_message():
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05, max_chars=50)
+    await live.start()
+    first_mid = live.message_id
+    # 60 chars, well above the 50-char cap.
+    await live.append("x" * 60)
+    await asyncio.sleep(0.12)
+    # The buffer should have rotated: a new message was sent after the seal.
+    assert len(bot.sent) == 2
+    assert live.message_id != first_mid
+    # The first message was sealed with the prefix of the overflowed content
+    # (content may have been split); the new message_id becomes the active one.
+    assert bot.sent[1]["chat_id"] == 1

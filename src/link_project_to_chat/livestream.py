@@ -79,6 +79,9 @@ class LiveMessage:
         async with self._lock:
             if self._finalized or self.message_id is None:
                 return
+            # Overflow: seal the current message and rotate to a new one.
+            while len(self._prefix + self._buffer) > self._max_chars:
+                await self._rotate_once()
             text = self._prefix + self._buffer
             if text == self._last_rendered:
                 return
@@ -91,6 +94,35 @@ class LiveMessage:
             )
             self._last_rendered = text
             self._last_edit_ts = time.monotonic()
+
+    async def _rotate_once(self) -> None:
+        """Seal the current message at the max-char boundary and open a new one."""
+        # Compute how much of the current buffer fits in the current message.
+        room = self._max_chars - len(self._prefix)
+        if room <= 0:
+            room = 0
+        head = self._buffer[:room]
+        tail = self._buffer[room:]
+        seal_text = self._prefix + head
+        try:
+            await self._bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                text=seal_text,
+            )
+        except Exception:
+            logger.warning("LiveMessage seal-edit failed (mid=%s)", self.message_id, exc_info=True)
+        # Open a new message with the tail as the initial content (or a placeholder if empty).
+        initial = tail or "…"
+        msg = await self._bot.send_message(
+            self.chat_id,
+            self._prefix + initial,
+            reply_to_message_id=self._reply_to,
+        )
+        self.message_id = msg.message_id
+        self._buffer = tail
+        self._last_rendered = self._prefix + initial
+        self._last_edit_ts = time.monotonic()
 
     async def finalize(
         self,
