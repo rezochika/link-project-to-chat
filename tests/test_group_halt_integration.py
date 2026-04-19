@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock, AsyncMock
+
+from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.group_state import GroupStateRegistry
 
 
@@ -23,3 +28,79 @@ def test_resume_via_user_message_clears_halt():
     s = reg.get(-1)
     assert s.halted is False
     assert s.bot_to_bot_rounds == 0
+
+
+def _mk_bot(tmp_path: Path, max_rounds: int = 3) -> ProjectBot:
+    """Construct a ProjectBot in team mode and rewire its registry to the requested cap."""
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot.bot_username = "acme_manager"
+    bot._group_state = GroupStateRegistry(max_bot_rounds=max_rounds)
+    return bot
+
+
+def _mk_update(chat_id: int, text: str, sender_username: str, sender_is_bot: bool):
+    """Build a MagicMock update for _on_text. Returns (update, ctx)."""
+    update = MagicMock()
+    msg = update.effective_message
+    msg.chat_id = chat_id
+    msg.text = text
+    msg.from_user = MagicMock(is_bot=sender_is_bot, username=sender_username)
+    msg.reply_to_message = None
+    # parse_entities returns dict[Entity, str]; build one mention entity that matches @acme_manager
+    entity = MagicMock()
+    entity.type = "mention"
+    msg.parse_entities = MagicMock(return_value={entity: "@acme_manager"})
+    msg.reply_text = AsyncMock()
+    update.effective_user = MagicMock(id=12345)
+    update.effective_chat = MagicMock(id=chat_id)
+    ctx = MagicMock()
+    ctx.user_data = {}
+    return update, ctx
+
+
+@pytest.mark.asyncio
+async def test_on_text_emits_cap_message_when_round_limit_tripped(tmp_path):
+    """When the bot-to-bot counter trips the cap, _on_text should reply with the auto-pause message exactly once."""
+    bot = _mk_bot(tmp_path, max_rounds=2)
+    # Two bot-to-bot messages — the second trips the cap.
+    update1, ctx1 = _mk_update(-100_111, "@acme_manager hello", sender_username="acme_dev", sender_is_bot=True)
+    update2, ctx2 = _mk_update(-100_111, "@acme_manager hello again", sender_username="acme_dev", sender_is_bot=True)
+    await bot._on_text(update1, ctx1)
+    await bot._on_text(update2, ctx2)
+    # Second update should have produced exactly one reply containing "Auto-paused".
+    update2.effective_message.reply_text.assert_called_once()
+    reply_text = update2.effective_message.reply_text.call_args[0][0]
+    assert "Auto-paused" in reply_text
+    assert "2 bot-to-bot rounds" in reply_text
+
+
+@pytest.mark.asyncio
+async def test_on_text_silently_drops_bot_messages_after_cap(tmp_path):
+    """Once halted, additional bot-to-bot messages must not produce any reply."""
+    bot = _mk_bot(tmp_path, max_rounds=2)
+    # Trip the cap.
+    for _ in range(2):
+        u, c = _mk_update(-100_111, "@acme_manager x", sender_username="acme_dev", sender_is_bot=True)
+        await bot._on_text(u, c)
+    # Now send a third bot message.
+    u3, c3 = _mk_update(-100_111, "@acme_manager x", sender_username="acme_dev", sender_is_bot=True)
+    await bot._on_text(u3, c3)
+    u3.effective_message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_text_human_message_resumes_halted_group(tmp_path):
+    """A trusted-user message in a halted group should clear the halt (group_state.resume)."""
+    bot = _mk_bot(tmp_path, max_rounds=2)
+    # Manually halt
+    bot._group_state.halt(-100_111)
+    assert bot._group_state.get(-100_111).halted is True
+    # Trusted-user message arrives (not a bot)
+    u, c = _mk_update(-100_111, "@acme_manager hi", sender_username="rezoc666", sender_is_bot=False)
+    # Auth path will likely reject (no allowed_username configured), but resume() must still happen first.
+    await bot._on_text(u, c)
+    assert bot._group_state.get(-100_111).halted is False
+    assert bot._group_state.get(-100_111).bot_to_bot_rounds == 0
