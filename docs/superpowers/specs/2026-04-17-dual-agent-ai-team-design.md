@@ -1,7 +1,7 @@
 # Dual-Agent AI Development Team — Design Spec
 
-**Status:** Approved via brainstorming
-**Date:** 2026-04-17
+**Status:** Implemented (2026-04-19) on `feat/dual-agent-team-merged` via the unified delivery plan at `docs/superpowers/plans/2026-04-19-dual-agent-team-merged.md`. Phase 1 (group routing, bundled personas, persona persistence) shipped in `dual-agent-team` PR; Phase 2 (round-counter / `/halt` / `/resume` / usage-cap auto-pause) and Phase 3 (`group_chat_id` auto-capture, `/create_team`) shipped in the merged plan. The `Config.teams` data model from `2026-04-17-create-team-command-design.md` superseded the per-project `group_mode`/`group_chat_id`/`role` fields originally proposed here.
+**Date:** 2026-04-17 (designed); 2026-04-19 (implemented)
 **Supersedes:** `Dual-Agent-AI.md` (original idea + v1.1 polish — retained as source material)
 
 ---
