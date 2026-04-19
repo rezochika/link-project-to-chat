@@ -98,6 +98,20 @@ class BotFatherClient:
             raise Exception(f"Unexpected BotFather response: {response_text[:200]}")
         raise Exception(f"Failed to create bot after {max_retries} retries. All username variants of '{username}' were taken.")
 
+    async def disable_privacy(self, bot_username: str) -> None:
+        """Send /setprivacy to BotFather, select the bot by @username, tap Disable.
+
+        Needed so group-mode bots receive non-command messages from group members
+        (Telegram filters them by default).
+        """
+        client = await self._ensure_client()
+        entity = await client.get_entity(_BOTFATHER)
+        await client.send_message(entity, "/setprivacy")
+        await asyncio.sleep(1.5)
+        await client.send_message(entity, f"@{bot_username}")
+        await asyncio.sleep(1.5)
+        await client.send_message(entity, "Disable")
+
     async def disconnect(self) -> None:
         if self._client and self._client.is_connected():
             await self._client.disconnect()
