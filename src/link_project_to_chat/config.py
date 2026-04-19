@@ -31,9 +31,6 @@ class ProjectConfig:
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
     session_id: str | None = None
     autostart: bool = False
-    group_mode: bool = False
-    group_chat_id: int | None = None
-    role: str | None = None  # "manager" or "dev" when group_mode=true
     active_persona: str | None = None
 
 
@@ -140,9 +137,6 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 permissions=_load_permissions(proj),
                 session_id=proj.get("session_id"),
                 autostart=proj.get("autostart", False),
-                group_mode=proj.get("group_mode", False),
-                group_chat_id=proj.get("group_chat_id"),
-                role=proj.get("role"),
                 active_persona=proj.get("active_persona"),
             )
         for name, team in raw.get("teams", {}).items():
@@ -255,15 +249,6 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         else:
             proj.pop("session_id", None)
         proj["autostart"] = p.autostart
-        proj["group_mode"] = p.group_mode
-        if p.group_chat_id is not None:
-            proj["group_chat_id"] = p.group_chat_id
-        else:
-            proj.pop("group_chat_id", None)
-        if p.role:
-            proj["role"] = p.role
-        else:
-            proj.pop("role", None)
         if p.active_persona:
             proj["active_persona"] = p.active_persona
         else:

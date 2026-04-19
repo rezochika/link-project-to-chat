@@ -1409,7 +1409,6 @@ def run_bots(
             trusted_user_ids=effective_trusted_ids,
             transcriber=transcriber,
             synthesizer=synthesizer,
-            group_mode=proj.group_mode,
             active_persona=proj.active_persona,
         )
     else:
