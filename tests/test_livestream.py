@@ -201,3 +201,38 @@ async def test_prefix_longer_than_max_chars_raises():
     bot = FakeBot()
     with pytest.raises(ValueError):
         LiveMessage(bot=bot, chat_id=1, prefix="💭 very long prefix", max_chars=5)
+
+
+class FakeRetryAfter(Exception):
+    """Stand-in for telegram.error.RetryAfter — matches on class name."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+
+
+@dataclass
+class FlakeyBot(FakeBot):
+    fail_first_edits: int = 1
+    _edit_fail_count: int = 0
+
+    async def edit_message_text(self, chat_id, message_id, text, **kw):
+        if self._edit_fail_count < self.fail_first_edits:
+            self._edit_fail_count += 1
+            raise FakeRetryAfter(retry_after=0.05)
+        return await super().edit_message_text(chat_id, message_id, text, **kw)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_backs_off_then_succeeds(monkeypatch):
+    import link_project_to_chat.livestream as ls_mod
+    # Patch the RetryAfter class the module recognises.
+    monkeypatch.setattr(ls_mod, "RetryAfter", FakeRetryAfter, raising=False)
+
+    bot = FlakeyBot(fail_first_edits=1)
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05)
+    await live.start()
+    await live.append("hello")
+    # Wait for initial flush (which fails) + retry after backoff.
+    await asyncio.sleep(0.4)
+    # A successful edit eventually lands.
+    assert any(e["text"] == "hello" for e in bot.edits)

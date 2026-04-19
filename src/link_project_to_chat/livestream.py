@@ -7,6 +7,12 @@ from typing import Any
 
 from .formatting import md_to_telegram
 
+try:
+    from telegram.error import RetryAfter  # type: ignore
+except Exception:  # pragma: no cover - test envs without full telegram install
+    class RetryAfter(Exception):  # type: ignore
+        retry_after: float = 0.0
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_THROTTLE = 1.2  # seconds between edits per message
@@ -71,7 +77,24 @@ class LiveMessage:
             wait = self._effective_throttle - (time.monotonic() - self._last_edit_ts)
             if wait > 0:
                 await asyncio.sleep(wait)
-            await self._edit_current()
+            try:
+                await self._edit_current()
+            except RetryAfter as e:
+                backoff = min(
+                    max(float(getattr(e, "retry_after", 1.0)), self._throttle) * 2,
+                    _MAX_THROTTLE,
+                )
+                self._effective_throttle = backoff
+                logger.warning(
+                    "Telegram RetryAfter; backing off to %.2fs (mid=%s)",
+                    backoff,
+                    self.message_id,
+                )
+                # Re-schedule another flush after the backoff window.
+                await asyncio.sleep(backoff)
+                await self._edit_current()
+                # Decay back toward the normal throttle on success.
+                self._effective_throttle = self._throttle
             # If new deltas landed during the edit, schedule another flush to drain them.
             if self._prefix + self._buffer != self._last_rendered and not self._finalized:
                 self._pending = asyncio.create_task(self._flush_soon())
