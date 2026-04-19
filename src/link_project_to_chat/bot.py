@@ -90,7 +90,7 @@ class ProjectBot(AuthMixin):
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
-        group_mode: bool = False,
+        team_name: str | None = None,
         group_chat_id: int | None = None,
         role: str | None = None,
     ):
@@ -129,7 +129,8 @@ class ProjectBot(AuthMixin):
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
-        self.group_mode = group_mode
+        self.team_name = team_name
+        self.group_mode = team_name is not None
         # Team-mode fields — stored now, wired into behavior in later tasks (B3/B4).
         self.group_chat_id = group_chat_id
         self.role = role
@@ -1342,7 +1343,7 @@ def run_bot(
     trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
-    group_mode: bool = False,
+    team_name: str | None = None,
     active_persona: str | None = None,
     group_chat_id: int | None = None,
     role: str | None = None,
@@ -1366,7 +1367,7 @@ def run_bot(
         transcriber=transcriber,
         synthesizer=synthesizer,
         active_persona=active_persona,
-        group_mode=group_mode,
+        team_name=team_name,
         group_chat_id=group_chat_id,
         role=role,
     )

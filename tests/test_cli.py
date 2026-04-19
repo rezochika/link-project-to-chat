@@ -237,7 +237,7 @@ def test_start_team_and_role_invokes_run_bot_with_team_primitives(tmp_path, monk
     # Token could be positional (3rd) or keyword — accept either shape
     token = kwargs.get("token") or (args[2] if len(args) > 2 else None)
     assert token == "t1"
-    assert kwargs.get("group_mode") is True
+    assert kwargs.get("team_name") == "acme"
     assert kwargs.get("active_persona") == "developer"
     assert kwargs.get("group_chat_id") == -1001
     assert kwargs.get("role") == "manager"

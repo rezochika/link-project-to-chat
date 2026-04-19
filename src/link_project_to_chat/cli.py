@@ -326,7 +326,7 @@ def start(
             trusted_user_ids=effective_trusted_ids,
             transcriber=transcriber,
             synthesizer=synthesizer,
-            group_mode=True,
+            team_name=team,
             group_chat_id=t.group_chat_id,
             role=role,
             active_persona=bot_cfg.active_persona,
