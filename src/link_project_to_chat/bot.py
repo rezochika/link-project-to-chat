@@ -216,24 +216,41 @@ class ProjectBot(AuthMixin):
         await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
 
     async def _finalize_claude_task(self, task: Task) -> None:
-        self._stream_text.pop(task.id, None)
+        live_text = self._live_text.pop(task.id, None)
+        live_thinking = self._live_thinking.pop(task.id, None)
         thinking = self._thinking_buf.pop(task.id, None)
         is_voice = task.id in self._voice_tasks
         self._voice_tasks.discard(task.id)
 
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
+            # Compact tasks don't stream, but clean up defensively.
+            if live_text is not None:
+                await live_text.cancel("(compacted)")
+            if live_thinking is not None:
+                await live_thinking.cancel("(compacted)")
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
 
         if task.status == TaskStatus.DONE:
-            if thinking:
+            if live_text is not None:
+                await live_text.finalize(task.result or None, render=True)
+            else:
+                await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+            if live_thinking is not None:
+                await live_thinking.finalize(render=False)
+            elif thinking:
                 self._thinking_store[task.id] = thinking
-            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
-            await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+            error_text = f"Error: {task.error}"
+            if live_text is not None:
+                await live_text.finalize(error_text, render=False)
+            else:
+                await self._send_to_chat(task.chat_id, error_text, reply_to=task.message_id)
+            if live_thinking is not None:
+                await live_thinking.finalize(render=False)
 
     async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"

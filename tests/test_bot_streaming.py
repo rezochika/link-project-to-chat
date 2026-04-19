@@ -100,3 +100,64 @@ async def test_thinking_delta_with_toggle_off_uses_buffer():
     assert bot._thinking_buf[task.id] == "step 1\n\nstep 2"
     # No Telegram messages were sent for thinking.
     assert len(bot._app.bot.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_live_text_does_not_resend():
+    bot = await _stub_bot()
+    # Stub out the voice/compact helpers we don't exercise.
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    task = _fake_task(task_id=10)
+    task.status = TaskStatus.DONE
+    task.result = "final answer"
+    await bot._on_stream_event(task, TextDelta(text="partial"))
+    sent_before = len(bot._app.bot.sent)
+
+    await bot._finalize_claude_task(task)
+
+    # No new send_message call — the live message was edited to the final answer.
+    assert len(bot._app.bot.sent) == sent_before
+    assert task.id not in bot._live_text
+    # A final edit landed carrying the final answer.
+    assert any("final answer" in e["text"] for e in bot._app.bot.edits)
+
+
+@pytest.mark.asyncio
+async def test_finalize_without_live_text_falls_back_to_send_to_chat():
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    sent_chats: list[tuple[int, str]] = []
+
+    async def fake_send(chat_id, text, reply_to=None):
+        sent_chats.append((chat_id, text))
+
+    bot._send_to_chat = fake_send
+    task = _fake_task(task_id=11)
+    task.status = TaskStatus.DONE
+    task.result = "tool-only answer"
+
+    await bot._finalize_claude_task(task)
+
+    assert sent_chats == [(task.chat_id, "tool-only answer")]
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_toggle_off_stores_thinking_for_button():
+    bot = await _stub_bot(show_thinking=False)
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+
+    async def fake_send(chat_id, text, reply_to=None):
+        pass
+
+    bot._send_to_chat = fake_send
+    task = _fake_task(task_id=12)
+    task.status = TaskStatus.DONE
+    task.result = "ok"
+    await bot._on_stream_event(task, ThinkingDelta(text="hidden reasoning"))
+
+    await bot._finalize_claude_task(task)
+
+    assert bot._thinking_store[task.id] == "hidden reasoning"
