@@ -77,8 +77,13 @@ def _parse_edit_callback(data: str) -> tuple[str, str] | None:
     return None
 
 
-def _create_team_preflight(cfg_path: Path, prefix: str) -> str | None:
-    """Return an error string if pre-flight fails, None if OK."""
+def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | None:
+    """Return an error string if pre-flight fails, None if OK.
+
+    When ``prefix`` is None, only checks credential prereqs (Telethon, GitHub).
+    When ``prefix`` is given, additionally checks for team-name and legacy project-name
+    collisions.
+    """
     from ..config import load_config
     from ..github_client import _gh_available
 
@@ -92,6 +97,9 @@ def _create_team_preflight(cfg_path: Path, prefix: str) -> str | None:
 
     if not config.github_pat and not _gh_available():
         return "GitHub auth missing — run `/setup` with a PAT, or authenticate `gh` CLI."
+
+    if prefix is None:
+        return None
 
     if prefix in config.teams:
         return f"Team `{prefix}` is already configured."
@@ -235,6 +243,16 @@ class ManagerBot(AuthMixin):
 
     # ConversationHandler states for /create_project
     CREATE_SOURCE, CREATE_REPO_LIST, CREATE_REPO_URL, CREATE_NAME, CREATE_NAME_INPUT, CREATE_BOT, CREATE_CLONE = range(11, 18)
+
+    # ConversationHandler states for /create_team
+    (
+        CREATE_TEAM_SOURCE,
+        CREATE_TEAM_REPO_LIST,
+        CREATE_TEAM_REPO_URL,
+        CREATE_TEAM_NAME,
+        CREATE_TEAM_PERSONA_MGR,
+        CREATE_TEAM_PERSONA_DEV,
+    ) = range(18, 24)
 
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -833,6 +851,39 @@ class ManagerBot(AuthMixin):
         ctx.user_data.pop("create", None)
         await update.effective_message.reply_text("Project creation cancelled.")
         return ConversationHandler.END
+
+    async def _on_create_team(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        """Entry point for /create_team — pick repo source (GitHub browse vs paste URL)."""
+        if not await self._guard(update):
+            return ConversationHandler.END
+
+        # Cred-only pre-flight (prefix isn't known yet; full collision check runs in NAME state).
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        err = _create_team_preflight(cfg_path, prefix=None)
+        if err:
+            await update.effective_message.reply_text(err)
+            return ConversationHandler.END
+
+        ctx.user_data["create_team"] = {"config_path": str(cfg_path)}
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Browse my GitHub repos", callback_data="ct_source:github")],
+            [InlineKeyboardButton("Paste a URL", callback_data="ct_source:url")],
+        ])
+        await update.effective_message.reply_text(
+            "How would you like to pick the repo?",
+            reply_markup=keyboard,
+        )
+        return self.CREATE_TEAM_SOURCE
+
+    async def _create_team_source_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        _, source = query.data.split(":", 1)
+        ctx.user_data.setdefault("create_team", {})["source"] = source
+        if source == "github":
+            return await self._show_repo_page(query, ctx, page=1, user_data_key="create_team")
+        await query.edit_message_text("Paste the repo URL (e.g. https://github.com/owner/repo):")
+        return self.CREATE_TEAM_REPO_URL
 
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
