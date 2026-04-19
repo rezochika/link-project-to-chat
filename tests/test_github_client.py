@@ -74,3 +74,36 @@ async def test_validate_repo_url_not_found(client):
         mock_client.get = AsyncMock(return_value=_mock_response(404, {"message": "Not Found"}))
         info = await client.validate_repo_url("https://github.com/owner/nonexistent")
     assert info is None
+
+
+@pytest.fixture
+def gh_client(monkeypatch):
+    monkeypatch.setattr("link_project_to_chat.github_client._gh_available", lambda: True)
+    return GitHubClient()
+
+
+async def test_list_repos_gh_includes_org_repos_and_paginates(gh_client):
+    body = json.dumps([
+        {"name": "user-repo", "full_name": "me/user-repo", "html_url": "https://github.com/me/user-repo",
+         "clone_url": "https://github.com/me/user-repo.git", "description": "mine", "private": False},
+        {"name": "org-repo", "full_name": "acme/org-repo", "html_url": "https://github.com/acme/org-repo",
+         "clone_url": "https://github.com/acme/org-repo.git", "description": "org", "private": True},
+    ])
+    headers = (
+        'HTTP/2.0 200 OK\r\n'
+        'Link: <https://api.github.com/user/repos?page=2>; rel="next"\r\n'
+    )
+    stdout = headers + "\r\n" + body
+    with patch("link_project_to_chat.github_client._run_gh", AsyncMock(return_value=(0, stdout, ""))):
+        repos, has_next = await gh_client.list_repos(page=1, per_page=5)
+    assert [r.full_name for r in repos] == ["me/user-repo", "acme/org-repo"]
+    assert has_next is True
+
+
+async def test_list_repos_gh_no_next_page(gh_client):
+    body = json.dumps([])
+    stdout = "HTTP/2.0 200 OK\r\n\r\n" + body
+    with patch("link_project_to_chat.github_client._run_gh", AsyncMock(return_value=(0, stdout, ""))):
+        repos, has_next = await gh_client.list_repos(page=1, per_page=5)
+    assert repos == []
+    assert has_next is False

@@ -75,28 +75,28 @@ class GitHubClient:
         return await self._list_repos_api(page, per_page)
 
     async def _list_repos_gh(self, page: int, per_page: int) -> tuple[list[RepoInfo], bool]:
-        # gh repo list gives us repos; we fetch per_page+1 to detect next page
-        limit = per_page + 1
-        skip = (page - 1) * per_page
+        # Use /user/repos so org-member repos are included (gh repo list is user-owned only).
         code, stdout, stderr = await _run_gh(
-            "repo", "list", "--limit", str(skip + limit),
-            "--json", "name,nameWithOwner,url,sshUrl,isPrivate,description",
+            "api", "--include",
+            f"/user/repos?sort=updated&page={page}&per_page={per_page}",
         )
         if code != 0:
-            raise Exception(f"gh repo list failed: {stderr}")
-        all_repos = json.loads(stdout) if stdout else []
-        page_repos = all_repos[skip:skip + per_page]
-        has_next = len(all_repos) > skip + per_page
+            raise Exception(f"gh api /user/repos failed: {stderr}")
+        sep = "\r\n\r\n" if "\r\n\r\n" in stdout else "\n\n"
+        headers_part, _, body_part = stdout.partition(sep)
+        if not body_part:
+            raise Exception("gh api returned no body")
+        has_next = 'rel="next"' in headers_part
         repos = [
             RepoInfo(
                 name=r["name"],
-                full_name=r["nameWithOwner"],
-                html_url=r["url"],
-                clone_url=r["url"] + ".git",
+                full_name=r["full_name"],
+                html_url=r["html_url"],
+                clone_url=r["clone_url"],
                 description=r.get("description") or "",
-                private=r["isPrivate"],
+                private=r["private"],
             )
-            for r in page_repos
+            for r in json.loads(body_part)
         ]
         return repos, has_next
 
