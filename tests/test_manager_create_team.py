@@ -138,3 +138,38 @@ async def test_show_repo_page_supports_user_data_key(tmp_path, monkeypatch):
     # Assert the repos landed in ctx.user_data["create_team"], not ["create"]
     assert "repos" in ctx.user_data["create_team"]
     assert "me/acme" in ctx.user_data["create_team"]["repos"]
+
+
+@pytest.mark.asyncio
+async def test_create_bot_with_retry_tries_suffixes(monkeypatch):
+    from link_project_to_chat.manager.bot import _create_bot_with_retry
+
+    attempts = []
+
+    async def fake_create_bot(display_name: str, username: str) -> str:
+        attempts.append(username)
+        if len(attempts) < 3:
+            raise ValueError("username taken")
+        return "FAKE_TOKEN"
+
+    bfc = MagicMock()
+    bfc.create_bot = fake_create_bot
+
+    token, username = await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_claude_bot")
+    assert token == "FAKE_TOKEN"
+    assert username == "acme_mgr_2_claude_bot"
+    assert attempts == ["acme_mgr_claude_bot", "acme_mgr_1_claude_bot", "acme_mgr_2_claude_bot"]
+
+
+@pytest.mark.asyncio
+async def test_create_bot_with_retry_fails_after_5_tries():
+    from link_project_to_chat.manager.bot import _create_bot_with_retry
+
+    async def fake_create_bot(display_name: str, username: str) -> str:
+        raise ValueError("username taken")
+
+    bfc = MagicMock()
+    bfc.create_bot = fake_create_bot
+
+    with pytest.raises(RuntimeError, match="5 attempts"):
+        await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_claude_bot")

@@ -112,6 +112,26 @@ def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | N
     return None
 
 
+async def _create_bot_with_retry(bfc, display_name: str, base_username: str, max_attempts: int = 5) -> tuple[str, str]:
+    """Try creating a bot with base_username; on failure append _1/_2/..., up to max_attempts."""
+    suffix_insert_at = base_username.rfind("_claude_bot")
+    if suffix_insert_at == -1:
+        suffix_insert_at = len(base_username)
+
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            candidate = base_username
+        else:
+            candidate = base_username[:suffix_insert_at] + f"_{attempt}" + base_username[suffix_insert_at:]
+        try:
+            token = await bfc.create_bot(display_name, candidate)
+            return token, candidate
+        except Exception:
+            if attempt == max_attempts - 1:
+                break
+    raise RuntimeError(f"Bot username unavailable after {max_attempts} attempts (base={base_username})")
+
+
 class ManagerBot(AuthMixin):
     _MAX_MESSAGES_PER_MINUTE = 20
 
