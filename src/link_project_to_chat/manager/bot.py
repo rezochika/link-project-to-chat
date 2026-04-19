@@ -34,6 +34,7 @@ COMMANDS = [
     ("remove_user", "Remove an authorized user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
+    ("create_team", "Create a dual-agent team (2 bots + group)"),
     ("model", "Set default model for all projects"),
     ("version", "Show version"),
     ("help", "Show commands"),
@@ -683,38 +684,46 @@ class ManagerBot(AuthMixin):
             ctx.user_data[user_data_key]["repo"] = repo_data
             suggested_name = repo_data["name"]
             ctx.user_data[user_data_key]["suggested_name"] = suggested_name
+            if user_data_key == "create_team":
+                await query.edit_message_text("Short project name?")
+                return self.CREATE_TEAM_NAME
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
                 [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
             ])
             await query.edit_message_text(f"Project name?", reply_markup=markup)
-            return self.CREATE_TEAM_NAME if user_data_key == "create_team" else self.CREATE_NAME
+            return self.CREATE_NAME
         elif data == "create_cancel":
             ctx.user_data.pop(user_data_key, None)
             await query.edit_message_text("Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
 
-    async def _create_repo_url(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _create_repo_url(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_data_key: str = "create"
+    ) -> int:
         url = update.message.text.strip()
         from ..github_client import GitHubClient
         from ..config import load_config
-        path = Path(ctx.user_data["create"]["config_path"])
+        path = Path(ctx.user_data[user_data_key]["config_path"])
         config = load_config(path)
         gh = GitHubClient(pat=config.github_pat)
         try:
             repo = await gh.validate_repo_url(url)
         except Exception as e:
             await update.effective_message.reply_text(f"Error: {e}\nTry again or /cancel:")
-            return self.CREATE_REPO_URL
+            return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
         finally:
             await gh.close()
         if not repo:
             await update.effective_message.reply_text("Invalid or not found. Paste a valid GitHub URL:")
-            return self.CREATE_REPO_URL
-        ctx.user_data["create"]["repo"] = repo.__dict__
+            return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
+        ctx.user_data[user_data_key]["repo"] = repo.__dict__
         suggested_name = repo.name
-        ctx.user_data["create"]["suggested_name"] = suggested_name
+        ctx.user_data[user_data_key]["suggested_name"] = suggested_name
+        if user_data_key == "create_team":
+            await update.effective_message.reply_text("Short project name?")
+            return self.CREATE_TEAM_NAME
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
             [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
@@ -1382,6 +1391,36 @@ class ManagerBot(AuthMixin):
                         MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_bot_token_input),
                     ],
                     self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
+                },
+                fallbacks=[CommandHandler("cancel", self._create_cancel)],
+            ))
+
+            app.add_handler(ConversationHandler(
+                entry_points=[CommandHandler("create_team", self._on_create_team)],
+                states={
+                    self.CREATE_TEAM_SOURCE: [
+                        CallbackQueryHandler(self._create_team_source_callback, pattern=r"^ct_source:"),
+                    ],
+                    self.CREATE_TEAM_REPO_LIST: [
+                        CallbackQueryHandler(
+                            lambda u, c: self._create_repo_list_callback(u, c, user_data_key="create_team"),
+                        ),
+                    ],
+                    self.CREATE_TEAM_REPO_URL: [
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND,
+                            lambda u, c: self._create_repo_url(u, c, user_data_key="create_team"),
+                        ),
+                    ],
+                    self.CREATE_TEAM_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_team_name),
+                    ],
+                    self.CREATE_TEAM_PERSONA_MGR: [
+                        CallbackQueryHandler(self._create_team_persona_mgr_callback, pattern=r"^ct_persona_mgr:"),
+                    ],
+                    self.CREATE_TEAM_PERSONA_DEV: [
+                        CallbackQueryHandler(self._create_team_persona_dev_callback, pattern=r"^ct_persona_dev:"),
+                    ],
                 },
                 fallbacks=[CommandHandler("cancel", self._create_cancel)],
             ))
