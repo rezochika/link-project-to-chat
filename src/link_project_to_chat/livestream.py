@@ -47,3 +47,42 @@ class LiveMessage:
         self.message_id = msg.message_id
         self._last_rendered = self._prefix + initial
         self._last_edit_ts = time.monotonic()
+
+    async def append(self, delta: str) -> None:
+        if self._finalized:
+            logger.debug("append after finalize ignored (mid=%s)", self.message_id)
+            return
+        if not delta:
+            return
+        self._buffer += delta
+        if self._pending is None or self._pending.done():
+            self._pending = asyncio.create_task(self._flush_soon())
+
+    async def _flush_soon(self) -> None:
+        try:
+            # Sleep until we're allowed to edit again.
+            wait = self._effective_throttle - (time.monotonic() - self._last_edit_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await self._edit_current()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("LiveMessage flush failed (mid=%s)", self.message_id)
+
+    async def _edit_current(self) -> None:
+        async with self._lock:
+            if self._finalized or self.message_id is None:
+                return
+            text = self._prefix + self._buffer
+            if text == self._last_rendered:
+                return
+            if not text.strip():
+                return
+            await self._bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                text=text,
+            )
+            self._last_rendered = text
+            self._last_edit_ts = time.monotonic()
