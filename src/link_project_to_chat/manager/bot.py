@@ -77,6 +77,33 @@ def _parse_edit_callback(data: str) -> tuple[str, str] | None:
     return None
 
 
+def _create_team_preflight(cfg_path: Path, prefix: str) -> str | None:
+    """Return an error string if pre-flight fails, None if OK."""
+    from ..config import load_config
+    from ..github_client import _gh_available
+
+    config = load_config(cfg_path)
+
+    if not config.telegram_api_id or not config.telegram_api_hash:
+        return "Run `/setup` first — Telegram API credentials are not configured."
+    session_file = cfg_path.parent / "telethon.session"
+    if not session_file.exists():
+        return "Run `/setup` first — Telethon session is not established."
+
+    if not config.github_pat and not _gh_available():
+        return "GitHub auth missing — run `/setup` with a PAT, or authenticate `gh` CLI."
+
+    if prefix in config.teams:
+        return f"Team `{prefix}` is already configured."
+
+    legacy_names = [f"{prefix}_mgr", f"{prefix}_dev"]
+    taken = [n for n in legacy_names if n in config.projects]
+    if taken:
+        return f"Those project names are taken: {', '.join(taken)}. Pick a different prefix."
+
+    return None
+
+
 class ManagerBot(AuthMixin):
     _MAX_MESSAGES_PER_MINUTE = 20
 

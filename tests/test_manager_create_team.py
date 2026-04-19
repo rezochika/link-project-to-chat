@@ -21,3 +21,76 @@ def test_persona_keyboard_lists_discovered_personas(tmp_path):
     # Callbacks are prefixed
     for btn in buttons:
         assert btn.callback_data.startswith("team_persona_mgr:")
+
+
+import pytest
+
+from link_project_to_chat.config import (
+    Config,
+    ProjectConfig,
+    TeamBotConfig,
+    TeamConfig,
+    save_config,
+)
+
+
+def test_preflight_rejects_existing_team_name(tmp_path):
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(
+        telegram_api_id=1,
+        telegram_api_hash="x",
+        github_pat="ghp_x",
+        teams={
+            "acme": TeamConfig(path="/a", group_chat_id=-1, bots={})
+        },
+    )
+    save_config(config, cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")  # fake session file
+
+    err = _create_team_preflight(cfg_path, "acme")
+    assert err is not None
+    assert "already configured" in err
+
+
+def test_preflight_rejects_legacy_project_name_collision(tmp_path):
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(
+        telegram_api_id=1,
+        telegram_api_hash="x",
+        github_pat="ghp_x",
+        projects={"acme_mgr": ProjectConfig(path="/a", telegram_bot_token="t")},
+    )
+    save_config(config, cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    err = _create_team_preflight(cfg_path, "acme")
+    assert err is not None
+    assert "project names are taken" in err or "acme_mgr" in err
+
+
+def test_preflight_rejects_missing_telethon_config(tmp_path):
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(github_pat="ghp_x")  # telegram_api_id/hash missing
+    save_config(config, cfg_path)
+
+    err = _create_team_preflight(cfg_path, "acme")
+    assert err is not None
+    assert "/setup" in err
+
+
+def test_preflight_passes_when_all_good(tmp_path):
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x")
+    save_config(config, cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    err = _create_team_preflight(cfg_path, "acme")
+    assert err is None
