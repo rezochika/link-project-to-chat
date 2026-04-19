@@ -310,11 +310,15 @@ class ProjectBot(AuthMixin):
         if typing:
             typing.cancel()
 
-        # Flush any accompanying text Claude produced alongside the question
-        accompanying = task.result or self._stream_text.pop(task.id, "")
-        if accompanying and accompanying.strip():
-            await self._send_to_chat(task.chat_id, accompanying, reply_to=task.message_id)
-        self._stream_text.pop(task.id, None)
+        # Finalize any live messages so the question buttons appear after the sealed stream.
+        live_text = self._live_text.pop(task.id, None)
+        if live_text is not None:
+            await live_text.finalize(task.result or None, render=True)
+        elif task.result and task.result.strip():
+            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+        live_thinking = self._live_thinking.pop(task.id, None)
+        if live_thinking is not None:
+            await live_thinking.finalize(render=False)
 
         def _esc(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

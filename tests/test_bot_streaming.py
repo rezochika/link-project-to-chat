@@ -161,3 +161,32 @@ async def test_finalize_with_toggle_off_stores_thinking_for_button():
     await bot._finalize_claude_task(task)
 
     assert bot._thinking_store[task.id] == "hidden reasoning"
+
+
+@pytest.mark.asyncio
+async def test_waiting_input_seals_live_text():
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+
+    # We don't exercise the question rendering here — stub it.
+    async def fake_send(chat_id, text, reply_to=None):
+        pass
+
+    bot._send_to_chat = fake_send
+
+    async def fake_render_questions(task):
+        pass
+
+    # _on_waiting_input will try to render questions; give it an empty list so that path is a no-op.
+    task = _fake_task(task_id=20)
+    task.pending_questions = []
+    task.result = ""
+
+    await bot._on_stream_event(task, TextDelta(text="mid-stream"))
+    assert task.id in bot._live_text
+
+    await bot._on_waiting_input(task)
+
+    # Live text was finalised and popped.
+    assert task.id not in bot._live_text
