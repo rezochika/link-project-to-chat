@@ -75,3 +75,28 @@ async def test_text_delta_starts_live_message():
     assert len(bot._app.bot.sent) == 1
     # The buffer contains both deltas.
     assert live._buffer == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_with_toggle_on_streams_separate_message():
+    bot = await _stub_bot(show_thinking=True)
+    task = _fake_task(task_id=2)
+    await bot._on_stream_event(task, ThinkingDelta(text="first thought"))
+    assert task.id in bot._live_thinking
+    # The first thinking delta produces its own separate placeholder send.
+    assert len(bot._app.bot.sent) == 1
+    assert bot._app.bot.sent[0]["text"].startswith("💭 ")
+    # `_thinking_buf` is NOT used when live thinking is on.
+    assert task.id not in bot._thinking_buf
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_with_toggle_off_uses_buffer():
+    bot = await _stub_bot(show_thinking=False)
+    task = _fake_task(task_id=3)
+    await bot._on_stream_event(task, ThinkingDelta(text="step 1"))
+    await bot._on_stream_event(task, ThinkingDelta(text="step 2"))
+    assert task.id not in bot._live_thinking
+    assert bot._thinking_buf[task.id] == "step 1\n\nstep 2"
+    # No Telegram messages were sent for thinking.
+    assert len(bot._app.bot.sent) == 0
