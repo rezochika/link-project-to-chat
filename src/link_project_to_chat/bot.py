@@ -353,8 +353,17 @@ class ProjectBot(AuthMixin):
         if not msg:
             return
         if self.group_mode:
-            if self.group_chat_id is not None and msg.chat_id != self.group_chat_id:
-                return  # message from a different group — silently ignore
+            # Auto-capture: if chat_id not yet bound (sentinel 0 or None), and sender is the trusted user,
+            # write this group's chat_id into the team config and update in-memory state.
+            if self.group_chat_id in (0, None):
+                if self._auth(update.effective_user) and self.team_name:
+                    from .config import patch_team
+                    new_chat_id = msg.chat_id
+                    patch_team(self.team_name, {"group_chat_id": new_chat_id})
+                    self.group_chat_id = new_chat_id
+                    # Fall through so this same message still gets processed normally.
+            elif msg.chat_id != self.group_chat_id:
+                return  # wrong group — silent ignore
             from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
             if is_from_self(msg, self.bot_username):
                 return  # self-silence

@@ -96,3 +96,74 @@ async def test_group_mode_no_chat_id_set_does_not_reject(tmp_path):
     # No mention → still no reply, but the early return came from is_directed_at_me, not the guard.
     await bot._on_text(update, ctx)
     update.effective_message.reply_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_first_group_message_captures_chat_id(tmp_path, monkeypatch):
+    """When group_chat_id=0 (sentinel), a trusted-user message captures the actual chat_id."""
+    from link_project_to_chat.bot import ProjectBot
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=0,
+    )
+    bot.bot_username = "acme_manager"
+    bot._auth = MagicMock(return_value=True)
+
+    captured = []
+    def fake_patch_team(name, fields, *args, **kwargs):
+        captured.append((name, fields))
+    monkeypatch.setattr("link_project_to_chat.config.patch_team", fake_patch_team)
+
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.chat_id = -100_999
+    update.effective_message.text = "@acme_manager hi"
+    update.effective_message.from_user = MagicMock(is_bot=False, username="rezoc666")
+    update.effective_message.reply_to_message = None
+    update.effective_message.parse_entities = MagicMock(return_value={})
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(id=12345)
+    update.effective_chat = MagicMock(id=-100_999)
+    ctx = MagicMock()
+    ctx.user_data = {}
+
+    await bot._on_text(update, ctx)
+
+    # Capture happened
+    assert captured == [("acme", {"group_chat_id": -100_999})]
+    assert bot.group_chat_id == -100_999
+
+
+@pytest.mark.asyncio
+async def test_unauth_user_does_not_trigger_capture(tmp_path, monkeypatch):
+    """An unauthenticated message must NOT capture the chat_id."""
+    from link_project_to_chat.bot import ProjectBot
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=0,
+    )
+    bot.bot_username = "acme_manager"
+    bot._auth = MagicMock(return_value=False)  # unauthorized
+
+    captured = []
+    def fake_patch_team(name, fields, *args, **kwargs):
+        captured.append((name, fields))
+    monkeypatch.setattr("link_project_to_chat.config.patch_team", fake_patch_team)
+
+    update = MagicMock()
+    update.effective_message = MagicMock()
+    update.effective_message.chat_id = -100_999
+    update.effective_message.text = "@acme_manager hi"
+    update.effective_message.from_user = MagicMock(is_bot=False, username="randoc")
+    update.effective_message.reply_to_message = None
+    update.effective_message.parse_entities = MagicMock(return_value={})
+    update.effective_message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(id=99999)
+    update.effective_chat = MagicMock(id=-100_999)
+    ctx = MagicMock()
+    ctx.user_data = {}
+
+    await bot._on_text(update, ctx)
+
+    assert captured == []
+    assert bot.group_chat_id == 0  # unchanged

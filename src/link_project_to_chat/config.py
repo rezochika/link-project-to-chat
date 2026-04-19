@@ -43,7 +43,7 @@ class TeamBotConfig:
 @dataclass
 class TeamConfig:
     path: str
-    group_chat_id: int
+    group_chat_id: int = 0  # 0 = sentinel "not yet captured"
     bots: dict[str, TeamBotConfig] = field(default_factory=dict)
 
 

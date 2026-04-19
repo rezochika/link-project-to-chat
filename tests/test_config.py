@@ -581,3 +581,20 @@ def test_load_teams_helper(tmp_path: Path):
 
 def test_load_teams_missing_file_returns_empty(tmp_path: Path):
     assert load_teams(tmp_path / "nope.json") == {}
+
+
+def test_team_with_sentinel_chat_id_roundtrips(tmp_path: Path):
+    """A team with group_chat_id=0 (not yet captured) saves and loads cleanly."""
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/a",
+                group_chat_id=0,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.teams["acme"].group_chat_id == 0
