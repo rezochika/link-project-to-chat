@@ -318,6 +318,8 @@ class ProjectBot(AuthMixin):
         if not msg:
             return
         if self.group_mode:
+            if self.group_chat_id is not None and msg.chat_id != self.group_chat_id:
+                return  # message from a different group — silently ignore
             from .group_filters import is_from_self, is_directed_at_me
             if is_from_self(msg, self.bot_username):
                 return  # self-silence
