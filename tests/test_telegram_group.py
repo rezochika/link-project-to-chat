@@ -91,3 +91,40 @@ async def test_invite_user_uses_invite_to_channel():
     request = invite_calls[0].args[0]
     assert request.channel is channel_entity
     assert request.users == [user_entity]
+
+
+@pytest.mark.asyncio
+async def test_flood_wait_under_30s_retries_once(monkeypatch):
+    from link_project_to_chat.manager.telegram_group import create_supergroup
+    from telethon.errors import FloodWaitError
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.telegram_group.asyncio.sleep", AsyncMock()
+    )
+
+    mock_chat = MagicMock()
+    mock_chat.id = 123
+    mock_resp = MagicMock(chats=[mock_chat])
+
+    call_count = {"n": 0}
+
+    async def side_effect(request):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise FloodWaitError(request=None, capture=5)
+        return mock_resp
+
+    client = AsyncMock(side_effect=side_effect)
+    result = await create_supergroup(client, "acme team")
+    assert result == -100123
+    assert call_count["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_flood_wait_over_30s_aborts():
+    from link_project_to_chat.manager.telegram_group import create_supergroup
+    from telethon.errors import FloodWaitError
+
+    client = AsyncMock(side_effect=FloodWaitError(request=None, capture=180))
+    with pytest.raises(FloodWaitError):
+        await create_supergroup(client, "acme team")
