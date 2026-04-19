@@ -94,3 +94,47 @@ def test_preflight_passes_when_all_good(tmp_path):
 
     err = _create_team_preflight(cfg_path, "acme")
     assert err is None
+
+
+from unittest.mock import AsyncMock, MagicMock
+
+
+@pytest.mark.asyncio
+async def test_show_repo_page_supports_user_data_key(tmp_path, monkeypatch):
+    """_show_repo_page must read/write to the key passed in, not hardcoded 'create'."""
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    mb = ManagerBot(
+        token="t",
+        process_manager=ProcessManager(project_config_path=cfg_path),
+        project_config_path=cfg_path,
+    )
+    ctx = MagicMock()
+    ctx.user_data = {"create_team": {"config_path": str(cfg_path)}}
+    query = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    # Monkeypatch GitHubClient.list_repos to avoid network
+    async def fake_list_repos(self, *a, **kw):
+        repo = MagicMock()
+        repo.name = "acme"
+        repo.full_name = "me/acme"
+        repo.description = "example"
+        repo.private = False
+        repo.html_url = "https://github.com/me/acme"
+        repo.clone_url = "https://github.com/me/acme.git"
+        return [repo], False
+
+    monkeypatch.setattr(
+        "link_project_to_chat.github_client.GitHubClient.list_repos", fake_list_repos
+    )
+
+    await mb._show_repo_page(query, ctx, page=1, user_data_key="create_team")
+    # Assert the repos landed in ctx.user_data["create_team"], not ["create"]
+    assert "repos" in ctx.user_data["create_team"]
+    assert "me/acme" in ctx.user_data["create_team"]["repos"]

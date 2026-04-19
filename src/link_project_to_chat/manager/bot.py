@@ -608,10 +608,10 @@ class ManagerBot(AuthMixin):
             return self.CREATE_REPO_URL
         return ConversationHandler.END
 
-    async def _show_repo_page(self, query, ctx, page: int) -> int:
+    async def _show_repo_page(self, query, ctx, page: int, user_data_key: str = "create") -> int:
         from ..github_client import GitHubClient
         from ..config import load_config
-        path = Path(ctx.user_data["create"]["config_path"])
+        path = Path(ctx.user_data[user_data_key]["config_path"])
         config = load_config(path)
         gh = GitHubClient(pat=config.github_pat)
         try:
@@ -624,8 +624,8 @@ class ManagerBot(AuthMixin):
         if not repos:
             await query.edit_message_text("No repos found.")
             return ConversationHandler.END
-        ctx.user_data["create"]["repos"] = {r.full_name: r.__dict__ for r in repos}
-        ctx.user_data["create"]["page"] = page
+        ctx.user_data[user_data_key]["repos"] = {r.full_name: r.__dict__ for r in repos}
+        ctx.user_data[user_data_key]["page"] = page
         buttons = [
             [InlineKeyboardButton(
                 f"{'🔒 ' if r.private else ''}{r.name}",
@@ -642,33 +642,35 @@ class ManagerBot(AuthMixin):
             buttons.append(nav)
         buttons.append([InlineKeyboardButton("Cancel", callback_data="create_cancel")])
         await query.edit_message_text("Select a repo:", reply_markup=InlineKeyboardMarkup(buttons))
-        return self.CREATE_REPO_LIST
+        return self.CREATE_TEAM_REPO_LIST if user_data_key == "create_team" else self.CREATE_REPO_LIST
 
-    async def _create_repo_list_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _create_repo_list_callback(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_data_key: str = "create"
+    ) -> int:
         query = update.callback_query
         await query.answer()
         data = query.data
         if data.startswith("create_page_"):
             page = int(data.split("_")[-1])
-            return await self._show_repo_page(query, ctx, page)
+            return await self._show_repo_page(query, ctx, page, user_data_key=user_data_key)
         elif data.startswith("create_repo_"):
             full_name = data[len("create_repo_"):]
-            repos = ctx.user_data["create"].get("repos", {})
+            repos = ctx.user_data[user_data_key].get("repos", {})
             if full_name not in repos:
                 await query.edit_message_text("Repo not found. Try again.")
                 return ConversationHandler.END
             repo_data = repos[full_name]
-            ctx.user_data["create"]["repo"] = repo_data
+            ctx.user_data[user_data_key]["repo"] = repo_data
             suggested_name = repo_data["name"]
-            ctx.user_data["create"]["suggested_name"] = suggested_name
+            ctx.user_data[user_data_key]["suggested_name"] = suggested_name
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
                 [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
             ])
             await query.edit_message_text(f"Project name?", reply_markup=markup)
-            return self.CREATE_NAME
+            return self.CREATE_TEAM_NAME if user_data_key == "create_team" else self.CREATE_NAME
         elif data == "create_cancel":
-            ctx.user_data.pop("create", None)
+            ctx.user_data.pop(user_data_key, None)
             await query.edit_message_text("Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
