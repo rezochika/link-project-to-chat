@@ -1,5 +1,7 @@
 """Tests for _sanitize_error() in claude_client."""
-from link_project_to_chat.claude_client import _sanitize_error
+from pathlib import Path
+
+from link_project_to_chat.claude_client import ClaudeClient, _sanitize_error
 
 
 def test_truncates_long_errors():
@@ -31,3 +33,15 @@ def test_empty_message():
 def test_preserves_short_clean_errors():
     msg = "Connection refused"
     assert _sanitize_error(msg) == msg
+
+
+def test_telegram_awareness_in_command():
+    client = ClaudeClient(project_path=Path("/tmp"))
+    cmd = client._build_cmd()
+    assert "--append-system-prompt" in cmd
+    prompt = cmd[cmd.index("--append-system-prompt") + 1]
+    # Covers all four scopes: identity, output style, user commands, fragility.
+    assert "link-project-to-chat" in prompt
+    assert "MarkdownV2" in prompt
+    assert "/run" in prompt and "/effort" in prompt
+    assert "CHANNEL FRAGILITY" in prompt

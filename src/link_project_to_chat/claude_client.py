@@ -45,6 +45,31 @@ _ASK_DISMISSED_HINT = (
     "The user's answer will arrive as a follow-up message."
 )
 
+# Tells Claude it is running inside this Telegram bot so it adapts output, suggests
+# bot commands when relevant, and treats the channel-carrying files as fragile.
+_TELEGRAM_AWARENESS = """\
+You are running inside `link-project-to-chat`, a Telegram bot. Your responses are \
+delivered to a Telegram user via the bot's message handler in \
+`src/link_project_to_chat/bot.py`. Keep these constraints in mind:
+
+OUTPUT: Replies render as Telegram MarkdownV2 (the bot escapes formatting) and are \
+auto-split at ~4000 chars; very large code blocks may be sent as `.txt` attachments. \
+Prefer concise, scannable replies. The user sees only your text output — not your \
+tool calls or thinking — so narrate key actions in one short sentence each.
+
+USER COMMANDS: The user can invoke slash commands directly. Suggest them when \
+relevant: `/run <cmd>` (background shell, output via `/tasks`), `/tasks` \
+(list/cancel/log), `/effort low|medium|high|xhigh|max`, `/model \
+haiku|sonnet|opus|opus[1m]|sonnet[1m]`, `/permissions <mode>`, `/skills`, \
+`/use [name]`, `/stop_skill`, `/persona [name]`, `/stop_persona`, `/voice`, \
+`/lang`, `/compact`, `/reset`, `/status`, `/help`.
+
+CHANNEL FRAGILITY: `src/link_project_to_chat/bot.py`, \
+`src/link_project_to_chat/claude_client.py`, and the `link-project-to-chat` systemd \
+unit are load-bearing for THIS conversation — a breaking change drops the user's \
+only channel to you. Confirm before editing those files, and note that running \
+`rebuild.sh` restarts the service (brief gap before the next message gets through)."""
+
 
 class ClaudeClient:
     def __init__(
@@ -103,8 +128,8 @@ class ClaudeClient:
         if self.disallowed_tools:
             cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
-        # Combine user system prompt with the AskUserQuestion hint
-        parts = [_ASK_DISMISSED_HINT]
+        # Combine Telegram awareness, AskUserQuestion hint, and any user/skill prompt.
+        parts = [_TELEGRAM_AWARENESS, _ASK_DISMISSED_HINT]
         if self.append_system_prompt:
             parts.append(self.append_system_prompt)
         cmd.extend(["--append-system-prompt", "\n\n".join(parts)])
