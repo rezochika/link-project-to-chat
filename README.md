@@ -75,6 +75,7 @@ Claude messages and `/run` commands execute in **parallel** — they don't block
 | `/tasks` | List tasks with per-task buttons (log, cancel) |
 | `/model haiku/sonnet/opus` | Set Claude model |
 | `/effort low/medium/high/max` | Set Claude thinking depth |
+| `/thinking on/off` | Stream Claude's internal reasoning live to chat |
 | `/permissions <mode>` | Set permission mode |
 | `/skills` | List available skills |
 | `/use [skill]` | Activate a skill (system prompt) — or pick from list |
