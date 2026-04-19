@@ -37,3 +37,43 @@ async def create_supergroup(client, title: str) -> int:
     )
     raw_id = resp.chats[0].id
     return int(f"-100{raw_id}")
+
+
+async def add_bot(client, chat_id: int, bot_username: str) -> None:
+    """Invite a bot to the group."""
+    bot_entity = await client.get_entity(bot_username)
+    await _call_with_flood_retry(
+        client,
+        InviteToChannelRequest(channel=chat_id, users=[bot_entity]),
+    )
+
+
+async def promote_admin(client, chat_id: int, bot_username: str) -> None:
+    """Promote a user/bot to admin with the rights group-mode bots need."""
+    entity = await client.get_entity(bot_username)
+    rights = ChatAdminRights(
+        change_info=False,
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        ban_users=True,
+        invite_users=True,
+        pin_messages=True,
+        add_admins=False,
+        anonymous=False,
+        manage_call=False,
+        other=False,
+    )
+    await _call_with_flood_retry(
+        client,
+        EditAdminRequest(channel=chat_id, user_id=entity, admin_rights=rights, rank=""),
+    )
+
+
+async def invite_user(client, chat_id: int, username: str) -> None:
+    """Invite a user (by @username, no @ prefix) to the group."""
+    user_entity = await client.get_entity(username)
+    await _call_with_flood_retry(
+        client,
+        InviteToChannelRequest(channel=chat_id, users=[user_entity]),
+    )
