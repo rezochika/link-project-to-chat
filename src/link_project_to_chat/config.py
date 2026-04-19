@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # Windows
+    class fcntl:  # type: ignore[no-redef]
+        LOCK_EX = 2
+
+        @staticmethod
+        def flock(fd, op):
+            pass  # no-op on Windows; locking is best-effort
+
 import json
 import os
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +31,10 @@ class ProjectConfig:
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
     session_id: str | None = None
     autostart: bool = False
+    group_mode: bool = False
+    group_chat_id: int | None = None
+    role: str | None = None  # "manager" or "dev" when group_mode=true
+    active_persona: str | None = None
 
 
 @dataclass
@@ -112,13 +126,18 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 permissions=_load_permissions(proj),
                 session_id=proj.get("session_id"),
                 autostart=proj.get("autostart", False),
+                group_mode=proj.get("group_mode", False),
+                group_chat_id=proj.get("group_chat_id"),
+                role=proj.get("role"),
+                active_persona=proj.get("active_persona"),
             )
     return config
 
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    if sys.platform != "win32":
+        path.parent.chmod(0o700)
     lock = path.with_suffix(".lock")
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
@@ -210,6 +229,19 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         else:
             proj.pop("session_id", None)
         proj["autostart"] = p.autostart
+        proj["group_mode"] = p.group_mode
+        if p.group_chat_id is not None:
+            proj["group_chat_id"] = p.group_chat_id
+        else:
+            proj.pop("group_chat_id", None)
+        if p.role:
+            proj["role"] = p.role
+        else:
+            proj.pop("role", None)
+        if p.active_persona:
+            proj["active_persona"] = p.active_persona
+        else:
+            proj.pop("active_persona", None)
         existing_projects[name] = proj
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
@@ -222,10 +254,11 @@ def _atomic_write(path: Path, data: str) -> None:
     closed = False
     try:
         os.write(fd, data.encode())
-        os.fchmod(fd, 0o600)
+        if sys.platform != "win32":
+            os.fchmod(fd, 0o600)
         os.close(fd)
         closed = True
-        os.rename(tmp, path)
+        os.replace(tmp, path)
     except BaseException:
         if not closed:
             os.close(fd)

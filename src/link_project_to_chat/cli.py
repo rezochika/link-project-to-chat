@@ -327,6 +327,8 @@ def start(
             on_trust=lambda uid: add_project_trusted_user_id(project, uid, cfg_path),
             transcriber=transcriber,
             synthesizer=synthesizer,
+            group_mode=proj.group_mode,
+            active_persona=proj.active_persona,
         )
     else:
         run_bots(

@@ -89,6 +89,8 @@ class ProjectBot(AuthMixin):
         trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
+        active_persona: str | None = None,
+        group_mode: bool = False,
     ):
         self.name = name
         self.path = path.resolve()
@@ -110,7 +112,7 @@ class ProjectBot(AuthMixin):
         self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
-        self._active_persona: str | None = None
+        self._active_persona = active_persona
         self._transcriber = transcriber
         self._synthesizer = synthesizer
         self._voice_tasks: set[int] = set()
@@ -125,6 +127,8 @@ class ProjectBot(AuthMixin):
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
+        self.group_mode = group_mode
+        self.bot_username: str = ""  # populated in _post_init via get_me()
 
     def _on_trust(self, user_id: int) -> None:
         if self._on_trust_fn:
@@ -307,6 +311,12 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
+        if self.group_mode:
+            from .group_filters import is_from_self, is_directed_at_me
+            if is_from_self(msg, self.bot_username):
+                return  # self-silence
+            if not is_directed_at_me(msg, self.bot_username):
+                return  # not addressed to this bot
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
         if self._rate_limited(update.effective_user.id):
@@ -629,6 +639,8 @@ class ProjectBot(AuthMixin):
         if not persona:
             return await update.effective_message.reply_text(f"Persona '{name}' not found.")
         self._active_persona = name
+        from .config import patch_project
+        patch_project(self.name, {"active_persona": name})
         await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
 
     async def _on_stop_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -638,6 +650,8 @@ class ProjectBot(AuthMixin):
             return await update.effective_message.reply_text("No active persona.")
         old = self._active_persona
         self._active_persona = None
+        from .config import patch_project
+        patch_project(self.name, {"active_persona": None})
         await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
 
     async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1211,6 +1225,16 @@ class ProjectBot(AuthMixin):
     async def _post_init(self, app) -> None:
         result = await app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
+        try:
+            me = await app.bot.get_me()
+            self.bot_username = (me.username or "").lower()
+        except Exception:
+            logger.error("get_me() failed at startup", exc_info=True)
+            if self.group_mode:
+                raise RuntimeError(
+                    "group_mode=True requires a reachable Telegram API at startup "
+                    "to fetch bot username; aborting."
+                )
         await app.bot.set_my_commands(COMMANDS)
         for uid in self._get_trusted_user_ids():
             try:
@@ -1253,31 +1277,42 @@ class ProjectBot(AuthMixin):
             "voice": self._on_voice_status,
             "lang": self._on_lang,
         }
-        private = filters.ChatType.PRIVATE
-        for name, handler in handlers.items():
-            app.add_handler(CommandHandler(name, handler, filters=private))
-        text_filter = (
-            private
-            & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
-            & filters.TEXT
-            & ~filters.COMMAND
-        )
-        app.add_handler(MessageHandler(text_filter, self._on_text))
-
-        file_filter = private & (filters.Document.ALL | filters.PHOTO)
-        app.add_handler(MessageHandler(file_filter, self._on_file))
-
-        voice_filter = private & (filters.VOICE | filters.AUDIO)
-        app.add_handler(MessageHandler(voice_filter, self._on_voice))
-
-        unsupported_filter = private & (
-            filters.VIDEO_NOTE
-            | filters.Sticker.ALL
-            | filters.VIDEO
-            | filters.LOCATION
-            | filters.CONTACT
-        )
-        app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
+        if self.group_mode:
+            # Group mode: accept commands and text from groups/supergroups only.
+            chat_filter = filters.ChatType.GROUPS
+            for name, handler in handlers.items():
+                app.add_handler(CommandHandler(name, handler, filters=chat_filter))
+            text_filter = (
+                chat_filter
+                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+                & filters.TEXT
+                & ~filters.COMMAND
+            )
+            app.add_handler(MessageHandler(text_filter, self._on_text))
+            # Voice, files, and other media are disabled in group mode for v1.
+        else:
+            private = filters.ChatType.PRIVATE
+            for name, handler in handlers.items():
+                app.add_handler(CommandHandler(name, handler, filters=private))
+            text_filter = (
+                private
+                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+                & filters.TEXT
+                & ~filters.COMMAND
+            )
+            app.add_handler(MessageHandler(text_filter, self._on_text))
+            file_filter = private & (filters.Document.ALL | filters.PHOTO)
+            app.add_handler(MessageHandler(file_filter, self._on_file))
+            voice_filter = private & (filters.VOICE | filters.AUDIO)
+            app.add_handler(MessageHandler(voice_filter, self._on_voice))
+            unsupported_filter = private & (
+                filters.VIDEO_NOTE
+                | filters.Sticker.ALL
+                | filters.VIDEO
+                | filters.LOCATION
+                | filters.CONTACT
+            )
+            app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
         app.add_error_handler(self._on_error)
         app.add_handler(CallbackQueryHandler(self._on_callback))
@@ -1302,6 +1337,8 @@ def run_bot(
     trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
+    group_mode: bool = False,
+    active_persona: str | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1321,6 +1358,8 @@ def run_bot(
         disallowed_tools=disallowed_tools,
         transcriber=transcriber,
         synthesizer=synthesizer,
+        active_persona=active_persona,
+        group_mode=group_mode,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -1370,6 +1409,8 @@ def run_bots(
             trusted_user_ids=effective_trusted_ids,
             transcriber=transcriber,
             synthesizer=synthesizer,
+            group_mode=proj.group_mode,
+            active_persona=proj.active_persona,
         )
     else:
         names = ", ".join(config.projects.keys())
