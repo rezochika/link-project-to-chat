@@ -51,6 +51,22 @@ MODEL_OPTIONS = [
 ]
 
 
+def _build_persona_keyboard(project_path: Path, callback_prefix: str) -> InlineKeyboardMarkup:
+    """Build an inline keyboard listing discovered personas for the given project.
+
+    Each button's callback_data is f'{callback_prefix}:{persona_name}'.
+    """
+    from ..skills import load_personas
+    personas = load_personas(project_path)
+    # load_personas may return a dict (name -> content) or a list of names
+    names = sorted(personas.keys() if hasattr(personas, "keys") else personas)
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"{callback_prefix}:{name}")]
+        for name in names
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def _parse_edit_callback(data: str) -> tuple[str, str] | None:
     """Parse 'proj_efld_<field>_<name>' → (field, name). Field comes first."""
     suffix = data[len("proj_efld_"):]
