@@ -303,8 +303,19 @@ class ProjectBot(AuthMixin):
                 # The LiveMessage buffer already holds every streamed text delta (narration
                 # + final answer); overwriting it would make intermediate narration vanish.
                 # Fall back to task.result only when the buffer is empty (stream dropped).
-                fallback = task.result if not live_text.buffer.strip() else None
-                await live_text.finalize(fallback, render=True)
+                has_buffer = bool(live_text.buffer.strip())
+                has_result = bool((task.result or "").strip())
+                if not has_buffer and not has_result:
+                    # Claude turn ended with only tool_use blocks (no text output). The
+                    # "…" placeholder would otherwise linger forever — replace with a
+                    # short notice so the user knows the turn finished.
+                    await live_text.finalize(
+                        "(done — no text response; check files/tools the bot touched)",
+                        render=False,
+                    )
+                else:
+                    fallback = task.result if not has_buffer else None
+                    await live_text.finalize(fallback, render=True)
             else:
                 await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
             if live_thinking is not None:

@@ -151,6 +151,28 @@ async def test_finalize_with_empty_buffer_falls_back_to_task_result():
 
 
 @pytest.mark.asyncio
+async def test_finalize_empty_buffer_and_empty_result_replaces_placeholder():
+    """If the turn produced no text (only tool_use), replace the '…' placeholder with
+    a short notice instead of leaving it stuck forever."""
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    task = _fake_task(task_id=12)
+    task.status = TaskStatus.DONE
+    task.result = ""  # Claude turn ended with only tool_use blocks
+
+    from link_project_to_chat.livestream import LiveMessage
+    lm = LiveMessage(bot=bot._app.bot, chat_id=task.chat_id, reply_to_message_id=task.message_id)
+    await lm.start()
+    bot._live_text[task.id] = lm
+
+    await bot._finalize_claude_task(task)
+    # Placeholder must be replaced with the "no text response" notice (not left as "…").
+    notice_edits = [e for e in bot._app.bot.edits if "no text response" in e["text"]]
+    assert notice_edits, f"Expected 'no text response' edit, got: {[e['text'] for e in bot._app.bot.edits]}"
+
+
+@pytest.mark.asyncio
 async def test_finalize_without_live_text_falls_back_to_send_to_chat():
     bot = await _stub_bot()
     bot._is_image = lambda p: False
