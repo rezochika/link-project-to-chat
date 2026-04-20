@@ -130,6 +130,25 @@ class TelegramTransport:
         for h in self._message_handlers:
             await h(incoming)
 
+    async def _dispatch_command(self, name: str, update: Any, ctx: Any) -> None:
+        """Convert a telegram command Update into CommandInvocation and invoke the handler."""
+        msg = update.effective_message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        from .base import CommandInvocation
+        ci = CommandInvocation(
+            chat=chat_ref_from_telegram(msg.chat),
+            sender=identity_from_telegram_user(user),
+            name=name,
+            args=list(getattr(ctx, "args", []) or []),
+            raw_text=msg.text or "",
+            message=message_ref_from_telegram(msg),
+        )
+        handler = self._command_handlers.get(name)
+        if handler is not None:
+            await handler(ci)
+
     # ── Inbound registration ──────────────────────────────────────────────
     def on_message(self, handler: MessageHandler) -> None:
         self._message_handlers.append(handler)

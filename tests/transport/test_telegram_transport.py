@@ -96,3 +96,32 @@ async def test_on_message_handler_fires_on_telegram_update():
     assert received[0].text == "hi there"
     assert received[0].sender.handle == "alice"
     assert received[0].chat.native_id == "12345"
+
+
+async def test_on_command_handler_fires_for_telegram_command():
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(ci):
+        captured.append(ci)
+
+    t.on_command("help", handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=77,
+        chat=tg_chat,
+        from_user=tg_user,
+        text="/help",
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+    ctx = SimpleNamespace(args=[])
+
+    await t._dispatch_command("help", update, ctx)
+
+    assert len(captured) == 1
+    assert captured[0].name == "help"
+    assert captured[0].args == []
+    assert captured[0].raw_text == "/help"
