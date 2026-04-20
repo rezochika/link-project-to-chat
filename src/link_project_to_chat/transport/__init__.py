@@ -14,6 +14,7 @@ from .base import (
     IncomingMessage,
     MessageHandler,
     MessageRef,
+    OnReadyCallback,
     Transport,
     TransportRetryAfter,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "IncomingMessage",
     "MessageHandler",
     "MessageRef",
+    "OnReadyCallback",
     "SentFile",
     "SentMessage",
     "TelegramTransport",

@@ -104,6 +104,7 @@ class CommandInvocation:
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 CommandHandler = Callable[[CommandInvocation], Awaitable[None]]
 ButtonHandler = Callable[[ButtonClick], Awaitable[None]]
+OnReadyCallback = Callable[["Identity"], Awaitable[None]]
 
 
 class TransportRetryAfter(Exception):
@@ -163,6 +164,14 @@ class Transport(Protocol):
         display_name: str | None = None,
     ) -> MessageRef: ...
 
+    async def send_voice(
+        self,
+        chat: ChatRef,
+        path: Path,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> MessageRef: ...
+
     async def send_typing(self, chat: ChatRef) -> None:
         """Emit a typing indicator. One-shot; caller loops if a sustained
         indicator is needed. Transports that don't support it MAY no-op.
@@ -172,3 +181,10 @@ class Transport(Protocol):
     def on_message(self, handler: MessageHandler) -> None: ...
     def on_command(self, name: str, handler: CommandHandler) -> None: ...
     def on_button(self, handler: ButtonHandler) -> None: ...
+
+    def on_ready(self, callback: OnReadyCallback) -> None:
+        """Register a callback fired after the Transport completes platform-specific
+        startup (e.g., identity discovery, menu registration). Called once per process
+        with the bot's own Identity as argument.
+        """
+        ...
