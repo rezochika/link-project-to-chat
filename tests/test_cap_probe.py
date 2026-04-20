@@ -36,6 +36,7 @@ async def test_cap_marker_halts_group_and_announces(tmp_path):
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=-100_111,
     )
+    bot._transport = MagicMock(TRANSPORT_ID="telegram")
     bot._send_to_chat = AsyncMock()
     bot._schedule_cap_probe = MagicMock()  # don't actually start a probe
     task = _mk_task(chat_id=-100_111, error="USAGE_CAP: Rate limit exceeded.")

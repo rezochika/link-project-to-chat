@@ -28,7 +28,6 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
-from .livestream import LiveMessage  # legacy — kept for test_livestream.py; bot.py uses StreamingMessage
 from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -169,11 +168,11 @@ class ProjectBot(AuthMixin):
 
     def _chat_ref_for_task(self, task: Task) -> ChatRef:
         kind = ChatKind.ROOM if self.group_mode else ChatKind.DM
-        return ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=kind)
+        return ChatRef(transport_id=self._transport.TRANSPORT_ID, native_id=str(task.chat_id), kind=kind)
 
     def _message_ref_for_task_trigger(self, task: Task) -> MessageRef:
         return MessageRef(
-            transport_id="telegram",
+            transport_id=self._transport.TRANSPORT_ID,
             native_id=str(task.message_id),
             chat=self._chat_ref_for_task(task),
         )
@@ -253,14 +252,14 @@ class ProjectBot(AuthMixin):
         """Send HTML message(s), attaching buttons to the last chunk. Returns last message ID."""
         assert self._transport is not None
         chat = ChatRef(
-            transport_id="telegram",
+            transport_id=self._transport.TRANSPORT_ID,
             native_id=str(chat_id),
             kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
         )
         reply_ref: MessageRef | None = None
         if reply_to is not None:
             reply_ref = MessageRef(
-                transport_id="telegram", native_id=str(reply_to), chat=chat,
+                transport_id=self._transport.TRANSPORT_ID, native_id=str(reply_to), chat=chat,
             )
         chunks = split_html(html)
         last_id: int | None = None
@@ -412,14 +411,14 @@ class ProjectBot(AuthMixin):
 
         assert self._transport is not None
         chat = ChatRef(
-            transport_id="telegram",
+            transport_id=self._transport.TRANSPORT_ID,
             native_id=str(chat_id),
             kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
         )
         reply_ref: MessageRef | None = None
         if reply_to is not None:
             reply_ref = MessageRef(
-                transport_id="telegram", native_id=str(reply_to), chat=chat,
+                transport_id=self._transport.TRANSPORT_ID, native_id=str(reply_to), chat=chat,
             )
 
         try:
@@ -1738,7 +1737,7 @@ class ProjectBot(AuthMixin):
             return
         assert self._transport is not None
         chat = ChatRef(
-            transport_id="telegram",
+            transport_id=self._transport.TRANSPORT_ID,
             native_id=str(chat_id),
             kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
         )
@@ -1786,7 +1785,7 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         for uid in self._get_trusted_user_ids():
             chat = ChatRef(
-                transport_id="telegram",
+                transport_id=self._transport.TRANSPORT_ID,
                 native_id=str(uid),
                 kind=ChatKind.DM,
             )
