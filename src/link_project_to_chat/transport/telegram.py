@@ -79,20 +79,27 @@ class TelegramTransport:
         self._message_handlers: list[MessageHandler] = []
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
+        self._on_ready_callbacks: list = []
+        self._menu: Any = None
 
     @classmethod
-    def build(cls, token: str, *, concurrent_updates: bool = True, post_init: Any = None) -> "TelegramTransport":
+    def build(
+        cls,
+        token: str,
+        *,
+        concurrent_updates: bool = True,
+        menu: Any = None,
+    ) -> "TelegramTransport":
         """Construct a TelegramTransport with a polling-mode Application.
 
-        Caller passes the bot token and optional post_init hook. The telegram
-        Application is created and wrapped in one step.
+        Post-init work (delete_webhook, get_me, set_my_commands) runs inside
+        start() — see TelegramTransport.start().
         """
         from telegram.ext import ApplicationBuilder
-        builder = ApplicationBuilder().token(token).concurrent_updates(concurrent_updates)
-        if post_init is not None:
-            builder = builder.post_init(post_init)
-        app = builder.build()
-        return cls(app)
+        app = ApplicationBuilder().token(token).concurrent_updates(concurrent_updates).build()
+        instance = cls(app)
+        instance._menu = menu
+        return instance
 
     def attach_telegram_routing(
         self,
@@ -166,8 +173,45 @@ class TelegramTransport:
     # ── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
         await self._app.initialize()
+
+        # Platform post-init: drain pending updates + discover own identity +
+        # register /commands menu. Runs between initialize() and start() so the
+        # Application is configured before polling begins.
+        try:
+            await self._app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass  # non-fatal
+        try:
+            me = await self._app.bot.get_me()
+            from .base import Identity
+            self_identity = Identity(
+                transport_id=TRANSPORT_ID,
+                native_id=str(me.id),
+                display_name=me.full_name or me.username or "bot",
+                handle=(me.username or "").lower() or None,
+                is_bot=True,
+            )
+        except Exception:
+            from .base import Identity
+            self_identity = Identity(
+                transport_id=TRANSPORT_ID, native_id="0",
+                display_name="bot", handle=None, is_bot=True,
+            )
+        if self._menu:
+            try:
+                await self._app.bot.set_my_commands(self._menu)
+            except Exception:
+                pass
+
+        # Fire caller-registered callbacks with the bot's identity.
+        for cb in self._on_ready_callbacks:
+            await cb(self_identity)
+
         await self._app.start()
         await self._app.updater.start_polling()
+
+    def on_ready(self, callback) -> None:
+        self._on_ready_callbacks.append(callback)
 
     async def stop(self) -> None:
         await self._app.updater.stop()

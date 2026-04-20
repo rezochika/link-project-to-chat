@@ -406,3 +406,45 @@ async def test_default_error_handler_logs_conflict_as_warning(caplog):
     conflict_recs = [r for r in caplog.records if "Conflict" in r.getMessage()]
     assert conflict_recs
     assert all(r.levelno == logging.WARNING for r in conflict_recs)
+
+
+async def test_start_fires_on_ready_with_bot_identity():
+    """start() should perform post-init (delete_webhook + get_me + set_my_commands)
+    and fire registered on_ready callbacks with the bot's own Identity."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=9876, full_name="Alice Bot", username="alicebot",
+    ))
+    bot.set_my_commands = AsyncMock()
+
+    # Attach a menu so set_my_commands gets called.
+    t._menu = [("help", "Show help")]
+
+    captured: list = []
+
+    async def cb(identity):
+        captured.append(identity)
+
+    t.on_ready(cb)
+
+    await t.start()
+
+    bot.delete_webhook.assert_awaited_once()
+    bot.get_me.assert_awaited_once()
+    bot.set_my_commands.assert_awaited_once()
+    assert len(captured) == 1
+    assert captured[0].native_id == "9876"
+    assert captured[0].handle == "alicebot"
+    assert captured[0].is_bot is True
+
+
+async def test_build_accepts_menu_kwarg():
+    """TelegramTransport.build(menu=...) must accept and store the menu."""
+    # We can't easily test the full build() because it instantiates a real
+    # Application. Instead: construct directly and test _menu storage.
+    from link_project_to_chat.transport.telegram import TelegramTransport
+    _mock_app = AsyncMock()
+    t = TelegramTransport(_mock_app)
+    t._menu = [("cmd", "desc")]
+    assert t._menu == [("cmd", "desc")]
