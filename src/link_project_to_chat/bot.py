@@ -585,14 +585,25 @@ class ProjectBot(AuthMixin):
                     # Fall through so this same message still gets processed normally.
             elif msg.chat_id != self.group_chat_id:
                 return  # wrong group — silent ignore
+            # Transient IncomingMessage for group_filters — fully replaced by
+            # _on_text_from_transport dispatch in Task 8.
+            from .transport import IncomingMessage
+            from .transport.telegram import chat_ref_from_telegram, identity_from_telegram_user
+            _transient_incoming = IncomingMessage(
+                chat=chat_ref_from_telegram(msg.chat),
+                sender=identity_from_telegram_user(update.effective_user),
+                text=msg.text or "",
+                files=[],
+                reply_to=None,  # not needed for group_filters in this transient path; is_reply_to_bot uses native
+                native=msg,
+            )
             from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
-            if is_from_self(msg, self.bot_username):
+            if is_from_self(_transient_incoming, self.bot_username):
                 return  # self-silence
-            if not is_directed_at_me(msg, self.bot_username):
+            if not is_directed_at_me(_transient_incoming, self.bot_username):
                 return  # not addressed to this bot
-            from .transport.telegram import chat_ref_from_telegram
             chat_ref = chat_ref_from_telegram(msg.chat)
-            if is_from_other_bot(msg, self.bot_username):
+            if is_from_other_bot(_transient_incoming, self.bot_username):
                 # Bot-to-bot message: check halt before acting.
                 if self._group_state.get(chat_ref).halted:
                     return
