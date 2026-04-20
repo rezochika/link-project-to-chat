@@ -570,6 +570,51 @@ class ProjectBot(AuthMixin):
             "This message type is not supported. Please send text, a voice message, or a file.",
         )
 
+    async def _handle_group_text(self, incoming) -> bool:
+        """Route a group-mode text message via the Transport-native path.
+
+        Returns True if handled (caller should return immediately).
+        Returns False if the message should proceed to further processing
+        (normal user flow OR bot-to-bot direct-to-Claude).
+        """
+        from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
+
+        # Auto-capture: if chat_id not yet bound and sender is trusted, write it.
+        if self.group_chat_id in (0, None):
+            if self._auth_identity(incoming.sender) and self.team_name:
+                new_chat_id = int(incoming.chat.native_id)
+                patch_team(self.team_name, {"group_chat_id": new_chat_id})
+                self.group_chat_id = new_chat_id
+                # Fall through so this message still gets processed.
+        elif int(incoming.chat.native_id) != self.group_chat_id:
+            return True  # wrong group — silent ignore
+
+        if is_from_self(incoming, self.bot_username):
+            return True  # self-silence
+
+        if not is_directed_at_me(incoming, self.bot_username):
+            return True  # not addressed to this bot
+
+        if incoming.is_relayed_bot_to_bot or is_from_other_bot(incoming, self.bot_username):
+            # Bot-to-bot path — via relay (is_relayed_bot_to_bot) or native (non-Telegram transports).
+            if self._group_state.get(incoming.chat).halted:
+                return True
+            self._group_state.note_bot_to_bot(incoming.chat)
+            if self._group_state.get(incoming.chat).halted:
+                assert self._transport is not None
+                await self._transport.send_text(
+                    incoming.chat,
+                    f"Auto-paused after {self._group_state.max_bot_rounds} bot-to-bot rounds. "
+                    "Send any message to resume.",
+                )
+                return True
+            # Caller submits to Claude on False return via _submit_group_message_to_claude.
+            return False
+
+        # Human (trusted user) message — reset the round counter and clear any halt.
+        self._group_state.resume(incoming.chat)
+        return False
+
     async def _on_text(self, update, ctx) -> None:
         msg = update.effective_message
         if not msg:
