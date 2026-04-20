@@ -310,6 +310,9 @@ async def test_relayed_bot_to_bot_increments_round_counter(tmp_path):
         await bot._on_text_from_transport(incoming)
 
     assert bot._group_state.get(chat).halted is True
+    assert any("Auto-paused" in m.text for m in bot._transport.sent_messages), (
+        "Q4-C: cap-tripping should emit the auto-pause message via transport"
+    )
 
 
 @pytest.mark.asyncio
@@ -331,3 +334,6 @@ async def test_native_bot_sender_increments_round_counter(tmp_path):
         await bot._on_text_from_transport(incoming)
 
     assert bot._group_state.get(chat).halted is True
+    assert any("Auto-paused" in m.text for m in bot._transport.sent_messages), (
+        "Q4-C: cap-tripping should emit the auto-pause message via transport"
+    )
