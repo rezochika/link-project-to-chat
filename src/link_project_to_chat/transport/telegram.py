@@ -126,7 +126,18 @@ class TelegramTransport:
             incoming_filter = (
                 chat_filter
                 & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
-                & (filters.TEXT | filters.Document.ALL | filters.PHOTO)
+                & (
+                    filters.TEXT
+                    | filters.Document.ALL
+                    | filters.PHOTO
+                    | filters.VOICE
+                    | filters.AUDIO
+                    | filters.VIDEO_NOTE
+                    | filters.Sticker.ALL
+                    | filters.VIDEO
+                    | filters.LOCATION
+                    | filters.CONTACT
+                )
                 & ~filters.COMMAND
             )
 
@@ -313,6 +324,35 @@ class TelegramTransport:
                 original_name=name,
                 mime_type=getattr(doc, "mime_type", None),
                 size_bytes=getattr(doc, "file_size", 0) or 0,
+            ))
+            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
+
+        voice = getattr(msg, "voice", None)
+        if voice is not None:
+            tmpdir = tempfile.TemporaryDirectory()
+            path = Path(tmpdir.name) / "voice.ogg"
+            tg_file = await voice.get_file()
+            await tg_file.download_to_drive(path)
+            files.append(IncomingFile(
+                path=path,
+                original_name="voice.ogg",
+                mime_type="audio/ogg",
+                size_bytes=getattr(voice, "file_size", 0) or 0,
+            ))
+            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
+
+        audio = getattr(msg, "audio", None)
+        if audio is not None:
+            tmpdir = tempfile.TemporaryDirectory()
+            name = getattr(audio, "file_name", None) or "audio"
+            path = Path(tmpdir.name) / name
+            tg_file = await audio.get_file()
+            await tg_file.download_to_drive(path)
+            files.append(IncomingFile(
+                path=path,
+                original_name=name,
+                mime_type=getattr(audio, "mime_type", None) or "audio/mpeg",
+                size_bytes=getattr(audio, "file_size", 0) or 0,
             ))
             msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 

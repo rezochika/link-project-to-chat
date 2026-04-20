@@ -332,3 +332,55 @@ async def test_send_voice_passes_reply_to(tmp_path):
 
     kwargs = bot.send_voice.call_args.kwargs
     assert kwargs["reply_to_message_id"] == 42
+
+
+async def test_incoming_message_populates_files_from_voice(tmp_path):
+    """Voice attachments get downloaded and exposed as IncomingFile with audio mime."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(msg):
+        captured.append(msg)
+
+    t.on_message(handler)
+
+    downloaded_bytes = b"ogg-voice"
+
+    async def fake_download_to_drive(path):
+        from pathlib import Path as _P
+        p = path if hasattr(path, "write_bytes") else _P(str(path))
+        p.write_bytes(downloaded_bytes)
+
+    tg_file_obj = SimpleNamespace(download_to_drive=fake_download_to_drive)
+
+    async def fake_get_file():
+        return tg_file_obj
+
+    tg_voice = SimpleNamespace(
+        file_id="abc",
+        file_size=len(downloaded_bytes),
+        get_file=fake_get_file,
+    )
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=300,
+        chat=tg_chat,
+        from_user=tg_user,
+        text=None,
+        photo=None,
+        document=None,
+        voice=tg_voice,
+        audio=None,
+        caption=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(captured) == 1
+    assert len(captured[0].files) == 1
+    f = captured[0].files[0]
+    assert f.mime_type == "audio/ogg"
+    assert f.path.read_bytes() == downloaded_bytes
