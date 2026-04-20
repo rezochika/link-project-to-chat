@@ -330,6 +330,7 @@ def start(
             group_chat_id=t.group_chat_id,
             role=role,
             active_persona=bot_cfg.active_persona,
+            model=model or config.default_model or None,
         )
         return
 
