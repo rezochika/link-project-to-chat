@@ -103,6 +103,18 @@ def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | N
     if prefix is None:
         return None
 
+    # Telegram bot usernames max out at 32 chars. The orchestrator generates
+    # `{prefix}_{role}_claude_bot` (15 chars overhead) and may append `_N` on
+    # collision retries (2 chars). A prefix > 15 would produce invalid
+    # usernames and BotFather would silently reject every retry. Fail fast.
+    _MAX_PREFIX_LEN = 15
+    if len(prefix) > _MAX_PREFIX_LEN:
+        return (
+            f"Prefix `{prefix}` is too long ({len(prefix)} chars, max {_MAX_PREFIX_LEN}). "
+            f"Telegram caps bot usernames at 32 chars and we generate "
+            f"`<prefix>_<role>_<N>_claude_bot`. Pick something shorter."
+        )
+
     if prefix in config.teams:
         return f"Team `{prefix}` is already configured."
 

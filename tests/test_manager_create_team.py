@@ -96,6 +96,32 @@ def test_preflight_passes_when_all_good(tmp_path):
     assert err is None
 
 
+def test_preflight_rejects_prefix_over_15_chars(tmp_path):
+    """Prefix + '_{role}_{N}_claude_bot' must fit Telegram's 32-char username cap."""
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    err = _create_team_preflight(cfg_path, "metaflow_modules_team")  # 21 chars
+    assert err is not None
+    assert "too long" in err
+    assert "metaflow_modules_team" in err
+
+
+def test_preflight_accepts_15_char_prefix(tmp_path):
+    from link_project_to_chat.manager.bot import _create_team_preflight
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    # Exactly 15 chars — should pass.
+    err = _create_team_preflight(cfg_path, "abcdefghijklmno")
+    assert err is None
+
+
 from unittest.mock import AsyncMock, MagicMock
 
 
