@@ -183,6 +183,28 @@ class TelegramTransport:
         for h in self._message_handlers:
             await h(incoming)
 
+    async def _dispatch_button(self, update: Any, ctx: Any) -> None:
+        """Convert a telegram CallbackQuery into ButtonClick and invoke handlers.
+
+        Also answers the query to dismiss the client-side loading spinner.
+        """
+        query = update.callback_query
+        if query is None:
+            return
+        try:
+            await query.answer()
+        except Exception:
+            pass  # already answered or expired; not fatal
+        from .base import ButtonClick
+        click = ButtonClick(
+            chat=chat_ref_from_telegram(query.message.chat),
+            message=message_ref_from_telegram(query.message),
+            sender=identity_from_telegram_user(query.from_user),
+            value=query.data or "",
+        )
+        for h in self._button_handlers:
+            await h(click)
+
     async def _dispatch_command(self, name: str, update: Any, ctx: Any) -> None:
         """Convert a telegram command Update into CommandInvocation and invoke the handler."""
         msg = update.effective_message

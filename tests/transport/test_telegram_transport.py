@@ -177,3 +177,31 @@ async def test_edit_text_with_buttons_passes_inline_keyboard():
     bot.edit_message_text.assert_awaited_once()
     kwargs = bot.edit_message_text.call_args.kwargs
     assert kwargs["reply_markup"] is not None
+
+
+async def test_on_button_fires_for_telegram_callback_query():
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(click):
+        captured.append(click)
+
+    t.on_button(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(message_id=99, chat=tg_chat)
+    tg_query = SimpleNamespace(
+        data="confirm_reset",
+        from_user=tg_user,
+        message=tg_msg,
+        answer=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=tg_query, effective_user=tg_user)
+
+    await t._dispatch_button(update, ctx=None)
+
+    assert len(captured) == 1
+    assert captured[0].value == "confirm_reset"
+    assert captured[0].sender.handle == "alice"
+    tg_query.answer.assert_awaited_once()
