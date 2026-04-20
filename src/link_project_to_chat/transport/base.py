@@ -88,6 +88,7 @@ class IncomingMessage:
     files: list[IncomingFile]
     reply_to: MessageRef | None
     native: Any = None
+    is_relayed_bot_to_bot: bool = False
 
 
 @dataclass(frozen=True)

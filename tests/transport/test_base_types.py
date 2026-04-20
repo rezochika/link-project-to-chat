@@ -103,3 +103,19 @@ def test_transport_is_importable():
     # Protocol runtime-check is a compile-time concern for mypy/pyright;
     # here we simply assert the symbol is importable without error.
     assert Transport is not None
+
+
+def test_incoming_message_has_is_relayed_bot_to_bot_field():
+    m = IncomingMessage(
+        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None, native=None,
+    )
+    # default is False
+    assert m.is_relayed_bot_to_bot is False
+
+
+def test_incoming_message_accepts_is_relayed_bot_to_bot_true():
+    m = IncomingMessage(
+        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None, native=None,
+        is_relayed_bot_to_bot=True,
+    )
+    assert m.is_relayed_bot_to_bot is True
