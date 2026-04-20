@@ -1758,11 +1758,41 @@ class ProjectBot(AuthMixin):
             except Exception:
                 logger.error("Failed to send startup message to %d", uid, exc_info=True)
 
+    async def _after_ready(self, self_identity) -> None:
+        """Called once after Transport.start() completes platform post-init.
+
+        Replaces the former _post_init method. The Transport has already run
+        delete_webhook, get_me, and set_my_commands. This callback does the
+        bot-specific post-ready work: backfill missing team metadata, refresh
+        the Claude system note with the discovered @handle, and send startup
+        pings to trusted users.
+        """
+        self.bot_username = self_identity.handle or ""
+        if self.team_name and self.role and self.bot_username:
+            self._backfill_own_bot_username()
+        self._refresh_team_system_note()
+
+        # Startup ping to trusted users.
+        assert self._transport is not None
+        for uid in self._get_trusted_user_ids():
+            chat = ChatRef(
+                transport_id="telegram",
+                native_id=str(uid),
+                kind=ChatKind.DM,
+            )
+            try:
+                await self._transport.send_text(
+                    chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+                )
+            except Exception:
+                logger.error("Failed to send startup message to %d", uid, exc_info=True)
+
     def build(self):
         from .transport.telegram import TelegramTransport
-        self._transport = TelegramTransport.build(self.token, post_init=self._post_init)
-        app = self._transport.app
-        self._app = app
+        self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
+        self._app = self._transport.app
+        self._transport.on_ready(self._after_ready)
+        app = self._app
 
         # Fully-ported commands — handler consumes CommandInvocation directly.
         ported_commands = (
