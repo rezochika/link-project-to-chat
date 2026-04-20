@@ -68,16 +68,25 @@ class TelegramTransport:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
-        raise NotImplementedError("Wired in Task 5")
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling()
 
     async def stop(self) -> None:
-        raise NotImplementedError("Wired in Task 5")
+        await self._app.updater.stop()
+        await self._app.stop()
+        await self._app.shutdown()
 
     # ── Outbound ──────────────────────────────────────────────────────────
     async def send_text(
         self, chat: ChatRef, text: str, *, buttons: Buttons | None = None
     ) -> MessageRef:
-        raise NotImplementedError("Wired in Task 5")
+        # buttons handled in Task 17; ignore here.
+        native_msg = await self._app.bot.send_message(
+            chat_id=int(chat.native_id),
+            text=text,
+        )
+        return message_ref_from_telegram(native_msg)
 
     async def edit_text(
         self, msg: MessageRef, text: str, *, buttons: Buttons | None = None
