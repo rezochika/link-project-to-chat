@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
@@ -40,7 +40,7 @@ from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
 from .livestream import LiveMessage  # legacy — kept for test_livestream.py; bot.py uses StreamingMessage
-from .transport import ChatKind, ChatRef, MessageRef
+from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
@@ -251,29 +251,46 @@ class ProjectBot(AuthMixin):
                     task.chat_id, event.path, reply_to=task.message_id
                 )
 
-    async def _send_html(self, chat_id: int, html: str, reply_to: int | None = None, reply_markup=None) -> int | None:
-        """Send HTML message(s), attaching reply_markup to the last chunk. Returns last message ID."""
+    async def _send_html(
+        self,
+        chat_id: int,
+        html: str,
+        reply_to: int | None = None,
+        reply_markup: Buttons | None = None,
+    ) -> int | None:
+        """Send HTML message(s), attaching buttons to the last chunk. Returns last message ID."""
+        assert self._transport is not None
+        chat = ChatRef(
+            transport_id="telegram",
+            native_id=str(chat_id),
+            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
+        )
+        reply_ref: MessageRef | None = None
+        if reply_to is not None:
+            reply_ref = MessageRef(
+                transport_id="telegram", native_id=str(reply_to), chat=chat,
+            )
         chunks = split_html(html)
-        last_id = None
+        last_id: int | None = None
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
-            km = reply_markup if is_last else None
+            btns = reply_markup if is_last else None
             try:
-                msg = await self._app.bot.send_message(
-                    chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to, reply_markup=km
+                sent = await self._transport.send_text(
+                    chat, chunk, html=True, reply_to=reply_ref, buttons=btns,
                 )
-                last_id = msg.message_id
+                last_id = int(sent.native_id)
             except Exception:
                 logger.warning("HTML send failed, falling back to plain", exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    msg = await self._app.bot.send_message(
-                        chat_id,
+                    sent = await self._transport.send_text(
+                        chat,
                         plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to_message_id=reply_to,
-                        reply_markup=km,
+                        reply_to=reply_ref,
+                        buttons=btns,
                     )
-                    last_id = msg.message_id
+                    last_id = int(sent.native_id)
         return last_id
 
     async def _send_to_chat(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
@@ -433,14 +450,14 @@ class ProjectBot(AuthMixin):
         else:
             await self._finalize_command_task(task)
 
-    def _question_markup(self, task_id: int, q_idx: int, question: Question) -> InlineKeyboardMarkup:
-        buttons = []
+    def _question_buttons(self, task_id: int, q_idx: int, question: Question) -> Buttons:
+        rows: list[list[Button]] = []
         for opt_idx, opt in enumerate(question.options):
             label = opt.label[:64] or f"Option {opt_idx + 1}"
-            buttons.append([
-                InlineKeyboardButton(label, callback_data=f"ask_{task_id}_{q_idx}_{opt_idx}")
+            rows.append([
+                Button(label=label, value=f"ask_{task_id}_{q_idx}_{opt_idx}")
             ])
-        return InlineKeyboardMarkup(buttons)
+        return Buttons(rows=rows)
 
     async def _on_waiting_input(self, task: Task) -> None:
         """Render pending questions as Telegram messages with option buttons."""
@@ -481,7 +498,7 @@ class ProjectBot(AuthMixin):
                 task.chat_id,
                 "\n".join(lines),
                 reply_to=task.message_id,
-                reply_markup=self._question_markup(task.id, q_idx, question),
+                reply_markup=self._question_buttons(task.id, q_idx, question),
             )
 
     async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -634,32 +651,41 @@ class ProjectBot(AuthMixin):
         TaskStatus.CANCELLED: "x",
     }
 
-    def _tasks_markup(self, chat_id: int) -> InlineKeyboardMarkup | None:
+    def _tasks_buttons(self, chat_id: int) -> Buttons | None:
         all_tasks = self.task_manager.list_tasks(chat_id=chat_id, limit=100)
         active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
         finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
         tasks = active + finished
         if not tasks:
             return None
-        buttons = []
+        rows: list[list[Button]] = []
         for t in tasks:
             icon = self._TASK_ICONS.get(t.status, "?")
             elapsed = f" {t.elapsed_human}" if t.elapsed_human else ""
             label = t.name if t.type == TaskType.COMMAND else t.input[:40]
-            buttons.append([InlineKeyboardButton(f"{icon} #{t.id}{elapsed} {label}", callback_data=f"task_info_{t.id}")])
-        return InlineKeyboardMarkup(buttons)
+            rows.append([Button(label=f"{icon} #{t.id}{elapsed} {label}", value=f"task_info_{t.id}")])
+        return Buttons(rows=rows)
 
-    async def _render_tasks(self, chat_id: int, edit_query) -> None:
-        markup = self._tasks_markup(chat_id)
-        await edit_query.edit_message_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
+    async def _render_tasks(self, chat_id: int, msg_ref: MessageRef) -> None:
+        """Render the tasks list into an existing message (edit)."""
+        buttons = self._tasks_buttons(chat_id)
+        assert self._transport is not None
+        await self._transport.edit_text(
+            msg_ref,
+            "Tasks:" if buttons else "No tasks.",
+            buttons=buttons,
+        )
 
-    async def _on_tasks(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_message or not update.effective_chat:
+    async def _on_tasks(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
             return
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        markup = self._tasks_markup(update.effective_chat.id)
-        await update.effective_message.reply_text("Tasks:" if markup else "No tasks.", reply_markup=markup)
+        buttons = self._tasks_buttons(int(ci.chat.native_id))
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci.chat,
+            "Tasks:" if buttons else "No tasks.",
+            buttons=buttons,
+        )
 
     MODEL_OPTIONS = [
         ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context"),
@@ -669,13 +695,13 @@ class ProjectBot(AuthMixin):
         ("haiku", "Haiku 4.5", "Fastest for quick answers"),
     ]
 
-    def _model_markup(self) -> InlineKeyboardMarkup:
+    def _model_buttons(self) -> Buttons:
         current = self.task_manager.claude.model
-        rows = []
+        rows: list[list[Button]] = []
         for model_id, label, _ in self.MODEL_OPTIONS:
             prefix = "● " if current == model_id else ""
-            rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"model_set_{model_id}")])
-        return InlineKeyboardMarkup(rows)
+            rows.append([Button(label=f"{prefix}{label}", value=f"model_set_{model_id}")])
+        return Buttons(rows=rows)
 
     def _current_model(self) -> str:
         raw = self.task_manager.claude.model
@@ -684,60 +710,64 @@ class ProjectBot(AuthMixin):
                 return f"{label} — {desc}"
         return self.task_manager.claude.model_display or raw
 
-    async def _on_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+    async def _on_model(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci.chat,
             f"Select model\nCurrent: {self._current_model()}",
-            reply_markup=self._model_markup(),
+            buttons=self._model_buttons(),
         )
 
-    def _effort_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(e, callback_data=f"effort_set_{e}")]
+    def _effort_buttons(self) -> Buttons:
+        return Buttons(rows=[
+            [Button(label=e, value=f"effort_set_{e}")]
             for e in EFFORT_LEVELS
         ])
 
     def _current_effort(self) -> str:
         return self.task_manager.claude.effort
 
-    async def _on_effort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+    async def _on_effort(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci.chat,
             f"Current: {self._current_effort()}",
-            reply_markup=self._effort_markup(),
+            buttons=self._effort_buttons(),
         )
 
-    def _thinking_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("On", callback_data="thinking_set_on"),
-                InlineKeyboardButton("Off", callback_data="thinking_set_off"),
-            ]
-        ])
+    def _thinking_buttons(self) -> Buttons:
+        return Buttons(rows=[[
+            Button(label="On", value="thinking_set_on"),
+            Button(label="Off", value="thinking_set_off"),
+        ]])
 
     def _current_thinking(self) -> str:
         return "on" if self.show_thinking else "off"
 
-    async def _on_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        args = (ctx.args or []) if ctx else []
+    async def _on_thinking(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        args = ci.args or []
         if args:
             arg = args[0].lower()
             if arg in ("on", "off"):
                 self.show_thinking = arg == "on"
                 patch_project(self.name, {"show_thinking": self.show_thinking})
-                return await update.effective_message.reply_text(
-                    f"Live thinking: {self._current_thinking()}"
+                await self._transport.send_text(
+                    ci.chat, f"Live thinking: {self._current_thinking()}"
                 )
-            return await update.effective_message.reply_text(
-                "Usage: /thinking on|off"
-            )
-        await update.effective_message.reply_text(
+                return
+            await self._transport.send_text(ci.chat, "Usage: /thinking on|off")
+            return
+        await self._transport.send_text(
+            ci.chat,
             f"Live thinking: {self._current_thinking()}",
-            reply_markup=self._thinking_markup(),
+            buttons=self._thinking_buttons(),
         )
 
     _PERMISSION_OPTIONS = (
@@ -745,9 +775,9 @@ class ProjectBot(AuthMixin):
         "dangerously-skip-permissions",
     )
 
-    def _permissions_markup(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(o, callback_data=f"permissions_set_{o}")]
+    def _permissions_buttons(self) -> Buttons:
+        return Buttons(rows=[
+            [Button(label=o, value=f"permissions_set_{o}")]
             for o in self._PERMISSION_OPTIONS
         ])
 
@@ -757,22 +787,26 @@ class ProjectBot(AuthMixin):
             return "dangerously-skip-permissions"
         return claude.permission_mode or "default"
 
-    async def _on_permissions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
+    async def _on_permissions(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci.chat,
             f"Current: {self._current_permission()}",
-            reply_markup=self._permissions_markup(),
+            buttons=self._permissions_buttons(),
         )
 
-    async def _on_compact(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+    async def _on_compact(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
         if not self.task_manager.claude.session_id:
-            return await update.effective_message.reply_text("No active session.")
+            await self._transport.send_text(ci.chat, "No active session.")
+            return
         self.task_manager.submit_compact(
-            chat_id=update.effective_chat.id,
-            message_id=update.effective_message.message_id,
+            chat_id=int(ci.chat.native_id),
+            message_id=int(ci.message.native_id),
         )
 
     async def _on_version(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -803,109 +837,120 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         await self._transport.send_text(ci.chat, _CMD_HELP)
 
-    async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not update.effective_message:
+    async def _on_reset(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
             return
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Yes, reset", callback_data="reset_confirm"),
-                    InlineKeyboardButton("Cancel", callback_data="reset_cancel"),
-                ]
-            ]
-        )
-        await update.effective_message.reply_text(
+        assert self._transport is not None
+        buttons = Buttons(rows=[[
+            Button(label="Yes, reset", value="reset_confirm"),
+            Button(label="Cancel", value="reset_cancel"),
+        ]])
+        await self._transport.send_text(
+            ci.chat,
             "Are you sure? This will clear the Claude session.",
-            reply_markup=keyboard,
+            buttons=buttons,
         )
 
-    def _picker_markup(self, items: dict, prefix: str) -> InlineKeyboardMarkup | None:
+    def _picker_buttons(self, items: dict, prefix: str) -> Buttons | None:
         if not items:
             return None
-        buttons = [
-            InlineKeyboardButton(name, callback_data=f"{prefix}_{name}")
+        btns = [
+            Button(label=name, value=f"{prefix}_{name}")
             for name in sorted(items)
         ]
-        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-        return InlineKeyboardMarkup(rows)
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        return Buttons(rows=rows)
 
-    async def _on_skills(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if ctx.args:
-            name = ctx.args[0].lower()
+    async def _on_skills(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if ci.args:
+            name = ci.args[0].lower()
             from .skills import load_skill
             skill = load_skill(name, self.path)
             if not skill:
-                return await update.effective_message.reply_text(f"Skill '{name}' not found.")
+                await self._transport.send_text(ci.chat, f"Skill '{name}' not found.")
+                return
             self.task_manager.claude.append_system_prompt = skill.content
             self._active_skill = name
-            return await update.effective_message.reply_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
+            await self._transport.send_text(
+                ci.chat, f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate."
+            )
+            return
         from .skills import load_skills
         skills = load_skills(self.path)
         if not skills:
-            return await update.effective_message.reply_text("No skills available.\nCreate one with /create_skill <name>")
+            await self._transport.send_text(
+                ci.chat, "No skills available.\nCreate one with /create_skill <name>"
+            )
+            return
         lines = ["Available skills:"]
         for name, skill in sorted(skills.items()):
             icon = "\U0001f4c1" if skill.source == "project" else "\U0001f310" if skill.source == "global" else "\U0001f916"
             lines.append(f"  {icon} {name} ({skill.source})")
         if self._active_skill:
             lines.append(f"\nActive: {self._active_skill}")
-        markup = self._picker_markup(skills, "pick_skill")
-        await update.effective_message.reply_text("\n".join(lines), reply_markup=markup)
+        buttons = self._picker_buttons(skills, "pick_skill")
+        await self._transport.send_text(ci.chat, "\n".join(lines), buttons=buttons)
 
-    async def _on_stop_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+    async def _on_stop_skill(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
         if not self._active_skill:
-            return await update.effective_message.reply_text("No active skill.")
+            await self._transport.send_text(ci.chat, "No active skill.")
+            return
         old = self._active_skill
         self._active_skill = None
         self.task_manager.claude.append_system_prompt = None
-        await update.effective_message.reply_text(f"Skill '{old}' deactivated.")
+        await self._transport.send_text(ci.chat, f"Skill '{old}' deactivated.")
 
-    async def _on_create_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /create_skill <name>")
-        name = ctx.args[0].lower()
+    async def _on_create_skill(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if not ci.args:
+            await self._transport.send_text(ci.chat, "Usage: /create_skill <name>")
+            return
+        name = ci.args[0].lower()
         from .skills import _sanitize_name
         try:
             name = _sanitize_name(name, "skill")
         except ValueError as e:
-            return await update.effective_message.reply_text(str(e))
-        ctx.user_data["pending_skill_name"] = name
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📁 Project", callback_data=f"skill_scope_project_{name}"),
-                InlineKeyboardButton("🌐 Global", callback_data=f"skill_scope_global_{name}"),
-            ]
-        ])
-        await update.effective_message.reply_text(
-            f"Where should skill '{name}' be saved?", reply_markup=keyboard,
+            await self._transport.send_text(ci.chat, str(e))
+            return
+        # Stash pending name so the scope-click handler knows which skill to create.
+        self._pending_skill_name = name
+        buttons = Buttons(rows=[[
+            Button(label="📁 Project", value=f"skill_scope_project_{name}"),
+            Button(label="🌐 Global", value=f"skill_scope_global_{name}"),
+        ]])
+        await self._transport.send_text(
+            ci.chat, f"Where should skill '{name}' be saved?", buttons=buttons,
         )
 
-    async def _on_delete_skill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /delete_skill <name>")
-        name = ctx.args[0].lower()
+    async def _on_delete_skill(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if not ci.args:
+            await self._transport.send_text(ci.chat, "Usage: /delete_skill <name>")
+            return
+        name = ci.args[0].lower()
         from .skills import load_skill
         skill = load_skill(name, self.path)
         if not skill:
-            return await update.effective_message.reply_text(f"Skill '{name}' not found.")
+            await self._transport.send_text(ci.chat, f"Skill '{name}' not found.")
+            return
         icon = "🌐" if skill.source == "global" else "📁"
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Delete", callback_data=f"skill_delete_confirm_{skill.source}_{name}"),
-                InlineKeyboardButton("Cancel", callback_data="skill_delete_cancel"),
-            ]
-        ])
-        await update.effective_message.reply_text(f"Delete {icon} {skill.source} skill '{name}'?", reply_markup=keyboard)
+        buttons = Buttons(rows=[[
+            Button(label="Delete", value=f"skill_delete_confirm_{skill.source}_{name}"),
+            Button(label="Cancel", value="skill_delete_cancel"),
+        ]])
+        await self._transport.send_text(
+            ci.chat, f"Delete {icon} {skill.source} skill '{name}'?", buttons=buttons,
+        )
 
     # --- Persona handlers ---
 
@@ -1012,35 +1057,49 @@ class ProjectBot(AuthMixin):
         else:
             patch_project(self.name, {"active_persona": name}, cfg)
 
-    async def _on_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
+    async def _on_persona(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if not ci.args:
             if self._active_persona:
-                return await update.effective_message.reply_text(f"Active persona: {self._active_persona}\nUse /stop_persona to deactivate.")
+                await self._transport.send_text(
+                    ci.chat,
+                    f"Active persona: {self._active_persona}\nUse /stop_persona to deactivate.",
+                )
+                return
             from .skills import load_personas
-            markup = self._picker_markup(load_personas(self.path), "pick_persona")
-            if not markup:
-                return await update.effective_message.reply_text("No personas available.\nCreate one with /create_persona <name>")
-            return await update.effective_message.reply_text("Pick a persona to activate:", reply_markup=markup)
-        name = ctx.args[0].lower()
+            buttons = self._picker_buttons(load_personas(self.path), "pick_persona")
+            if not buttons:
+                await self._transport.send_text(
+                    ci.chat, "No personas available.\nCreate one with /create_persona <name>"
+                )
+                return
+            await self._transport.send_text(ci.chat, "Pick a persona to activate:", buttons=buttons)
+            return
+        name = ci.args[0].lower()
         from .skills import load_persona
         persona = load_persona(name, self.path)
         if not persona:
-            return await update.effective_message.reply_text(f"Persona '{name}' not found.")
+            await self._transport.send_text(ci.chat, f"Persona '{name}' not found.")
+            return
         self._active_persona = name
         self._persist_active_persona(name)
-        await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
+        await self._transport.send_text(
+            ci.chat, f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate."
+        )
 
-    async def _on_stop_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+    async def _on_stop_persona(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
         if not self._active_persona:
-            return await update.effective_message.reply_text("No active persona.")
+            await self._transport.send_text(ci.chat, "No active persona.")
+            return
         old = self._active_persona
         self._active_persona = None
         self._persist_active_persona(None)
-        await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
+        await self._transport.send_text(ci.chat, f"Persona '{old}' deactivated.")
 
     async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self.group_mode:
@@ -1062,46 +1121,50 @@ class ProjectBot(AuthMixin):
         self._group_state.resume(update.effective_chat.id)
         await update.effective_message.reply_text("Resumed.")
 
-    async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /create_persona <name>")
-        name = ctx.args[0].lower()
+    async def _on_create_persona(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if not ci.args:
+            await self._transport.send_text(ci.chat, "Usage: /create_persona <name>")
+            return
+        name = ci.args[0].lower()
         from .skills import _sanitize_name
         try:
             name = _sanitize_name(name, "persona")
         except ValueError as e:
-            return await update.effective_message.reply_text(str(e))
-        ctx.user_data["pending_persona_name"] = name
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📁 Project", callback_data=f"persona_scope_project_{name}"),
-                InlineKeyboardButton("🌐 Global", callback_data=f"persona_scope_global_{name}"),
-            ]
-        ])
-        await update.effective_message.reply_text(
-            f"Where should persona '{name}' be saved?", reply_markup=keyboard,
+            await self._transport.send_text(ci.chat, str(e))
+            return
+        self._pending_persona_name = name
+        buttons = Buttons(rows=[[
+            Button(label="📁 Project", value=f"persona_scope_project_{name}"),
+            Button(label="🌐 Global", value=f"persona_scope_global_{name}"),
+        ]])
+        await self._transport.send_text(
+            ci.chat, f"Where should persona '{name}' be saved?", buttons=buttons,
         )
 
-    async def _on_delete_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /delete_persona <name>")
-        name = ctx.args[0].lower()
+    async def _on_delete_persona(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        if not ci.args:
+            await self._transport.send_text(ci.chat, "Usage: /delete_persona <name>")
+            return
+        name = ci.args[0].lower()
         from .skills import load_persona
         persona = load_persona(name, self.path)
         if not persona:
-            return await update.effective_message.reply_text(f"Persona '{name}' not found.")
+            await self._transport.send_text(ci.chat, f"Persona '{name}' not found.")
+            return
         icon = "🌐" if persona.source == "global" else "📁"
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Delete", callback_data=f"persona_delete_confirm_{persona.source}_{name}"),
-                InlineKeyboardButton("Cancel", callback_data="persona_delete_cancel"),
-            ]
-        ])
-        await update.effective_message.reply_text(f"Delete {icon} {persona.source} persona '{name}'?", reply_markup=keyboard)
+        buttons = Buttons(rows=[[
+            Button(label="Delete", value=f"persona_delete_confirm_{persona.source}_{name}"),
+            Button(label="Cancel", value="persona_delete_cancel"),
+        ]])
+        await self._transport.send_text(
+            ci.chat, f"Delete {icon} {persona.source} persona '{name}'?", buttons=buttons,
+        )
 
     async def _on_voice_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -1129,103 +1192,110 @@ class ProjectBot(AuthMixin):
         ("zh", "Chinese"),
     ]
 
-    async def _on_lang(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+    async def _on_lang(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
         if not self._transcriber:
-            return await update.effective_message.reply_text("Voice is not configured.")
-        if ctx.args:
-            code = ctx.args[0].lower()
+            await self._transport.send_text(ci.chat, "Voice is not configured.")
+            return
+        if ci.args:
+            code = ci.args[0].lower()
             if code == "auto":
                 code = ""
             self._transcriber._language = code
             label = code or "auto-detect"
-            return await update.effective_message.reply_text(f"Voice language set to: {label}")
+            await self._transport.send_text(ci.chat, f"Voice language set to: {label}")
+            return
         current = getattr(self._transcriber, "_language", "") or "auto-detect"
-        buttons = [
-            InlineKeyboardButton(
-                f"{'● ' if (code or '') == getattr(self._transcriber, '_language', '') else ''}{label}",
-                callback_data=f"lang_set_{code}",
+        btns = [
+            Button(
+                label=f"{'● ' if (code or '') == getattr(self._transcriber, '_language', '') else ''}{label}",
+                value=f"lang_set_{code}",
             )
             for code, label in self.LANGUAGES
         ]
-        rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-        await update.effective_message.reply_text(
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        await self._transport.send_text(
+            ci.chat,
             f"Current language: {current}\nSelect voice language:",
-            reply_markup=InlineKeyboardMarkup(rows),
+            buttons=Buttons(rows=rows),
         )
 
-    async def _on_callback(
-        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        query = update.callback_query
-        if not query or not query.data:
+    async def _on_button(self, click) -> None:
+        """Transport-native button-click handler. Replaces legacy _on_callback."""
+        if not self._auth_identity(click.sender):
             return
-        if not self._auth(query.from_user):
-            await query.answer("Unauthorized.")
-            return
-        await query.answer()
+        assert self._transport is not None
+        value = click.value
+        msg_ref = click.message
+        chat = click.chat
 
-        if query.data.startswith("model_set_"):
-            name = query.data[len("model_set_"):]
+        if value.startswith("model_set_"):
+            name = value[len("model_set_"):]
             valid = {m[0] for m in self.MODEL_OPTIONS}
             if name in valid:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
                 patch_project(self.name, {"model": name})
-            await query.edit_message_text(
+            await self._transport.edit_text(
+                msg_ref,
                 f"Select model\nCurrent: {self._current_model()}",
-                reply_markup=self._model_markup(),
+                buttons=self._model_buttons(),
             )
-        elif query.data.startswith("effort_set_"):
-            level = query.data[len("effort_set_"):]
+        elif value.startswith("effort_set_"):
+            level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self.task_manager.claude.effort = level
                 patch_project(self.name, {"effort": level})
-            await query.edit_message_text(
+            await self._transport.edit_text(
+                msg_ref,
                 f"Effort: {self._current_effort()}",
-                reply_markup=self._effort_markup(),
+                buttons=self._effort_buttons(),
             )
-        elif query.data.startswith("thinking_set_"):
-            value = query.data[len("thinking_set_"):]
-            if value in ("on", "off"):
-                self.show_thinking = value == "on"
+        elif value.startswith("thinking_set_"):
+            val = value[len("thinking_set_"):]
+            if val in ("on", "off"):
+                self.show_thinking = val == "on"
                 patch_project(self.name, {"show_thinking": self.show_thinking})
-            await query.edit_message_text(
+            await self._transport.edit_text(
+                msg_ref,
                 f"Live thinking: {self._current_thinking()}",
-                reply_markup=self._thinking_markup(),
+                buttons=self._thinking_buttons(),
             )
-        elif query.data.startswith("permissions_set_"):
-            mode = query.data[len("permissions_set_"):]
+        elif value.startswith("permissions_set_"):
+            mode = value[len("permissions_set_"):]
             if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
                 skip, pm = resolve_permissions(mode)
                 self.task_manager.claude.skip_permissions = skip
                 self.task_manager.claude.permission_mode = pm
                 patch_project(self.name, {"permissions": mode if mode != "default" else None})
-            await query.edit_message_text(
+            await self._transport.edit_text(
+                msg_ref,
                 f"Permissions: {self._current_permission()}",
-                reply_markup=self._permissions_markup(),
+                buttons=self._permissions_buttons(),
             )
-        elif query.data.startswith("lang_set_"):
-            code = query.data[len("lang_set_"):]
+        elif value.startswith("lang_set_"):
+            code = value[len("lang_set_"):]
             if code == "auto":
                 code = ""
             if self._transcriber:
                 self._transcriber._language = code
             label = code or "auto-detect"
-            buttons = [
-                InlineKeyboardButton(
-                    f"{'● ' if (c or '') == code else ''}{l}",
-                    callback_data=f"lang_set_{c}",
+            btns = [
+                Button(
+                    label=f"{'● ' if (c or '') == code else ''}{l}",
+                    value=f"lang_set_{c}",
                 )
                 for c, l in self.LANGUAGES
             ]
-            rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-            await query.edit_message_text(
+            rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+            await self._transport.edit_text(
+                msg_ref,
                 f"Voice language set to: {label}",
-                reply_markup=InlineKeyboardMarkup(rows),
+                buttons=Buttons(rows=rows),
             )
-        elif query.data == "reset_confirm":
+        elif value == "reset_confirm":
             live_task_ids = list({*self._live_text.keys(), *self._live_thinking.keys()})
             for tid in live_task_ids:
                 await self._cancel_live_for(tid)
@@ -1235,157 +1305,162 @@ class ProjectBot(AuthMixin):
             self._active_persona = None
             self.task_manager.claude.append_system_prompt = None
             clear_session(self.name)
-            await query.edit_message_text("Session reset.")
-        elif query.data == "reset_cancel":
-            await query.edit_message_text("Reset cancelled.")
+            await self._transport.edit_text(msg_ref, "Session reset.")
+        elif value == "reset_cancel":
+            await self._transport.edit_text(msg_ref, "Reset cancelled.")
         # Skill callbacks
-        elif query.data.startswith("skill_delete_confirm_"):
-            rest = query.data[len("skill_delete_confirm_"):]
+        elif value.startswith("skill_delete_confirm_"):
+            rest = value[len("skill_delete_confirm_"):]
             scope, _, name = rest.partition("_")
             from .skills import delete_skill as _delete_skill
             _delete_skill(name, self.path, scope=scope)
             if self._active_skill == name:
                 self._active_skill = None
                 self.task_manager.claude.append_system_prompt = None
-            await query.edit_message_text(f"Skill '{name}' deleted.")
-        elif query.data == "skill_delete_cancel":
-            await query.edit_message_text("Cancelled.")
-        elif query.data.startswith("skill_scope_"):
-            rest = query.data[len("skill_scope_"):]
+            await self._transport.edit_text(msg_ref, f"Skill '{name}' deleted.")
+        elif value == "skill_delete_cancel":
+            await self._transport.edit_text(msg_ref, "Cancelled.")
+        elif value.startswith("skill_scope_"):
+            rest = value[len("skill_scope_"):]
             scope, _, name = rest.partition("_")
-            ctx.user_data["pending_skill_name"] = name
-            ctx.user_data["pending_skill_scope"] = scope
-            await query.edit_message_text(f"Send the content for skill '{name}':")
-        elif query.data.startswith("pick_skill_"):
-            name = query.data[len("pick_skill_"):]
+            self._pending_skill_name = name
+            self._pending_skill_scope = scope
+            await self._transport.edit_text(msg_ref, f"Send the content for skill '{name}':")
+        elif value.startswith("pick_skill_"):
+            name = value[len("pick_skill_"):]
             from .skills import load_skill
             skill = load_skill(name, self.path)
             if not skill:
-                return await query.edit_message_text(f"Skill '{name}' not found.")
+                await self._transport.edit_text(msg_ref, f"Skill '{name}' not found.")
+                return
             self.task_manager.claude.append_system_prompt = skill.content
             self._active_skill = name
-            await query.edit_message_text(f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate.")
+            await self._transport.edit_text(
+                msg_ref, f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate."
+            )
         # Persona callbacks
-        elif query.data.startswith("persona_delete_confirm_"):
-            rest = query.data[len("persona_delete_confirm_"):]
+        elif value.startswith("persona_delete_confirm_"):
+            rest = value[len("persona_delete_confirm_"):]
             scope, _, name = rest.partition("_")
             from .skills import delete_persona as _delete_persona
             _delete_persona(name, self.path, scope=scope)
             if self._active_persona == name:
                 self._active_persona = None
-            await query.edit_message_text(f"Persona '{name}' deleted.")
-        elif query.data == "persona_delete_cancel":
-            await query.edit_message_text("Cancelled.")
-        elif query.data.startswith("persona_scope_"):
-            rest = query.data[len("persona_scope_"):]
+            await self._transport.edit_text(msg_ref, f"Persona '{name}' deleted.")
+        elif value == "persona_delete_cancel":
+            await self._transport.edit_text(msg_ref, "Cancelled.")
+        elif value.startswith("persona_scope_"):
+            rest = value[len("persona_scope_"):]
             scope, _, name = rest.partition("_")
-            ctx.user_data["pending_persona_name"] = name
-            ctx.user_data["pending_persona_scope"] = scope
-            await query.edit_message_text(f"Send the content for persona '{name}':")
-        elif query.data.startswith("pick_persona_"):
-            name = query.data[len("pick_persona_"):]
+            self._pending_persona_name = name
+            self._pending_persona_scope = scope
+            await self._transport.edit_text(msg_ref, f"Send the content for persona '{name}':")
+        elif value.startswith("pick_persona_"):
+            name = value[len("pick_persona_"):]
             from .skills import load_persona
             persona = load_persona(name, self.path)
             if not persona:
-                return await query.edit_message_text(f"Persona '{name}' not found.")
+                await self._transport.edit_text(msg_ref, f"Persona '{name}' not found.")
+                return
             self._active_persona = name
             self._persist_active_persona(name)
-            await query.edit_message_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
-        elif query.data.startswith("ask_"):
-            # Format: ask_{task_id}_{q_idx}_{opt_idx}
-            parts = query.data.split("_")
+            await self._transport.edit_text(
+                msg_ref, f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate."
+            )
+        elif value.startswith("ask_"):
+            parts = value.split("_")
             if len(parts) != 4:
-                await query.answer("Invalid option.")
                 return
             try:
                 task_id = int(parts[1])
                 q_idx = int(parts[2])
                 opt_idx = int(parts[3])
             except ValueError:
-                await query.answer("Invalid option.")
                 return
             task = self.task_manager.get(task_id)
             if not task or task.status != TaskStatus.WAITING_INPUT:
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.answer("No longer waiting on input.")
+                # Drop the buttons by editing the text without buttons.
                 return
             if q_idx >= len(task.pending_questions):
-                await query.answer("Question no longer active.")
                 return
             question = task.pending_questions[q_idx]
             if opt_idx >= len(question.options):
-                await query.answer("Option no longer available.")
                 return
             label = question.options[opt_idx].label
             if self.task_manager.submit_answer(task_id, label):
-                await query.edit_message_reply_markup(reply_markup=None)
-                # Append selection to the message so the user sees what they chose
+                # Annotate the selection into the existing message body.
                 try:
-                    original = query.message.text_html or query.message.text or ""
+                    # click.message.native carries the original telegram.Message,
+                    # giving us the rendered text_html. When it's a FakeMessage
+                    # in tests, this just no-ops.
+                    original = ""
+                    native = getattr(msg_ref, "native", None)
+                    if native is not None:
+                        original = getattr(native, "text_html", None) or getattr(native, "text", "") or ""
                     escaped = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                    await query.edit_message_text(
+                    await self._transport.edit_text(
+                        msg_ref,
                         f"{original}\n\n<i>Selected:</i> {escaped}",
-                        parse_mode="HTML",
+                        html=True,
                     )
                 except Exception:
                     logger.debug("could not annotate selected option", exc_info=True)
-            else:
-                await query.answer("Could not send answer.")
-        elif query.data.startswith("task_info_"):
-            task_id = _parse_task_id(query.data)
+        elif value.startswith("task_info_"):
+            task_id = _parse_task_id(value)
             task = self.task_manager.get(task_id)
             if not task:
-                await query.edit_message_text(f"Task #{task_id} not found.")
+                await self._transport.edit_text(msg_ref, f"Task #{task_id} not found.")
                 return
             elapsed = f" | {task.elapsed_human}" if task.elapsed_human else ""
             text = f"#{task.id} [{task.type.value}] {task.status.value}{elapsed}\n{task.input[:200]}"
-            rows = []
+            rows: list[list[Button]] = []
             if task.status in (TaskStatus.WAITING, TaskStatus.RUNNING):
-                rows.append([InlineKeyboardButton("Cancel", callback_data=f"task_cancel_{task_id}")])
+                rows.append([Button(label="Cancel", value=f"task_cancel_{task_id}")])
             if task.status in (TaskStatus.RUNNING, TaskStatus.DONE, TaskStatus.FAILED):
-                rows.append([InlineKeyboardButton("Log", callback_data=f"task_log_{task_id}")])
+                rows.append([Button(label="Log", value=f"task_log_{task_id}")])
             if task_id in self._thinking_store:
-                rows.append([InlineKeyboardButton("Thinking", callback_data=f"show_thinking_{task_id}")])
-            rows.append([InlineKeyboardButton("« Back", callback_data="tasks_back")])
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
-        elif query.data == "tasks_back":
-            await self._render_tasks(query.message.chat_id, edit_query=query)
-        elif query.data.startswith("task_cancel_"):
-            task_id = _parse_task_id(query.data)
+                rows.append([Button(label="Thinking", value=f"show_thinking_{task_id}")])
+            rows.append([Button(label="« Back", value="tasks_back")])
+            await self._transport.edit_text(msg_ref, text, buttons=Buttons(rows=rows))
+        elif value == "tasks_back":
+            await self._render_tasks(int(chat.native_id), msg_ref)
+        elif value.startswith("task_cancel_"):
+            task_id = _parse_task_id(value)
             await self._cancel_live_for(task_id)
             if self.task_manager.cancel(task_id):
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:
                     typing.cancel()
-                await query.edit_message_text(f"#{task_id} cancelled.")
+                await self._transport.edit_text(msg_ref, f"#{task_id} cancelled.")
             else:
-                await query.edit_message_text(f"#{task_id} not found or already finished.")
-        elif query.data.startswith("task_log_"):
-            task_id = _parse_task_id(query.data)
+                await self._transport.edit_text(
+                    msg_ref, f"#{task_id} not found or already finished."
+                )
+        elif value.startswith("task_log_"):
+            task_id = _parse_task_id(value)
             task = self.task_manager.get(task_id)
             if not task:
-                await query.edit_message_text(f"Task #{task_id} not found.")
+                await self._transport.edit_text(msg_ref, f"Task #{task_id} not found.")
                 return
-            # For running tasks, read from live log buffer; for finished tasks, use result
             if task._log:
                 output = "\n".join(task._log)
             else:
                 output = task.result or task.error or "(no output)"
             if len(output) > 3000:
                 output = output[:3000] + f"\n... (truncated, {len(task.result or '')} chars total)"
-            rows = [[InlineKeyboardButton("« Back", callback_data=f"task_info_{task_id}")]]
-            await query.edit_message_text(f"#{task_id} log:\n{output}", reply_markup=InlineKeyboardMarkup(rows))
-        elif query.data.startswith("show_thinking_"):
+            rows = [[Button(label="« Back", value=f"task_info_{task_id}")]]
+            await self._transport.edit_text(
+                msg_ref, f"#{task_id} log:\n{output}", buttons=Buttons(rows=rows),
+            )
+        elif value.startswith("show_thinking_"):
             try:
-                task_id = int(query.data[len("show_thinking_"):])
+                task_id = int(value[len("show_thinking_"):])
             except ValueError:
-                await query.answer("Invalid thinking reference.")
                 return
             thinking = self._thinking_store.get(task_id)
             if not thinking:
-                await query.answer("Thinking not available.")
                 return
-            await self._send_to_chat(query.message.chat_id, f"💭 {thinking}")
+            await self._send_to_chat(int(chat.native_id), f"💭 {thinking}")
 
     def _compose_status(self) -> str:
         uptime = time.monotonic() - self._started_at
@@ -1698,12 +1773,6 @@ class ProjectBot(AuthMixin):
             ("help", self._on_help_t),
             ("version", self._on_version_t),
             ("status", self._on_status_t),
-        )
-        # Legacy commands — still use Update/ctx internals; bridged via _legacy_command shim.
-        # These get fully ported in later spec tasks (buttons, files).
-        legacy_commands = (
-            ("start", self._on_start),
-            ("run", self._on_run),
             ("tasks", self._on_tasks),
             ("model", self._on_model),
             ("effort", self._on_effort),
@@ -1719,13 +1788,19 @@ class ProjectBot(AuthMixin):
             ("stop_persona", self._on_stop_persona),
             ("create_persona", self._on_create_persona),
             ("delete_persona", self._on_delete_persona),
-            ("voice", self._on_voice_status),
             ("lang", self._on_lang),
+        )
+        # Legacy commands — still use Update/ctx internals; bridged via _legacy_command shim.
+        legacy_commands = (
+            ("start", self._on_start),
+            ("run", self._on_run),
+            ("voice", self._on_voice_status),
             ("halt", self._on_halt),
             ("resume", self._on_resume),
         )
         assert self._transport is not None
         self._transport.on_message(self._on_text_from_transport)
+        self._transport.on_button(self._on_button)
         for _name, _handler in ported_commands:
             self._transport.on_command(_name, _handler)
         for _name, _legacy in legacy_commands:
@@ -1782,7 +1857,7 @@ class ProjectBot(AuthMixin):
             app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
         app.add_error_handler(self._on_error)
-        app.add_handler(CallbackQueryHandler(self._on_callback))
+        app.add_handler(CallbackQueryHandler(self._transport._dispatch_button))
         return app
 
 

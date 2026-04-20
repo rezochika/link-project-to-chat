@@ -251,10 +251,14 @@ async def test_permissions_callback_works_in_group_chat(tmp_path):
     """Team bots live in groups; /permissions + button click must work there.
 
     Previously _on_callback had a blanket "Only available in private chats"
-    short-circuit that blocked every setting change on team bots.
+    short-circuit that blocked every setting change on team bots. The port to
+    _on_button still has to honor that: a click in a group is valid.
     """
-    from telegram.constants import ChatType
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport import (
+        ButtonClick, ChatKind, ChatRef, Identity, MessageRef,
+    )
+    from link_project_to_chat.transport.telegram import TelegramTransport
 
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
@@ -262,24 +266,24 @@ async def test_permissions_callback_works_in_group_chat(tmp_path):
         allowed_usernames=["rezo"],
         trusted_user_ids=[42],
     )
+    # Stub the transport so we can observe the resulting edit.
+    mock_app = MagicMock()
+    mock_app.bot = MagicMock()
+    mock_app.bot.edit_message_text = AsyncMock()
+    bot._transport = TelegramTransport(mock_app)
 
-    query = AsyncMock()
-    query.data = "permissions_set_acceptEdits"
-    query.from_user = MagicMock(id=42, username="rezo", is_bot=False)
-    query.answer = AsyncMock()
-    query.edit_message_text = AsyncMock()
-    query.message = MagicMock()
-    query.message.chat = MagicMock(type=ChatType.GROUP)
-    update = MagicMock(callback_query=query)
-    ctx = MagicMock()
+    chat = ChatRef(transport_id="telegram", native_id="-100111", kind=ChatKind.ROOM)
+    msg = MessageRef(transport_id="telegram", native_id="500", chat=chat)
+    sender = Identity(
+        transport_id="telegram", native_id="42",
+        display_name="Rezo", handle="rezo", is_bot=False,
+    )
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="permissions_set_acceptEdits")
 
-    await bot._on_callback(update, ctx)
+    await bot._on_button(click)
 
-    # Must not answer "Only available in private chats."
-    for call in query.answer.call_args_list:
-        assert "private chats" not in (call.args[0] if call.args else "")
-    # Must have edited the message to show the new permissions keyboard.
-    query.edit_message_text.assert_called_once()
+    # edit_message_text must have been called with the new permissions text.
+    mock_app.bot.edit_message_text.assert_awaited_once()
 
 
 # --- persona persistence for team bots ---
