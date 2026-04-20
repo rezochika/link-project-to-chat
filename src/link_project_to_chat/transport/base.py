@@ -170,7 +170,14 @@ class Transport(Protocol):
         path: Path,
         *,
         reply_to: MessageRef | None = None,
-    ) -> MessageRef: ...
+    ) -> MessageRef:
+        """Send an audio file as a platform-appropriate voice message.
+
+        Telegram renders as a voice note with waveform UI; Discord as an audio
+        attachment; other transports render per their platform conventions.
+        Transports that don't distinguish voice from file MAY delegate to send_file.
+        """
+        ...
 
     async def send_typing(self, chat: ChatRef) -> None:
         """Emit a typing indicator. One-shot; caller loops if a sustained
