@@ -89,6 +89,7 @@ class TelegramTransport:
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list = []
         self._menu: Any = None
+        self._team_relay = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
 
     @classmethod
     def build(
@@ -108,6 +109,31 @@ class TelegramTransport:
         instance = cls(app)
         instance._menu = menu
         return instance
+
+    def enable_team_relay(
+        self,
+        telethon_client: Any,
+        team_bot_usernames: set[str],
+        group_chat_id: int,
+        team_name: str,
+    ) -> None:
+        """Activate the Telethon-user-session relay for a team group chat.
+
+        Required because Telegram Bot API never delivers bot-to-bot messages.
+        Other transports (Discord, Slack, Web) don't need this and don't
+        implement it — this method is TelegramTransport-specific, not on the
+        Transport Protocol.
+
+        Call once after build(), before start(). Relay lifecycle is tied to
+        start()/stop() thereafter.
+        """
+        from ._telegram_relay import TeamRelay
+        self._team_relay = TeamRelay(
+            client=telethon_client,
+            team_name=team_name,
+            group_chat_id=group_chat_id,
+            bot_usernames=team_bot_usernames,
+        )
 
     def attach_telegram_routing(
         self,
@@ -215,6 +241,9 @@ class TelegramTransport:
         for cb in self._on_ready_callbacks:
             await cb(self_identity)
 
+        if self._team_relay is not None:
+            await self._team_relay.start()
+
         await self._app.start()
         await self._app.updater.start_polling()
 
@@ -222,6 +251,8 @@ class TelegramTransport:
         self._on_ready_callbacks.append(callback)
 
     async def stop(self) -> None:
+        if self._team_relay is not None:
+            await self._team_relay.stop()
         await self._app.updater.stop()
         await self._app.stop()
         await self._app.shutdown()

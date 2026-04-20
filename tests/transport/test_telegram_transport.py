@@ -502,3 +502,41 @@ async def test_dispatch_non_relay_text_unchanged():
 
     assert captured[0].is_relayed_bot_to_bot is False
     assert captured[0].text == "hello world"
+
+
+async def test_enable_team_relay_lifecycle():
+    """enable_team_relay stashes config; start() starts the relay; stop() stops it."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+
+    mock_client = MagicMock()
+    mock_client.add_event_handler = MagicMock(return_value=object())
+    mock_client.remove_event_handler = MagicMock()
+
+    t.enable_team_relay(
+        telethon_client=mock_client,
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100123,
+        team_name="acme",
+    )
+
+    await t.start()
+    mock_client.add_event_handler.assert_called_once()
+
+    await t.stop()
+    mock_client.remove_event_handler.assert_called_once()
+
+
+async def test_build_without_enable_team_relay_starts_and_stops_cleanly():
+    """TelegramTransport without a team relay starts/stops without touching relay code."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+
+    await t.start()
+    await t.stop()
