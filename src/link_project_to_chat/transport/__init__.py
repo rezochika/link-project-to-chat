@@ -18,7 +18,7 @@ from .base import (
     Transport,
     TransportRetryAfter,
 )
-from .fake import EditedMessage, FakeTransport, SentFile, SentMessage
+from .fake import EditedMessage, FakeTransport, SentFile, SentMessage, SentVoice
 from .telegram import TelegramTransport
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     "OnReadyCallback",
     "SentFile",
     "SentMessage",
+    "SentVoice",
     "TelegramTransport",
     "Transport",
     "TransportRetryAfter",

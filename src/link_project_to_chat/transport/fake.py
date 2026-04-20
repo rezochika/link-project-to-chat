@@ -51,6 +51,14 @@ class SentFile:
     message: MessageRef
 
 
+@dataclass
+class SentVoice:
+    chat: ChatRef
+    path: Path
+    reply_to: MessageRef | None
+    message: MessageRef
+
+
 class FakeTransport:
     """In-memory implementation of the Transport Protocol."""
 
@@ -60,10 +68,12 @@ class FakeTransport:
         self.sent_messages: list[SentMessage] = []
         self.edited_messages: list[EditedMessage] = []
         self.sent_files: list[SentFile] = []
+        self.sent_voices: list[SentVoice] = []
         self.typing_signals: list[ChatRef] = []
         self._message_handlers: list[MessageHandler] = []
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
+        self._on_ready_callbacks: list = []
         self._msg_counter = itertools.count(1)
         self._running = False
 
@@ -112,6 +122,17 @@ class FakeTransport:
         self.sent_files.append(SentFile(chat=chat, path=path, caption=caption, display_name=display_name, message=ref))
         return ref
 
+    async def send_voice(
+        self,
+        chat: ChatRef,
+        path: Path,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> MessageRef:
+        ref = MessageRef(transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat)
+        self.sent_voices.append(SentVoice(chat=chat, path=path, reply_to=reply_to, message=ref))
+        return ref
+
     async def send_typing(self, chat: ChatRef) -> None:
         self.typing_signals.append(chat)
 
@@ -124,6 +145,9 @@ class FakeTransport:
 
     def on_button(self, handler: ButtonHandler) -> None:
         self._button_handlers.append(handler)
+
+    def on_ready(self, callback) -> None:
+        self._on_ready_callbacks.append(callback)
 
     # ── Test injection ────────────────────────────────────────────────────
     async def inject_message(

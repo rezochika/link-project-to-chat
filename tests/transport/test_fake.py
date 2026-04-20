@@ -107,3 +107,43 @@ async def test_start_and_stop_are_idempotent():
     await t.start()  # second start must not raise
     await t.stop()
     await t.stop()  # second stop must not raise
+
+
+async def test_send_voice_is_captured(tmp_path: Path):
+    t = FakeTransport()
+    p = tmp_path / "v.opus"
+    p.write_bytes(b"fake opus")
+    ref = await t.send_voice(_chat(), p)
+    assert len(t.sent_voices) == 1
+    assert t.sent_voices[0].path == p
+    assert ref.chat == _chat()
+
+
+async def test_send_voice_with_reply_to_captures_ref(tmp_path: Path):
+    t = FakeTransport()
+    orig = await t.send_text(_chat(), "hi")
+    p = tmp_path / "v.opus"
+    p.write_bytes(b"fake opus")
+    await t.send_voice(_chat(), p, reply_to=orig)
+    assert t.sent_voices[0].reply_to == orig
+
+
+async def test_on_ready_callbacks_fire_on_trigger():
+    """FakeTransport doesn't auto-fire on_ready (no real startup sequence) — but
+    registered callbacks must be invocable via the captured list for tests that
+    want to drive it manually."""
+    t = FakeTransport()
+    fired: list = []
+
+    async def cb(identity):
+        fired.append(identity)
+
+    t.on_ready(cb)
+    # Manual fire — FakeTransport exposes _on_ready_callbacks for tests.
+    for c in t._on_ready_callbacks:
+        await c(Identity(
+            transport_id="fake", native_id="1", display_name="Bot",
+            handle="bot", is_bot=True,
+        ))
+    assert len(fired) == 1
+    assert fired[0].handle == "bot"
