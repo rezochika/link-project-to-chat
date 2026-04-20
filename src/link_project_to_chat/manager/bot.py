@@ -231,29 +231,45 @@ class ManagerBot(AuthMixin):
         from ..config import load_config
         return load_config(self._project_config_path or DEFAULT_CONFIG).teams
 
+    def _team_running_count(self, team_name: str, team) -> int:
+        return sum(
+            1 for role in team.bots
+            if self._pm.status(f"team:{team_name}:{role}") == "running"
+        )
+
     def _teams_list_markup(self) -> InlineKeyboardMarkup | None:
         teams = self._load_teams()
         if not teams:
             return None
         rows = []
         for team_name in sorted(teams):
-            for role in sorted(teams[team_name].bots):
-                key = f"team:{team_name}:{role}"
-                status = self._pm.status(key)
-                prefix = "[+]" if status == "running" else "[-]"
-                rows.append([InlineKeyboardButton(
-                    f"{prefix} {team_name}/{role}",
-                    callback_data=f"team_info_{team_name}:{role}",
-                )])
+            team = teams[team_name]
+            running = self._team_running_count(team_name, team)
+            total = len(team.bots)
+            rows.append([InlineKeyboardButton(
+                f"[{running}/{total}] {team_name}",
+                callback_data=f"team_info_{team_name}",
+            )])
         return InlineKeyboardMarkup(rows)
 
-    def _team_detail_markup(self, team_name: str, role: str, status: str) -> InlineKeyboardMarkup:
+    def _team_detail_text(self, team_name: str, team) -> str:
+        lines = [f"Team '{team_name}':"]
+        for role in sorted(team.bots):
+            status = self._pm.status(f"team:{team_name}:{role}")
+            lines.append(f"  {role}: {status}")
+        return "\n".join(lines)
+
+    def _team_detail_markup(self, team_name: str, team) -> InlineKeyboardMarkup:
+        running = self._team_running_count(team_name, team)
+        total = len(team.bots)
         rows = []
-        if status == "running":
-            rows.append([InlineKeyboardButton("Stop", callback_data=f"team_stop_{team_name}:{role}")])
-            rows.append([InlineKeyboardButton("Logs", callback_data=f"team_logs_{team_name}:{role}")])
-        else:
-            rows.append([InlineKeyboardButton("Start", callback_data=f"team_start_{team_name}:{role}")])
+        if running < total:
+            rows.append([InlineKeyboardButton(
+                "Start" if running == 0 else "Start remaining",
+                callback_data=f"team_start_{team_name}",
+            )])
+        if running > 0:
+            rows.append([InlineKeyboardButton("Stop", callback_data=f"team_stop_{team_name}")])
         rows.append([InlineKeyboardButton("« Back", callback_data="team_back")])
         return InlineKeyboardMarkup(rows)
 
@@ -267,15 +283,8 @@ class ManagerBot(AuthMixin):
             )
             return
         teams = self._load_teams()
-        total = sum(len(t.bots) for t in teams.values())
-        running = sum(
-            1
-            for team_name, t in teams.items()
-            for role in t.bots
-            if self._pm.status(f"team:{team_name}:{role}") == "running"
-        )
         await update.effective_message.reply_text(
-            f"Teams ({running}/{total} bots running):", reply_markup=markup
+            f"Teams ({len(teams)}):", reply_markup=markup
         )
 
     def _global_model_markup(self) -> InlineKeyboardMarkup:
@@ -1360,57 +1369,49 @@ class ManagerBot(AuthMixin):
                 await query.edit_message_text("No teams configured.")
             else:
                 teams = self._load_teams()
-                total = sum(len(t.bots) for t in teams.values())
-                running = sum(
-                    1
-                    for tname, t in teams.items()
-                    for r in t.bots
-                    if self._pm.status(f"team:{tname}:{r}") == "running"
-                )
                 await query.edit_message_text(
-                    f"Teams ({running}/{total} bots running):", reply_markup=markup
+                    f"Teams ({len(teams)}):", reply_markup=markup
                 )
 
         elif data.startswith("team_info_"):
-            team_name, role = data[len("team_info_"):].split(":", 1)
-            key = f"team:{team_name}:{role}"
-            status = self._pm.status(key)
-            await query.edit_message_text(
-                f"{team_name}/{role}: {status}",
-                reply_markup=self._team_detail_markup(team_name, role, status),
-            )
+            team_name = data[len("team_info_"):]
+            teams = self._load_teams()
+            team = teams.get(team_name)
+            if team is None:
+                await query.edit_message_text(f"Team '{team_name}' not found.")
+            else:
+                await query.edit_message_text(
+                    self._team_detail_text(team_name, team),
+                    reply_markup=self._team_detail_markup(team_name, team),
+                )
 
         elif data.startswith("team_start_"):
-            team_name, role = data[len("team_start_"):].split(":", 1)
-            self._pm.start_team(team_name, role)
-            key = f"team:{team_name}:{role}"
-            status = self._pm.status(key)
-            await query.edit_message_text(
-                f"{team_name}/{role}: {status}",
-                reply_markup=self._team_detail_markup(team_name, role, status),
-            )
+            team_name = data[len("team_start_"):]
+            teams = self._load_teams()
+            team = teams.get(team_name)
+            if team is None:
+                await query.edit_message_text(f"Team '{team_name}' not found.")
+            else:
+                for role in team.bots:
+                    self._pm.start_team(team_name, role)
+                await query.edit_message_text(
+                    self._team_detail_text(team_name, team),
+                    reply_markup=self._team_detail_markup(team_name, team),
+                )
 
         elif data.startswith("team_stop_"):
-            team_name, role = data[len("team_stop_"):].split(":", 1)
-            key = f"team:{team_name}:{role}"
-            self._pm.stop(key)
-            status = self._pm.status(key)
-            await query.edit_message_text(
-                f"{team_name}/{role}: {status}",
-                reply_markup=self._team_detail_markup(team_name, role, status),
-            )
-
-        elif data.startswith("team_logs_"):
-            team_name, role = data[len("team_logs_"):].split(":", 1)
-            key = f"team:{team_name}:{role}"
-            output = self._pm.logs(key)
-            if len(output) > 3500:
-                output = output[-3500:]
-            escaped = output.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            rows = [[InlineKeyboardButton("« Back", callback_data=f"team_info_{team_name}:{role}")]]
-            await query.edit_message_text(
-                f"<pre>{escaped}</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
-            )
+            team_name = data[len("team_stop_"):]
+            teams = self._load_teams()
+            team = teams.get(team_name)
+            if team is None:
+                await query.edit_message_text(f"Team '{team_name}' not found.")
+            else:
+                for role in team.bots:
+                    self._pm.stop(f"team:{team_name}:{role}")
+                await query.edit_message_text(
+                    self._team_detail_text(team_name, team),
+                    reply_markup=self._team_detail_markup(team_name, team),
+                )
 
         elif data == "setup_gh":
             ctx.user_data["setup_awaiting"] = "github_pat"

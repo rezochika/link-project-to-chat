@@ -353,7 +353,23 @@ def _write_team(proj_cfg: Path, team: str, bots: dict, group_chat_id: int = -100
 
 
 @pytest.mark.asyncio
-async def test_on_teams_lists_configured_teams(bot_env):
+async def test_on_teams_lists_one_button_per_team(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
+    _write_team(proj_cfg, "beta", {"manager": {"telegram_bot_token": "t3"}})
+    update, ctx = _make_update()
+    await bot._on_teams(update, ctx)
+    update.effective_message.reply_text.assert_called_once()
+    markup = update.effective_message.reply_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert button_datas == ["team_info_acme", "team_info_beta"]
+
+
+@pytest.mark.asyncio
+async def test_on_teams_button_label_shows_running_count(bot_env):
     bot, pm, proj_cfg = bot_env
     _write_team(proj_cfg, "acme", {
         "manager": {"telegram_bot_token": "t1"},
@@ -361,11 +377,9 @@ async def test_on_teams_lists_configured_teams(bot_env):
     })
     update, ctx = _make_update()
     await bot._on_teams(update, ctx)
-    update.effective_message.reply_text.assert_called_once()
     markup = update.effective_message.reply_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("team_info_acme:manager" == d for d in button_datas)
-    assert any("team_info_acme:dev" == d for d in button_datas)
+    labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert any("0/2" in label and "acme" in label for label in labels)
 
 
 @pytest.mark.asyncio
@@ -378,45 +392,57 @@ async def test_on_teams_empty_no_markup(bot_env):
 
 
 @pytest.mark.asyncio
-async def test_callback_team_info_shows_start_when_stopped(bot_env):
+async def test_callback_team_info_shows_start_and_per_bot_status(bot_env):
     bot, pm, proj_cfg = bot_env
-    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
-    update, ctx, query = _make_callback("team_info_acme:manager")
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
+    update, ctx, query = _make_callback("team_info_acme")
     await bot._on_callback(update, ctx)
+    text = query.edit_message_text.call_args[0][0]
+    assert "acme" in text
+    assert "manager" in text and "dev" in text
     markup = query.edit_message_text.call_args[1]["reply_markup"]
     button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("team_start_acme:manager" == d for d in button_datas)
-    assert not any("team_stop_acme:manager" == d for d in button_datas)
+    assert "team_start_acme" in button_datas
+    assert "team_back" in button_datas
 
 
 @pytest.mark.asyncio
-async def test_callback_team_start_invokes_start_team(bot_env):
+async def test_callback_team_start_invokes_start_team_for_each_bot(bot_env):
     bot, pm, proj_cfg = bot_env
-    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
     pm.start_team = MagicMock(return_value=True)
     pm.status = MagicMock(return_value="running")
-    update, ctx, query = _make_callback("team_start_acme:manager")
+    update, ctx, query = _make_callback("team_start_acme")
     await bot._on_callback(update, ctx)
-    pm.start_team.assert_called_once_with("acme", "manager")
-    query.edit_message_text.assert_called_once()
+    calls = {c.args for c in pm.start_team.call_args_list}
+    assert calls == {("acme", "manager"), ("acme", "dev")}
     markup = query.edit_message_text.call_args[1]["reply_markup"]
     button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("team_stop_acme:manager" == d for d in button_datas)
+    assert "team_stop_acme" in button_datas
 
 
 @pytest.mark.asyncio
-async def test_callback_team_stop_invokes_stop_with_team_key(bot_env):
+async def test_callback_team_stop_invokes_stop_for_each_bot(bot_env):
     bot, pm, proj_cfg = bot_env
-    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
     pm.stop = MagicMock(return_value=True)
     pm.status = MagicMock(return_value="stopped")
-    update, ctx, query = _make_callback("team_stop_acme:manager")
+    update, ctx, query = _make_callback("team_stop_acme")
     await bot._on_callback(update, ctx)
-    pm.stop.assert_called_once_with("team:acme:manager")
-    query.edit_message_text.assert_called_once()
+    stopped_keys = {c.args[0] for c in pm.stop.call_args_list}
+    assert stopped_keys == {"team:acme:manager", "team:acme:dev"}
     markup = query.edit_message_text.call_args[1]["reply_markup"]
     button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("team_start_acme:manager" == d for d in button_datas)
+    assert "team_start_acme" in button_datas
 
 
 @pytest.mark.asyncio
@@ -427,4 +453,4 @@ async def test_callback_team_back_relists_teams(bot_env):
     await bot._on_callback(update, ctx)
     markup = query.edit_message_text.call_args[1]["reply_markup"]
     button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("team_info_acme:manager" == d for d in button_datas)
+    assert "team_info_acme" in button_datas
