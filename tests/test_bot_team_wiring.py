@@ -1,6 +1,54 @@
 from pathlib import Path
 
 from link_project_to_chat.bot import ProjectBot
+from link_project_to_chat.transport import ChatKind, ChatRef, Identity, IncomingMessage, MessageRef
+from link_project_to_chat.transport.fake import FakeTransport
+
+
+def _team_bot_with_fake_transport(bot: ProjectBot) -> ProjectBot:
+    """Replace a team ProjectBot's _transport with a FakeTransport for assertion."""
+    bot._transport = FakeTransport()
+    return bot
+
+
+def _group_chat(chat_id: int) -> ChatRef:
+    return ChatRef(transport_id="fake", native_id=str(chat_id), kind=ChatKind.ROOM)
+
+
+def _sender_identity(uid: int, handle: str, is_bot: bool) -> Identity:
+    return Identity(
+        transport_id="fake", native_id=str(uid),
+        display_name=handle, handle=handle, is_bot=is_bot,
+    )
+
+
+def _group_incoming(
+    chat: ChatRef,
+    text: str,
+    *,
+    sender_uid: int = 1,
+    sender_handle: str = "rezo",
+    sender_is_bot: bool = False,
+    is_relayed: bool = False,
+    reply_to_bot_username: str | None = None,
+) -> IncomingMessage:
+    from types import SimpleNamespace
+    native = None
+    reply_to = None
+    if reply_to_bot_username:
+        reply_from_user = SimpleNamespace(username=reply_to_bot_username)
+        reply_native = SimpleNamespace(from_user=reply_from_user)
+        native = SimpleNamespace(reply_to_message=reply_native, message_id=1)
+        reply_to = MessageRef(transport_id="fake", native_id="0", chat=chat)
+    return IncomingMessage(
+        chat=chat,
+        sender=_sender_identity(uid=sender_uid, handle=sender_handle, is_bot=sender_is_bot),
+        text=text,
+        files=[],
+        reply_to=reply_to,
+        native=native,
+        is_relayed_bot_to_bot=is_relayed,
+    )
 
 
 def test_project_bot_derives_group_mode_from_team_args(tmp_path):
@@ -37,16 +85,18 @@ async def test_group_mode_rejects_wrong_chat_id(tmp_path):
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=-100_111,
     )
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_222  # wrong group
-    update.effective_message.text = "@acme_manager hi"
-    update.effective_message.reply_text = AsyncMock()
-    ctx = MagicMock()
-    ctx.user_data = {}
-    # Expect: early return, no reply_text call, no further processing
-    await bot._on_text(update, ctx)
-    update.effective_message.reply_text.assert_not_called()
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_claude = MagicMock()
+
+    # Wrong group — should be silently ignored by the group chat_id guard.
+    chat = _group_chat(-100_222)
+    incoming = _group_incoming(chat, "@acme_manager hi", sender_handle="rezoc666")
+    await bot._on_text_from_transport(incoming)
+
+    # No replies sent, no Claude submission.
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_claude.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -57,21 +107,17 @@ async def test_group_mode_allows_matching_chat_id_passes_routing(tmp_path):
         team_name="acme", role="manager", group_chat_id=-100_111,
     )
     bot.bot_username = "acme_manager"  # required by group_filters
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_111  # matching
-    update.effective_message.text = "no mention here"
-    update.effective_message.from_user = MagicMock(is_bot=False, username="someone")
-    update.effective_message.reply_to_message = None
-    update.effective_message.parse_entities = MagicMock(return_value={})
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    ctx = MagicMock()
-    ctx.user_data = {}
-    # Without an @mention this should still early-return (not addressed to bot),
-    # but NOT because of chat_id mismatch.
-    await bot._on_text(update, ctx)
-    update.effective_message.reply_text.assert_not_called()
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_claude = MagicMock()
+
+    # Matching chat, but no mention → not addressed to the bot (early return
+    # via is_directed_at_me=False, not the chat_id guard).
+    chat = _group_chat(-100_111)
+    incoming = _group_incoming(chat, "no mention here", sender_handle="someone")
+    await bot._on_text_from_transport(incoming)
+
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_claude.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -82,20 +128,18 @@ async def test_group_mode_no_chat_id_set_does_not_reject(tmp_path):
         team_name="acme", role="manager", group_chat_id=None,
     )
     bot.bot_username = "acme_manager"
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_999  # any group
-    update.effective_message.text = "no mention"
-    update.effective_message.from_user = MagicMock(is_bot=False, username="someone")
-    update.effective_message.reply_to_message = None
-    update.effective_message.parse_entities = MagicMock(return_value={})
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    ctx = MagicMock()
-    ctx.user_data = {}
-    # No mention → still no reply, but the early return came from is_directed_at_me, not the guard.
-    await bot._on_text(update, ctx)
-    update.effective_message.reply_text.assert_not_called()
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_claude = MagicMock()
+
+    # No chat_id bound — the guard does NOT fire. Capture would require a
+    # trusted user, and "someone" isn't in the allowed list, so capture is
+    # skipped. Then is_directed_at_me=False early-returns.
+    chat = _group_chat(-100_999)
+    incoming = _group_incoming(chat, "no mention", sender_handle="someone")
+    await bot._on_text_from_transport(incoming)
+
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_claude.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -108,26 +152,19 @@ async def test_first_group_message_captures_chat_id(tmp_path, monkeypatch):
     )
     bot.bot_username = "acme_manager"
     bot._auth = MagicMock(return_value=True)
+    _team_bot_with_fake_transport(bot)
 
     captured = []
     def fake_patch_team(name, fields, *args, **kwargs):
         captured.append((name, fields))
     monkeypatch.setattr("link_project_to_chat.bot.patch_team", fake_patch_team)
 
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_999
-    update.effective_message.text = "@acme_manager hi"
-    update.effective_message.from_user = MagicMock(is_bot=False, username="rezoc666")
-    update.effective_message.reply_to_message = None
-    update.effective_message.parse_entities = MagicMock(return_value={})
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    update.effective_chat = MagicMock(id=-100_999)
-    ctx = MagicMock()
-    ctx.user_data = {}
-
-    await bot._on_text(update, ctx)
+    chat = _group_chat(-100_999)
+    incoming = _group_incoming(
+        chat, "@acme_manager hi",
+        sender_uid=12345, sender_handle="rezoc666",
+    )
+    await bot._on_text_from_transport(incoming)
 
     # Capture happened
     assert captured == [("acme", {"group_chat_id": -100_999})]
@@ -144,26 +181,19 @@ async def test_unauth_user_does_not_trigger_capture(tmp_path, monkeypatch):
     )
     bot.bot_username = "acme_manager"
     bot._auth = MagicMock(return_value=False)  # unauthorized
+    _team_bot_with_fake_transport(bot)
 
     captured = []
     def fake_patch_team(name, fields, *args, **kwargs):
         captured.append((name, fields))
     monkeypatch.setattr("link_project_to_chat.bot.patch_team", fake_patch_team)
 
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_999
-    update.effective_message.text = "@acme_manager hi"
-    update.effective_message.from_user = MagicMock(is_bot=False, username="randoc")
-    update.effective_message.reply_to_message = None
-    update.effective_message.parse_entities = MagicMock(return_value={})
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=99999)
-    update.effective_chat = MagicMock(id=-100_999)
-    ctx = MagicMock()
-    ctx.user_data = {}
-
-    await bot._on_text(update, ctx)
+    chat = _group_chat(-100_999)
+    incoming = _group_incoming(
+        chat, "@acme_manager hi",
+        sender_uid=99999, sender_handle="randoc",
+    )
+    await bot._on_text_from_transport(incoming)
 
     assert captured == []
     assert bot.group_chat_id == 0  # unchanged
@@ -179,34 +209,30 @@ async def test_second_message_after_capture_routes_normally(tmp_path, monkeypatc
     )
     bot.bot_username = "acme_manager"
     bot._auth = MagicMock(return_value=True)
+    _team_bot_with_fake_transport(bot)
 
     captured = []
     def fake_patch_team(name, fields, *args, **kwargs):
         captured.append((name, fields))
     monkeypatch.setattr("link_project_to_chat.bot.patch_team", fake_patch_team)
 
-    def _make_update(chat_id):
-        u = MagicMock()
-        u.effective_message = MagicMock()
-        u.effective_message.chat_id = chat_id
-        u.effective_message.text = "@acme_manager hi"
-        u.effective_message.from_user = MagicMock(is_bot=False, username="rezoc666")
-        u.effective_message.reply_to_message = None
-        u.effective_message.parse_entities = MagicMock(return_value={})
-        u.effective_message.reply_text = AsyncMock()
-        u.effective_user = MagicMock(id=12345)
-        u.effective_chat = MagicMock(id=chat_id)
-        return u, MagicMock(user_data={})
+    chat = _group_chat(-100_999)
 
     # First message captures.
-    u1, c1 = _make_update(-100_999)
-    await bot._on_text(u1, c1)
+    incoming1 = _group_incoming(
+        chat, "@acme_manager hi",
+        sender_uid=12345, sender_handle="rezoc666",
+    )
+    await bot._on_text_from_transport(incoming1)
     assert captured == [("acme", {"group_chat_id": -100_999})]
     assert bot.group_chat_id == -100_999
 
     # Second message: must NOT re-trigger capture.
-    u2, c2 = _make_update(-100_999)
-    await bot._on_text(u2, c2)
+    incoming2 = _group_incoming(
+        chat, "@acme_manager hi",
+        sender_uid=12345, sender_handle="rezoc666",
+    )
+    await bot._on_text_from_transport(incoming2)
     assert captured == [("acme", {"group_chat_id": -100_999})]  # still only one entry
 
 
@@ -220,27 +246,23 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
     )
     bot.bot_username = "acme_manager"
     bot._auth = MagicMock(return_value=True)
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_claude = MagicMock()
 
     captured = []
     monkeypatch.setattr("link_project_to_chat.bot.patch_team", lambda *a, **k: captured.append(a))
 
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.chat_id = -100_222  # wrong group
-    update.effective_message.text = "@acme_manager hi"
-    update.effective_message.from_user = MagicMock(is_bot=False, username="rezoc666")
-    update.effective_message.reply_to_message = None
-    update.effective_message.parse_entities = MagicMock(return_value={})
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    update.effective_chat = MagicMock(id=-100_222)
-    ctx = MagicMock(user_data={})
+    chat = _group_chat(-100_222)  # wrong group
+    incoming = _group_incoming(
+        chat, "@acme_manager hi",
+        sender_uid=12345, sender_handle="rezoc666",
+    )
+    await bot._on_text_from_transport(incoming)
 
-    await bot._on_text(update, ctx)
-
-    # No capture should happen, no reply should be sent
+    # No capture should happen, nothing sent, no Claude submission.
     assert captured == []
-    update.effective_message.reply_text.assert_not_called()
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_claude.assert_not_called()
 
 
 # --- settings callbacks must work in group chats for team bots ---
