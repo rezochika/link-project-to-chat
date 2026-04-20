@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
-from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
 
 from .config import (
@@ -508,7 +507,7 @@ class ProjectBot(AuthMixin):
                 reply_markup=self._question_buttons(task.id, q_idx, question),
             )
 
-    async def _on_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_start(self, update, ctx) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(
@@ -572,7 +571,7 @@ class ProjectBot(AuthMixin):
             "This message type is not supported. Please send text, a voice message, or a file.",
         )
 
-    async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_text(self, update, ctx) -> None:
         msg = update.effective_message
         if not msg:
             return
@@ -663,7 +662,7 @@ class ProjectBot(AuthMixin):
             prompt=prompt,
         )
 
-    async def _on_run(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_run(self, update, ctx) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         if not ctx.args:
@@ -841,7 +840,7 @@ class ProjectBot(AuthMixin):
             message_id=int(ci.message.native_id),
         )
 
-    async def _on_version(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_version(self, update, ctx) -> None:
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
@@ -856,7 +855,7 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         await self._transport.send_text(ci.chat, f"link-project-to-chat v{__version__}")
 
-    async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_help(self, update, ctx) -> None:
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
@@ -1133,7 +1132,7 @@ class ProjectBot(AuthMixin):
         self._persist_active_persona(None)
         await self._transport.send_text(ci.chat, f"Persona '{old}' deactivated.")
 
-    async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_halt(self, update, ctx) -> None:
         if not self.group_mode:
             return await update.effective_message.reply_text("/halt is only available in group mode.")
         if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
@@ -1143,7 +1142,7 @@ class ProjectBot(AuthMixin):
         self._group_state.halt(update.effective_chat.id)
         await update.effective_message.reply_text("Halted. Use /resume to continue.")
 
-    async def _on_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_resume(self, update, ctx) -> None:
         if not self.group_mode:
             return await update.effective_message.reply_text("/resume is only available in group mode.")
         if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
@@ -1198,7 +1197,7 @@ class ProjectBot(AuthMixin):
             ci.chat, f"Delete {icon} {persona.source} persona '{name}'?", buttons=buttons,
         )
 
-    async def _on_voice_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_voice_status(self, update, ctx) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         if self._transcriber:
@@ -1514,7 +1513,7 @@ class ProjectBot(AuthMixin):
         ]
         return "\n".join(lines)
 
-    async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _on_status(self, update, ctx) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(self._compose_status())
