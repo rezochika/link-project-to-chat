@@ -22,6 +22,8 @@ from .base import (
 
 TRANSPORT_ID = "telegram"
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
 
 def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
     """Convert a Buttons primitive to telegram's InlineKeyboardMarkup (or None)."""
@@ -154,7 +156,19 @@ class TelegramTransport:
         caption: str | None = None,
         display_name: str | None = None,
     ) -> MessageRef:
-        raise NotImplementedError("Wired in Task 22")
+        suffix = path.suffix.lower()
+        chat_id = int(chat.native_id)
+        if suffix in _IMAGE_SUFFIXES:
+            with path.open("rb") as fh:
+                native = await self._app.bot.send_photo(
+                    chat_id=chat_id, photo=fh, caption=caption,
+                )
+        else:
+            with path.open("rb") as fh:
+                native = await self._app.bot.send_document(
+                    chat_id=chat_id, document=fh, caption=caption, filename=display_name,
+                )
+        return message_ref_from_telegram(native)
 
     # ── Inbound dispatch ──────────────────────────────────────────────────
     async def _dispatch_message(self, update: Any, ctx: Any) -> None:

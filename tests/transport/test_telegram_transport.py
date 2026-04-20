@@ -237,6 +237,40 @@ async def test_incoming_message_populates_files_from_document(tmp_path):
     assert captured[0].text == "see this file"
 
 
+async def test_send_file_calls_send_document_for_non_image(tmp_path):
+    t, bot = _make_transport_with_mock_bot()
+    bot.send_document = AsyncMock(return_value=SimpleNamespace(
+        message_id=200, chat=SimpleNamespace(id=12345, type="private"),
+    ))
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    path = tmp_path / "notes.txt"
+    path.write_text("x")
+
+    ref = await t.send_file(chat, path, caption="see")
+
+    bot.send_document.assert_awaited_once()
+    kwargs = bot.send_document.call_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["caption"] == "see"
+    assert ref.native_id == "200"
+
+
+async def test_send_file_calls_send_photo_for_image(tmp_path):
+    t, bot = _make_transport_with_mock_bot()
+    bot.send_photo = AsyncMock(return_value=SimpleNamespace(
+        message_id=201, chat=SimpleNamespace(id=12345, type="private"),
+    ))
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    path = tmp_path / "pic.png"
+    path.write_bytes(b"\x89PNG\r\n")
+
+    await t.send_file(chat, path)
+
+    bot.send_photo.assert_awaited_once()
+
+
 async def test_on_button_fires_for_telegram_callback_query():
     t, _bot = _make_transport_with_mock_bot()
     captured: list = []
