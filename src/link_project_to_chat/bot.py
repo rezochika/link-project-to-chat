@@ -116,6 +116,7 @@ class ProjectBot(AuthMixin):
         self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
         self._app = None
+        self._transport = None  # TelegramTransport — set in _build_app
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._live_text: dict[int, LiveMessage] = {}
         self._live_thinking: dict[int, LiveMessage] = {}
@@ -1509,7 +1510,10 @@ class ProjectBot(AuthMixin):
         else:
             text = "This message type isn't supported. Please type your message or send a file."
 
-        await msg.reply_text(text)
+        from .transport.telegram import chat_ref_from_telegram
+        chat = chat_ref_from_telegram(msg.chat)
+        assert self._transport is not None
+        await self._transport.send_text(chat, text)
 
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 
@@ -1620,6 +1624,8 @@ class ProjectBot(AuthMixin):
             .build()
         )
         self._app = app
+        from .transport.telegram import TelegramTransport
+        self._transport = TelegramTransport(app)
         handlers = {
             "start": self._on_start,
             "run": self._on_run,
