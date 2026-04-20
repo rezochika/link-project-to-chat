@@ -17,6 +17,7 @@ from .base import (
     Transport,
 )
 from .fake import EditedMessage, FakeTransport, SentFile, SentMessage
+from .telegram import TelegramTransport
 
 __all__ = [
     "Button",
@@ -37,5 +38,6 @@ __all__ = [
     "MessageRef",
     "SentFile",
     "SentMessage",
+    "TelegramTransport",
     "Transport",
 ]
