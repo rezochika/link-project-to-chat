@@ -49,6 +49,14 @@
   - `StreamingMessage` transport-agnostic streaming-edit helper with throttling, chunking, HTML rendering on finalize, and `TransportRetryAfter` back-off (replaces `livestream.LiveMessage` in the project bot)
   - `bot.py` only imports `Update`, `ContextTypes`, `MessageHandler`, and `filters` from telegram (voice + unsupported-type handlers, pending spec #0b)
   - `tests/test_transport_lockout.py` prevents future direct-telegram coupling via an import allowlist
+- **Voice port — transport complete** (spec #0b, v0.14.0):
+  - `Transport.send_voice` primitive added; TelegramTransport and FakeTransport both implement
+  - Voice/audio messages arrive as `IncomingFile` with `audio/*` mime type through the same `on_message` path as text/files
+  - `_on_voice_from_transport` replaces legacy `_on_voice`; consumes `IncomingMessage` directly
+  - `_send_voice_response` uses `transport.send_voice`
+  - Unsupported message types (sticker, video_note, location, contact, etc.) collapse to a single generic fallback reply
+  - `_on_error` and `_post_init` moved into TelegramTransport; bot.py registers `_after_ready` via `Transport.on_ready`
+  - **bot.py has zero telegram imports.** Lockout test enforces empty allowlist.
 
 ## Coding Style
 - Single-purpose functions
@@ -66,7 +74,6 @@
 - `chmod 0o600` missing from `clear_session()` write path
 - No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
-- Voice handling still uses legacy telegram types (pending spec #0b — Transport port for voice)
 - Group/team features (team_relay, group_filters, group_state) still telegram-specific (pending spec #0a)
 - Manager bot (`manager/bot.py`) still telegram-specific (pending spec #0c)
 - `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it
