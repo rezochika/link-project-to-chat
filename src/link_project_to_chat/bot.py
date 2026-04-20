@@ -402,19 +402,31 @@ class ProjectBot(AuthMixin):
         self._probe_tasks.add(task)
         task.add_done_callback(self._probe_tasks.discard)
 
-    async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+    async def _send_voice_response(
+        self, chat_id: int, text: str, reply_to: int | None = None
+    ) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
         voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Strip markdown formatting for cleaner speech
         plain = strip_html(md_to_telegram(text))
-        # OpenAI TTS has a 4096 char limit per request
         if len(plain) > 4096:
             plain = plain[:4093] + "..."
         out_path = voice_dir / f"tts_{uuid.uuid4().hex}.opus"
+
+        assert self._transport is not None
+        chat = ChatRef(
+            transport_id="telegram",
+            native_id=str(chat_id),
+            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
+        )
+        reply_ref: MessageRef | None = None
+        if reply_to is not None:
+            reply_ref = MessageRef(
+                transport_id="telegram", native_id=str(reply_to), chat=chat,
+            )
+
         try:
             await self._synthesizer.synthesize(plain, out_path)
-            with out_path.open("rb") as f:
-                await self._app.bot.send_voice(chat_id, f, reply_to_message_id=reply_to)
+            await self._transport.send_voice(chat, out_path, reply_to=reply_ref)
         except Exception:
             logger.warning("TTS failed", exc_info=True)
         finally:
