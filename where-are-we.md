@@ -42,6 +42,13 @@
   - `task_manager.py`: extracted `_submit` helper used by `submit_claude` and `submit_compact`
   - `bot.py`: extracted `_CMD_HELP`, `_parse_task_id`, `_send_html`, `_send_stream_result`; split `_on_task_complete` into `_finalize_claude_task` and `_finalize_command_task`
   - `manager/config.py`: extracted `_load_json` helper; `resolve_flags` uses `vars(defaults)` to auto-include all `PermissionDefaults` fields
+- **Transport abstraction** (spec #0, v0.13.0):
+  - `Transport` Protocol + primitive types (`ChatRef`, `Identity`, `MessageRef`, `Buttons`, `IncomingMessage`, `IncomingFile`, `CommandInvocation`) in `src/link_project_to_chat/transport/`
+  - `TelegramTransport` implementation wraps python-telegram-bot end-to-end: send_text/edit_text (with html + reply_to), send_file, send_typing, on_message/on_command/on_button, and build() + attach_telegram_routing() for bootstrap
+  - `FakeTransport` in-memory double for tests; parametrized contract test in `tests/transport/test_contract.py` enforces the Protocol across all implementations
+  - `StreamingMessage` transport-agnostic streaming-edit helper with throttling, chunking, HTML rendering on finalize, and `TransportRetryAfter` back-off (replaces `livestream.LiveMessage` in the project bot)
+  - `bot.py` only imports `Update`, `ContextTypes`, `MessageHandler`, and `filters` from telegram (voice + unsupported-type handlers, pending spec #0b)
+  - `tests/test_transport_lockout.py` prevents future direct-telegram coupling via an import allowlist
 
 ## Coding Style
 - Single-purpose functions
@@ -55,9 +62,11 @@
 
 ## Pending
 - Stream state (`_stream_messages`, `_stream_text`) not cleaned up on cancel
-- Open file handles in `_send_image` (`open(path, "rb")` passed directly without closing)
-- File uploads stored permanently in project dir — consider `/tmp/{project_name}/` for temp files
 - `_proc` on `ClaudeClient` is a single slot — concurrent Claude tasks could overwrite it
 - `chmod 0o600` missing from `clear_session()` write path
 - No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
+- Voice handling still uses legacy telegram types (pending spec #0b — Transport port for voice)
+- Group/team features (team_relay, group_filters, group_state) still telegram-specific (pending spec #0a)
+- Manager bot (`manager/bot.py`) still telegram-specific (pending spec #0c)
+- `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it
