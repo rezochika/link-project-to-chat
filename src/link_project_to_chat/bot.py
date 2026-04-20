@@ -1662,115 +1662,6 @@ class ProjectBot(AuthMixin):
                 status_ref, f"Transcription failed: {error_summary}",
             )
 
-    async def _on_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle voice messages and audio files."""
-        msg = update.effective_message
-        if not msg or not update.effective_chat:
-            return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-        if self._rate_limited(update.effective_user.id):
-            return await msg.reply_text("Rate limited. Try again shortly.")
-
-        if not self._transcriber:
-            return await msg.reply_text(
-                "Voice messages aren't configured. "
-                "Set up STT with: link-project-to-chat setup --stt-backend whisper-api"
-            )
-
-        voice = msg.voice or msg.audio
-        if not voice:
-            return await msg.reply_text("Could not read voice message.")
-
-        # Telegram Bot API caps file downloads at 20 MB.
-        MAX_VOICE_BYTES = 20 * 1024 * 1024
-        if voice.file_size and voice.file_size > MAX_VOICE_BYTES:
-            size_mb = voice.file_size // (1024 * 1024)
-            return await msg.reply_text(
-                f"Audio too large ({size_mb} MB). Telegram Bot API limit is 20 MB."
-            )
-
-        status_msg = await msg.reply_text("🎤 Transcribing...")
-
-        voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "voice"
-        voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-        ogg_path = voice_dir / f"voice_{uuid.uuid4().hex}.ogg"
-
-        try:
-            file = await voice.get_file()
-            await file.download_to_drive(str(ogg_path))
-
-            text = await self._transcriber.transcribe(ogg_path)
-
-            if not text or not text.strip():
-                await status_msg.edit_text("Could not transcribe the voice message (empty result).")
-                return
-
-            # Show the transcript (truncated for status display)
-            display = text if len(text) <= 200 else text[:200] + "..."
-            await status_msg.edit_text(f'🎤 "{display}"')
-
-            # If Claude is waiting on a question, route transcript as the answer.
-            waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
-            if waiting:
-                self.task_manager.submit_answer(waiting.id, text)
-                return
-
-            # Build prompt with optional reply context
-            prompt = text
-            if msg.reply_to_message and msg.reply_to_message.text:
-                prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
-
-            # Apply active persona
-            if self._active_persona:
-                from .skills import load_persona, format_persona_prompt
-                persona = load_persona(self._active_persona, self.path)
-                if persona:
-                    prompt = format_persona_prompt(persona, prompt)
-
-            task = self.task_manager.submit_claude(
-                chat_id=update.effective_chat.id,
-                message_id=msg.message_id,
-                prompt=prompt,
-            )
-            if self._synthesizer:
-                self._voice_tasks.add(task.id)
-
-        except Exception as e:
-            logger.exception("Voice transcription failed")
-            # Sanitize: only the first line, hard-truncated, to avoid leaking
-            # API keys or full request payloads in SDK error messages.
-            error_summary = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
-            await status_msg.edit_text(f"Transcription failed: {error_summary}")
-        finally:
-            if ogg_path.exists():
-                try:
-                    ogg_path.unlink()
-                except OSError:
-                    pass
-
-    async def _on_unsupported(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        if not msg:
-            return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-
-        if msg.video_note:
-            text = "Video notes aren't supported yet. Please type your message or send a voice message."
-        elif msg.sticker:
-            text = "Stickers aren't supported. Please type your message."
-        elif msg.video:
-            text = "Video messages aren't supported. Please type your message."
-        else:
-            text = "This message type isn't supported. Please type your message or send a file."
-
-        from .transport.telegram import chat_ref_from_telegram
-        chat = chat_ref_from_telegram(msg.chat)
-        assert self._transport is not None
-        await self._transport.send_text(chat, text)
-
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 
     def _is_image(self, path: str) -> bool:
@@ -1918,22 +1809,6 @@ class ProjectBot(AuthMixin):
             group_mode=self.group_mode,
             command_names=all_command_names,
         )
-
-        # Legacy auxiliary handlers — voice + unsupported types live in bot.py
-        # until spec #0b (voice port) lands; registered directly via telegram
-        # filters because they're transport-model-specific.
-        if not self.group_mode:
-            private = filters.ChatType.PRIVATE
-            voice_filter = private & (filters.VOICE | filters.AUDIO)
-            app.add_handler(MessageHandler(voice_filter, self._on_voice))
-            unsupported_filter = private & (
-                filters.VIDEO_NOTE
-                | filters.Sticker.ALL
-                | filters.VIDEO
-                | filters.LOCATION
-                | filters.CONTACT
-            )
-            app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
         app.add_error_handler(self._on_error)
         return app
