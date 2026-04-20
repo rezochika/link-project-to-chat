@@ -31,10 +31,20 @@ class ProjectConfig:
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
     session_id: str | None = None
     autostart: bool = False
-    group_mode: bool = False
-    group_chat_id: int | None = None
-    role: str | None = None  # "manager" or "dev" when group_mode=true
     active_persona: str | None = None
+
+
+@dataclass
+class TeamBotConfig:
+    telegram_bot_token: str
+    active_persona: str | None = None
+
+
+@dataclass
+class TeamConfig:
+    path: str
+    group_chat_id: int = 0  # 0 = sentinel "not yet captured"
+    bots: dict[str, TeamBotConfig] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,6 +64,7 @@ class Config:
     tts_voice: str = "alloy"        # OpenAI TTS voice
     default_model: str = ""          # global default model for all projects
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
+    teams: dict[str, TeamConfig] = field(default_factory=dict)
 
 
 def _load_permissions(proj: dict) -> str | None:
@@ -126,10 +137,19 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 permissions=_load_permissions(proj),
                 session_id=proj.get("session_id"),
                 autostart=proj.get("autostart", False),
-                group_mode=proj.get("group_mode", False),
-                group_chat_id=proj.get("group_chat_id"),
-                role=proj.get("role"),
                 active_persona=proj.get("active_persona"),
+            )
+        for name, team in raw.get("teams", {}).items():
+            config.teams[name] = TeamConfig(
+                path=team["path"],
+                group_chat_id=team["group_chat_id"],
+                bots={
+                    role: TeamBotConfig(
+                        telegram_bot_token=b.get("telegram_bot_token", ""),
+                        active_persona=b.get("active_persona"),
+                    )
+                    for role, b in team.get("bots", {}).items()
+                },
             )
     return config
 
@@ -229,20 +249,28 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         else:
             proj.pop("session_id", None)
         proj["autostart"] = p.autostart
-        proj["group_mode"] = p.group_mode
-        if p.group_chat_id is not None:
-            proj["group_chat_id"] = p.group_chat_id
-        else:
-            proj.pop("group_chat_id", None)
-        if p.role:
-            proj["role"] = p.role
-        else:
-            proj.pop("role", None)
         if p.active_persona:
             proj["active_persona"] = p.active_persona
         else:
             proj.pop("active_persona", None)
         existing_projects[name] = proj
+    # Merge teams
+    existing_teams: dict = raw.get("teams", {})
+    for name, team in config.teams.items():
+        entry = existing_teams.get(name, {})
+        entry["path"] = team.path
+        entry["group_chat_id"] = team.group_chat_id
+        entry["bots"] = {
+            role: {
+                "telegram_bot_token": b.telegram_bot_token,
+                **({"active_persona": b.active_persona} if b.active_persona else {}),
+            }
+            for role, b in team.bots.items()
+        }
+        existing_teams[name] = entry
+    raw["teams"] = {k: v for k, v in existing_teams.items() if k in config.teams}
+    if not raw["teams"]:
+        raw.pop("teams", None)
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
     _atomic_write(path, json.dumps(raw, indent=2) + "\n")
@@ -310,6 +338,47 @@ def patch_project(project_name: str, fields: dict, path: Path = DEFAULT_CONFIG) 
             else:
                 proj[k] = v
     _patch_json(_patch, path)
+
+
+def patch_team(team_name: str, fields: dict, path: Path = DEFAULT_CONFIG) -> None:
+    """Update specific fields on a team entry. None values remove the key.
+
+    Top-level replacement only: passing {"bots": {...}} replaces the entire
+    `bots` dict (not a deep merge). Callers that need to update one bot must
+    read the current team, modify the bots dict, and write it back whole.
+    """
+    def _patch(raw: dict) -> None:
+        team = raw.setdefault("teams", {}).setdefault(team_name, {})
+        for k, v in fields.items():
+            if v is None:
+                team.pop(k, None)
+            else:
+                team[k] = v
+    _patch_json(_patch, path)
+
+
+def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
+    """Load all team entries. Returns empty dict if the file is missing or invalid."""
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+            return {
+                name: TeamConfig(
+                    path=team["path"],
+                    group_chat_id=team["group_chat_id"],
+                    bots={
+                        role: TeamBotConfig(
+                            telegram_bot_token=b.get("telegram_bot_token", ""),
+                            active_persona=b.get("active_persona"),
+                        )
+                        for role, b in team.get("bots", {}).items()
+                    },
+                )
+                for name, team in raw.get("teams", {}).items()
+            }
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+    return {}
 
 
 def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:

@@ -1,7 +1,7 @@
 # `/create_team` Manager Command — Design Spec
 
-**Status:** Approved via brainstorming
-**Date:** 2026-04-17
+**Status:** Implemented (2026-04-19) on `feat/dual-agent-team-merged` via the unified delivery plan at `docs/superpowers/plans/2026-04-19-dual-agent-team-merged.md`. The `TeamConfig` / `TeamBotConfig` data model and `/create_team` ConversationHandler (manager command) are live; manual end-to-end verification (G1) and rollback verification (G2) deferred to actual deployment since they require live Telegram + BotFather + Telethon credentials.
+**Date:** 2026-04-17 (designed); 2026-04-19 (implemented)
 **Supersedes (in part):** `2026-04-17-dual-agent-ai-team-design.md` — specifically its "No automated Telegram group creation" non-goal, and its "two project entries with a shared `group_chat_id`" data model.
 
 ---

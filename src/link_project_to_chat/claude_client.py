@@ -33,6 +33,45 @@ def _sanitize_error(text: str) -> str:
     return first_line
 
 
+_USAGE_CAP_PATTERNS = (
+    "usage limit",
+    "rate_limit_error",
+    "anthropic-ratelimit",
+    "you've reached your usage",
+)
+
+
+def _detect_usage_cap(stderr: str) -> bool:
+    """Return True if the stderr text looks like a Claude usage-cap or rate-limit error."""
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return any(p in lowered for p in _USAGE_CAP_PATTERNS)
+
+
+def is_usage_cap_error(message: str | None) -> bool:
+    """Return True if `message` was produced as a USAGE_CAP-marked error.
+
+    Single source of truth for "is this string a usage-cap signal?" — used by
+    both `_finalize_claude_task` (to branch on the marker) and the cap probe
+    (to confirm a probe response is not still capped).
+    """
+    if not message:
+        return False
+    return message.startswith("USAGE_CAP:") or _detect_usage_cap(message)
+
+
+class ClaudeUsageCapError(Exception):
+    """Reserved exception type for Claude usage-cap / rate-limit signals.
+
+    Currently the cap signal flows through the existing stream contract as
+    ``Error(message="USAGE_CAP:" + ...)`` rather than as a raised exception
+    (preserves the AsyncGenerator yield semantics in `_read_events`). The class
+    is exported so consumers can isinstance-check if a future revision starts
+    raising it directly.
+    """
+
+
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
@@ -254,7 +293,10 @@ class ClaudeClient:
         await asyncio.to_thread(proc.wait)
         if proc.returncode != 0:
             err = stderr_bytes.decode("utf-8", errors="replace").strip()
-            yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
+            if _detect_usage_cap(err):
+                yield Error(message="USAGE_CAP:" + _sanitize_error(err))
+            else:
+                yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
         # Clean up reference
         if self._proc is proc:
             self._proc = None

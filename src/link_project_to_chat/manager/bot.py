@@ -34,6 +34,7 @@ COMMANDS = [
     ("remove_user", "Remove an authorized user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
+    ("create_team", "Create a dual-agent team (2 bots + group)"),
     ("model", "Set default model for all projects"),
     ("version", "Show version"),
     ("help", "Show commands"),
@@ -51,6 +52,22 @@ MODEL_OPTIONS = [
 ]
 
 
+def _build_persona_keyboard(project_path: Path, callback_prefix: str) -> InlineKeyboardMarkup:
+    """Build an inline keyboard listing discovered personas for the given project.
+
+    Each button's callback_data is f'{callback_prefix}:{persona_name}'.
+    """
+    from ..skills import load_personas
+    personas = load_personas(project_path)
+    # load_personas may return a dict (name -> content) or a list of names
+    names = sorted(personas.keys() if hasattr(personas, "keys") else personas)
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"{callback_prefix}:{name}")]
+        for name in names
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
 def _parse_edit_callback(data: str) -> tuple[str, str] | None:
     """Parse 'proj_efld_<field>_<name>' → (field, name). Field comes first."""
     suffix = data[len("proj_efld_"):]
@@ -59,6 +76,61 @@ def _parse_edit_callback(data: str) -> tuple[str, str] | None:
             name = suffix[len(field) + 1:]
             return field, name
     return None
+
+
+def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | None:
+    """Return an error string if pre-flight fails, None if OK.
+
+    When ``prefix`` is None, only checks credential prereqs (Telethon, GitHub).
+    When ``prefix`` is given, additionally checks for team-name and legacy project-name
+    collisions.
+    """
+    from ..config import load_config
+    from ..github_client import _gh_available
+
+    config = load_config(cfg_path)
+
+    if not config.telegram_api_id or not config.telegram_api_hash:
+        return "Run `/setup` first — Telegram API credentials are not configured."
+    session_file = cfg_path.parent / "telethon.session"
+    if not session_file.exists():
+        return "Run `/setup` first — Telethon session is not established."
+
+    if not config.github_pat and not _gh_available():
+        return "GitHub auth missing — run `/setup` with a PAT, or authenticate `gh` CLI."
+
+    if prefix is None:
+        return None
+
+    if prefix in config.teams:
+        return f"Team `{prefix}` is already configured."
+
+    legacy_names = [f"{prefix}_mgr", f"{prefix}_dev"]
+    taken = [n for n in legacy_names if n in config.projects]
+    if taken:
+        return f"Those project names are taken: {', '.join(taken)}. Pick a different prefix."
+
+    return None
+
+
+async def _create_bot_with_retry(bfc, display_name: str, base_username: str, max_attempts: int = 5) -> tuple[str, str]:
+    """Try creating a bot with base_username; on failure append _1/_2/..., up to max_attempts."""
+    suffix_insert_at = base_username.rfind("_claude_bot")
+    if suffix_insert_at == -1:
+        suffix_insert_at = len(base_username)
+
+    for attempt in range(max_attempts):
+        if attempt == 0:
+            candidate = base_username
+        else:
+            candidate = base_username[:suffix_insert_at] + f"_{attempt}" + base_username[suffix_insert_at:]
+        try:
+            token = await bfc.create_bot(display_name, candidate)
+            return token, candidate
+        except Exception:
+            if attempt == max_attempts - 1:
+                break
+    raise RuntimeError(f"Bot username unavailable after {max_attempts} attempts (base={base_username})")
 
 
 class ManagerBot(AuthMixin):
@@ -192,6 +264,16 @@ class ManagerBot(AuthMixin):
 
     # ConversationHandler states for /create_project
     CREATE_SOURCE, CREATE_REPO_LIST, CREATE_REPO_URL, CREATE_NAME, CREATE_NAME_INPUT, CREATE_BOT, CREATE_CLONE = range(11, 18)
+
+    # ConversationHandler states for /create_team
+    (
+        CREATE_TEAM_SOURCE,
+        CREATE_TEAM_REPO_LIST,
+        CREATE_TEAM_REPO_URL,
+        CREATE_TEAM_NAME,
+        CREATE_TEAM_PERSONA_MGR,
+        CREATE_TEAM_PERSONA_DEV,
+    ) = range(18, 24)
 
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -547,10 +629,10 @@ class ManagerBot(AuthMixin):
             return self.CREATE_REPO_URL
         return ConversationHandler.END
 
-    async def _show_repo_page(self, query, ctx, page: int) -> int:
+    async def _show_repo_page(self, query, ctx, page: int, user_data_key: str = "create") -> int:
         from ..github_client import GitHubClient
         from ..config import load_config
-        path = Path(ctx.user_data["create"]["config_path"])
+        path = Path(ctx.user_data[user_data_key]["config_path"])
         config = load_config(path)
         gh = GitHubClient(pat=config.github_pat)
         try:
@@ -563,8 +645,8 @@ class ManagerBot(AuthMixin):
         if not repos:
             await query.edit_message_text("No repos found.")
             return ConversationHandler.END
-        ctx.user_data["create"]["repos"] = {r.full_name: r.__dict__ for r in repos}
-        ctx.user_data["create"]["page"] = page
+        ctx.user_data[user_data_key]["repos"] = {r.full_name: r.__dict__ for r in repos}
+        ctx.user_data[user_data_key]["page"] = page
         buttons = [
             [InlineKeyboardButton(
                 f"{'🔒 ' if r.private else ''}{r.name}",
@@ -581,25 +663,30 @@ class ManagerBot(AuthMixin):
             buttons.append(nav)
         buttons.append([InlineKeyboardButton("Cancel", callback_data="create_cancel")])
         await query.edit_message_text("Select a repo:", reply_markup=InlineKeyboardMarkup(buttons))
-        return self.CREATE_REPO_LIST
+        return self.CREATE_TEAM_REPO_LIST if user_data_key == "create_team" else self.CREATE_REPO_LIST
 
-    async def _create_repo_list_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _create_repo_list_callback(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_data_key: str = "create"
+    ) -> int:
         query = update.callback_query
         await query.answer()
         data = query.data
         if data.startswith("create_page_"):
             page = int(data.split("_")[-1])
-            return await self._show_repo_page(query, ctx, page)
+            return await self._show_repo_page(query, ctx, page, user_data_key=user_data_key)
         elif data.startswith("create_repo_"):
             full_name = data[len("create_repo_"):]
-            repos = ctx.user_data["create"].get("repos", {})
+            repos = ctx.user_data[user_data_key].get("repos", {})
             if full_name not in repos:
                 await query.edit_message_text("Repo not found. Try again.")
                 return ConversationHandler.END
             repo_data = repos[full_name]
-            ctx.user_data["create"]["repo"] = repo_data
+            ctx.user_data[user_data_key]["repo"] = repo_data
             suggested_name = repo_data["name"]
-            ctx.user_data["create"]["suggested_name"] = suggested_name
+            ctx.user_data[user_data_key]["suggested_name"] = suggested_name
+            if user_data_key == "create_team":
+                await query.edit_message_text("Short project name?")
+                return self.CREATE_TEAM_NAME
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
                 [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
@@ -607,31 +694,36 @@ class ManagerBot(AuthMixin):
             await query.edit_message_text(f"Project name?", reply_markup=markup)
             return self.CREATE_NAME
         elif data == "create_cancel":
-            ctx.user_data.pop("create", None)
+            ctx.user_data.pop(user_data_key, None)
             await query.edit_message_text("Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
 
-    async def _create_repo_url(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _create_repo_url(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_data_key: str = "create"
+    ) -> int:
         url = update.message.text.strip()
         from ..github_client import GitHubClient
         from ..config import load_config
-        path = Path(ctx.user_data["create"]["config_path"])
+        path = Path(ctx.user_data[user_data_key]["config_path"])
         config = load_config(path)
         gh = GitHubClient(pat=config.github_pat)
         try:
             repo = await gh.validate_repo_url(url)
         except Exception as e:
             await update.effective_message.reply_text(f"Error: {e}\nTry again or /cancel:")
-            return self.CREATE_REPO_URL
+            return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
         finally:
             await gh.close()
         if not repo:
             await update.effective_message.reply_text("Invalid or not found. Paste a valid GitHub URL:")
-            return self.CREATE_REPO_URL
-        ctx.user_data["create"]["repo"] = repo.__dict__
+            return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
+        ctx.user_data[user_data_key]["repo"] = repo.__dict__
         suggested_name = repo.name
-        ctx.user_data["create"]["suggested_name"] = suggested_name
+        ctx.user_data[user_data_key]["suggested_name"] = suggested_name
+        if user_data_key == "create_team":
+            await update.effective_message.reply_text("Short project name?")
+            return self.CREATE_TEAM_NAME
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
             [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
@@ -790,6 +882,268 @@ class ManagerBot(AuthMixin):
         ctx.user_data.pop("create", None)
         await update.effective_message.reply_text("Project creation cancelled.")
         return ConversationHandler.END
+
+    async def _on_create_team(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        """Entry point for /create_team — pick repo source (GitHub browse vs paste URL)."""
+        if not await self._guard(update):
+            return ConversationHandler.END
+
+        # Cred-only pre-flight (prefix isn't known yet; full collision check runs in NAME state).
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        err = _create_team_preflight(cfg_path, prefix=None)
+        if err:
+            await update.effective_message.reply_text(err)
+            return ConversationHandler.END
+
+        ctx.user_data["create_team"] = {"config_path": str(cfg_path)}
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Browse my GitHub repos", callback_data="ct_source:github")],
+            [InlineKeyboardButton("Paste a URL", callback_data="ct_source:url")],
+        ])
+        await update.effective_message.reply_text(
+            "How would you like to pick the repo?",
+            reply_markup=keyboard,
+        )
+        return self.CREATE_TEAM_SOURCE
+
+    async def _create_team_source_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        _, source = query.data.split(":", 1)
+        ctx.user_data.setdefault("create_team", {})["source"] = source
+        if source == "github":
+            return await self._show_repo_page(query, ctx, page=1, user_data_key="create_team")
+        await query.edit_message_text("Paste the repo URL (e.g. https://github.com/owner/repo):")
+        return self.CREATE_TEAM_REPO_URL
+
+    async def _create_team_name(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        prefix = update.message.text.strip().lower()
+        if not prefix.isidentifier() or not prefix.isascii():
+            await update.message.reply_text("Prefix must be lowercase ascii word characters only. Try again:")
+            return self.CREATE_TEAM_NAME
+
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        err = _create_team_preflight(cfg_path, prefix)
+        if err:
+            await update.message.reply_text(f"✗ {err}")
+            return ConversationHandler.END
+
+        ctx.user_data["create_team"]["project_prefix"] = prefix
+
+        # Persona picker — list global personas (no project path yet, since clone hasn't happened).
+        fake_path = Path(DEFAULT_CONFIG).parent
+        keyboard = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_mgr")
+        await update.message.reply_text(
+            "Pick manager-role persona:",
+            reply_markup=keyboard,
+        )
+        return self.CREATE_TEAM_PERSONA_MGR
+
+    async def _create_team_persona_mgr_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        _, persona = query.data.split(":", 1)
+        ctx.user_data["create_team"]["persona_mgr"] = persona
+
+        fake_path = Path(DEFAULT_CONFIG).parent
+        keyboard = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_dev")
+        await query.edit_message_text(
+            f"Manager persona: {persona}\n\nPick dev-role persona:",
+            reply_markup=keyboard,
+        )
+        return self.CREATE_TEAM_PERSONA_DEV
+
+    async def _create_team_persona_dev_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        _, persona = query.data.split(":", 1)
+        ctx.user_data["create_team"]["persona_dev"] = persona
+
+        # All inputs captured — kick off orchestrator (F7).
+        return await self._create_team_execute(update, ctx)
+
+    async def _create_team_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        """F7 orchestrator: create both bots, clone repo, build group, commit config, spawn."""
+        from ..config import load_config, patch_team
+        from ..botfather import BotFatherClient, sanitize_bot_username
+        from ..github_client import GitHubClient, RepoInfo
+        from .telegram_group import (
+            create_supergroup,
+            add_bot,
+            promote_admin,
+            invite_user,
+        )
+
+        data = ctx.user_data["create_team"]
+        prefix = data["project_prefix"]
+        mgr_persona = data["persona_mgr"]
+        dev_persona = data["persona_dev"]
+        repo_data = data["repo"]
+        # Repo is stored as a dict (RepoInfo.__dict__) by _create_repo_list_callback;
+        # reconstitute the dataclass for clone_repo. If it's already a RepoInfo
+        # (e.g. from a test), use it directly.
+        if isinstance(repo_data, dict):
+            repo = RepoInfo(**repo_data)
+        else:
+            repo = repo_data
+
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(cfg_path)
+        chat = update.effective_chat
+
+        status = await self._app.bot.send_message(chat.id, "⟳ Creating bot 1...")
+
+        async def edit(text: str) -> None:
+            try:
+                await status.edit_text(text)
+            except Exception:
+                pass
+
+        bfc = BotFatherClient(
+            api_id=config.telegram_api_id,
+            api_hash=config.telegram_api_hash,
+            session_path=cfg_path.parent / "telethon.session",
+        )
+
+        completed: dict[str, str] = {}
+        config_committed = False
+        try:
+            # --- Bot 1 (manager) ---
+            mgr_base = sanitize_bot_username(f"{prefix}_mgr")
+            mgr_token, mgr_username = await _create_bot_with_retry(
+                bfc, f"{prefix} Manager", mgr_base
+            )
+            completed["bot1"] = f"@{mgr_username}"
+            await edit(f"✓ Bot 1 (@{mgr_username}) | ⟳ Creating bot 2...")
+
+            # --- Bot 2 (dev) ---
+            dev_base = sanitize_bot_username(f"{prefix}_dev")
+            dev_token, dev_username = await _create_bot_with_retry(
+                bfc, f"{prefix} Dev", dev_base
+            )
+            completed["bot2"] = f"@{dev_username}"
+            await edit("✓ Bots | ⟳ Disabling privacy mode...")
+
+            # --- Privacy disable (non-fatal) ---
+            for username in (mgr_username, dev_username):
+                try:
+                    await bfc.disable_privacy(username)
+                except Exception as exc:
+                    logger.warning("Privacy disable failed for %s: %s", username, exc)
+            await edit("✓ Bots ready | ⟳ Cloning repo...")
+
+            # --- Clone ---
+            dest = cfg_path.parent / "repos" / prefix
+            gh = GitHubClient(pat=config.github_pat)
+            try:
+                await gh.clone_repo(repo, dest)
+            finally:
+                await gh.close()
+            completed["repo"] = str(dest)
+            # Scaffold the dual-agent layout (idempotent — exist_ok=True).
+            for sub in ("docs", "src", "tests"):
+                (dest / sub).mkdir(parents=True, exist_ok=True)
+            await edit(f'✓ Cloned | ⟳ Creating group "{prefix} team"...')
+
+            # --- Group ---
+            client = await bfc._ensure_client()  # reuse authenticated Telethon client
+            group_id = await create_supergroup(client, f"{prefix} team")
+            completed["group"] = str(group_id)
+            await edit("✓ Group | ⟳ Adding + promoting bots...")
+
+            await add_bot(client, group_id, mgr_username)
+            await add_bot(client, group_id, dev_username)
+
+            # --- COMMIT config (point of no return) ---
+            patch_team(
+                prefix,
+                {
+                    "path": str(dest),
+                    "group_chat_id": group_id,
+                    "bots": {
+                        "manager": {
+                            "telegram_bot_token": mgr_token,
+                            "active_persona": mgr_persona,
+                        },
+                        "dev": {
+                            "telegram_bot_token": dev_token,
+                            "active_persona": dev_persona,
+                        },
+                    },
+                },
+                cfg_path,
+            )
+            config_committed = True
+
+            # --- Post-commit (all non-fatal) ---
+            for username in (mgr_username, dev_username):
+                try:
+                    await promote_admin(client, group_id, username)
+                except Exception as exc:
+                    logger.warning("Promote admin failed for %s: %s", username, exc)
+
+            requester = update.effective_user.username if update.effective_user else None
+            if requester:
+                try:
+                    await invite_user(client, group_id, requester)
+                except Exception as exc:
+                    logger.warning("Invite requester %s failed: %s", requester, exc)
+
+            await edit("✓ Group wired | ⟳ Starting both bots...")
+            self._pm.start_team(prefix, "manager")
+            self._pm.start_team(prefix, "dev")
+            await edit(f'✓ Team ready. Open the "{prefix} team" group to start chatting.')
+
+        except Exception as exc:
+            await self._send_partial_failure_report(
+                chat.id, exc, completed, config_committed=config_committed
+            )
+        finally:
+            try:
+                await bfc.disconnect()
+            except Exception:
+                pass
+
+        return ConversationHandler.END
+
+    async def _send_partial_failure_report(
+        self,
+        chat_id: int,
+        exc: Exception,
+        completed: dict[str, str],
+        config_committed: bool = False,
+    ) -> None:
+        """Send a human-readable report of what was completed before the failure."""
+        lines = [
+            f"✗ Team creation failed: {type(exc).__name__}: {exc}",
+            "",
+        ]
+        if completed:
+            lines.append("Completed (needs manual cleanup):")
+            if "bot1" in completed:
+                lines.append(
+                    f"  - Bot {completed['bot1']} (delete via BotFather /deletebot)"
+                )
+            if "bot2" in completed:
+                lines.append(
+                    f"  - Bot {completed['bot2']} (delete via BotFather /deletebot)"
+                )
+            if "repo" in completed:
+                lines.append(
+                    f"  - Directory {completed['repo']} (remove if not needed)"
+                )
+            if "group" in completed:
+                lines.append(
+                    f"  - Group {completed['group']} (delete via Telegram)"
+                )
+            lines.append("")
+        if config_committed:
+            lines.append(
+                "⚠ Team config WAS saved. Use /delete_team to clean up before retrying."
+            )
+        else:
+            lines.append("Config not saved. Safe to retry with a different prefix.")
+        await self._app.bot.send_message(chat_id, "\n".join(lines))
 
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1037,6 +1391,36 @@ class ManagerBot(AuthMixin):
                         MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_bot_token_input),
                     ],
                     self.CREATE_CLONE: [CallbackQueryHandler(self._create_clone_callback)],
+                },
+                fallbacks=[CommandHandler("cancel", self._create_cancel)],
+            ))
+
+            app.add_handler(ConversationHandler(
+                entry_points=[CommandHandler("create_team", self._on_create_team)],
+                states={
+                    self.CREATE_TEAM_SOURCE: [
+                        CallbackQueryHandler(self._create_team_source_callback, pattern=r"^ct_source:"),
+                    ],
+                    self.CREATE_TEAM_REPO_LIST: [
+                        CallbackQueryHandler(
+                            lambda u, c: self._create_repo_list_callback(u, c, user_data_key="create_team"),
+                        ),
+                    ],
+                    self.CREATE_TEAM_REPO_URL: [
+                        MessageHandler(
+                            filters.TEXT & ~filters.COMMAND,
+                            lambda u, c: self._create_repo_url(u, c, user_data_key="create_team"),
+                        ),
+                    ],
+                    self.CREATE_TEAM_NAME: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, self._create_team_name),
+                    ],
+                    self.CREATE_TEAM_PERSONA_MGR: [
+                        CallbackQueryHandler(self._create_team_persona_mgr_callback, pattern=r"^ct_persona_mgr:"),
+                    ],
+                    self.CREATE_TEAM_PERSONA_DEV: [
+                        CallbackQueryHandler(self._create_team_persona_dev_callback, pattern=r"^ct_persona_dev:"),
+                    ],
                 },
                 fallbacks=[CommandHandler("cancel", self._create_cancel)],
             ))

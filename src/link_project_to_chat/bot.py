@@ -29,6 +29,7 @@ from .config import (
     clear_session,
     load_sessions,
     patch_project,
+    patch_team,
     resolve_permissions,
     save_session,
     add_trusted_user_id,
@@ -36,7 +37,7 @@ from .config import (
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -63,6 +64,8 @@ COMMANDS = [
     ("delete_persona", "Delete a persona"),
     ("voice", "Show voice transcription status"),
     ("lang", "Switch voice message language"),
+    ("halt", "Pause bot-to-bot iteration (group only)"),
+    ("resume", "Resume bot-to-bot iteration (group only)"),
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
@@ -90,7 +93,9 @@ class ProjectBot(AuthMixin):
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
-        group_mode: bool = False,
+        team_name: str | None = None,
+        group_chat_id: int | None = None,
+        role: str | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -127,8 +132,15 @@ class ProjectBot(AuthMixin):
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
-        self.group_mode = group_mode
+        self.team_name = team_name
+        self.group_mode = team_name is not None
+        # Team-mode fields — stored now, wired into behavior in later tasks (B3/B4).
+        self.group_chat_id = group_chat_id
+        self.role = role
         self.bot_username: str = ""  # populated in _post_init via get_me()
+        from .group_state import GroupStateRegistry
+        self._group_state = GroupStateRegistry(max_bot_rounds=20)
+        self._probe_tasks: set[asyncio.Task] = set()
 
     def _on_trust(self, user_id: int) -> None:
         if self._on_trust_fn:
@@ -209,7 +221,37 @@ class ProjectBot(AuthMixin):
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
+            if is_usage_cap_error(task.error) and self.group_mode:
+                self._group_state.halt(task.chat_id)
+                await self._send_to_chat(
+                    task.chat_id,
+                    "Hit Max usage cap. Pausing until reset. Will retry every 30 min.",
+                    reply_to=task.message_id,
+                )
+                self._schedule_cap_probe(task.chat_id)
+                return
             await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+
+    def _schedule_cap_probe(self, chat_id: int, interval_s: int = 1800) -> None:
+        """Probe Claude every `interval_s` seconds; on success, resume the group."""
+        async def _probe() -> None:
+            from .claude_client import ClaudeClient
+            while self._group_state.get(chat_id).halted:
+                await asyncio.sleep(interval_s)
+                if not self._group_state.get(chat_id).halted:
+                    return  # user manually resumed
+                try:
+                    probe = ClaudeClient(project_path=self.path)
+                    result = await probe.chat("ping")
+                    if not result.startswith("Error:") and not is_usage_cap_error(result):
+                        self._group_state.resume(chat_id)
+                        await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
+                        return
+                except Exception:
+                    logger.warning("cap probe failed", exc_info=True)
+        task = asyncio.create_task(_probe())
+        self._probe_tasks.add(task)
+        task.add_done_callback(self._probe_tasks.discard)
 
     async def _send_voice_response(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
@@ -312,11 +354,37 @@ class ProjectBot(AuthMixin):
         if not msg:
             return
         if self.group_mode:
-            from .group_filters import is_from_self, is_directed_at_me
+            # Auto-capture: if chat_id not yet bound (sentinel 0 or None), and sender is the trusted user,
+            # write this group's chat_id into the team config and update in-memory state.
+            if self.group_chat_id in (0, None):
+                if self._auth(update.effective_user) and self.team_name:
+                    new_chat_id = msg.chat_id
+                    patch_team(self.team_name, {"group_chat_id": new_chat_id})
+                    self.group_chat_id = new_chat_id
+                    # Fall through so this same message still gets processed normally.
+            elif msg.chat_id != self.group_chat_id:
+                return  # wrong group — silent ignore
+            from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
             if is_from_self(msg, self.bot_username):
                 return  # self-silence
             if not is_directed_at_me(msg, self.bot_username):
                 return  # not addressed to this bot
+            chat_id = msg.chat_id
+            if is_from_other_bot(msg, self.bot_username):
+                # Bot-to-bot message: check halt before acting.
+                if self._group_state.get(chat_id).halted:
+                    return
+                self._group_state.note_bot_to_bot(chat_id)
+                if self._group_state.get(chat_id).halted:
+                    # Cap tripped by this very message.
+                    await msg.reply_text(
+                        f"Auto-paused after {self._group_state.max_bot_rounds} bot-to-bot rounds. "
+                        "Send any message to resume."
+                    )
+                    return
+            else:
+                # Human (trusted user) message — reset the round counter and clear any halt.
+                self._group_state.resume(chat_id)
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
         if self._rate_limited(update.effective_user.id):
@@ -653,6 +721,26 @@ class ProjectBot(AuthMixin):
         from .config import patch_project
         patch_project(self.name, {"active_persona": None})
         await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
+
+    async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.group_mode:
+            return await update.effective_message.reply_text("/halt is only available in group mode.")
+        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            return  # silently ignore — wrong group
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        self._group_state.halt(update.effective_chat.id)
+        await update.effective_message.reply_text("Halted. Use /resume to continue.")
+
+    async def _on_resume(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.group_mode:
+            return await update.effective_message.reply_text("/resume is only available in group mode.")
+        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            return  # silently ignore — wrong group
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        self._group_state.resume(update.effective_chat.id)
+        await update.effective_message.reply_text("Resumed.")
 
     async def _on_create_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -1232,7 +1320,7 @@ class ProjectBot(AuthMixin):
             logger.error("get_me() failed at startup", exc_info=True)
             if self.group_mode:
                 raise RuntimeError(
-                    "group_mode=True requires a reachable Telegram API at startup "
+                    "team mode requires a reachable Telegram API at startup "
                     "to fetch bot username; aborting."
                 )
         await app.bot.set_my_commands(COMMANDS)
@@ -1276,6 +1364,8 @@ class ProjectBot(AuthMixin):
             "delete_persona": self._on_delete_persona,
             "voice": self._on_voice_status,
             "lang": self._on_lang,
+            "halt": self._on_halt,
+            "resume": self._on_resume,
         }
         if self.group_mode:
             # Group mode: accept commands and text from groups/supergroups only.
@@ -1337,8 +1427,10 @@ def run_bot(
     trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
-    group_mode: bool = False,
+    team_name: str | None = None,
     active_persona: str | None = None,
+    group_chat_id: int | None = None,
+    role: str | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1359,7 +1451,9 @@ def run_bot(
         transcriber=transcriber,
         synthesizer=synthesizer,
         active_persona=active_persona,
-        group_mode=group_mode,
+        team_name=team_name,
+        group_chat_id=group_chat_id,
+        role=role,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:
@@ -1409,7 +1503,6 @@ def run_bots(
             trusted_user_ids=effective_trusted_ids,
             transcriber=transcriber,
             synthesizer=synthesizer,
-            group_mode=proj.group_mode,
             active_persona=proj.active_persona,
         )
     else:
