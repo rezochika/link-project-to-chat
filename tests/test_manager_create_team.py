@@ -202,6 +202,61 @@ async def test_create_bot_with_retry_fails_after_5_tries():
 
 
 @pytest.mark.asyncio
+async def test_create_bot_with_retry_backs_off_on_rate_limit(monkeypatch):
+    """Rate-limit should sleep + retry the SAME candidate (no suffix bump)."""
+    from link_project_to_chat.botfather import BotFatherRateLimit
+    from link_project_to_chat.manager.bot import _create_bot_with_retry
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    attempts = []
+
+    async def fake_create_bot(display_name: str, username: str) -> str:
+        attempts.append(username)
+        if len(attempts) == 1:
+            raise BotFatherRateLimit("throttled", retry_after=8.0)
+        return "FAKE_TOKEN"
+
+    bfc = MagicMock()
+    bfc.create_bot = fake_create_bot
+
+    token, username = await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_claude_bot")
+    assert token == "FAKE_TOKEN"
+    # Same candidate on both calls — no suffix bump after rate-limit.
+    assert attempts == ["acme_mgr_claude_bot", "acme_mgr_claude_bot"]
+    # Slept at least the hinted retry_after.
+    assert sleeps and sleeps[0] >= 8.0
+
+
+@pytest.mark.asyncio
+async def test_create_bot_with_retry_gives_up_after_repeated_rate_limits(monkeypatch):
+    """Permanent throttle should surface as a RuntimeError, not hang."""
+    from link_project_to_chat.botfather import BotFatherRateLimit
+    from link_project_to_chat.manager.bot import _create_bot_with_retry
+
+    async def fake_sleep(seconds):
+        return None
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    async def fake_create_bot(display_name: str, username: str) -> str:
+        raise BotFatherRateLimit("throttled", retry_after=60.0)
+
+    bfc = MagicMock()
+    bfc.create_bot = fake_create_bot
+
+    with pytest.raises(RuntimeError, match="throttled"):
+        await _create_bot_with_retry(
+            bfc, "Acme Manager", "acme_mgr_claude_bot", max_rate_limit_retries=2,
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_team_execute_partial_failure_report(tmp_path):
     """When orchestration aborts mid-flight, a partial-failure report is sent."""
     from unittest.mock import patch

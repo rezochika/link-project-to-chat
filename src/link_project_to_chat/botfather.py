@@ -15,6 +15,45 @@ logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"\d{7,15}:[A-Za-z0-9_-]{20,50}")
 _BOTFATHER = "BotFather"
+# Matches BotFather throttle replies like "Sorry, too many attempts. Please
+# try again in 8 seconds." or "…try again in 1 minute."
+_RATE_LIMIT_RE = re.compile(
+    r"try again in (\d+)\s*(second|minute|hour)s?", re.IGNORECASE,
+)
+
+
+class BotFatherRateLimit(Exception):
+    """BotFather is throttling /newbot (or similar). Caller should back off.
+
+    ``retry_after`` is the server-hinted wait in seconds (defaults to 60 if
+    the reply mentions throttling without a concrete duration).
+    """
+
+    def __init__(self, message: str, retry_after: float = 60.0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_rate_limit(text: str) -> float | None:
+    """Return the hinted retry_after in seconds if ``text`` is a BotFather
+    throttle reply, else None. Falls back to 60s when the text signals
+    throttling but doesn't include a concrete duration.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if "too many attempts" not in lowered and "please try again" not in lowered:
+        return None
+    match = _RATE_LIMIT_RE.search(text)
+    if not match:
+        return 60.0
+    n = int(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("min"):
+        return n * 60.0
+    if unit.startswith("hour"):
+        return n * 3600.0
+    return float(n)
 
 
 def sanitize_bot_username(name: str) -> str:
@@ -94,6 +133,14 @@ class BotFatherClient:
             if token:
                 logger.info("Created bot @%s", trial_username)
                 return token
+            # Throttle — surface as a distinct error so the caller can back off
+            # rather than spinning through suffixed retries (which only make it worse).
+            rate_wait = _parse_rate_limit(response_text)
+            if rate_wait is not None:
+                raise BotFatherRateLimit(
+                    f"BotFather throttled after @{trial_username}: {response_text[:200]}",
+                    retry_after=rate_wait,
+                )
             if "not available" in response_text.lower() or "already" in response_text.lower():
                 logger.info("Username @%s taken, retrying...", trial_username)
                 if attempt < max_retries:

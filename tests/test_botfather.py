@@ -34,6 +34,34 @@ def test_extract_token_from_multiline():
     assert token == "1234567890:ABCdefGHIjklMNOpqr-stUVWx"
 
 
+def test_parse_rate_limit_seconds():
+    from link_project_to_chat.botfather import _parse_rate_limit
+
+    assert _parse_rate_limit("Sorry, too many attempts. Please try again in 8 seconds.") == 8.0
+    assert _parse_rate_limit("Sorry, too many attempts. Please try again in 1 second.") == 1.0
+
+
+def test_parse_rate_limit_minutes_and_hours():
+    from link_project_to_chat.botfather import _parse_rate_limit
+
+    assert _parse_rate_limit("too many attempts. try again in 2 minutes") == 120.0
+    assert _parse_rate_limit("too many attempts. try again in 1 hour") == 3600.0
+
+
+def test_parse_rate_limit_throttle_without_duration_defaults_to_60s():
+    from link_project_to_chat.botfather import _parse_rate_limit
+
+    assert _parse_rate_limit("Sorry, too many attempts.") == 60.0
+
+
+def test_parse_rate_limit_ignores_non_throttle_text():
+    from link_project_to_chat.botfather import _parse_rate_limit
+
+    assert _parse_rate_limit("Sorry, this username is invalid.") is None
+    assert _parse_rate_limit("Good. Now let's choose a username.") is None
+    assert _parse_rate_limit("") is None
+
+
 @pytest.mark.asyncio
 async def test_disable_privacy_sends_correct_dialog(tmp_path):
     from link_project_to_chat.botfather import BotFatherClient

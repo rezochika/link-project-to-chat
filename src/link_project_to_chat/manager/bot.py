@@ -126,13 +126,30 @@ def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | N
     return None
 
 
-async def _create_bot_with_retry(bfc, display_name: str, base_username: str, max_attempts: int = 5) -> tuple[str, str]:
-    """Try creating a bot with base_username; on failure append _1/_2/..., up to max_attempts."""
+async def _create_bot_with_retry(
+    bfc,
+    display_name: str,
+    base_username: str,
+    max_attempts: int = 5,
+    max_rate_limit_retries: int = 2,
+) -> tuple[str, str]:
+    """Try creating a bot with base_username; on failure append _1/_2/..., up to max_attempts.
+
+    A ``BotFatherRateLimit`` on the same candidate sleeps for the hinted
+    ``retry_after`` and re-tries the SAME candidate (doesn't eat a suffix
+    attempt). Limits total rate-limit retries via ``max_rate_limit_retries``
+    so a permanent throttle still surfaces instead of hanging forever.
+    """
+    import asyncio
+    from ..botfather import BotFatherRateLimit
+
     suffix_insert_at = base_username.rfind("_claude_bot")
     if suffix_insert_at == -1:
         suffix_insert_at = len(base_username)
 
-    for attempt in range(max_attempts):
+    rate_limit_retries = 0
+    attempt = 0
+    while attempt < max_attempts:
         if attempt == 0:
             candidate = base_username
         else:
@@ -140,9 +157,27 @@ async def _create_bot_with_retry(bfc, display_name: str, base_username: str, max
         try:
             token = await bfc.create_bot(display_name, candidate)
             return token, candidate
+        except BotFatherRateLimit as exc:
+            if rate_limit_retries >= max_rate_limit_retries:
+                raise RuntimeError(
+                    f"BotFather throttled us after {rate_limit_retries + 1} waits; giving up. "
+                    f"Try /create_team again in a few minutes."
+                ) from exc
+            wait = max(float(exc.retry_after), 1.0) + 2.0  # +2s jitter
+            logger.warning(
+                "BotFather throttle on @%s; sleeping %.1fs before retrying same candidate.",
+                candidate, wait,
+            )
+            await asyncio.sleep(wait)
+            rate_limit_retries += 1
+            # Don't advance `attempt` — retry the same candidate once BotFather cools down.
+            continue
         except Exception:
             if attempt == max_attempts - 1:
                 break
+            attempt += 1
+            continue
+        attempt += 1
     raise RuntimeError(f"Bot username unavailable after {max_attempts} attempts (base={base_username})")
 
 
