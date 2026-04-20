@@ -32,6 +32,7 @@ class ProjectConfig:
     session_id: str | None = None
     autostart: bool = False
     active_persona: str | None = None
+    show_thinking: bool = False
 
 
 @dataclass
@@ -138,6 +139,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 session_id=proj.get("session_id"),
                 autostart=proj.get("autostart", False),
                 active_persona=proj.get("active_persona"),
+                show_thinking=proj.get("show_thinking", False),
             )
         for name, team in raw.get("teams", {}).items():
             config.teams[name] = TeamConfig(
@@ -253,6 +255,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             proj["active_persona"] = p.active_persona
         else:
             proj.pop("active_persona", None)
+        if p.show_thinking:
+            proj["show_thinking"] = True
+        else:
+            proj.pop("show_thinking", None)
         existing_projects[name] = proj
     # Merge teams
     existing_teams: dict = raw.get("teams", {})

@@ -38,6 +38,7 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
+from .livestream import LiveMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -48,6 +49,7 @@ COMMANDS = [
     ("tasks", "List all tasks"),
     ("model", "Set Claude model (haiku/sonnet/opus)"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
+    ("thinking", "Toggle live thinking display (on/off)"),
     ("permissions", "Set permission mode"),
     ("compact", "Compress session context"),
     ("status", "Bot status"),
@@ -93,6 +95,7 @@ class ProjectBot(AuthMixin):
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
+        show_thinking: bool = False,
         team_name: str | None = None,
         group_chat_id: int | None = None,
         role: str | None = None,
@@ -112,12 +115,14 @@ class ProjectBot(AuthMixin):
         self._started_at = time.monotonic()
         self._app = None
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._stream_text: dict[int, str] = {}
-        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking
-        self._thinking_store: dict[int, str] = {}  # result_msg_id → thinking text
+        self._live_text: dict[int, LiveMessage] = {}
+        self._live_thinking: dict[int, LiveMessage] = {}
+        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking (toggle-off path)
+        self._thinking_store: dict[int, str] = {}  # task_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
         self._active_persona = active_persona
+        self.show_thinking = show_thinking
         self._transcriber = transcriber
         self._synthesizer = synthesizer
         self._voice_tasks: set[int] = set()
@@ -156,14 +161,34 @@ class ProjectBot(AuthMixin):
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
-        if isinstance(event, ThinkingDelta):
-            self._thinking_buf.setdefault(task.id, "")
-            if self._thinking_buf[task.id]:
-                self._thinking_buf[task.id] += "\n\n"
-            self._thinking_buf[task.id] += event.text
-        elif isinstance(event, TextDelta):
-            self._stream_text.setdefault(task.id, "")
-            self._stream_text[task.id] += event.text
+        if isinstance(event, TextDelta):
+            live = self._live_text.get(task.id)
+            if live is None:
+                live = LiveMessage(
+                    bot=self._app.bot,
+                    chat_id=task.chat_id,
+                    reply_to_message_id=task.message_id,
+                )
+                self._live_text[task.id] = live
+                await live.start()
+            await live.append(event.text)
+        elif isinstance(event, ThinkingDelta):
+            if self.show_thinking:
+                live = self._live_thinking.get(task.id)
+                if live is None:
+                    live = LiveMessage(
+                        bot=self._app.bot,
+                        chat_id=task.chat_id,
+                        reply_to_message_id=task.message_id,
+                        prefix="💭 ",
+                    )
+                    self._live_thinking[task.id] = live
+                    await live.start()
+                await live.append(event.text)
+            else:
+                buf = self._thinking_buf.setdefault(task.id, "")
+                sep = "\n\n" if buf else ""
+                self._thinking_buf[task.id] = buf + sep + event.text
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(
@@ -203,25 +228,56 @@ class ProjectBot(AuthMixin):
         escaped = (text or "[No output]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
 
+    async def _cancel_live_for(self, task_id: int, note: str = "(cancelled)") -> None:
+        """Seal any live text/thinking messages for this task with a cancellation marker."""
+        live_text = self._live_text.pop(task_id, None)
+        if live_text is not None:
+            try:
+                await live_text.cancel(note)
+            except Exception:
+                logger.warning("Failed to cancel live text for task %d", task_id, exc_info=True)
+        live_thinking = self._live_thinking.pop(task_id, None)
+        if live_thinking is not None:
+            try:
+                await live_thinking.cancel(note)
+            except Exception:
+                logger.warning("Failed to cancel live thinking for task %d", task_id, exc_info=True)
+
     async def _finalize_claude_task(self, task: Task) -> None:
-        self._stream_text.pop(task.id, None)
+        live_text = self._live_text.pop(task.id, None)
+        live_thinking = self._live_thinking.pop(task.id, None)
         thinking = self._thinking_buf.pop(task.id, None)
         is_voice = task.id in self._voice_tasks
         self._voice_tasks.discard(task.id)
 
         if task._compact:
             text = "Session compacted." if task.status == TaskStatus.DONE else f"Compact failed: {task.error}"
+            # Compact tasks don't stream, but clean up defensively.
+            if live_text is not None:
+                await live_text.cancel("(compacted)")
+            if live_thinking is not None:
+                await live_thinking.cancel("(compacted)")
             await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
             return
 
         if task.status == TaskStatus.DONE:
-            if thinking:
+            if live_text is not None:
+                await live_text.finalize(task.result or None, render=True)
+            else:
+                await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+            if live_thinking is not None:
+                await live_thinking.finalize(render=False)
+            elif thinking:
                 self._thinking_store[task.id] = thinking
-            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
         else:
+            error_text = f"Error: {task.error}"
             if is_usage_cap_error(task.error) and self.group_mode:
+                if live_text is not None:
+                    await live_text.finalize(error_text, render=False)
+                if live_thinking is not None:
+                    await live_thinking.finalize(render=False)
                 self._group_state.halt(task.chat_id)
                 await self._send_to_chat(
                     task.chat_id,
@@ -230,7 +286,12 @@ class ProjectBot(AuthMixin):
                 )
                 self._schedule_cap_probe(task.chat_id)
                 return
-            await self._send_to_chat(task.chat_id, f"Error: {task.error}", reply_to=task.message_id)
+            if live_text is not None:
+                await live_text.finalize(error_text, render=False)
+            else:
+                await self._send_to_chat(task.chat_id, error_text, reply_to=task.message_id)
+            if live_thinking is not None:
+                await live_thinking.finalize(render=False)
 
     def _schedule_cap_probe(self, chat_id: int, interval_s: int = 1800) -> None:
         """Probe Claude every `interval_s` seconds; on success, resume the group."""
@@ -311,11 +372,15 @@ class ProjectBot(AuthMixin):
         if typing:
             typing.cancel()
 
-        # Flush any accompanying text Claude produced alongside the question
-        accompanying = task.result or self._stream_text.pop(task.id, "")
-        if accompanying and accompanying.strip():
-            await self._send_to_chat(task.chat_id, accompanying, reply_to=task.message_id)
-        self._stream_text.pop(task.id, None)
+        # Finalize any live messages so the question buttons appear after the sealed stream.
+        live_text = self._live_text.pop(task.id, None)
+        if live_text is not None:
+            await live_text.finalize(task.result or None, render=True)
+        elif task.result and task.result.strip():
+            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+        live_thinking = self._live_thinking.pop(task.id, None)
+        if live_thinking is not None:
+            await live_thinking.finalize(render=False)
 
         def _esc(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -420,6 +485,7 @@ class ProjectBot(AuthMixin):
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
+            await self._cancel_live_for(prev.id, "(superseded)")
             self.task_manager.cancel(prev.id)
             typing = self._typing_tasks.pop(prev.id, None)
             if typing:
@@ -532,6 +598,37 @@ class ProjectBot(AuthMixin):
         await update.effective_message.reply_text(
             f"Current: {self._current_effort()}",
             reply_markup=self._effort_markup(),
+        )
+
+    def _thinking_markup(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("On", callback_data="thinking_set_on"),
+                InlineKeyboardButton("Off", callback_data="thinking_set_off"),
+            ]
+        ])
+
+    def _current_thinking(self) -> str:
+        return "on" if self.show_thinking else "off"
+
+    async def _on_thinking(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        args = (ctx.args or []) if ctx else []
+        if args:
+            arg = args[0].lower()
+            if arg in ("on", "off"):
+                self.show_thinking = arg == "on"
+                patch_project(self.name, {"show_thinking": self.show_thinking})
+                return await update.effective_message.reply_text(
+                    f"Live thinking: {self._current_thinking()}"
+                )
+            return await update.effective_message.reply_text(
+                "Usage: /thinking on|off"
+            )
+        await update.effective_message.reply_text(
+            f"Live thinking: {self._current_thinking()}",
+            reply_markup=self._thinking_markup(),
         )
 
     _PERMISSION_OPTIONS = (
@@ -869,6 +966,15 @@ class ProjectBot(AuthMixin):
                 f"Effort: {self._current_effort()}",
                 reply_markup=self._effort_markup(),
             )
+        elif query.data.startswith("thinking_set_"):
+            value = query.data[len("thinking_set_"):]
+            if value in ("on", "off"):
+                self.show_thinking = value == "on"
+                patch_project(self.name, {"show_thinking": self.show_thinking})
+            await query.edit_message_text(
+                f"Live thinking: {self._current_thinking()}",
+                reply_markup=self._thinking_markup(),
+            )
         elif query.data.startswith("permissions_set_"):
             mode = query.data[len("permissions_set_"):]
             if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
@@ -900,6 +1006,9 @@ class ProjectBot(AuthMixin):
                 reply_markup=InlineKeyboardMarkup(rows),
             )
         elif query.data == "reset_confirm":
+            live_task_ids = list({*self._live_text.keys(), *self._live_thinking.keys()})
+            for tid in live_task_ids:
+                await self._cancel_live_for(tid)
             self.task_manager.cancel_all()
             self.task_manager.claude.session_id = None
             self._active_skill = None
@@ -1022,6 +1131,7 @@ class ProjectBot(AuthMixin):
             await self._render_tasks(query.message.chat_id, edit_query=query)
         elif query.data.startswith("task_cancel_"):
             task_id = _parse_task_id(query.data)
+            await self._cancel_live_for(task_id)
             if self.task_manager.cancel(task_id):
                 typing = self._typing_tasks.pop(task_id, None)
                 if typing:
@@ -1348,6 +1458,7 @@ class ProjectBot(AuthMixin):
             "tasks": self._on_tasks,
             "model": self._on_model,
             "effort": self._on_effort,
+            "thinking": self._on_thinking,
             "permissions": self._on_permissions,
             "compact": self._on_compact,
             "reset": self._on_reset,
@@ -1429,6 +1540,7 @@ def run_bot(
     synthesizer: "Synthesizer | None" = None,
     team_name: str | None = None,
     active_persona: str | None = None,
+    show_thinking: bool = False,
     group_chat_id: int | None = None,
     role: str | None = None,
 ) -> None:
@@ -1451,6 +1563,7 @@ def run_bot(
         transcriber=transcriber,
         synthesizer=synthesizer,
         active_persona=active_persona,
+        show_thinking=show_thinking,
         team_name=team_name,
         group_chat_id=group_chat_id,
         role=role,
@@ -1504,6 +1617,7 @@ def run_bots(
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
+            show_thinking=proj.show_thinking,
         )
     else:
         names = ", ".join(config.projects.keys())

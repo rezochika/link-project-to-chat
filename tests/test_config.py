@@ -598,3 +598,28 @@ def test_team_with_sentinel_chat_id_roundtrips(tmp_path: Path):
     save_config(cfg, p)
     loaded = load_config(p)
     assert loaded.teams["acme"].group_chat_id == 0
+
+
+def test_project_show_thinking_roundtrip(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        projects={
+            "proj": ProjectConfig(
+                path="/x",
+                telegram_bot_token="T",
+                show_thinking=True,
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.projects["proj"].show_thinking is True
+
+
+def test_project_show_thinking_defaults_false(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {"proj": {"path": "/x", "telegram_bot_token": "T"}}
+    }))
+    loaded = load_config(p)
+    assert loaded.projects["proj"].show_thinking is False

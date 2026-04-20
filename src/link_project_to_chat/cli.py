@@ -362,6 +362,7 @@ def start(
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
+            show_thinking=proj.show_thinking,
         )
     else:
         run_bots(
