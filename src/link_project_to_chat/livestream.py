@@ -53,6 +53,11 @@ class LiveMessage:
         self._finalized = False
         self.message_id: int | None = None
 
+    @property
+    def buffer(self) -> str:
+        """Accumulated streamed content (read-only snapshot)."""
+        return self._buffer
+
     async def start(self, initial: str = "…") -> None:
         msg = await self._bot.send_message(
             self.chat_id, self._prefix + initial, reply_to_message_id=self._reply_to

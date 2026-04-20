@@ -262,7 +262,12 @@ class ProjectBot(AuthMixin):
 
         if task.status == TaskStatus.DONE:
             if live_text is not None:
-                await live_text.finalize(task.result or None, render=True)
+                # Don't pass task.result — it contains only the LAST assistant text block.
+                # The LiveMessage buffer already holds every streamed text delta (narration
+                # + final answer); overwriting it would make intermediate narration vanish.
+                # Fall back to task.result only when the buffer is empty (stream dropped).
+                fallback = task.result if not live_text.buffer.strip() else None
+                await live_text.finalize(fallback, render=True)
             else:
                 await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
             if live_thinking is not None:

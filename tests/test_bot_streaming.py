@@ -104,23 +104,48 @@ async def test_thinking_delta_with_toggle_off_uses_buffer():
 
 @pytest.mark.asyncio
 async def test_finalize_with_live_text_does_not_resend():
+    """Live-text path: keeps the accumulated buffer, edits in place, no new message sent."""
     bot = await _stub_bot()
-    # Stub out the voice/compact helpers we don't exercise.
     bot._is_image = lambda p: False
     bot._synthesizer = None
     task = _fake_task(task_id=10)
     task.status = TaskStatus.DONE
+    # task.result contains only the LAST assistant text block; the streamed buffer
+    # has every text delta (narration + final). The finalized message must preserve
+    # the buffer's content, not clobber it with task.result.
     task.result = "final answer"
-    await bot._on_stream_event(task, TextDelta(text="partial"))
+    await bot._on_stream_event(task, TextDelta(text="narration before tool use"))
+    await bot._on_stream_event(task, TextDelta(text=" — final answer"))
     sent_before = len(bot._app.bot.sent)
 
     await bot._finalize_claude_task(task)
 
-    # No new send_message call — the live message was edited to the final answer.
+    # No new send_message call — the live message was edited in place.
     assert len(bot._app.bot.sent) == sent_before
     assert task.id not in bot._live_text
-    # A final edit landed carrying the final answer.
-    assert any("final answer" in e["text"] for e in bot._app.bot.edits)
+    # Full streamed buffer preserved (narration survives, not just task.result).
+    assert any("narration before tool use" in e["text"] for e in bot._app.bot.edits)
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_empty_buffer_falls_back_to_task_result():
+    """If the stream dropped before any deltas arrived, use task.result as the message body."""
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    task = _fake_task(task_id=11)
+    task.status = TaskStatus.DONE
+    task.result = "fallback answer"
+
+    # Create an empty-buffer LiveMessage (no TextDelta ever fired).
+    from link_project_to_chat.livestream import LiveMessage
+    lm = LiveMessage(bot=bot._app.bot, chat_id=task.chat_id, reply_to_message_id=task.message_id)
+    await lm.start()
+    bot._live_text[task.id] = lm
+
+    await bot._finalize_claude_task(task)
+    # With empty buffer, the fallback kicks in and the final edit contains task.result.
+    assert any("fallback answer" in e["text"] for e in bot._app.bot.edits)
 
 
 @pytest.mark.asyncio
