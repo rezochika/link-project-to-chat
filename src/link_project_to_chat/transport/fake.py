@@ -30,6 +30,8 @@ class SentMessage:
     text: str
     buttons: Buttons | None
     message: MessageRef
+    html: bool = False
+    reply_to: MessageRef | None = None
 
 
 @dataclass
@@ -37,6 +39,7 @@ class EditedMessage:
     message: MessageRef
     text: str
     buttons: Buttons | None
+    html: bool = False
 
 
 @dataclass
@@ -72,16 +75,29 @@ class FakeTransport:
 
     # ── Outbound ──────────────────────────────────────────────────────────
     async def send_text(
-        self, chat: ChatRef, text: str, *, buttons: Buttons | None = None
+        self,
+        chat: ChatRef,
+        text: str,
+        *,
+        buttons: Buttons | None = None,
+        html: bool = False,
+        reply_to: MessageRef | None = None,
     ) -> MessageRef:
         ref = MessageRef(transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat)
-        self.sent_messages.append(SentMessage(chat=chat, text=text, buttons=buttons, message=ref))
+        self.sent_messages.append(SentMessage(
+            chat=chat, text=text, buttons=buttons, message=ref, html=html, reply_to=reply_to,
+        ))
         return ref
 
     async def edit_text(
-        self, msg: MessageRef, text: str, *, buttons: Buttons | None = None
+        self,
+        msg: MessageRef,
+        text: str,
+        *,
+        buttons: Buttons | None = None,
+        html: bool = False,
     ) -> None:
-        self.edited_messages.append(EditedMessage(message=msg, text=text, buttons=buttons))
+        self.edited_messages.append(EditedMessage(message=msg, text=text, buttons=buttons, html=html))
 
     async def send_file(
         self,

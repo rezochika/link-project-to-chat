@@ -79,24 +79,57 @@ class TelegramTransport:
 
     # ── Outbound ──────────────────────────────────────────────────────────
     async def send_text(
-        self, chat: ChatRef, text: str, *, buttons: Buttons | None = None
+        self,
+        chat: ChatRef,
+        text: str,
+        *,
+        buttons: Buttons | None = None,
+        html: bool = False,
+        reply_to: MessageRef | None = None,
     ) -> MessageRef:
         # buttons handled in Task 17; ignore here.
-        native_msg = await self._app.bot.send_message(
-            chat_id=int(chat.native_id),
-            text=text,
-        )
+        kwargs: dict[str, Any] = {
+            "chat_id": int(chat.native_id),
+            "text": text,
+        }
+        if html:
+            kwargs["parse_mode"] = "HTML"
+        if reply_to is not None:
+            kwargs["reply_to_message_id"] = int(reply_to.native_id)
+        try:
+            native_msg = await self._app.bot.send_message(**kwargs)
+        except Exception as e:
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None:
+                from .base import TransportRetryAfter
+                raise TransportRetryAfter(float(retry_after)) from e
+            raise
         return message_ref_from_telegram(native_msg)
 
     async def edit_text(
-        self, msg: MessageRef, text: str, *, buttons: Buttons | None = None
+        self,
+        msg: MessageRef,
+        text: str,
+        *,
+        buttons: Buttons | None = None,
+        html: bool = False,
     ) -> None:
         # buttons handled in Task 17; ignore here.
-        await self._app.bot.edit_message_text(
-            chat_id=int(msg.chat.native_id),
-            message_id=int(msg.native_id),
-            text=text,
-        )
+        kwargs: dict[str, Any] = {
+            "chat_id": int(msg.chat.native_id),
+            "message_id": int(msg.native_id),
+            "text": text,
+        }
+        if html:
+            kwargs["parse_mode"] = "HTML"
+        try:
+            await self._app.bot.edit_message_text(**kwargs)
+        except Exception as e:
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None:
+                from .base import TransportRetryAfter
+                raise TransportRetryAfter(float(retry_after)) from e
+            raise
 
     async def send_file(
         self,

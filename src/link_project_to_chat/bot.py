@@ -39,7 +39,9 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
-from .livestream import LiveMessage
+from .livestream import LiveMessage  # legacy — kept for test_livestream.py; bot.py uses StreamingMessage
+from .transport import ChatKind, ChatRef, MessageRef
+from .transport.streaming import StreamingMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
@@ -118,9 +120,9 @@ class ProjectBot(AuthMixin):
         self._app = None
         self._transport = None  # TelegramTransport — set in _build_app
         self._typing_tasks: dict[int, asyncio.Task] = {}
-        self._live_text: dict[int, LiveMessage] = {}
-        self._live_thinking: dict[int, LiveMessage] = {}
-        # Tasks whose LiveMessage.start() failed once — don't retry for the
+        self._live_text: dict[int, StreamingMessage] = {}
+        self._live_thinking: dict[int, StreamingMessage] = {}
+        # Tasks whose live message start() failed once — don't retry for the
         # rest of the turn; fall back to post-completion paths instead.
         self._live_text_failed: set[int] = set()
         self._live_thinking_failed: set[int] = set()
@@ -173,20 +175,32 @@ class ProjectBot(AuthMixin):
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
 
+    def _chat_ref_for_task(self, task: Task) -> ChatRef:
+        kind = ChatKind.ROOM if self.group_mode else ChatKind.DM
+        return ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=kind)
+
+    def _message_ref_for_task_trigger(self, task: Task) -> MessageRef:
+        return MessageRef(
+            transport_id="telegram",
+            native_id=str(task.message_id),
+            chat=self._chat_ref_for_task(task),
+        )
+
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, TextDelta):
             live = self._live_text.get(task.id)
             if live is None and task.id not in self._live_text_failed:
-                live = LiveMessage(
-                    bot=self._app.bot,
-                    chat_id=task.chat_id,
-                    reply_to_message_id=task.message_id,
+                assert self._transport is not None
+                live = StreamingMessage(
+                    self._transport,
+                    self._chat_ref_for_task(task),
+                    reply_to=self._message_ref_for_task_trigger(task),
                 )
                 try:
                     await live.start()
                 except Exception:
                     logger.exception(
-                        "LiveMessage.start failed for live text (task #%d); "
+                        "StreamingMessage.start failed for live text (task #%d); "
                         "falling back to send-at-finalize",
                         task.id,
                     )
@@ -202,17 +216,18 @@ class ProjectBot(AuthMixin):
             if self.show_thinking and task.id not in self._live_thinking_failed:
                 live = self._live_thinking.get(task.id)
                 if live is None:
-                    live = LiveMessage(
-                        bot=self._app.bot,
-                        chat_id=task.chat_id,
-                        reply_to_message_id=task.message_id,
+                    assert self._transport is not None
+                    live = StreamingMessage(
+                        self._transport,
+                        self._chat_ref_for_task(task),
+                        reply_to=self._message_ref_for_task_trigger(task),
                         prefix="💭 ",
                     )
                     try:
                         await live.start()
                     except Exception:
                         logger.exception(
-                            "LiveMessage.start failed for live thinking (task #%d); "
+                            "StreamingMessage.start failed for live thinking (task #%d); "
                             "falling back to post-completion Thinking button",
                             task.id,
                         )

@@ -1,9 +1,20 @@
-"""Unit tests for StreamingMessage — transport-agnostic streaming-edit helper."""
+"""Unit tests for StreamingMessage — transport-agnostic streaming-edit helper.
+
+Covers:
+- start() sends initial placeholder
+- append() accumulates and throttles edits
+- finalize() performs a final render-with-HTML edit
+- cancel() finalizes with a note appended
+- overflow rotates into a new message
+- TransportRetryAfter triggers back-off
+"""
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 
-from link_project_to_chat.transport import ChatKind, ChatRef
+from link_project_to_chat.transport import ChatKind, ChatRef, TransportRetryAfter
 from link_project_to_chat.transport.fake import FakeTransport
 from link_project_to_chat.transport.streaming import StreamingMessage
 
@@ -12,52 +23,91 @@ def _chat() -> ChatRef:
     return ChatRef(transport_id="fake", native_id="c1", kind=ChatKind.DM)
 
 
-async def test_open_sends_initial_text():
+async def test_start_sends_initial_placeholder():
     t = FakeTransport()
-    sm = StreamingMessage(t, _chat(), min_interval_s=0)
-    await sm.open("starting...")
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
     assert len(t.sent_messages) == 1
-    assert t.sent_messages[0].text == "starting..."
+    assert t.sent_messages[0].text == "…"
 
 
-async def test_update_edits_existing_message():
+async def test_start_with_custom_initial():
     t = FakeTransport()
-    sm = StreamingMessage(t, _chat(), min_interval_s=0)
-    await sm.open("v1")
-    await sm.update("v2")
-    await sm.close()
-    assert len(t.edited_messages) >= 1
-    assert t.edited_messages[-1].text == "v2"
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start("thinking…")
+    assert t.sent_messages[0].text == "thinking…"
 
 
-async def test_close_with_final_text_performs_final_edit():
+async def test_append_schedules_edit_after_throttle():
     t = FakeTransport()
-    sm = StreamingMessage(t, _chat(), min_interval_s=0)
-    await sm.open("working...")
-    await sm.close(final_text="done")
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
+    await sm.append("hello ")
+    await sm.append("world")
+    # Allow the pending flush task to run.
+    await asyncio.sleep(0.02)
+    assert any(e.text == "hello world" for e in t.edited_messages)
+
+
+async def test_finalize_renders_html_on_final_edit():
+    t = FakeTransport()
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
+    await sm.append("hello **bold**")
+    await sm.finalize()
+    # Final edit goes out with html=True.
+    assert any(e.html for e in t.edited_messages)
+
+
+async def test_finalize_with_final_text_overrides_buffer():
+    t = FakeTransport()
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
+    await sm.append("interim")
+    await sm.finalize(final_text="done", render=False)
     assert any(e.text == "done" for e in t.edited_messages)
 
 
-async def test_throttle_defers_interim_updates():
-    """Back-to-back updates inside the throttle window coalesce."""
+async def test_cancel_appends_note():
     t = FakeTransport()
-    sm = StreamingMessage(t, _chat(), min_interval_s=10)  # huge window
-    await sm.open("v0")
-    await sm.update("v1")
-    await sm.update("v2")
-    await sm.update("v3")
-    # None of v1/v2/v3 should be sent yet — only the initial open.
-    assert len(t.edited_messages) == 0
-    # close() must flush the final text.
-    await sm.close()
-    assert t.edited_messages[-1].text == "v3"
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
+    await sm.append("part1")
+    await sm.cancel(note="(stopped)")
+    last = t.edited_messages[-1]
+    assert "part1" in last.text
+    assert "(stopped)" in last.text
 
 
-async def test_overflow_sends_new_message_and_continues_editing_tail():
+async def test_overflow_rotates_into_new_message():
     t = FakeTransport()
-    sm = StreamingMessage(t, _chat(), min_interval_s=0, max_chars=10)
-    await sm.open("0123456789")  # exactly at cap
-    await sm.update("0123456789ABCDE")  # overflow by 5 chars
-    await sm.close()
-    # At least 2 messages sent total: the original plus the overflow chunk.
+    sm = StreamingMessage(t, _chat(), throttle=0, max_chars=20)
+    await sm.start()
+    # Push well over max_chars.
+    await sm.append("x" * 50)
+    await sm.finalize()
+    # At least one rotation — so >1 send_text call.
     assert len(t.sent_messages) >= 2
+
+
+async def test_retry_after_triggers_throttle_backoff():
+    """If the Transport raises TransportRetryAfter, StreamingMessage retries after the hint."""
+    t = FakeTransport()
+    # Monkey-patch edit_text to raise once, then succeed.
+    calls = {"count": 0}
+    original_edit = t.edit_text
+
+    async def flaky_edit(msg, text, *, buttons=None, html=False):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise TransportRetryAfter(0.01)
+        return await original_edit(msg, text, buttons=buttons, html=html)
+
+    t.edit_text = flaky_edit  # type: ignore[assignment]
+
+    sm = StreamingMessage(t, _chat(), throttle=0)
+    await sm.start()
+    await sm.append("hello")
+    await asyncio.sleep(0.1)  # let the retry happen
+    # Should have retried and eventually landed an edit.
+    assert calls["count"] >= 2

@@ -13,8 +13,15 @@ from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
 
 
 @dataclass
+class FakeChat:
+    id: int
+    type: str = "private"
+
+
+@dataclass
 class FakeMessage:
     message_id: int
+    chat: FakeChat = field(default_factory=lambda: FakeChat(id=99))
 
 
 @dataclass
@@ -27,7 +34,7 @@ class FakeBot:
         mid = self.next_id
         self.next_id += 1
         self.sent.append({"chat_id": chat_id, "text": text, "reply_to": reply_to_message_id, "mid": mid, **kw})
-        return FakeMessage(message_id=mid)
+        return FakeMessage(message_id=mid, chat=FakeChat(id=chat_id))
 
     async def edit_message_text(self, chat_id, message_id, text, **kw):
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kw})
@@ -50,8 +57,11 @@ def _fake_task(task_id: int = 1) -> Task:
 async def _stub_bot(show_thinking: bool = False):
     """Construct a minimal ProjectBot-like object just for the stream event tests."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport.telegram import TelegramTransport
     bot = ProjectBot.__new__(ProjectBot)
-    bot._app = SimpleNamespace(bot=FakeBot())
+    fake_bot = FakeBot()
+    bot._app = SimpleNamespace(bot=fake_bot)
+    bot._transport = TelegramTransport(bot._app)
     bot._typing_tasks = {}
     bot._live_text = {}
     bot._live_thinking = {}
@@ -61,6 +71,7 @@ async def _stub_bot(show_thinking: bool = False):
     bot._thinking_store = {}
     bot._voice_tasks = set()
     bot.show_thinking = show_thinking
+    bot.group_mode = False
     return bot
 
 
@@ -288,8 +299,10 @@ class FailingStartBot(FakeBot):
 async def _stub_bot_with_bot(fake_bot, show_thinking: bool = False):
     """Same as _stub_bot but with a caller-provided FakeBot variant."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport.telegram import TelegramTransport
     bot = ProjectBot.__new__(ProjectBot)
     bot._app = SimpleNamespace(bot=fake_bot)
+    bot._transport = TelegramTransport(bot._app)
     bot._typing_tasks = {}
     bot._live_text = {}
     bot._live_thinking = {}
@@ -299,6 +312,7 @@ async def _stub_bot_with_bot(fake_bot, show_thinking: bool = False):
     bot._thinking_store = {}
     bot._voice_tasks = set()
     bot.show_thinking = show_thinking
+    bot.group_mode = False
     return bot
 
 

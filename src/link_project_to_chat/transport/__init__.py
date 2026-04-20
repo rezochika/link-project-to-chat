@@ -15,6 +15,7 @@ from .base import (
     MessageHandler,
     MessageRef,
     Transport,
+    TransportRetryAfter,
 )
 from .fake import EditedMessage, FakeTransport, SentFile, SentMessage
 from .telegram import TelegramTransport
@@ -40,4 +41,5 @@ __all__ = [
     "SentMessage",
     "TelegramTransport",
     "Transport",
+    "TransportRetryAfter",
 ]
