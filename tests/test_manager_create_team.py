@@ -234,6 +234,159 @@ async def test_create_bot_with_retry_backs_off_on_rate_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
+    """Stops bots, deletes bots via BotFather, deletes group, rm -rf folder, removes config entry."""
+    from unittest.mock import patch
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.config import (
+        Config, TeamBotConfig, TeamConfig, save_config, load_config,
+    )
+
+    # Set up on-disk config with one team + project folder.
+    cfg_path = tmp_path / "config.json"
+    proj_dir = tmp_path / "acme"
+    proj_dir.mkdir()
+    save_config(
+        Config(
+            telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x",
+            teams={
+                "acme": TeamConfig(
+                    path=str(proj_dir), group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(
+                            telegram_bot_token="t1",
+                            bot_username="acme_mgr_claude_bot",
+                        ),
+                        "dev": TeamBotConfig(
+                            telegram_bot_token="t2",
+                            bot_username="acme_dev_claude_bot",
+                        ),
+                    },
+                )
+            },
+        ),
+        cfg_path,
+    )
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock(
+        return_value=MagicMock(edit_text=AsyncMock())
+    )
+    mb._pm = MagicMock()
+    mb._pm.stop = MagicMock()
+    mb._team_relays = {}
+    mb._telethon_client = MagicMock()
+
+    # Patch the heavy bits.
+    with patch(
+        "link_project_to_chat.botfather.BotFatherClient.delete_bot",
+        new=AsyncMock(),
+    ) as mock_delete_bot, patch(
+        "link_project_to_chat.manager.telegram_group.delete_supergroup",
+        new=AsyncMock(),
+    ) as mock_delete_group:
+        await mb._delete_team_execute(chat_id=1, target="acme")
+
+    # Both bots stopped.
+    assert mb._pm.stop.call_count == 2
+    # Both bots deleted via BotFather.
+    assert mock_delete_bot.await_count == 2
+    # Supergroup deleted.
+    assert mock_delete_group.await_count == 1
+    # Project folder removed.
+    assert not proj_dir.exists()
+    # Team entry gone from config.
+    assert "acme" not in load_config(cfg_path).teams
+    # Success message sent.
+    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
+    assert any("fully deleted" in m for m in sent)
+
+
+@pytest.mark.asyncio
+async def test_delete_team_execute_unknown_target_is_noop(tmp_path):
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.config import Config, save_config
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(), cfg_path)
+
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock()
+
+    await mb._delete_team_execute(chat_id=1, target="ghost")
+    # Should send one message and not raise.
+    mb._app.bot.send_message.assert_awaited_once()
+    args, _ = mb._app.bot.send_message.call_args
+    assert "not found" in args[1]
+
+
+@pytest.mark.asyncio
+async def test_delete_team_execute_continues_on_individual_failures(tmp_path, monkeypatch):
+    """If BotFather delete fails for one bot, the rest of the cleanup still runs."""
+    from unittest.mock import patch
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.config import (
+        Config, TeamBotConfig, TeamConfig, save_config, load_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    proj_dir = tmp_path / "acme"
+    proj_dir.mkdir()
+    save_config(
+        Config(
+            telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x",
+            teams={
+                "acme": TeamConfig(
+                    path=str(proj_dir), group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(telegram_bot_token="t1", bot_username="mgr_bot"),
+                        "dev": TeamBotConfig(telegram_bot_token="t2", bot_username="dev_bot"),
+                    },
+                )
+            },
+        ),
+        cfg_path,
+    )
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
+    mb._pm = MagicMock()
+    mb._team_relays = {}
+    mb._telethon_client = MagicMock()
+
+    async def sometimes_fail(username):
+        if username == "mgr_bot":
+            raise RuntimeError("BotFather said no")
+
+    with patch(
+        "link_project_to_chat.botfather.BotFatherClient.delete_bot",
+        new=AsyncMock(side_effect=sometimes_fail),
+    ), patch(
+        "link_project_to_chat.manager.telegram_group.delete_supergroup",
+        new=AsyncMock(),
+    ):
+        await mb._delete_team_execute(chat_id=1, target="acme")
+
+    # Team still removed from config, folder still gone, but issues reported.
+    assert "acme" not in load_config(cfg_path).teams
+    assert not proj_dir.exists()
+    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
+    assert any("deleted with issues" in m for m in sent)
+    assert any("BotFather /deletebot @mgr_bot" in m for m in sent)
+
+
+@pytest.mark.asyncio
 async def test_create_bot_with_retry_gives_up_after_repeated_rate_limits(monkeypatch):
     """Permanent throttle should surface as a RuntimeError, not hang."""
     from link_project_to_chat.botfather import BotFatherRateLimit

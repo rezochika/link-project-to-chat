@@ -153,6 +153,36 @@ class BotFatherClient:
             raise Exception(f"Unexpected BotFather response: {response_text[:200]}")
         raise Exception(f"Failed to create bot after {max_retries} retries. All username variants of '{username}' were taken.")
 
+    async def delete_bot(self, bot_username: str) -> None:
+        """Send /deletebot to BotFather, select the bot, confirm with the magic phrase.
+
+        Raises on unexpected BotFather reply so the caller can report.
+        """
+        client = await self._ensure_client()
+        entity = await client.get_entity(_BOTFATHER)
+        await client.send_message(entity, "/deletebot")
+        await asyncio.sleep(1.5)
+        await client.send_message(entity, f"@{bot_username}")
+        await asyncio.sleep(1.5)
+        # BotFather requires the literal phrase "Yes, I am totally sure." to confirm.
+        await client.send_message(entity, "Yes, I am totally sure.")
+        await asyncio.sleep(1.5)
+        messages = await client.get_messages(entity, limit=1)
+        if messages:
+            text = (messages[0].text or "").lower()
+            if "done" in text or "deleted" in text or "gone" in text:
+                logger.info("Deleted bot @%s", bot_username)
+                return
+            if "try again" in text or _parse_rate_limit(messages[0].text or "") is not None:
+                raise BotFatherRateLimit(
+                    f"BotFather throttled /deletebot for @{bot_username}",
+                    retry_after=_parse_rate_limit(messages[0].text or "") or 60.0,
+                )
+            logger.warning(
+                "Unexpected BotFather reply after deleting @%s: %s",
+                bot_username, messages[0].text[:200] if messages[0].text else "",
+            )
+
     async def disable_privacy(self, bot_username: str) -> None:
         """Send /setprivacy to BotFather, select the bot by @username, tap Disable.
 

@@ -35,6 +35,7 @@ COMMANDS = [
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
     ("create_team", "Create a dual-agent team (2 bots + group)"),
+    ("delete_team", "Delete a team (bots + group + folder)"),
     ("teams", "List existing teams (start/stop bots)"),
     ("model", "Set default model for all projects"),
     ("version", "Show version"),
@@ -385,6 +386,9 @@ class ManagerBot(AuthMixin):
         CREATE_TEAM_PERSONA_MGR,
         CREATE_TEAM_PERSONA_DEV,
     ) = range(18, 24)
+
+    # ConversationHandler state for /delete_team (single confirmation step)
+    DELETE_TEAM_CONFIRM = 24
 
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -1283,6 +1287,202 @@ class ManagerBot(AuthMixin):
             lines.append("Config not saved. Safe to retry with a different prefix.")
         await self._app.bot.send_message(chat_id, "\n".join(lines))
 
+    # --- /delete_team -------------------------------------------------------
+
+    async def _on_delete_team(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        """Entry: /delete_team [prefix]. Lists teams if no arg, else confirms the target."""
+        if not await self._guard(update):
+            return ConversationHandler.END
+
+        from ..config import load_config
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(cfg_path)
+        if not config.teams:
+            await update.effective_message.reply_text("No teams configured.")
+            return ConversationHandler.END
+
+        target: str | None = None
+        if ctx.args:
+            target = ctx.args[0].strip().lower()
+
+        if target is None:
+            # Show a keyboard of existing teams.
+            buttons = [
+                [InlineKeyboardButton(name, callback_data=f"dt_pick:{name}")]
+                for name in sorted(config.teams)
+            ]
+            buttons.append([InlineKeyboardButton("Cancel", callback_data="dt_pick:__cancel__")])
+            await update.effective_message.reply_text(
+                "Pick a team to delete:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return self.DELETE_TEAM_CONFIRM
+
+        if target not in config.teams:
+            await update.effective_message.reply_text(f"Team `{target}` not found.")
+            return ConversationHandler.END
+
+        return await self._delete_team_show_confirm(update.effective_chat.id, target, ctx)
+
+    async def _delete_team_show_confirm(
+        self, chat_id: int, target: str, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Render the irreversible-action confirmation."""
+        from ..config import load_config
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        team = load_config(cfg_path).teams[target]
+        ctx.user_data["delete_team"] = {"target": target}
+        bot_usernames = [b.bot_username or "(no username)" for b in team.bots.values()]
+        message = (
+            f"⚠ Delete team `{target}`?\n\n"
+            f"This will:\n"
+            f"  • Stop both team bot subprocesses\n"
+            f"  • Delete bots via BotFather: {', '.join('@' + u for u in bot_usernames if u and u != '(no username)')}\n"
+            f"  • Delete the Telegram supergroup (chat_id={team.group_chat_id})\n"
+            f"  • Remove `{team.path}` from disk\n"
+            f"  • Remove the team entry from config.json\n\n"
+            f"This cannot be undone. Proceed?"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"Delete {target}", callback_data="dt_confirm")],
+            [InlineKeyboardButton("Cancel", callback_data="dt_cancel")],
+        ])
+        await self._app.bot.send_message(chat_id, message, reply_markup=keyboard)
+        return self.DELETE_TEAM_CONFIRM
+
+    async def _delete_team_confirm_callback(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE
+    ) -> int:
+        """Callback for the pick / confirm / cancel keyboard."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data or ""
+        if data.startswith("dt_pick:"):
+            target = data.split(":", 1)[1]
+            if target == "__cancel__":
+                await query.edit_message_text("Cancelled.")
+                return ConversationHandler.END
+            await query.edit_message_text(f"Selected: `{target}`")
+            return await self._delete_team_show_confirm(query.message.chat_id, target, ctx)
+        if data == "dt_cancel":
+            ctx.user_data.pop("delete_team", None)
+            await query.edit_message_text("Cancelled.")
+            return ConversationHandler.END
+        if data == "dt_confirm":
+            target = ctx.user_data.get("delete_team", {}).get("target")
+            if not target:
+                await query.edit_message_text("No team selected — cancelling.")
+                return ConversationHandler.END
+            await query.edit_message_text(f"⟳ Deleting team `{target}`...")
+            await self._delete_team_execute(query.message.chat_id, target)
+            ctx.user_data.pop("delete_team", None)
+            return ConversationHandler.END
+        return ConversationHandler.END
+
+    async def _delete_team_execute(self, chat_id: int, target: str) -> None:
+        """Best-effort cleanup. Partial-failure report lists whatever didn't work."""
+        import shutil
+        from ..config import load_config, patch_team
+        from ..botfather import BotFatherClient
+        from .telegram_group import delete_supergroup
+
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        config = load_config(cfg_path)
+        team = config.teams.get(target)
+        if team is None:
+            await self._app.bot.send_message(chat_id, f"Team `{target}` not found (already deleted?).")
+            return
+
+        status_msg = await self._app.bot.send_message(chat_id, "⟳ Stopping bots...")
+
+        async def edit(text: str) -> None:
+            try:
+                await status_msg.edit_text(text)
+            except Exception:
+                pass
+
+        failures: list[str] = []
+
+        # 1. Stop subprocesses (non-fatal).
+        for role in team.bots:
+            key = f"team:{target}:{role}"
+            try:
+                self._pm.stop(key)
+            except Exception as exc:
+                failures.append(f"stop {key}: {exc}")
+
+        # 2. Stop relay (non-fatal).
+        relays = getattr(self, "_team_relays", None)
+        if relays is not None:
+            relay = relays.pop(target, None)
+            if relay is not None:
+                try:
+                    await relay.stop()
+                except Exception as exc:
+                    failures.append(f"stop relay: {exc}")
+
+        # 3. Delete bots via BotFather (non-fatal per bot).
+        await edit("⟳ Deleting bots via BotFather...")
+        bfc = BotFatherClient(
+            api_id=config.telegram_api_id,
+            api_hash=config.telegram_api_hash,
+            session_path=cfg_path.parent / "telethon.session",
+            client=getattr(self, "_telethon_client", None),
+        )
+        try:
+            for role, bot in team.bots.items():
+                if not bot.bot_username:
+                    continue
+                try:
+                    await bfc.delete_bot(bot.bot_username)
+                except Exception as exc:
+                    failures.append(f"BotFather /deletebot @{bot.bot_username}: {exc}")
+        finally:
+            try:
+                await bfc.disconnect()
+            except Exception:
+                pass
+
+        # 4. Delete Telegram supergroup (non-fatal).
+        if team.group_chat_id and self._telethon_client is not None:
+            await edit("⟳ Deleting Telegram supergroup...")
+            try:
+                await delete_supergroup(self._telethon_client, team.group_chat_id)
+            except Exception as exc:
+                failures.append(f"delete supergroup {team.group_chat_id}: {exc}")
+
+        # 5. rm -rf project folder (non-fatal).
+        if team.path:
+            project_path = Path(team.path)
+            if project_path.exists():
+                await edit(f"⟳ Removing {project_path}...")
+                try:
+                    shutil.rmtree(project_path)
+                except Exception as exc:
+                    failures.append(f"rmtree {project_path}: {exc}")
+
+        # 6. Remove team entry from config (ALWAYS — final step).
+        await edit("⟳ Removing team from config...")
+        try:
+            updated = load_config(cfg_path)
+            updated.teams.pop(target, None)
+            from ..config import save_config
+            save_config(updated, cfg_path)
+        except Exception as exc:
+            failures.append(f"remove team from config: {exc}")
+
+        # 7. Report.
+        if failures:
+            report = (
+                f"✗ Team `{target}` deleted with issues:\n\n"
+                + "\n".join(f"  • {f}" for f in failures)
+                + "\n\nThe team config entry was removed; you may need to clean the "
+                "listed items manually."
+            )
+        else:
+            report = f"✓ Team `{target}` fully deleted."
+        await self._app.bot.send_message(chat_id, report)
+
     @staticmethod
     async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data.pop("pending_edit", None)
@@ -1679,6 +1879,19 @@ class ManagerBot(AuthMixin):
                     ],
                     self.CREATE_TEAM_PERSONA_DEV: [
                         CallbackQueryHandler(self._create_team_persona_dev_callback, pattern=r"^ct_persona_dev:"),
+                    ],
+                },
+                fallbacks=[CommandHandler("cancel", self._create_cancel)],
+            ))
+
+            app.add_handler(ConversationHandler(
+                entry_points=[CommandHandler("delete_team", self._on_delete_team)],
+                states={
+                    self.DELETE_TEAM_CONFIRM: [
+                        CallbackQueryHandler(
+                            self._delete_team_confirm_callback,
+                            pattern=r"^dt_(pick:|confirm$|cancel$)",
+                        ),
                     ],
                 },
                 fallbacks=[CommandHandler("cancel", self._create_cancel)],

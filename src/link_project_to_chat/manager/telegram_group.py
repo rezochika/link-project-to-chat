@@ -7,6 +7,7 @@ import logging
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import (
     CreateChannelRequest,
+    DeleteChannelRequest,
     EditAdminRequest,
     InviteToChannelRequest,
 )
@@ -80,3 +81,9 @@ async def invite_user(client, chat_id: int, username: str) -> None:
         client,
         InviteToChannelRequest(channel=channel, users=[user_entity]),
     )
+
+
+async def delete_supergroup(client, chat_id: int) -> None:
+    """Delete a supergroup. Caller must be the creator; admin-only is not enough."""
+    channel = await client.get_input_entity(chat_id)
+    await _call_with_flood_retry(client, DeleteChannelRequest(channel=channel))
