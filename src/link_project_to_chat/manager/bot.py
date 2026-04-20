@@ -127,6 +127,13 @@ def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | N
     return None
 
 
+_MAX_IN_SESSION_RATE_LIMIT_WAIT = 300.0
+"""Upper bound (seconds) on how long we'll sleep waiting out a BotFather
+throttle inside the /create_team callback. Above this we surface the wait to
+the user — blocking a callback for hours is strictly worse than asking them
+to retry tomorrow."""
+
+
 async def _create_bot_with_retry(
     bfc,
     display_name: str,
@@ -140,6 +147,9 @@ async def _create_bot_with_retry(
     ``retry_after`` and re-tries the SAME candidate (doesn't eat a suffix
     attempt). Limits total rate-limit retries via ``max_rate_limit_retries``
     so a permanent throttle still surfaces instead of hanging forever.
+
+    If the hinted wait exceeds ``_MAX_IN_SESSION_RATE_LIMIT_WAIT`` we surface
+    the throttle immediately (user-actionable) rather than sleeping through it.
     """
     import asyncio
     from ..botfather import BotFatherRateLimit
@@ -159,17 +169,25 @@ async def _create_bot_with_retry(
             token = await bfc.create_bot(display_name, candidate)
             return token, candidate
         except BotFatherRateLimit as exc:
+            wait = max(float(exc.retry_after), 1.0)
+            if wait > _MAX_IN_SESSION_RATE_LIMIT_WAIT:
+                hours = wait / 3600.0
+                raise RuntimeError(
+                    f"BotFather is flood-limited for ~{hours:.1f}h ({wait:.0f}s). "
+                    f"Retry /create_team after the cooldown; delete any orphaned "
+                    f"bot via BotFather /deletebot first."
+                ) from exc
             if rate_limit_retries >= max_rate_limit_retries:
                 raise RuntimeError(
                     f"BotFather throttled us after {rate_limit_retries + 1} waits; giving up. "
                     f"Try /create_team again in a few minutes."
                 ) from exc
-            wait = max(float(exc.retry_after), 1.0) + 2.0  # +2s jitter
+            sleep_for = wait + 2.0  # +2s jitter
             logger.warning(
                 "BotFather throttle on @%s; sleeping %.1fs before retrying same candidate.",
-                candidate, wait,
+                candidate, sleep_for,
             )
-            await asyncio.sleep(wait)
+            await asyncio.sleep(sleep_for)
             rate_limit_retries += 1
             # Don't advance `attempt` — retry the same candidate once BotFather cools down.
             continue

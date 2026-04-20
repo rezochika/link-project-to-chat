@@ -410,6 +410,35 @@ async def test_create_bot_with_retry_gives_up_after_repeated_rate_limits(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_create_bot_with_retry_short_circuits_on_long_flood_wait(monkeypatch):
+    """A multi-hour BotFather cooldown must not be waited out inside the
+    /create_team callback — we surface the wait to the user instead of
+    sleeping. Regression for the 2026-04-20 incident (68436s ≈ 19h).
+    """
+    from link_project_to_chat.botfather import BotFatherRateLimit
+    from link_project_to_chat.manager.bot import _create_bot_with_retry
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    async def fake_create_bot(display_name: str, username: str) -> str:
+        raise BotFatherRateLimit("flooded", retry_after=68436.0)
+
+    bfc = MagicMock()
+    bfc.create_bot = fake_create_bot
+
+    with pytest.raises(RuntimeError, match=r"flood-limited for ~19\."):
+        await _create_bot_with_retry(bfc, "Acme Dev", "acme_dev_claude_bot")
+
+    # Must not have slept — the short-circuit path fires before any await sleep.
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
 async def test_create_team_execute_partial_failure_report(tmp_path):
     """When orchestration aborts mid-flight, a partial-failure report is sent."""
     from unittest.mock import patch

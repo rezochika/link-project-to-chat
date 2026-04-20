@@ -63,6 +63,76 @@ def test_parse_rate_limit_ignores_non_throttle_text():
 
 
 @pytest.mark.asyncio
+async def test_create_bot_raises_rate_limit_after_newbot_response(tmp_path):
+    """Regression: BotFather throttles `/newbot` itself (not just username picks).
+    Without detecting it at this step, the loop burns suffix retries until it
+    hits the generic "unexpected response" path. Simulates the 68436s cooldown
+    seen in the 2026-04-20 chat export.
+    """
+    from link_project_to_chat.botfather import BotFatherClient, BotFatherRateLimit
+
+    client_mock = MagicMock()
+    client_mock.is_connected = MagicMock(return_value=True)
+    client_mock.is_user_authorized = AsyncMock(return_value=True)
+    client_mock.send_message = AsyncMock()
+    client_mock.get_entity = AsyncMock(return_value=MagicMock(name="botfather_entity"))
+
+    throttle_reply = MagicMock()
+    throttle_reply.text = "Sorry, too many attempts. Please try again in 68436 seconds."
+    client_mock.get_messages = AsyncMock(return_value=[throttle_reply])
+
+    bfc = BotFatherClient(api_id=1, api_hash="x", session_path=tmp_path / "s")
+    bfc._client = client_mock
+
+    with patch("link_project_to_chat.botfather.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(BotFatherRateLimit) as excinfo:
+            await bfc.create_bot("Acme Dev", "acme_dev_claude_bot")
+
+    # Hinted retry_after propagated and the step is attributed to /newbot,
+    # so callers can choose to surface the long wait instead of retrying blindly.
+    assert excinfo.value.retry_after == 68436.0
+    assert "/newbot" in str(excinfo.value)
+    # We never reached the display_name or username send — those belong to the
+    # suffix-retry path that used to mask this throttle.
+    sent = [c.args[1] for c in client_mock.send_message.call_args_list]
+    assert sent == ["/newbot"]
+
+
+@pytest.mark.asyncio
+async def test_create_bot_raises_rate_limit_after_display_name_response(tmp_path):
+    """BotFather can also throttle between /newbot and display_name. Cover that
+    path so we don't keep firing the username and misread the reply.
+    """
+    from link_project_to_chat.botfather import BotFatherClient, BotFatherRateLimit
+
+    client_mock = MagicMock()
+    client_mock.is_connected = MagicMock(return_value=True)
+    client_mock.is_user_authorized = AsyncMock(return_value=True)
+    client_mock.send_message = AsyncMock()
+    client_mock.get_entity = AsyncMock(return_value=MagicMock(name="botfather_entity"))
+
+    healthy = MagicMock()
+    healthy.text = "Alright, a new bot. How are we going to call it?"
+    throttled = MagicMock()
+    throttled.text = "Sorry, too many attempts. Please try again in 42 seconds."
+    # First poll (after /newbot): healthy. Second poll (after display_name): throttled.
+    client_mock.get_messages = AsyncMock(side_effect=[[healthy], [throttled]])
+
+    bfc = BotFatherClient(api_id=1, api_hash="x", session_path=tmp_path / "s")
+    bfc._client = client_mock
+
+    with patch("link_project_to_chat.botfather.asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(BotFatherRateLimit) as excinfo:
+            await bfc.create_bot("Acme Dev", "acme_dev_claude_bot")
+
+    assert excinfo.value.retry_after == 42.0
+    assert "display_name" in str(excinfo.value)
+    sent = [c.args[1] for c in client_mock.send_message.call_args_list]
+    # /newbot + display_name sent, but the username send never happened.
+    assert sent == ["/newbot", "Acme Dev"]
+
+
+@pytest.mark.asyncio
 async def test_disable_privacy_sends_correct_dialog(tmp_path):
     from link_project_to_chat.botfather import BotFatherClient
     from unittest.mock import AsyncMock, MagicMock

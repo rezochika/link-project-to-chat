@@ -114,10 +114,33 @@ class BotFatherClient:
         if not await client.is_user_authorized():
             raise Exception("Not authenticated. Run /setup first.")
         entity = await client.get_entity(_BOTFATHER)
+
+        async def _latest_text() -> str:
+            msgs = await client.get_messages(entity, limit=1)
+            if not msgs:
+                return ""
+            return msgs[0].text or ""
+
+        def _raise_if_throttled(response_text: str, step: str) -> None:
+            wait = _parse_rate_limit(response_text)
+            if wait is not None:
+                raise BotFatherRateLimit(
+                    f"BotFather throttled at {step}: {response_text[:200]}",
+                    retry_after=wait,
+                )
+
         await client.send_message(entity, "/newbot")
         await asyncio.sleep(1.5)
+        # BotFather rate-limits `/newbot` itself (not just username picks) —
+        # if we don't check here we keep firing display_name + username at a
+        # BotFather that has fallen out of the new-bot flow, then misread its
+        # generic help text as an "unexpected" failure and burn suffix retries.
+        _raise_if_throttled(await _latest_text(), "/newbot")
+
         await client.send_message(entity, display_name)
         await asyncio.sleep(1.5)
+        _raise_if_throttled(await _latest_text(), "display_name")
+
         max_retries = 3
         for attempt in range(max_retries + 1):
             trial_username = username if attempt == 0 else f"{username.rstrip('bot')}_{attempt + 1}_bot"
