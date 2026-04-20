@@ -13,7 +13,7 @@ import re
 
 from .transport import IncomingMessage
 
-_MENTION_RE = re.compile(r"@([A-Za-z][A-Za-z0-9_]*)")
+_MENTION_RE = re.compile(r"(?:^|[^A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]*)")
 
 
 def extract_mentions(text: str) -> list[str]:

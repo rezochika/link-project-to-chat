@@ -85,6 +85,28 @@ def test_extract_mentions_strips_punctuation_boundaries():
     assert extract_mentions("hey @bot_a, can you") == ["bot_a"]
 
 
+def test_extract_mentions_ignores_email_addresses():
+    """Regression: v1 used Telegram entity parsing, which treats email @ as non-mention.
+    Our pure-regex version must match that behavior by requiring a non-word left boundary."""
+    assert extract_mentions("contact me at alice@acme_dev_bot.com") == []
+
+
+def test_extract_mentions_ignores_embedded_at_after_word_char():
+    """Regression: `foo@handle` (no space before @) is not a mention."""
+    assert extract_mentions("run foo@acme_dev_bot") == []
+
+
+def test_extract_mentions_still_matches_at_start_of_string():
+    """Boundary: the left-boundary must allow start-of-string, not require a preceding non-word char."""
+    assert extract_mentions("@acme_dev_bot hi") == ["acme_dev_bot"]
+
+
+def test_extract_mentions_still_matches_after_newline_or_punctuation():
+    """Newlines and punctuation count as non-word — mention on the second line should match."""
+    assert extract_mentions("hello\n@acme_dev_bot") == ["acme_dev_bot"]
+    assert extract_mentions("(@acme_dev_bot)") == ["acme_dev_bot"]
+
+
 # is_directed_at_me
 
 
