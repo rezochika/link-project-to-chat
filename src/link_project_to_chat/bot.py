@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
-from telegram.ext import ContextTypes, MessageHandler, filters
-
 from .config import (
     Config,
     DEFAULT_CONFIG,
