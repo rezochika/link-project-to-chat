@@ -1561,6 +1561,8 @@ class ProjectBot(AuthMixin):
             )
             return
 
+        if not incoming.files:
+            return
         audio = incoming.files[0]
 
         MAX_VOICE_BYTES = 20 * 1024 * 1024

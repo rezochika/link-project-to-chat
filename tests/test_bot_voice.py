@@ -114,6 +114,7 @@ async def test_voice_unauthorized_sender_ignored(tmp_path):
     # No status message sent; no task submitted.
     assert bot._transport.sent_messages == []
     bot.task_manager.submit_claude.assert_not_called()
+    bot._transcriber.transcribe.assert_not_called()
 
 
 async def test_voice_no_transcriber_replies_with_setup_instructions(tmp_path):
@@ -147,3 +148,47 @@ async def test_voice_transcription_error_shows_message(tmp_path):
         "Transcription failed" in e.text
         for e in bot._transport.edited_messages
     )
+
+
+async def test_voice_with_reply_prefixes_prompt(tmp_path):
+    """When incoming has a reply_to with text, the prompt is prefixed with '[Replying to: ...]'."""
+    bot = _make_project_bot_stub()
+    incoming = _audio_incoming(tmp_path)
+    # Construct a reply-to MessageRef and attach reply_to_message.text on native.
+    chat = incoming.chat
+    reply_ref = MessageRef(transport_id="fake", native_id="42", chat=chat)
+    incoming_with_reply = IncomingMessage(
+        chat=incoming.chat,
+        sender=incoming.sender,
+        text=incoming.text,
+        files=incoming.files,
+        reply_to=reply_ref,
+        native=SimpleNamespace(
+            message_id=1,
+            reply_to_message=SimpleNamespace(text="earlier message"),
+        ),
+    )
+    await bot._on_voice_from_transport(incoming_with_reply)
+    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    assert kwargs["prompt"].startswith("[Replying to: earlier message]")
+
+
+async def test_voice_with_active_persona_formats_prompt(tmp_path, monkeypatch):
+    """When _active_persona is set, load_persona + format_persona_prompt run on the transcript."""
+    bot = _make_project_bot_stub()
+    bot._active_persona = "reviewer"
+
+    # Stub the persona-loading helpers by monkeypatching the skills module.
+    from link_project_to_chat import skills as skills_module
+    fake_persona = SimpleNamespace(content="You are a reviewer.")
+    monkeypatch.setattr(skills_module, "load_persona", lambda name, path: fake_persona)
+    monkeypatch.setattr(
+        skills_module, "format_persona_prompt",
+        lambda persona, prompt: f"[persona={persona.content}] {prompt}",
+    )
+
+    incoming = _audio_incoming(tmp_path)
+    await bot._on_voice_from_transport(incoming)
+    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    assert "[persona=You are a reviewer.]" in kwargs["prompt"]
+    assert "transcribed text" in kwargs["prompt"]
