@@ -28,6 +28,7 @@ from .config import (
     DEFAULT_CONFIG,
     clear_session,
     load_sessions,
+    load_teams,
     patch_project,
     patch_team,
     resolve_permissions,
@@ -792,6 +793,39 @@ class ProjectBot(AuthMixin):
 
     # --- Persona handlers ---
 
+    def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
+        """Persist this bot's active_persona.
+
+        Team bots live under ``config.teams[team].bots[role]``; solo bots under
+        ``config.projects[name]``. ``patch_project`` on a team bot would create
+        a stray projects entry and never touch the real team config, so the
+        team path re-serialises the full ``bots`` dict via ``patch_team``.
+
+        ``config_path`` is for tests; production uses DEFAULT_CONFIG.
+        """
+        cfg = config_path or DEFAULT_CONFIG
+        if self.team_name:
+            teams = load_teams(cfg)
+            team = teams.get(self.team_name)
+            if team is None:
+                logger.warning(
+                    "Team %r not in config; persona change not persisted.", self.team_name
+                )
+                return
+            bots_dict: dict[str, dict] = {}
+            for role, bot in team.bots.items():
+                entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
+                if role == self.role:
+                    if name is not None:
+                        entry["active_persona"] = name
+                else:
+                    if bot.active_persona:
+                        entry["active_persona"] = bot.active_persona
+                bots_dict[role] = entry
+            patch_team(self.team_name, {"bots": bots_dict}, cfg)
+        else:
+            patch_project(self.name, {"active_persona": name}, cfg)
+
     async def _on_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
@@ -809,8 +843,7 @@ class ProjectBot(AuthMixin):
         if not persona:
             return await update.effective_message.reply_text(f"Persona '{name}' not found.")
         self._active_persona = name
-        from .config import patch_project
-        patch_project(self.name, {"active_persona": name})
+        self._persist_active_persona(name)
         await update.effective_message.reply_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
 
     async def _on_stop_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -820,8 +853,7 @@ class ProjectBot(AuthMixin):
             return await update.effective_message.reply_text("No active persona.")
         old = self._active_persona
         self._active_persona = None
-        from .config import patch_project
-        patch_project(self.name, {"active_persona": None})
+        self._persist_active_persona(None)
         await update.effective_message.reply_text(f"Persona '{old}' deactivated.")
 
     async def _on_halt(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1074,6 +1106,7 @@ class ProjectBot(AuthMixin):
             if not persona:
                 return await query.edit_message_text(f"Persona '{name}' not found.")
             self._active_persona = name
+            self._persist_active_persona(name)
             await query.edit_message_text(f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate.")
         elif query.data.startswith("ask_"):
             # Format: ask_{task_id}_{q_idx}_{opt_idx}

@@ -241,3 +241,149 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
     # No capture should happen, no reply should be sent
     assert captured == []
     update.effective_message.reply_text.assert_not_called()
+
+
+# --- persona persistence for team bots ---
+
+
+def test_persist_active_persona_team_bot_updates_team_config(tmp_path, monkeypatch):
+    """Setting persona on a team bot writes to config.teams[team].bots[role], not projects."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import (
+        Config,
+        TeamBotConfig,
+        TeamConfig,
+        load_config,
+        load_teams,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "acme": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(telegram_bot_token="t1", active_persona="old_manager"),
+                        "dev":     TeamBotConfig(telegram_bot_token="t2", active_persona="old_dev"),
+                    },
+                )
+            }
+        ),
+        cfg_path,
+    )
+    # Tests pass cfg_path explicitly to _persist_active_persona — no monkeypatch needed.
+    _ = monkeypatch  # placeholder to keep the fixture arg; no longer needed
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t1",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot._persist_active_persona("software_manager", config_path=cfg_path)
+
+    teams = load_teams(cfg_path)
+    # Manager's persona was updated; dev's persona is preserved.
+    assert teams["acme"].bots["manager"].active_persona == "software_manager"
+    assert teams["acme"].bots["dev"].active_persona == "old_dev"
+    # Tokens survive the full-bots-dict rewrite.
+    assert teams["acme"].bots["manager"].telegram_bot_token == "t1"
+    assert teams["acme"].bots["dev"].telegram_bot_token == "t2"
+    # No stray projects entry was created.
+    cfg = load_config(cfg_path)
+    assert "acme_manager" not in cfg.projects
+
+
+def test_persist_active_persona_team_bot_none_clears_role_only(tmp_path, monkeypatch):
+    """Passing None clears this role's persona but preserves the other role's."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import (
+        Config,
+        TeamBotConfig,
+        TeamConfig,
+        load_teams,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "acme": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(telegram_bot_token="t1", active_persona="software_manager"),
+                        "dev":     TeamBotConfig(telegram_bot_token="t2", active_persona="software_dev"),
+                    },
+                )
+            }
+        ),
+        cfg_path,
+    )
+    # Tests pass cfg_path explicitly to _persist_active_persona — no monkeypatch needed.
+    _ = monkeypatch  # placeholder to keep the fixture arg; no longer needed
+
+    bot = ProjectBot(
+        name="acme_dev", path=tmp_path, token="t2",
+        team_name="acme", role="dev", group_chat_id=-100_111,
+    )
+    bot._persist_active_persona(None, config_path=cfg_path)
+
+    teams = load_teams(cfg_path)
+    # Dev's persona cleared; manager's survives.
+    assert teams["acme"].bots["dev"].active_persona is None
+    assert teams["acme"].bots["manager"].active_persona == "software_manager"
+
+
+def test_persist_active_persona_solo_bot_uses_patch_project(tmp_path, monkeypatch):
+    """Solo bots (no team_name) should still use patch_project — no team write."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import (
+        Config,
+        ProjectConfig,
+        load_config,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            projects={
+                "solo": ProjectConfig(path=str(tmp_path), telegram_bot_token="t"),
+            }
+        ),
+        cfg_path,
+    )
+    # Tests pass cfg_path explicitly to _persist_active_persona — no monkeypatch needed.
+    _ = monkeypatch  # placeholder to keep the fixture arg; no longer needed
+
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    bot._persist_active_persona("teacher", config_path=cfg_path)
+
+    cfg = load_config(cfg_path)
+    assert cfg.projects["solo"].active_persona == "teacher"
+    # No stray teams entry.
+    assert cfg.teams == {}
+
+
+def test_persist_active_persona_missing_team_logs_and_skips(tmp_path, monkeypatch, caplog):
+    """Team bot with a team_name that isn't in config should warn, not raise."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import Config, save_config, load_teams
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(), cfg_path)  # no teams
+    # Tests pass cfg_path explicitly to _persist_active_persona — no monkeypatch needed.
+    _ = monkeypatch  # placeholder to keep the fixture arg; no longer needed
+
+    bot = ProjectBot(
+        name="ghost_manager", path=tmp_path, token="t",
+        team_name="ghost", role="manager", group_chat_id=-100_111,
+    )
+    with caplog.at_level("WARNING"):
+        bot._persist_active_persona("software_manager", config_path=cfg_path)
+    # Nothing was persisted (no teams created).
+    assert load_teams(cfg_path) == {}
+    assert any("ghost" in r.message for r in caplog.records)
