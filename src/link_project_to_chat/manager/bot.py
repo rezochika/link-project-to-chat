@@ -160,6 +160,9 @@ class ManagerBot(AuthMixin):
         self._started_at = time.monotonic()
         self._app = None
         self._project_config_path = project_config_path
+        # Persistent Telethon client shared by team relays and /create_team.
+        self._telethon_client = None
+        self._team_relays: dict = {}
         self._init_auth()
 
     def _on_trust(self, user_id: int) -> None:
@@ -1060,10 +1063,13 @@ class ManagerBot(AuthMixin):
             except Exception:
                 pass
 
+        # Reuse the manager's persistent Telethon client if available so we
+        # don't fight the team relay for the same SQLite session file.
         bfc = BotFatherClient(
             api_id=config.telegram_api_id,
             api_hash=config.telegram_api_hash,
             session_path=cfg_path.parent / "telethon.session",
+            client=getattr(self, "_telethon_client", None),
         )
 
         completed: dict[str, str] = {}
@@ -1160,6 +1166,23 @@ class ManagerBot(AuthMixin):
             await edit("✓ Group wired | ⟳ Starting both bots...")
             self._pm.start_team(prefix, "manager")
             self._pm.start_team(prefix, "dev")
+            # Register a TeamRelay for this new team so bot-to-bot handoffs work
+            # without restarting the manager service.
+            try:
+                from .team_relay import TeamRelay
+                client_ = getattr(self, "_telethon_client", None)
+                relays_ = getattr(self, "_team_relays", None)
+                if client_ and relays_ is not None and prefix not in relays_:
+                    relay = TeamRelay(
+                        client_,
+                        prefix,
+                        group_id,
+                        {mgr_username, dev_username},
+                    )
+                    await relay.start()
+                    relays_[prefix] = relay
+            except Exception:
+                logger.exception("Failed to start TeamRelay for new team %s", prefix)
             await edit(f'✓ Team ready. Open the "{prefix} team" group to start chatting.')
 
         except Exception as exc:
@@ -1445,10 +1468,80 @@ class ManagerBot(AuthMixin):
         elif data == "setup_done":
             await query.edit_message_text("Setup complete.")
 
-    @staticmethod
-    async def _post_init(app) -> None:
+    async def _post_init(self, app) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.bot.set_my_commands(COMMANDS)
+        # Start bot-to-bot relays for any teams with a bound group_chat_id.
+        try:
+            await self._start_team_relays()
+        except Exception:
+            logger.exception("Starting team relays failed (team bots will still run)")
+
+    async def _start_team_relays(self) -> None:
+        """Spin up one TeamRelay per team with a bound group_chat_id.
+
+        Skipped silently when Telegram API creds are missing, telethon is not
+        installed, or the telethon.session file is absent — a solo-project
+        deployment never needs this and shouldn't pay a startup cost for it.
+        """
+        from ..config import load_config
+        cfg_path = self._project_config_path or DEFAULT_CONFIG
+        try:
+            config = load_config(cfg_path)
+        except Exception:
+            logger.exception("Could not load config for team relays")
+            return
+        candidates = [
+            (name, team) for name, team in config.teams.items()
+            if team.group_chat_id
+        ]
+        if not candidates:
+            return
+        if not config.telegram_api_id or not config.telegram_api_hash:
+            logger.info("Team relays skipped — Telegram API credentials unset")
+            return
+        session_path = cfg_path.parent / "telethon.session"
+        if not session_path.exists():
+            logger.info("Team relays skipped — telethon session at %s not found", session_path)
+            return
+        try:
+            from telethon import TelegramClient
+            from .team_relay import TeamRelay
+        except ImportError:
+            logger.info("Team relays skipped — telethon not installed")
+            return
+
+        self._telethon_client = TelegramClient(
+            str(session_path), config.telegram_api_id, config.telegram_api_hash,
+        )
+        try:
+            await self._telethon_client.connect()
+            if not await self._telethon_client.is_user_authorized():
+                logger.warning("Telethon session not authorized; skipping team relays")
+                await self._telethon_client.disconnect()
+                self._telethon_client = None
+                return
+        except Exception:
+            logger.exception("Telethon client connect failed; skipping team relays")
+            self._telethon_client = None
+            return
+
+        for name, team in candidates:
+            bot_usernames = {
+                b.bot_username for b in team.bots.values() if b.bot_username
+            }
+            if len(bot_usernames) < 2:
+                logger.info(
+                    "Team %s: fewer than 2 bots with bot_username set; skipping relay",
+                    name,
+                )
+                continue
+            relay = TeamRelay(self._telethon_client, name, team.group_chat_id, bot_usernames)
+            try:
+                await relay.start()
+                self._team_relays[name] = relay
+            except Exception:
+                logger.exception("Failed to start TeamRelay for %s", name)
 
     def build(self):
         app = (

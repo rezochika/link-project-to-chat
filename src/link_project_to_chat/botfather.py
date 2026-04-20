@@ -33,7 +33,13 @@ def extract_token(text: str) -> str | None:
 
 
 class BotFatherClient:
-    def __init__(self, api_id: int, api_hash: str, session_path: Path):
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session_path: Path,
+        client: TelegramClient | None = None,
+    ):
         if TelegramClient is None:
             raise ImportError(
                 "telethon is required for BotFather automation. "
@@ -42,7 +48,9 @@ class BotFatherClient:
         self._api_id = api_id
         self._api_hash = api_hash
         self._session_path = session_path
-        self._client: TelegramClient | None = None
+        # If an external client is provided, share it (don't disconnect in dispose).
+        self._client: TelegramClient | None = client
+        self._owns_client = client is None
 
     async def _ensure_client(self) -> TelegramClient:
         if self._client is None:
@@ -113,5 +121,7 @@ class BotFatherClient:
         await client.send_message(entity, "Disable")
 
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected():
+        # Only disconnect if we own the client — a shared external client is
+        # the caller's responsibility to manage.
+        if self._client and self._client.is_connected() and self._owns_client:
             await self._client.disconnect()
