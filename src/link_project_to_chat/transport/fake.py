@@ -60,6 +60,7 @@ class FakeTransport:
         self.sent_messages: list[SentMessage] = []
         self.edited_messages: list[EditedMessage] = []
         self.sent_files: list[SentFile] = []
+        self.typing_signals: list[ChatRef] = []
         self._message_handlers: list[MessageHandler] = []
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
@@ -110,6 +111,9 @@ class FakeTransport:
         ref = MessageRef(transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat)
         self.sent_files.append(SentFile(chat=chat, path=path, caption=caption, display_name=display_name, message=ref))
         return ref
+
+    async def send_typing(self, chat: ChatRef) -> None:
+        self.typing_signals.append(chat)
 
     # ── Inbound registration ──────────────────────────────────────────────
     def on_message(self, handler: MessageHandler) -> None:

@@ -72,12 +72,84 @@ class TelegramTransport:
     def __init__(self, application: Any) -> None:
         """Construct from an already-built telegram.ext.Application.
 
-        bot.py owns the ApplicationBuilder; this class just uses the Application.
+        Prefer the `build()` classmethod for production use; this constructor
+        exists so tests can inject a mocked Application.
         """
         self._app = application
         self._message_handlers: list[MessageHandler] = []
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
+
+    @classmethod
+    def build(cls, token: str, *, concurrent_updates: bool = True, post_init: Any = None) -> "TelegramTransport":
+        """Construct a TelegramTransport with a polling-mode Application.
+
+        Caller passes the bot token and optional post_init hook. The telegram
+        Application is created and wrapped in one step.
+        """
+        from telegram.ext import ApplicationBuilder
+        builder = ApplicationBuilder().token(token).concurrent_updates(concurrent_updates)
+        if post_init is not None:
+            builder = builder.post_init(post_init)
+        app = builder.build()
+        return cls(app)
+
+    def attach_telegram_routing(
+        self,
+        *,
+        group_mode: bool,
+        command_names: list[str],
+    ) -> None:
+        """Wire telegram's MessageHandler/CommandHandler/CallbackQueryHandler
+        so all incoming updates route through our _dispatch_* methods.
+
+        Called by the bot once during setup. Encapsulates every remaining
+        telegram import (filters, handler types) inside this module.
+        """
+        from telegram.ext import (
+            CallbackQueryHandler,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
+
+        if group_mode:
+            chat_filter = filters.ChatType.GROUPS
+            incoming_filter = (
+                chat_filter
+                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+                & filters.TEXT
+                & ~filters.COMMAND
+            )
+        else:
+            chat_filter = filters.ChatType.PRIVATE
+            incoming_filter = (
+                chat_filter
+                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+                & (filters.TEXT | filters.Document.ALL | filters.PHOTO)
+                & ~filters.COMMAND
+            )
+
+        self._app.add_handler(MessageHandler(incoming_filter, self._dispatch_message))
+
+        for name in command_names:
+            self._app.add_handler(CommandHandler(
+                name,
+                lambda u, c, _n=name: self._dispatch_command(_n, u, c),
+                filters=chat_filter,
+            ))
+
+        self._app.add_handler(CallbackQueryHandler(self._dispatch_button))
+
+    @property
+    def app(self) -> Any:
+        """Direct access to the underlying telegram.ext.Application.
+
+        For legacy bot.py code that still needs to call bot methods directly
+        (e.g., set_my_commands at post_init time). New code should go through
+        the Transport interface.
+        """
+        return self._app
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -169,6 +241,15 @@ class TelegramTransport:
                     chat_id=chat_id, document=fh, caption=caption, filename=display_name,
                 )
         return message_ref_from_telegram(native)
+
+    async def send_typing(self, chat: ChatRef) -> None:
+        try:
+            await self._app.bot.send_chat_action(
+                chat_id=int(chat.native_id), action="typing",
+            )
+        except Exception:
+            # Typing indicators are best-effort; never fatal.
+            pass
 
     # ── Inbound dispatch ──────────────────────────────────────────────────
     async def _dispatch_message(self, update: Any, ctx: Any) -> None:

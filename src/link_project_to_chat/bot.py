@@ -13,15 +13,7 @@ if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
 from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ContextTypes, MessageHandler, filters
 
 from .config import (
     Config,
@@ -172,8 +164,11 @@ class ProjectBot(AuthMixin):
         # Only show typing indicator for Claude tasks, not /run commands
         if task.type == TaskType.COMMAND:
             return
-        chat = await self._app.bot.get_chat(task.chat_id)
-        self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
+        chat_ref = self._chat_ref_for_task(task)
+        assert self._transport is not None
+        self._typing_tasks[task.id] = asyncio.create_task(
+            self._keep_typing(self._transport, chat_ref)
+        )
 
     def _chat_ref_for_task(self, task: Task) -> ChatRef:
         kind = ChatKind.ROOM if self.group_mode else ChatKind.DM
@@ -1701,11 +1696,11 @@ class ProjectBot(AuthMixin):
             logger.warning("Failed to send image %s", path, exc_info=True)
 
     @staticmethod
-    async def _keep_typing(chat) -> None:
+    async def _keep_typing(transport, chat_ref: ChatRef) -> None:
         try:
             while True:
                 try:
-                    await chat.send_action(ChatAction.TYPING)
+                    await transport.send_typing(chat_ref)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1755,16 +1750,11 @@ class ProjectBot(AuthMixin):
                 logger.error("Failed to send startup message to %d", uid, exc_info=True)
 
     def build(self):
-        app = (
-            ApplicationBuilder()
-            .token(self.token)
-            .concurrent_updates(True)
-            .post_init(self._post_init)
-            .build()
-        )
-        self._app = app
         from .transport.telegram import TelegramTransport
-        self._transport = TelegramTransport(app)
+        self._transport = TelegramTransport.build(self.token, post_init=self._post_init)
+        app = self._transport.app
+        self._app = app
+
         # Fully-ported commands — handler consumes CommandInvocation directly.
         ported_commands = (
             ("help", self._on_help_t),
@@ -1795,7 +1785,6 @@ class ProjectBot(AuthMixin):
             ("halt", self._on_halt),
             ("resume", self._on_resume),
         )
-        assert self._transport is not None
         self._transport.on_message(self._on_text_from_transport)
         self._transport.on_button(self._on_button)
         for _name, _handler in ported_commands:
@@ -1805,41 +1794,18 @@ class ProjectBot(AuthMixin):
                 _name, lambda ci, _h=_legacy: self._legacy_command(_h, ci)
             )
 
-        # Wire telegram's CommandHandler for every command (ported or legacy) to
-        # route through the transport's _dispatch_command.
+        # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
         all_command_names = [n for n, _ in ported_commands] + [n for n, _ in legacy_commands]
+        self._transport.attach_telegram_routing(
+            group_mode=self.group_mode,
+            command_names=all_command_names,
+        )
 
-        if self.group_mode:
-            chat_filter = filters.ChatType.GROUPS
-            for _name in all_command_names:
-                app.add_handler(CommandHandler(
-                    _name,
-                    lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
-                    filters=chat_filter,
-                ))
-            text_filter = (
-                chat_filter
-                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
-                & filters.TEXT
-                & ~filters.COMMAND
-            )
-            app.add_handler(MessageHandler(text_filter, self._transport._dispatch_message))
-            # Voice, files, and other media are disabled in group mode for v1.
-        else:
+        # Legacy auxiliary handlers — voice + unsupported types live in bot.py
+        # until spec #0b (voice port) lands; registered directly via telegram
+        # filters because they're transport-model-specific.
+        if not self.group_mode:
             private = filters.ChatType.PRIVATE
-            for _name in all_command_names:
-                app.add_handler(CommandHandler(
-                    _name,
-                    lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
-                    filters=private,
-                ))
-            incoming_filter = (
-                private
-                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
-                & (filters.TEXT | filters.Document.ALL | filters.PHOTO)
-                & ~filters.COMMAND
-            )
-            app.add_handler(MessageHandler(incoming_filter, self._transport._dispatch_message))
             voice_filter = private & (filters.VOICE | filters.AUDIO)
             app.add_handler(MessageHandler(voice_filter, self._on_voice))
             unsupported_filter = private & (
@@ -1852,7 +1818,6 @@ class ProjectBot(AuthMixin):
             app.add_handler(MessageHandler(unsupported_filter, self._on_unsupported))
 
         app.add_error_handler(self._on_error)
-        app.add_handler(CallbackQueryHandler(self._transport._dispatch_button))
         return app
 
 
