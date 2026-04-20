@@ -23,6 +23,17 @@ from .base import (
 TRANSPORT_ID = "telegram"
 
 
+def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
+    """Convert a Buttons primitive to telegram's InlineKeyboardMarkup (or None)."""
+    if buttons is None:
+        return None
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(text=b.label, callback_data=b.value) for b in row]
+        for row in buttons.rows
+    ])
+
+
 def chat_ref_from_telegram(chat: Any) -> ChatRef:
     """Map a telegram.Chat (or duck-typed equivalent with .id and .type) to ChatRef."""
     kind = ChatKind.DM if chat.type == "private" else ChatKind.ROOM
@@ -96,6 +107,8 @@ class TelegramTransport:
             kwargs["parse_mode"] = "HTML"
         if reply_to is not None:
             kwargs["reply_to_message_id"] = int(reply_to.native_id)
+        if buttons is not None:
+            kwargs["reply_markup"] = _buttons_to_inline_keyboard(buttons)
         try:
             native_msg = await self._app.bot.send_message(**kwargs)
         except Exception as e:
@@ -122,6 +135,8 @@ class TelegramTransport:
         }
         if html:
             kwargs["parse_mode"] = "HTML"
+        if buttons is not None:
+            kwargs["reply_markup"] = _buttons_to_inline_keyboard(buttons)
         try:
             await self._app.bot.edit_message_text(**kwargs)
         except Exception as e:

@@ -141,3 +141,39 @@ async def test_edit_text_calls_edit_message_text():
     assert kwargs["chat_id"] == 12345
     assert kwargs["message_id"] == 99
     assert kwargs["text"] == "updated text"
+
+
+async def test_send_text_with_buttons_passes_inline_keyboard():
+    t, bot = _make_transport_with_mock_bot()
+    from link_project_to_chat.transport import Button, Buttons
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    buttons = Buttons(rows=[[Button(label="Go", value="go"), Button(label="Stop", value="stop")]])
+
+    await t.send_text(chat, "pick one", buttons=buttons)
+
+    bot.send_message.assert_awaited_once()
+    kwargs = bot.send_message.call_args.kwargs
+    markup = kwargs["reply_markup"]
+    assert markup is not None
+    assert len(markup.inline_keyboard) == 1
+    row = markup.inline_keyboard[0]
+    assert len(row) == 2
+    assert row[0].text == "Go"
+    assert row[0].callback_data == "go"
+
+
+async def test_edit_text_with_buttons_passes_inline_keyboard():
+    t, bot = _make_transport_with_mock_bot()
+    bot.edit_message_text = AsyncMock()
+    from link_project_to_chat.transport import Button, Buttons
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    ref = MessageRef(transport_id=TRANSPORT_ID, native_id="99", chat=chat)
+    buttons = Buttons(rows=[[Button(label="Ok", value="ok")]])
+
+    await t.edit_text(ref, "new text", buttons=buttons)
+
+    bot.edit_message_text.assert_awaited_once()
+    kwargs = bot.edit_message_text.call_args.kwargs
+    assert kwargs["reply_markup"] is not None
