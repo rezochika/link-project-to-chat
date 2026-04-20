@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import (
     ButtonHandler,
@@ -20,6 +20,9 @@ from .base import (
     MessageHandler,
     MessageRef,
 )
+
+if TYPE_CHECKING:
+    from ._telegram_relay import TeamRelay
 
 TRANSPORT_ID = "telegram"
 
@@ -89,7 +92,7 @@ class TelegramTransport:
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list = []
         self._menu: Any = None
-        self._team_relay = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
+        self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
 
     @classmethod
     def build(
@@ -126,6 +129,10 @@ class TelegramTransport:
 
         Call once after build(), before start(). Relay lifecycle is tied to
         start()/stop() thereafter.
+
+        TODO(spec #0c): manager/bot.py still constructs TeamRelay directly via
+        the deferred-port compromise. Once the manager port lands, all relay
+        instantiation should funnel through this method.
         """
         from ._telegram_relay import TeamRelay
         self._team_relay = TeamRelay(
