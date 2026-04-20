@@ -6,6 +6,7 @@ Telegram-specific lives behind it.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,13 @@ from .base import (
 TRANSPORT_ID = "telegram"
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# Matches the prefix the Telethon relay prepends to forwarded bot-to-bot messages.
+# Format: "[auto-relay from <handle>]\n\n" — note there is no '@' on the handle.
+# That is intentional: '@handle' would make peer bots re-process the relayed
+# message as a self-mention. See transport/_telegram_relay.py for where the
+# prefix is written.
+_RELAY_PREFIX_RE = re.compile(r"^\[auto-relay from [A-Za-z][A-Za-z0-9_]*\]\n\n")
 
 
 def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
@@ -401,10 +409,19 @@ class TelegramTransport:
             ))
             msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 
+        text = msg.text or getattr(msg, "caption", None) or ""
+        is_relayed = False
+        # The Telethon relay posts messages with this prefix (no '@' on the handle —
+        # intentional, see transport/_telegram_relay.py comment). Detect and strip.
+        relay_match = _RELAY_PREFIX_RE.match(text)
+        if relay_match:
+            is_relayed = True
+            text = text[relay_match.end():]
+
         incoming = IncomingMessage(
             chat=chat_ref_from_telegram(msg.chat),
             sender=identity_from_telegram_user(user),
-            text=msg.text or getattr(msg, "caption", None) or "",
+            text=text,
             files=files,
             reply_to=(
                 message_ref_from_telegram(msg.reply_to_message)
@@ -412,6 +429,7 @@ class TelegramTransport:
                 else None
             ),
             native=msg,
+            is_relayed_bot_to_bot=is_relayed,
         )
         for h in self._message_handlers:
             await h(incoming)

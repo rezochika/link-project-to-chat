@@ -448,3 +448,57 @@ async def test_build_accepts_menu_kwarg():
     t = TelegramTransport(_mock_app)
     t._menu = [("cmd", "desc")]
     assert t._menu == [("cmd", "desc")]
+
+
+async def test_dispatch_sets_is_relayed_bot_to_bot_and_strips_prefix():
+    """Inbound text starting with '[auto-relay from <handle>]' is marked as relayed
+    and the prefix is stripped from the dispatched IncomingMessage.text."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(msg):
+        captured.append(msg)
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=-100123, type="supergroup")
+    tg_user = SimpleNamespace(id=42, full_name="Rezo", username="rezo", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100,
+        chat=tg_chat,
+        from_user=tg_user,
+        text="[auto-relay from bot_a]\n\n@bot_b go do X",
+        photo=None, document=None, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(captured) == 1
+    assert captured[0].is_relayed_bot_to_bot is True
+    assert captured[0].text == "@bot_b go do X"
+
+
+async def test_dispatch_non_relay_text_unchanged():
+    """Messages without the relay prefix have is_relayed_bot_to_bot=False and text unchanged."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(msg):
+        captured.append(msg)
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text="hello world",
+        photo=None, document=None, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert captured[0].is_relayed_bot_to_bot is False
+    assert captured[0].text == "hello world"
