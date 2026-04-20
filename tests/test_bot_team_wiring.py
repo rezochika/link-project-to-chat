@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.transport import ChatKind, ChatRef, Identity, IncomingMessage, MessageRef
 from link_project_to_chat.transport.fake import FakeTransport
