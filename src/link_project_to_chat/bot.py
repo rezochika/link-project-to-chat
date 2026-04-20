@@ -118,7 +118,11 @@ class ProjectBot(AuthMixin):
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._live_text: dict[int, LiveMessage] = {}
         self._live_thinking: dict[int, LiveMessage] = {}
-        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking (toggle-off path)
+        # Tasks whose LiveMessage.start() failed once — don't retry for the
+        # rest of the turn; fall back to post-completion paths instead.
+        self._live_text_failed: set[int] = set()
+        self._live_thinking_failed: set[int] = set()
+        self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking (toggle-off path OR live fallback)
         self._thinking_store: dict[int, str] = {}  # task_id → thinking text
         self._init_auth()
         self._active_skill: str | None = None
@@ -164,17 +168,30 @@ class ProjectBot(AuthMixin):
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, TextDelta):
             live = self._live_text.get(task.id)
-            if live is None:
+            if live is None and task.id not in self._live_text_failed:
                 live = LiveMessage(
                     bot=self._app.bot,
                     chat_id=task.chat_id,
                     reply_to_message_id=task.message_id,
                 )
+                try:
+                    await live.start()
+                except Exception:
+                    logger.exception(
+                        "LiveMessage.start failed for live text (task #%d); "
+                        "falling back to send-at-finalize",
+                        task.id,
+                    )
+                    self._live_text_failed.add(task.id)
+                    # task.result will be populated from collected_text in
+                    # task_manager; _finalize_claude_task's "no live_text"
+                    # branch will then _send_to_chat it in one shot.
+                    return
                 self._live_text[task.id] = live
-                await live.start()
-            await live.append(event.text)
+            if live is not None:
+                await live.append(event.text)
         elif isinstance(event, ThinkingDelta):
-            if self.show_thinking:
+            if self.show_thinking and task.id not in self._live_thinking_failed:
                 live = self._live_thinking.get(task.id)
                 if live is None:
                     live = LiveMessage(
@@ -183,13 +200,28 @@ class ProjectBot(AuthMixin):
                         reply_to_message_id=task.message_id,
                         prefix="💭 ",
                     )
-                    self._live_thinking[task.id] = live
-                    await live.start()
-                await live.append(event.text)
-            else:
-                buf = self._thinking_buf.setdefault(task.id, "")
-                sep = "\n\n" if buf else ""
-                self._thinking_buf[task.id] = buf + sep + event.text
+                    try:
+                        await live.start()
+                    except Exception:
+                        logger.exception(
+                            "LiveMessage.start failed for live thinking (task #%d); "
+                            "falling back to post-completion Thinking button",
+                            task.id,
+                        )
+                        self._live_thinking_failed.add(task.id)
+                        # Fall through to the buffer-accumulation branch so
+                        # _finalize_claude_task can still populate _thinking_store
+                        # (which powers the /tasks → Thinking button).
+                        live = None
+                    else:
+                        self._live_thinking[task.id] = live
+                if live is not None:
+                    await live.append(event.text)
+                    return
+            # Toggle-off path, OR toggle-on with failed live start.
+            buf = self._thinking_buf.setdefault(task.id, "")
+            sep = "\n\n" if buf else ""
+            self._thinking_buf[task.id] = buf + sep + event.text
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(
@@ -232,12 +264,14 @@ class ProjectBot(AuthMixin):
     async def _cancel_live_for(self, task_id: int, note: str = "(cancelled)") -> None:
         """Seal any live text/thinking messages for this task with a cancellation marker."""
         live_text = self._live_text.pop(task_id, None)
+        self._live_text_failed.discard(task_id)
         if live_text is not None:
             try:
                 await live_text.cancel(note)
             except Exception:
                 logger.warning("Failed to cancel live text for task %d", task_id, exc_info=True)
         live_thinking = self._live_thinking.pop(task_id, None)
+        self._live_thinking_failed.discard(task_id)
         if live_thinking is not None:
             try:
                 await live_thinking.cancel(note)
@@ -247,6 +281,8 @@ class ProjectBot(AuthMixin):
     async def _finalize_claude_task(self, task: Task) -> None:
         live_text = self._live_text.pop(task.id, None)
         live_thinking = self._live_thinking.pop(task.id, None)
+        self._live_text_failed.discard(task.id)
+        self._live_thinking_failed.discard(task.id)
         thinking = self._thinking_buf.pop(task.id, None)
         is_voice = task.id in self._voice_tasks
         self._voice_tasks.discard(task.id)
@@ -380,11 +416,13 @@ class ProjectBot(AuthMixin):
 
         # Finalize any live messages so the question buttons appear after the sealed stream.
         live_text = self._live_text.pop(task.id, None)
+        self._live_text_failed.discard(task.id)
         if live_text is not None:
             await live_text.finalize(task.result or None, render=True)
         elif task.result and task.result.strip():
             await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
         live_thinking = self._live_thinking.pop(task.id, None)
+        self._live_thinking_failed.discard(task.id)
         if live_thinking is not None:
             await live_thinking.finalize(render=False)
 

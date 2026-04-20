@@ -623,3 +623,37 @@ def test_project_show_thinking_defaults_false(tmp_path: Path):
     }))
     loaded = load_config(p)
     assert loaded.projects["proj"].show_thinking is False
+
+
+def test_load_config_skips_phantom_project_without_path(tmp_path: Path, capsys):
+    """Pre-34b8dc5 buggy /persona on team bots created projects[<team>_<role>]
+    entries with only active_persona (no path). load_config must tolerate them
+    so the bot still starts; save_config then filters them out on next write."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {
+            "good": {"path": "/x", "telegram_bot_token": "T"},
+            "acme_manager": {"active_persona": "software_manager"},
+        },
+    }))
+    loaded = load_config(p)
+    assert "good" in loaded.projects
+    assert "acme_manager" not in loaded.projects
+    err = capsys.readouterr().err
+    assert "acme_manager" in err
+
+
+def test_save_config_drops_phantom_project_on_next_write(tmp_path: Path):
+    """After a tolerant load, saving the config removes the phantom entry from disk."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {
+            "good": {"path": "/x", "telegram_bot_token": "T"},
+            "acme_manager": {"active_persona": "software_manager"},
+        },
+    }))
+    cfg = load_config(p)
+    save_config(cfg, p)
+    raw = json.loads(p.read_text())
+    assert "acme_manager" not in raw["projects"]
+    assert "good" in raw["projects"]

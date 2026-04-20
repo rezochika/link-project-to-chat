@@ -128,6 +128,16 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.tts_voice = raw.get("tts_voice", "alloy")
         config.default_model = raw.get("default_model", "")
         for name, proj in raw.get("projects", {}).items():
+            # Tolerate phantom projects entries (no `path`) left over from a
+            # pre-34b8dc5 bug where /persona on a team bot wrote to
+            # projects[<team>_<role>] instead of the team config. Skipping
+            # lets the manager start; save_config filters them out next write.
+            if "path" not in proj:
+                print(
+                    f"warning: skipping malformed project '{name}' (no path) in config",
+                    file=sys.stderr,
+                )
+                continue
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
