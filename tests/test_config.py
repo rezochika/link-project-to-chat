@@ -9,13 +9,17 @@ from link_project_to_chat.config import (
     _atomic_write,
     Config,
     ProjectConfig,
+    TeamBotConfig,
+    TeamConfig,
     add_project_trusted_user_id,
     add_trusted_user_id,
     clear_session,
     clear_trusted_user_id,
     load_config,
     load_sessions,
+    load_teams,
     load_trusted_user_id,
+    patch_team,
     save_config,
     save_project_trusted_user_id,
     save_session,
@@ -427,40 +431,173 @@ class TestAtomicWrite:
         assert not target.exists()
 
 
-def test_project_config_group_fields_default_false_none(tmp_path):
-    cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(json.dumps({
-        "projects": {
-            "p1": {"path": str(tmp_path), "telegram_bot_token": "t"}
-        }
+def test_team_config_default_empty_dict(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"projects": {}}))
+    config = load_config(p)
+    assert config.teams == {}
+
+
+def test_load_config_teams(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {},
+        "teams": {
+            "acme": {
+                "path": "/home/user/acme",
+                "group_chat_id": -1001234567890,
+                "bots": {
+                    "manager": {"telegram_bot_token": "t1", "active_persona": "software_manager"},
+                    "dev":     {"telegram_bot_token": "t2", "active_persona": "software_dev"},
+                },
+            }
+        },
     }))
-    config = load_config(cfg_path)
-    p = config.projects["p1"]
-    assert p.group_mode is False
-    assert p.group_chat_id is None
-    assert p.role is None
-    assert p.active_persona is None
+    config = load_config(p)
+    team = config.teams["acme"]
+    assert team.path == "/home/user/acme"
+    assert team.group_chat_id == -1001234567890
+    assert team.bots["manager"].telegram_bot_token == "t1"
+    assert team.bots["manager"].active_persona == "software_manager"
+    assert team.bots["dev"].telegram_bot_token == "t2"
 
 
-def test_project_config_group_fields_roundtrip(tmp_path):
-    cfg_path = tmp_path / "config.json"
-    cfg_path.parent.mkdir(exist_ok=True)
-    config = Config()
-    config.projects["acme_mgr"] = ProjectConfig(
-        path=str(tmp_path / "acme"),
-        telegram_bot_token="token",
-        group_mode=True,
-        group_chat_id=-100123456,
-        role="manager",
-        active_persona="software_manager",
+def test_save_and_load_team(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/home/user/acme",
+                group_chat_id=-1001234567890,
+                bots={
+                    "manager": TeamBotConfig(telegram_bot_token="t1", active_persona="developer"),
+                    "dev": TeamBotConfig(telegram_bot_token="t2", active_persona="tester"),
+                },
+            )
+        }
     )
-    save_config(config, cfg_path)
-    reloaded = load_config(cfg_path)
-    p = reloaded.projects["acme_mgr"]
-    assert p.group_mode is True
-    assert p.group_chat_id == -100123456
-    assert p.role == "manager"
-    assert p.active_persona == "software_manager"
+    save_config(cfg, p)
+    loaded = load_config(p)
+    team = loaded.teams["acme"]
+    assert team.path == "/home/user/acme"
+    assert team.group_chat_id == -1001234567890
+    assert team.bots["manager"].telegram_bot_token == "t1"
+    assert team.bots["dev"].active_persona == "tester"
+
+
+def test_teams_coexist_with_projects(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        projects={"solo": ProjectConfig(path="/a", telegram_bot_token="tx")},
+        teams={
+            "acme": TeamConfig(
+                path="/b",
+                group_chat_id=-100,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        },
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert "solo" in loaded.projects
+    assert "acme" in loaded.teams
+
+
+def test_save_config_removes_deleted_teams(tmp_path: Path):
+    """Saving a config where a team was dropped from config.teams removes it from the JSON too."""
+    p = tmp_path / "cfg.json"
+    # First save: two teams
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/a", group_chat_id=-100,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            ),
+            "beta": TeamConfig(
+                path="/b", group_chat_id=-200,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t2")},
+            ),
+        }
+    )
+    save_config(cfg, p)
+    # Second save: drop "beta"
+    cfg.teams.pop("beta")
+    save_config(cfg, p)
+    # Reload: only "acme" should remain
+    loaded = load_config(p)
+    assert "acme" in loaded.teams
+    assert "beta" not in loaded.teams
+
+
+def test_patch_team_creates_entry(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team(
+        "acme",
+        {
+            "path": "/home/user/acme",
+            "group_chat_id": -1001,
+            "bots": {"manager": {"telegram_bot_token": "t1"}},
+        },
+        p,
+    )
+    raw = json.loads(p.read_text())
+    assert raw["teams"]["acme"]["path"] == "/home/user/acme"
+    assert raw["teams"]["acme"]["group_chat_id"] == -1001
+    assert raw["teams"]["acme"]["bots"]["manager"]["telegram_bot_token"] == "t1"
+
+
+def test_patch_team_replaces_at_top_level(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team("acme", {"path": "/a", "group_chat_id": -1, "bots": {"manager": {"telegram_bot_token": "t1"}}}, p)
+    patch_team("acme", {"bots": {"dev": {"telegram_bot_token": "t2"}}}, p)
+    raw = json.loads(p.read_text())
+    # Entire bots dict replaced; path and group_chat_id preserved from first call
+    assert raw["teams"]["acme"]["bots"] == {"dev": {"telegram_bot_token": "t2"}}
+    assert raw["teams"]["acme"]["path"] == "/a"
+
+
+def test_patch_team_none_removes_key(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team("acme", {"path": "/a", "group_chat_id": -1}, p)
+    patch_team("acme", {"path": None}, p)
+    raw = json.loads(p.read_text())
+    assert "path" not in raw["teams"]["acme"]
+
+
+def test_load_teams_helper(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team(
+        "acme",
+        {
+            "path": "/a",
+            "group_chat_id": -1,
+            "bots": {"manager": {"telegram_bot_token": "t1", "active_persona": "developer"}},
+        },
+        p,
+    )
+    teams = load_teams(p)
+    assert teams["acme"].bots["manager"].active_persona == "developer"
+
+
+def test_load_teams_missing_file_returns_empty(tmp_path: Path):
+    assert load_teams(tmp_path / "nope.json") == {}
+
+
+def test_team_with_sentinel_chat_id_roundtrips(tmp_path: Path):
+    """A team with group_chat_id=0 (not yet captured) saves and loads cleanly."""
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/a",
+                group_chat_id=0,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.teams["acme"].group_chat_id == 0
 
 
 def test_project_show_thinking_roundtrip(tmp_path: Path):
