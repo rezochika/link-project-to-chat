@@ -297,3 +297,38 @@ async def test_on_button_fires_for_telegram_callback_query():
     assert captured[0].value == "confirm_reset"
     assert captured[0].sender.handle == "alice"
     tg_query.answer.assert_awaited_once()
+
+
+async def test_send_voice_calls_bot_send_voice(tmp_path):
+    t, bot = _make_transport_with_mock_bot()
+    bot.send_voice = AsyncMock(return_value=SimpleNamespace(
+        message_id=300, chat=SimpleNamespace(id=12345, type="private"),
+    ))
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    p = tmp_path / "v.opus"
+    p.write_bytes(b"fake opus")
+
+    ref = await t.send_voice(chat, p)
+
+    bot.send_voice.assert_awaited_once()
+    kwargs = bot.send_voice.call_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert ref.native_id == "300"
+
+
+async def test_send_voice_passes_reply_to(tmp_path):
+    t, bot = _make_transport_with_mock_bot()
+    bot.send_voice = AsyncMock(return_value=SimpleNamespace(
+        message_id=301, chat=SimpleNamespace(id=12345, type="private"),
+    ))
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    reply_ref = MessageRef(transport_id=TRANSPORT_ID, native_id="42", chat=chat)
+    p = tmp_path / "v.opus"
+    p.write_bytes(b"fake opus")
+
+    await t.send_voice(chat, p, reply_to=reply_ref)
+
+    kwargs = bot.send_voice.call_args.kwargs
+    assert kwargs["reply_to_message_id"] == 42

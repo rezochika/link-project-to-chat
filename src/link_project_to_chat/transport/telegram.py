@@ -242,6 +242,22 @@ class TelegramTransport:
                 )
         return message_ref_from_telegram(native)
 
+    async def send_voice(
+        self,
+        chat: ChatRef,
+        path: Path,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> MessageRef:
+        kwargs: dict[str, Any] = {
+            "chat_id": int(chat.native_id),
+        }
+        if reply_to is not None:
+            kwargs["reply_to_message_id"] = int(reply_to.native_id)
+        with path.open("rb") as fh:
+            native = await self._app.bot.send_voice(voice=fh, **kwargs)
+        return message_ref_from_telegram(native)
+
     async def send_typing(self, chat: ChatRef) -> None:
         try:
             await self._app.bot.send_chat_action(
