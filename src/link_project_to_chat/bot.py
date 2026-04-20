@@ -1544,6 +1544,86 @@ class ProjectBot(AuthMixin):
             prompt=prompt,
         )
 
+    async def _on_voice_from_transport(self, incoming) -> None:
+        if not self._auth_identity(incoming.sender):
+            return
+        if self._rate_limited(int(incoming.sender.native_id)):
+            assert self._transport is not None
+            await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
+            return
+        assert self._transport is not None
+
+        if not self._transcriber:
+            await self._transport.send_text(
+                incoming.chat,
+                "Voice messages aren't configured. "
+                "Set up STT with: link-project-to-chat setup --stt-backend whisper-api",
+            )
+            return
+
+        audio = incoming.files[0]
+
+        MAX_VOICE_BYTES = 20 * 1024 * 1024
+        if audio.size_bytes > MAX_VOICE_BYTES:
+            size_mb = audio.size_bytes // (1024 * 1024)
+            await self._transport.send_text(
+                incoming.chat, f"Audio too large ({size_mb} MB). 20 MB limit.",
+            )
+            return
+
+        status_ref = await self._transport.send_text(incoming.chat, "🎤 Transcribing...")
+
+        try:
+            text = await self._transcriber.transcribe(audio.path)
+
+            if not text or not text.strip():
+                await self._transport.edit_text(
+                    status_ref, "Could not transcribe the voice message (empty result).",
+                )
+                return
+
+            display = text if len(text) <= 200 else text[:200] + "..."
+            await self._transport.edit_text(status_ref, f'🎤 "{display}"')
+
+            chat_id_int = int(incoming.chat.native_id)
+            waiting = self.task_manager.waiting_input_task(chat_id_int)
+            if waiting:
+                self.task_manager.submit_answer(waiting.id, text)
+                return
+
+            prompt = text
+            if incoming.reply_to is not None and incoming.native is not None:
+                reply_text = getattr(
+                    getattr(incoming.native, "reply_to_message", None), "text", None,
+                )
+                if reply_text:
+                    prompt = f"[Replying to: {reply_text}]\n\n{prompt}"
+
+            if self._active_persona:
+                from .skills import load_persona, format_persona_prompt
+                persona = load_persona(self._active_persona, self.path)
+                if persona:
+                    prompt = format_persona_prompt(persona, prompt)
+
+            message_id_int = (
+                int(getattr(incoming.native, "message_id", 0))
+                if incoming.native is not None else 0
+            )
+            task = self.task_manager.submit_claude(
+                chat_id=chat_id_int,
+                message_id=message_id_int,
+                prompt=prompt,
+            )
+            if self._synthesizer:
+                self._voice_tasks.add(task.id)
+
+        except Exception as e:
+            logger.exception("Voice transcription failed")
+            error_summary = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+            await self._transport.edit_text(
+                status_ref, f"Transcription failed: {error_summary}",
+            )
+
     async def _on_voice(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle voice messages and audio files."""
         msg = update.effective_message
