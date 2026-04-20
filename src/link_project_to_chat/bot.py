@@ -100,6 +100,7 @@ class ProjectBot(AuthMixin):
         team_name: str | None = None,
         group_chat_id: int | None = None,
         role: str | None = None,
+        peer_bot_username: str = "",
     ):
         self.name = name
         self.path = path.resolve()
@@ -144,9 +145,19 @@ class ProjectBot(AuthMixin):
         )
         self.team_name = team_name
         self.group_mode = team_name is not None
-        # Team-mode fields — stored now, wired into behavior in later tasks (B3/B4).
         self.group_chat_id = group_chat_id
         self.role = role
+        self.peer_bot_username = peer_bot_username
+        # Tell Claude about its peer so it uses the correct @handle instead of
+        # placeholders like "@developer" or "@manager".
+        if peer_bot_username:
+            peer_role = "developer" if role == "manager" else "manager"
+            self.task_manager.claude.team_system_note = (
+                f"You are the '{role}' role bot in a dual-agent team group. "
+                f"Your team peer (role: {peer_role}) in this group is @{peer_bot_username}. "
+                f"When directing work to the other role bot, use the exact @username "
+                f"'@{peer_bot_username}' — never a placeholder like '@developer' or '@manager'."
+            )
         self.bot_username: str = ""  # populated in _post_init via get_me()
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
@@ -842,6 +853,41 @@ class ProjectBot(AuthMixin):
 
     # --- Persona handlers ---
 
+    def _backfill_own_bot_username(self, config_path: Path | None = None) -> None:
+        """One-time migration: write self.bot_username into TeamConfig if empty.
+
+        For teams created before bot_username was stored at /create_team time,
+        this lets the next team-bot startup discover each bot's @handle and
+        populate it in config.json so the peer role can read it.
+        """
+        cfg = config_path or DEFAULT_CONFIG
+        teams = load_teams(cfg)
+        team = teams.get(self.team_name or "")
+        if team is None:
+            return
+        bot = team.bots.get(self.role or "")
+        if bot is None or bot.bot_username == self.bot_username:
+            return
+        bots_dict: dict[str, dict] = {}
+        for role, b in team.bots.items():
+            entry: dict = {"telegram_bot_token": b.telegram_bot_token}
+            if b.active_persona:
+                entry["active_persona"] = b.active_persona
+            if b.autostart:
+                entry["autostart"] = True
+            if b.permissions:
+                entry["permissions"] = b.permissions
+            if role == self.role:
+                entry["bot_username"] = self.bot_username
+            elif b.bot_username:
+                entry["bot_username"] = b.bot_username
+            bots_dict[role] = entry
+        patch_team(self.team_name, {"bots": bots_dict}, cfg)
+        logger.info(
+            "Backfilled bot_username=%s for team=%s role=%s in config",
+            self.bot_username, self.team_name, self.role,
+        )
+
     def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
         """Persist this bot's active_persona.
 
@@ -870,6 +916,14 @@ class ProjectBot(AuthMixin):
                 else:
                     if bot.active_persona:
                         entry["active_persona"] = bot.active_persona
+                # Preserve the other fields so patch_team's whole-bots-dict
+                # rewrite doesn't drop them.
+                if bot.autostart:
+                    entry["autostart"] = True
+                if bot.permissions:
+                    entry["permissions"] = bot.permissions
+                if bot.bot_username:
+                    entry["bot_username"] = bot.bot_username
                 bots_dict[role] = entry
             patch_team(self.team_name, {"bots": bots_dict}, cfg)
         else:
@@ -1520,6 +1574,10 @@ class ProjectBot(AuthMixin):
                     "team mode requires a reachable Telegram API at startup "
                     "to fetch bot username; aborting."
                 )
+        # Backfill own bot_username into TeamConfig if missing (one-time migration
+        # for teams created before bot_username was stored at /create_team time).
+        if self.team_name and self.role and self.bot_username:
+            self._backfill_own_bot_username()
         await app.bot.set_my_commands(COMMANDS)
         for uid in self._get_trusted_user_ids():
             try:
@@ -1630,6 +1688,7 @@ def run_bot(
     show_thinking: bool = False,
     group_chat_id: int | None = None,
     role: str | None = None,
+    peer_bot_username: str = "",
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1654,6 +1713,7 @@ def run_bot(
         team_name=team_name,
         group_chat_id=group_chat_id,
         role=role,
+        peer_bot_username=peer_bot_username,
     )
     bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
     if model:

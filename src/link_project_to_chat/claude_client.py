@@ -129,6 +129,11 @@ class ClaudeClient:
         self.allowed_tools: list[str] = allowed_tools or []
         self.disallowed_tools: list[str] = disallowed_tools or []
         self.append_system_prompt: str | None = None
+        # Optional team-mode context note (set by ProjectBot when team_name and
+        # peer_bot_username are both known). Injected alongside the Telegram
+        # awareness preamble so it survives `/use <skill>` overwriting
+        # append_system_prompt.
+        self.team_system_note: str | None = None
         self.session_id: str | None = None
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
@@ -167,8 +172,11 @@ class ClaudeClient:
         if self.disallowed_tools:
             cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
-        # Combine Telegram awareness, AskUserQuestion hint, and any user/skill prompt.
+        # Combine Telegram awareness, AskUserQuestion hint, team context (if any),
+        # and any user/skill prompt.
         parts = [_TELEGRAM_AWARENESS, _ASK_DISMISSED_HINT]
+        if self.team_system_note:
+            parts.append(self.team_system_note)
         if self.append_system_prompt:
             parts.append(self.append_system_prompt)
         cmd.extend(["--append-system-prompt", "\n\n".join(parts)])

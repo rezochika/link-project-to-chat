@@ -318,6 +318,18 @@ def start(
         bot_cfg = t.bots[role]
         effective_usernames = config.allowed_usernames
         effective_trusted_ids = config.trusted_user_ids
+        # Team bots run unattended in a group — a Claude tool-permission prompt
+        # would block forever. Default to dangerously-skip-permissions unless
+        # the team config explicitly overrides.
+        team_skip, team_pm = resolve_permissions(
+            bot_cfg.permissions if bot_cfg.permissions is not None else "dangerously-skip-permissions"
+        )
+        # Look up peer's @username so the bot can address the other role directly.
+        peer_username = ""
+        for other_role, other_bot in t.bots.items():
+            if other_role != role and other_bot.bot_username:
+                peer_username = other_bot.bot_username
+                break
         run_bot(
             f"{team}_{role}",
             Path(t.path),
@@ -331,6 +343,9 @@ def start(
             role=role,
             active_persona=bot_cfg.active_persona,
             model=model or config.default_model or None,
+            skip_permissions=team_skip,
+            permission_mode=team_pm,
+            peer_bot_username=peer_username,
         )
         return
 

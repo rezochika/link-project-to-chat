@@ -40,6 +40,12 @@ class TeamBotConfig:
     telegram_bot_token: str
     active_persona: str | None = None
     autostart: bool = False
+    # None means "use the team default" — resolved at CLI startup to
+    # "dangerously-skip-permissions" so team bots don't block on tool prompts.
+    permissions: str | None = None
+    # The bot's @username, captured at /create_team time (or backfilled via
+    # getMe on first startup). Used so each team bot knows its peer's @handle.
+    bot_username: str = ""
 
 
 @dataclass
@@ -161,6 +167,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                         telegram_bot_token=b.get("telegram_bot_token", ""),
                         active_persona=b.get("active_persona"),
                         autostart=b.get("autostart", False),
+                        permissions=b.get("permissions"),
+                        bot_username=b.get("bot_username", ""),
                     )
                     for role, b in team.get("bots", {}).items()
                 },
@@ -283,6 +291,8 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
                 "telegram_bot_token": b.telegram_bot_token,
                 **({"active_persona": b.active_persona} if b.active_persona else {}),
                 **({"autostart": True} if b.autostart else {}),
+                **({"permissions": b.permissions} if b.permissions else {}),
+                **({"bot_username": b.bot_username} if b.bot_username else {}),
             }
             for role, b in team.bots.items()
         }
@@ -390,6 +400,8 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                             telegram_bot_token=b.get("telegram_bot_token", ""),
                             active_persona=b.get("active_persona"),
                             autostart=b.get("autostart", False),
+                            permissions=b.get("permissions"),
+                            bot_username=b.get("bot_username", ""),
                         )
                         for role, b in team.get("bots", {}).items()
                     },

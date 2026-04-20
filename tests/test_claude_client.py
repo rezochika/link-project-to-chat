@@ -45,3 +45,22 @@ def test_telegram_awareness_in_command():
     assert "MarkdownV2" in prompt
     assert "/run" in prompt and "/effort" in prompt
     assert "CHANNEL FRAGILITY" in prompt
+
+
+def test_team_system_note_injected_into_append_system_prompt():
+    """When set, team_system_note rides alongside the Telegram awareness preamble."""
+    client = ClaudeClient(project_path=Path("/tmp"))
+    client.team_system_note = "Your peer is @acme_dev_bot."
+    prompt = client._build_cmd()[client._build_cmd().index("--append-system-prompt") + 1]
+    assert "@acme_dev_bot" in prompt
+
+
+def test_team_system_note_survives_active_skill():
+    """A later /use <skill> sets append_system_prompt; team note must still be present."""
+    client = ClaudeClient(project_path=Path("/tmp"))
+    client.team_system_note = "Peer: @acme_dev_bot."
+    client.append_system_prompt = "# Custom skill content\nRemember: haiku every reply."
+    cmd = client._build_cmd()
+    prompt = cmd[cmd.index("--append-system-prompt") + 1]
+    assert "@acme_dev_bot" in prompt
+    assert "haiku every reply" in prompt

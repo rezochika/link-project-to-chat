@@ -387,3 +387,123 @@ def test_persist_active_persona_missing_team_logs_and_skips(tmp_path, monkeypatc
     # Nothing was persisted (no teams created).
     assert load_teams(cfg_path) == {}
     assert any("ghost" in r.message for r in caplog.records)
+
+
+# --- peer bot_username + team_system_note ---
+
+
+def test_team_bot_with_peer_username_sets_team_system_note(tmp_path):
+    """ProjectBot in team mode should inject peer @handle into the Claude client."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="acme_dev_claude_bot",
+    )
+    note = bot.task_manager.claude.team_system_note
+    assert note is not None
+    assert "acme_dev_claude_bot" in note
+    assert "manager" in note  # self role
+    assert "developer" in note  # peer role label
+
+
+def test_team_bot_without_peer_username_leaves_note_unset(tmp_path):
+    """Missing peer @handle should leave team_system_note as None (no stale placeholder)."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="",
+    )
+    assert bot.task_manager.claude.team_system_note is None
+
+
+def test_backfill_own_bot_username_writes_to_team_config(tmp_path, monkeypatch):
+    """On startup, a team bot writes its getMe username into TeamConfig if missing."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import (
+        Config,
+        TeamBotConfig,
+        TeamConfig,
+        load_teams,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "acme": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(
+                            telegram_bot_token="t1",
+                            active_persona="software_manager",
+                            bot_username="",  # missing — should be backfilled
+                        ),
+                        "dev": TeamBotConfig(
+                            telegram_bot_token="t2",
+                            active_persona="software_dev",
+                            bot_username="acme_dev_bot",  # already present
+                        ),
+                    },
+                )
+            }
+        ),
+        cfg_path,
+    )
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t1",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot.bot_username = "acme_manager_bot"  # simulate getMe result
+    bot._backfill_own_bot_username(config_path=cfg_path)
+
+    teams = load_teams(cfg_path)
+    # Own username backfilled, peer's preserved.
+    assert teams["acme"].bots["manager"].bot_username == "acme_manager_bot"
+    assert teams["acme"].bots["dev"].bot_username == "acme_dev_bot"
+
+
+def test_teambotconfig_round_trips_permissions_and_bot_username(tmp_path):
+    """TeamBotConfig fields survive save/load through config.json."""
+    from link_project_to_chat.config import (
+        Config,
+        TeamBotConfig,
+        TeamConfig,
+        load_config,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path=str(tmp_path),
+                group_chat_id=-100_111,
+                bots={
+                    "manager": TeamBotConfig(
+                        telegram_bot_token="t1",
+                        active_persona="software_manager",
+                        permissions="dangerously-skip-permissions",
+                        bot_username="acme_mgr_bot",
+                    ),
+                    "dev": TeamBotConfig(telegram_bot_token="t2"),
+                },
+            )
+        }
+    )
+    save_config(cfg, cfg_path)
+
+    loaded = load_config(cfg_path)
+    mgr = loaded.teams["acme"].bots["manager"]
+    dev = loaded.teams["acme"].bots["dev"]
+    assert mgr.permissions == "dangerously-skip-permissions"
+    assert mgr.bot_username == "acme_mgr_bot"
+    # Dev has defaults — no permissions / no bot_username.
+    assert dev.permissions is None
+    assert dev.bot_username == ""

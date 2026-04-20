@@ -1125,10 +1125,17 @@ class ManagerBot(AuthMixin):
                         "manager": {
                             "telegram_bot_token": mgr_token,
                             "active_persona": mgr_persona,
+                            # Team bots run unattended — skip tool-permission prompts.
+                            "permissions": "dangerously-skip-permissions",
+                            # Store each bot's @handle so the peer role can address it
+                            # directly instead of using a persona-placeholder like "@developer".
+                            "bot_username": mgr_username,
                         },
                         "dev": {
                             "telegram_bot_token": dev_token,
                             "active_persona": dev_persona,
+                            "permissions": "dangerously-skip-permissions",
+                            "bot_username": dev_username,
                         },
                     },
                 },
