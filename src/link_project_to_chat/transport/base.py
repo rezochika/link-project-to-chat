@@ -98,6 +98,7 @@ class CommandInvocation:
     args: list[str]
     raw_text: str
     message: MessageRef
+    native: Any = None
 
 
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]

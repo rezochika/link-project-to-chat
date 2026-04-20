@@ -477,6 +477,18 @@ class ProjectBot(AuthMixin):
             f"Send a message to chat with Claude.\n{_CMD_HELP}"
         )
 
+    async def _legacy_command(self, legacy_handler, ci) -> None:
+        """Bridge from CommandInvocation to a legacy handler that takes (Update, ctx).
+
+        Temporary shim: lets commands be registered via transport.on_command while
+        their implementation still uses telegram-native types. Ported away piecemeal
+        as each command's internals are rewritten to use the Transport directly.
+        """
+        if ci.native is None:
+            return
+        update, ctx = ci.native
+        await legacy_handler(update, ctx)
+
     async def _on_text_from_transport(self, incoming) -> None:
         """Bridge handler registered on TelegramTransport.on_message.
 
@@ -1666,47 +1678,53 @@ class ProjectBot(AuthMixin):
         self._app = app
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport(app)
-        # Commands still routed through telegram's CommandHandler directly.
-        # Ported commands (registered via transport.on_command below) are excluded.
-        handlers = {
-            "start": self._on_start,
-            "run": self._on_run,
-            "tasks": self._on_tasks,
-            "model": self._on_model,
-            "effort": self._on_effort,
-            "thinking": self._on_thinking,
-            "permissions": self._on_permissions,
-            "compact": self._on_compact,
-            "reset": self._on_reset,
-            "skills": self._on_skills,
-            "stop_skill": self._on_stop_skill,
-            "create_skill": self._on_create_skill,
-            "delete_skill": self._on_delete_skill,
-            "persona": self._on_persona,
-            "stop_persona": self._on_stop_persona,
-            "create_persona": self._on_create_persona,
-            "delete_persona": self._on_delete_persona,
-            "voice": self._on_voice_status,
-            "lang": self._on_lang,
-            "halt": self._on_halt,
-            "resume": self._on_resume,
-        }
-        # Commands ported to run through TelegramTransport.on_command.
+        # Fully-ported commands — handler consumes CommandInvocation directly.
         ported_commands = (
             ("help", self._on_help_t),
             ("version", self._on_version_t),
             ("status", self._on_status_t),
         )
+        # Legacy commands — still use Update/ctx internals; bridged via _legacy_command shim.
+        # These get fully ported in later spec tasks (buttons, files).
+        legacy_commands = (
+            ("start", self._on_start),
+            ("run", self._on_run),
+            ("tasks", self._on_tasks),
+            ("model", self._on_model),
+            ("effort", self._on_effort),
+            ("thinking", self._on_thinking),
+            ("permissions", self._on_permissions),
+            ("compact", self._on_compact),
+            ("reset", self._on_reset),
+            ("skills", self._on_skills),
+            ("stop_skill", self._on_stop_skill),
+            ("create_skill", self._on_create_skill),
+            ("delete_skill", self._on_delete_skill),
+            ("persona", self._on_persona),
+            ("stop_persona", self._on_stop_persona),
+            ("create_persona", self._on_create_persona),
+            ("delete_persona", self._on_delete_persona),
+            ("voice", self._on_voice_status),
+            ("lang", self._on_lang),
+            ("halt", self._on_halt),
+            ("resume", self._on_resume),
+        )
         assert self._transport is not None
         self._transport.on_message(self._on_text_from_transport)
         for _name, _handler in ported_commands:
             self._transport.on_command(_name, _handler)
+        for _name, _legacy in legacy_commands:
+            self._transport.on_command(
+                _name, lambda ci, _h=_legacy: self._legacy_command(_h, ci)
+            )
+
+        # Wire telegram's CommandHandler for every command (ported or legacy) to
+        # route through the transport's _dispatch_command.
+        all_command_names = [n for n, _ in ported_commands] + [n for n, _ in legacy_commands]
+
         if self.group_mode:
-            # Group mode: accept commands and text from groups/supergroups only.
             chat_filter = filters.ChatType.GROUPS
-            for name, handler in handlers.items():
-                app.add_handler(CommandHandler(name, handler, filters=chat_filter))
-            for _name, _ in ported_commands:
+            for _name in all_command_names:
                 app.add_handler(CommandHandler(
                     _name,
                     lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
@@ -1722,9 +1740,7 @@ class ProjectBot(AuthMixin):
             # Voice, files, and other media are disabled in group mode for v1.
         else:
             private = filters.ChatType.PRIVATE
-            for name, handler in handlers.items():
-                app.add_handler(CommandHandler(name, handler, filters=private))
-            for _name, _ in ported_commands:
+            for _name in all_command_names:
                 app.add_handler(CommandHandler(
                     _name,
                     lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),

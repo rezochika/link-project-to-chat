@@ -144,6 +144,7 @@ class TelegramTransport:
             args=list(getattr(ctx, "args", []) or []),
             raw_text=msg.text or "",
             message=message_ref_from_telegram(msg),
+            native=(update, ctx),
         )
         handler = self._command_handlers.get(name)
         if handler is not None:
