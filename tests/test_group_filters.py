@@ -1,41 +1,95 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 from link_project_to_chat.group_filters import (
+    extract_mentions,
     is_directed_at_me,
-    is_from_self,
     is_from_other_bot,
+    is_from_self,
+    is_reply_to_bot,
+    mentions_bot,
 )
+from link_project_to_chat.transport import (
+    ChatKind,
+    ChatRef,
+    Identity,
+    IncomingMessage,
+    MessageRef,
+)
+
+
+def _chat() -> ChatRef:
+    return ChatRef(transport_id="telegram", native_id="-100123", kind=ChatKind.ROOM)
+
+
+def _sender(handle: str | None = None, is_bot: bool = False) -> Identity:
+    return Identity(
+        transport_id="telegram",
+        native_id="1",
+        display_name="X",
+        handle=handle,
+        is_bot=is_bot,
+    )
 
 
 def _msg(
     text: str = "",
-    from_username: str | None = None,
-    from_is_bot: bool = False,
+    sender_handle: str | None = None,
+    sender_is_bot: bool = False,
     reply_to_bot_username: str | None = None,
-    entities=None,
-) -> MagicMock:
-    m = MagicMock()
-    m.text = text
-    m.from_user = MagicMock()
-    m.from_user.username = from_username
-    m.from_user.is_bot = from_is_bot
+) -> IncomingMessage:
+    native = None
+    reply_to: MessageRef | None = None
     if reply_to_bot_username:
-        m.reply_to_message = MagicMock()
-        m.reply_to_message.from_user = MagicMock()
-        m.reply_to_message.from_user.username = reply_to_bot_username
-    else:
-        m.reply_to_message = None
-    m.parse_entities = MagicMock(return_value={})
-    if entities is not None:
-        m.parse_entities.return_value = entities
-    return m
+        # Construct a minimal native object carrying reply_to_message.from_user.username.
+        reply_from_user = SimpleNamespace(username=reply_to_bot_username)
+        reply_native = SimpleNamespace(from_user=reply_from_user)
+        native = SimpleNamespace(reply_to_message=reply_native)
+        reply_to = MessageRef(transport_id="telegram", native_id="0", chat=_chat())
+    return IncomingMessage(
+        chat=_chat(),
+        sender=_sender(handle=sender_handle, is_bot=sender_is_bot),
+        text=text,
+        files=[],
+        reply_to=reply_to,
+        native=native,
+    )
 
 
-def test_directed_at_me_via_mention_entity():
-    mention = MagicMock(type="mention")
-    msg = _msg(text="@acme_dev_bot implement task 1", entities={mention: "@acme_dev_bot"})
+# extract_mentions
+
+
+def test_extract_mentions_empty_text():
+    assert extract_mentions("") == []
+
+
+def test_extract_mentions_single():
+    assert extract_mentions("@acme_dev_bot do X") == ["acme_dev_bot"]
+
+
+def test_extract_mentions_multiple():
+    out = extract_mentions("@bot_a and @bot_b please")
+    assert out == ["bot_a", "bot_b"]
+
+
+def test_extract_mentions_case_folding():
+    assert extract_mentions("@Acme_Dev_Bot hi") == ["acme_dev_bot"]
+
+
+def test_extract_mentions_ignores_non_mention_text():
+    assert extract_mentions("no mentions here") == []
+
+
+def test_extract_mentions_strips_punctuation_boundaries():
+    assert extract_mentions("hey @bot_a, can you") == ["bot_a"]
+
+
+# is_directed_at_me
+
+
+def test_directed_at_me_via_mention():
+    msg = _msg(text="@acme_dev_bot implement task 1")
     assert is_directed_at_me(msg, "acme_dev_bot") is True
 
 
@@ -45,8 +99,7 @@ def test_directed_at_me_via_reply_to_bot():
 
 
 def test_not_directed_when_mention_is_other_bot():
-    mention = MagicMock(type="mention")
-    msg = _msg(text="@acme_manager_bot review", entities={mention: "@acme_manager_bot"})
+    msg = _msg(text="@acme_manager_bot review")
     assert is_directed_at_me(msg, "acme_dev_bot") is False
 
 
@@ -55,70 +108,60 @@ def test_not_directed_when_no_mention_no_reply():
     assert is_directed_at_me(msg, "acme_dev_bot") is False
 
 
-def test_is_from_self_true_when_usernames_match():
-    msg = _msg(from_username="acme_dev_bot", from_is_bot=True)
-    assert is_from_self(msg, "acme_dev_bot") is True
-
-
-def test_is_from_self_false_when_different_username():
-    msg = _msg(from_username="acme_manager_bot", from_is_bot=True)
-    assert is_from_self(msg, "acme_dev_bot") is False
-
-
-def test_is_from_self_false_when_not_bot():
-    msg = _msg(from_username="acme_dev_bot", from_is_bot=False)
-    assert is_from_self(msg, "acme_dev_bot") is False
-
-
-def test_is_from_other_bot_true():
-    msg = _msg(from_username="acme_manager_bot", from_is_bot=True)
-    assert is_from_other_bot(msg, my_username="acme_dev_bot") is True
-
-
-def test_is_from_other_bot_false_when_human():
-    msg = _msg(from_username="revaz", from_is_bot=False)
-    assert is_from_other_bot(msg, my_username="acme_dev_bot") is False
-
-
-def test_is_from_other_bot_false_when_self():
-    msg = _msg(from_username="acme_dev_bot", from_is_bot=True)
-    assert is_from_other_bot(msg, my_username="acme_dev_bot") is False
-
-
-def test_mention_match_is_case_insensitive():
-    mention = MagicMock(type="mention")
-    msg = _msg(text="@Acme_Dev_Bot hi", entities={mention: "@Acme_Dev_Bot"})
-    assert is_directed_at_me(msg, "acme_dev_bot") is True
-
-
-def test_directed_at_me_when_human_mentions_bot():
-    """A human user @mentioning the bot should still be detected as directed."""
-    mention = MagicMock(type="mention")
-    msg = _msg(
-        text="@acme_dev_bot help me out",
-        from_username="alice",
-        from_is_bot=False,
-        entities={mention: "@acme_dev_bot"},
-    )
-    assert is_directed_at_me(msg, "acme_dev_bot") is True
-
-
 def test_reply_to_me_is_suppressed_when_user_mentions_other_bot():
     """Regression: if the user replies to bot A's message but only @mentions
     bot B, bot A must not respond (previously both woke up)."""
-    mention = MagicMock(type="mention")
     msg = _msg(
         text="@acme_manager_bot",
-        entities={mention: "@acme_manager_bot"},
         reply_to_bot_username="acme_dev_bot",
     )
-    # The dev bot is the reply target but the user pinged the manager → dev stays quiet.
     assert is_directed_at_me(msg, "acme_dev_bot") is False
-    # The manager bot is explicitly mentioned → it still responds.
     assert is_directed_at_me(msg, "acme_manager_bot") is True
 
 
 def test_reply_to_me_still_fires_without_any_mention():
-    """Sanity: a bare reply (no @mention) should still wake the replied-to bot."""
     msg = _msg(text="yes please redo it", reply_to_bot_username="acme_dev_bot")
     assert is_directed_at_me(msg, "acme_dev_bot") is True
+
+
+def test_mention_match_is_case_insensitive():
+    msg = _msg(text="@Acme_Dev_Bot hi")
+    assert is_directed_at_me(msg, "acme_dev_bot") is True
+
+
+def test_directed_at_me_when_human_mentions_bot():
+    msg = _msg(text="@acme_dev_bot help me out", sender_handle="alice", sender_is_bot=False)
+    assert is_directed_at_me(msg, "acme_dev_bot") is True
+
+
+# is_from_self / is_from_other_bot
+
+
+def test_is_from_self_true_when_usernames_match():
+    msg = _msg(sender_handle="acme_dev_bot", sender_is_bot=True)
+    assert is_from_self(msg, "acme_dev_bot") is True
+
+
+def test_is_from_self_false_when_different_username():
+    msg = _msg(sender_handle="acme_manager_bot", sender_is_bot=True)
+    assert is_from_self(msg, "acme_dev_bot") is False
+
+
+def test_is_from_self_false_when_not_bot():
+    msg = _msg(sender_handle="acme_dev_bot", sender_is_bot=False)
+    assert is_from_self(msg, "acme_dev_bot") is False
+
+
+def test_is_from_other_bot_true():
+    msg = _msg(sender_handle="acme_manager_bot", sender_is_bot=True)
+    assert is_from_other_bot(msg, my_username="acme_dev_bot") is True
+
+
+def test_is_from_other_bot_false_when_human():
+    msg = _msg(sender_handle="revaz", sender_is_bot=False)
+    assert is_from_other_bot(msg, my_username="acme_dev_bot") is False
+
+
+def test_is_from_other_bot_false_when_self():
+    msg = _msg(sender_handle="acme_dev_bot", sender_is_bot=True)
+    assert is_from_other_bot(msg, my_username="acme_dev_bot") is False
