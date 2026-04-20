@@ -756,12 +756,25 @@ class ProjectBot(AuthMixin):
         from . import __version__
         await update.effective_message.reply_text(f"link-project-to-chat v{__version__}")
 
+    async def _on_version_t(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        from . import __version__
+        assert self._transport is not None
+        await self._transport.send_text(ci.chat, f"link-project-to-chat v{__version__}")
+
     async def _on_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
             return
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         await update.effective_message.reply_text(_CMD_HELP)
+
+    async def _on_help_t(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(ci.chat, _CMD_HELP)
 
     async def _on_reset(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_message:
@@ -1347,10 +1360,7 @@ class ProjectBot(AuthMixin):
                 return
             await self._send_to_chat(query.message.chat_id, f"💭 {thinking}")
 
-    async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-
+    def _compose_status(self) -> str:
         uptime = time.monotonic() - self._started_at
         h, rem = divmod(int(uptime), 3600)
         m, s = divmod(rem, 60)
@@ -1368,7 +1378,18 @@ class ProjectBot(AuthMixin):
             f"Skill: {self._active_skill or 'none'}",
             f"Persona: {self._active_persona or 'none'}",
         ]
-        await update.effective_message.reply_text("\n".join(lines))
+        return "\n".join(lines)
+
+    async def _on_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._auth(update.effective_user):
+            return await update.effective_message.reply_text("Unauthorized.")
+        await update.effective_message.reply_text(self._compose_status())
+
+    async def _on_status_t(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(ci.chat, self._compose_status())
 
     async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -1645,6 +1666,8 @@ class ProjectBot(AuthMixin):
         self._app = app
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport(app)
+        # Commands still routed through telegram's CommandHandler directly.
+        # Ported commands (registered via transport.on_command below) are excluded.
         handlers = {
             "start": self._on_start,
             "run": self._on_run,
@@ -1655,9 +1678,6 @@ class ProjectBot(AuthMixin):
             "permissions": self._on_permissions,
             "compact": self._on_compact,
             "reset": self._on_reset,
-            "status": self._on_status,
-            "version": self._on_version,
-            "help": self._on_help,
             "skills": self._on_skills,
             "stop_skill": self._on_stop_skill,
             "create_skill": self._on_create_skill,
@@ -1671,13 +1691,27 @@ class ProjectBot(AuthMixin):
             "halt": self._on_halt,
             "resume": self._on_resume,
         }
+        # Commands ported to run through TelegramTransport.on_command.
+        ported_commands = (
+            ("help", self._on_help_t),
+            ("version", self._on_version_t),
+            ("status", self._on_status_t),
+        )
         assert self._transport is not None
         self._transport.on_message(self._on_text_from_transport)
+        for _name, _handler in ported_commands:
+            self._transport.on_command(_name, _handler)
         if self.group_mode:
             # Group mode: accept commands and text from groups/supergroups only.
             chat_filter = filters.ChatType.GROUPS
             for name, handler in handlers.items():
                 app.add_handler(CommandHandler(name, handler, filters=chat_filter))
+            for _name, _ in ported_commands:
+                app.add_handler(CommandHandler(
+                    _name,
+                    lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
+                    filters=chat_filter,
+                ))
             text_filter = (
                 chat_filter
                 & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
@@ -1690,6 +1724,12 @@ class ProjectBot(AuthMixin):
             private = filters.ChatType.PRIVATE
             for name, handler in handlers.items():
                 app.add_handler(CommandHandler(name, handler, filters=private))
+            for _name, _ in ported_commands:
+                app.add_handler(CommandHandler(
+                    _name,
+                    lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
+                    filters=private,
+                ))
             text_filter = (
                 private
                 & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)

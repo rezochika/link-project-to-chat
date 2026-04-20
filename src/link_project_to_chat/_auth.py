@@ -79,6 +79,15 @@ class AuthMixin:
         self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
         return False
 
+    def _auth_identity(self, identity) -> bool:
+        """Authorize based on a transport Identity. Wraps _auth."""
+        from types import SimpleNamespace
+        user = SimpleNamespace(
+            id=int(identity.native_id),
+            username=identity.handle or "",
+        )
+        return self._auth(user)
+
     def _rate_limited(self, user_id: int) -> bool:
         now = time.monotonic()
         timestamps = self._rate_limits.setdefault(user_id, collections.deque())
