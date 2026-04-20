@@ -1718,46 +1718,6 @@ class ProjectBot(AuthMixin):
         except asyncio.CancelledError:
             pass
 
-    @staticmethod
-    async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        err = str(ctx.error)
-        if "Conflict" in err:
-            logger.warning(
-                "Conflict error (another instance?): %s | update=%s", err, update
-            )
-        else:
-            logger.error("Update error: %s | update=%s", ctx.error, update)
-
-    async def _post_init(self, app) -> None:
-        result = await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("delete_webhook result=%s (drop_pending_updates=True)", result)
-        try:
-            me = await app.bot.get_me()
-            self.bot_username = (me.username or "").lower()
-        except Exception:
-            logger.error("get_me() failed at startup", exc_info=True)
-            if self.group_mode:
-                raise RuntimeError(
-                    "team mode requires a reachable Telegram API at startup "
-                    "to fetch bot username; aborting."
-                )
-        # Backfill own bot_username into TeamConfig if missing (one-time migration
-        # for teams created before bot_username was stored at /create_team time).
-        if self.team_name and self.role and self.bot_username:
-            self._backfill_own_bot_username()
-        # Now that we know our actual @handle from Telegram, re-pin it in the
-        # system note so Claude stops fabricating pre-suffix-bump usernames.
-        self._refresh_team_system_note()
-        await app.bot.set_my_commands(COMMANDS)
-        for uid in self._get_trusted_user_ids():
-            try:
-                await app.bot.send_message(
-                    uid,
-                    f"Bot started.\nProject: {self.name}\nPath: {self.path}",
-                )
-            except Exception:
-                logger.error("Failed to send startup message to %d", uid, exc_info=True)
-
     async def _after_ready(self, self_identity) -> None:
         """Called once after Transport.start() completes platform post-init.
 
@@ -1840,7 +1800,6 @@ class ProjectBot(AuthMixin):
             command_names=all_command_names,
         )
 
-        app.add_error_handler(self._on_error)
         return app
 
 
