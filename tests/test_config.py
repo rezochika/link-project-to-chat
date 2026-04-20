@@ -600,6 +600,61 @@ def test_team_with_sentinel_chat_id_roundtrips(tmp_path: Path):
     assert loaded.teams["acme"].group_chat_id == 0
 
 
+def test_team_bot_autostart_defaults_false(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {},
+        "teams": {
+            "acme": {
+                "path": "/a",
+                "group_chat_id": -1,
+                "bots": {"manager": {"telegram_bot_token": "t1"}},
+            }
+        },
+    }))
+    loaded = load_config(p)
+    assert loaded.teams["acme"].bots["manager"].autostart is False
+
+
+def test_team_bot_autostart_roundtrip(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        teams={
+            "acme": TeamConfig(
+                path="/a",
+                group_chat_id=-1,
+                bots={
+                    "manager": TeamBotConfig(telegram_bot_token="t1", autostart=True),
+                    "dev": TeamBotConfig(telegram_bot_token="t2", autostart=False),
+                },
+            )
+        }
+    )
+    save_config(cfg, p)
+    loaded = load_config(p)
+    assert loaded.teams["acme"].bots["manager"].autostart is True
+    assert loaded.teams["acme"].bots["dev"].autostart is False
+    # Default-false autostart should not be written to JSON to keep files clean
+    raw = json.loads(p.read_text())
+    assert "autostart" not in raw["teams"]["acme"]["bots"]["dev"]
+    assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is True
+
+
+def test_load_teams_reads_autostart(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    patch_team(
+        "acme",
+        {
+            "path": "/a",
+            "group_chat_id": -1,
+            "bots": {"manager": {"telegram_bot_token": "t1", "autostart": True}},
+        },
+        p,
+    )
+    teams = load_teams(p)
+    assert teams["acme"].bots["manager"].autostart is True
+
+
 def test_project_show_thinking_roundtrip(tmp_path: Path):
     p = tmp_path / "cfg.json"
     cfg = Config(

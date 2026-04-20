@@ -34,3 +34,20 @@ def set_project_autostart(project_name: str, value: bool, path: Path = PROJECT_C
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(existing, indent=2) + "\n")
     path.chmod(0o600)
+
+
+def set_team_bot_autostart(
+    team_name: str, role: str, value: bool, path: Path = PROJECT_CONFIG
+) -> None:
+    """Persist autostart for a specific team bot. No-op if team or role is missing."""
+    existing = _load_json(path)
+    team = existing.get("teams", {}).get(team_name)
+    if not team:
+        return
+    bot = team.get("bots", {}).get(role)
+    if bot is None:
+        return
+    bot["autostart"] = value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, indent=2) + "\n")
+    path.chmod(0o600)

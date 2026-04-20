@@ -7,7 +7,7 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
-from .config import load_project_configs, set_project_autostart
+from .config import load_project_configs, set_project_autostart, set_team_bot_autostart
 from ..config import load_config
 
 logger = logging.getLogger(__name__)
@@ -80,8 +80,6 @@ class ProcessManager:
         if role not in config.teams[team_name].bots:
             logger.error("Role %s not in team %s", role, team_name)
             return False
-        # NOTE: no _set_autostart call here — team bots are not tracked in the projects
-        # config, so per-team autostart isn't persisted (deferred to a future task).
         key = f"team:{team_name}:{role}"
         if key in self._processes and self._processes[key].poll() is None:
             return False
@@ -93,6 +91,7 @@ class ProcessManager:
         thread.start()
         self._log_threads[key] = thread
         logger.info("Started team %s/%s (pid=%d)", team_name, role, proc.pid)
+        self._set_team_bot_autostart(team_name, role, True)
         return True
 
     def stop(self, project_name: str) -> bool:
@@ -109,7 +108,11 @@ class ProcessManager:
         self._processes.pop(project_name, None)
         self._log_threads.pop(project_name, None)
         logger.info("Stopped %s", project_name)
-        self._set_autostart(project_name, False)
+        if project_name.startswith("team:"):
+            _, team_name, role = project_name.split(":", 2)
+            self._set_team_bot_autostart(team_name, role, False)
+        else:
+            self._set_autostart(project_name, False)
         return True
 
     def status(self, project_name: str) -> str:
@@ -135,15 +138,36 @@ class ProcessManager:
         return sum(1 for name in list(self._processes) if self.stop(name))
 
     def start_autostart(self) -> int:
-        """Start all projects that have autostart=true in config."""
-        projects = self._load_projects()
-        return sum(1 for name, proj in projects.items() if proj.get("autostart") and self.start(name))
+        """Start all projects and team bots that have autostart=true in config.
+
+        Teams whose ``group_chat_id`` is still the ``0`` sentinel (group not yet
+        captured after ``/create_team``) are skipped — starting them would
+        produce a bot with no group to attach to.
+        """
+        count = 0
+        for name, proj in self._load_projects().items():
+            if proj.get("autostart") and self.start(name):
+                count += 1
+        config = load_config(self._project_config_path) if self._project_config_path else load_config()
+        for team_name, team in config.teams.items():
+            if not team.group_chat_id:
+                continue
+            for role, bot in team.bots.items():
+                if bot.autostart and self.start_team(team_name, role):
+                    count += 1
+        return count
 
     def _set_autostart(self, project_name: str, value: bool) -> None:
         if self._project_config_path:
             set_project_autostart(project_name, value, self._project_config_path)
         else:
             set_project_autostart(project_name, value)
+
+    def _set_team_bot_autostart(self, team_name: str, role: str, value: bool) -> None:
+        if self._project_config_path:
+            set_team_bot_autostart(team_name, role, value, self._project_config_path)
+        else:
+            set_team_bot_autostart(team_name, role, value)
 
     def rename(self, old_name: str, new_name: str) -> None:
         for store in (self._processes, self._logs, self._log_threads):

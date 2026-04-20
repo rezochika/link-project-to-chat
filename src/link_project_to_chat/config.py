@@ -39,6 +39,7 @@ class ProjectConfig:
 class TeamBotConfig:
     telegram_bot_token: str
     active_persona: str | None = None
+    autostart: bool = False
 
 
 @dataclass
@@ -159,6 +160,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     role: TeamBotConfig(
                         telegram_bot_token=b.get("telegram_bot_token", ""),
                         active_persona=b.get("active_persona"),
+                        autostart=b.get("autostart", False),
                     )
                     for role, b in team.get("bots", {}).items()
                 },
@@ -280,6 +282,7 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             role: {
                 "telegram_bot_token": b.telegram_bot_token,
                 **({"active_persona": b.active_persona} if b.active_persona else {}),
+                **({"autostart": True} if b.autostart else {}),
             }
             for role, b in team.bots.items()
         }
@@ -386,6 +389,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                         role: TeamBotConfig(
                             telegram_bot_token=b.get("telegram_bot_token", ""),
                             active_persona=b.get("active_persona"),
+                            autostart=b.get("autostart", False),
                         )
                         for role, b in team.get("bots", {}).items()
                     },

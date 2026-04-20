@@ -340,3 +340,91 @@ async def test_edit_field_save_noop_without_pending(bot_env):
     ctx.user_data = {}
     await bot._edit_field_save(update, ctx)  # should not raise or reply
     update.effective_message.reply_text.assert_not_called()
+
+
+def _write_team(proj_cfg: Path, team: str, bots: dict, group_chat_id: int = -1001) -> None:
+    raw = json.loads(proj_cfg.read_text())
+    raw.setdefault("teams", {})[team] = {
+        "path": str(proj_cfg.parent),
+        "group_chat_id": group_chat_id,
+        "bots": bots,
+    }
+    proj_cfg.write_text(json.dumps(raw))
+
+
+@pytest.mark.asyncio
+async def test_on_teams_lists_configured_teams(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
+    update, ctx = _make_update()
+    await bot._on_teams(update, ctx)
+    update.effective_message.reply_text.assert_called_once()
+    markup = update.effective_message.reply_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert any("team_info_acme:manager" == d for d in button_datas)
+    assert any("team_info_acme:dev" == d for d in button_datas)
+
+
+@pytest.mark.asyncio
+async def test_on_teams_empty_no_markup(bot_env):
+    bot, pm, proj_cfg = bot_env
+    update, ctx = _make_update()
+    await bot._on_teams(update, ctx)
+    text = update.effective_message.reply_text.call_args[0][0]
+    assert "No teams" in text
+
+
+@pytest.mark.asyncio
+async def test_callback_team_info_shows_start_when_stopped(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    update, ctx, query = _make_callback("team_info_acme:manager")
+    await bot._on_callback(update, ctx)
+    markup = query.edit_message_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert any("team_start_acme:manager" == d for d in button_datas)
+    assert not any("team_stop_acme:manager" == d for d in button_datas)
+
+
+@pytest.mark.asyncio
+async def test_callback_team_start_invokes_start_team(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    pm.start_team = MagicMock(return_value=True)
+    pm.status = MagicMock(return_value="running")
+    update, ctx, query = _make_callback("team_start_acme:manager")
+    await bot._on_callback(update, ctx)
+    pm.start_team.assert_called_once_with("acme", "manager")
+    query.edit_message_text.assert_called_once()
+    markup = query.edit_message_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert any("team_stop_acme:manager" == d for d in button_datas)
+
+
+@pytest.mark.asyncio
+async def test_callback_team_stop_invokes_stop_with_team_key(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    pm.stop = MagicMock(return_value=True)
+    pm.status = MagicMock(return_value="stopped")
+    update, ctx, query = _make_callback("team_stop_acme:manager")
+    await bot._on_callback(update, ctx)
+    pm.stop.assert_called_once_with("team:acme:manager")
+    query.edit_message_text.assert_called_once()
+    markup = query.edit_message_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert any("team_start_acme:manager" == d for d in button_datas)
+
+
+@pytest.mark.asyncio
+async def test_callback_team_back_relists_teams(bot_env):
+    bot, pm, proj_cfg = bot_env
+    _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
+    update, ctx, query = _make_callback("team_back")
+    await bot._on_callback(update, ctx)
+    markup = query.edit_message_text.call_args[1]["reply_markup"]
+    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert any("team_info_acme:manager" == d for d in button_datas)

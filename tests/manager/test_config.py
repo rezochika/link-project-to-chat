@@ -12,6 +12,7 @@ from link_project_to_chat.manager.config import (
     load_project_configs,
     save_project_configs,
     set_project_autostart,
+    set_team_bot_autostart,
 )
 
 
@@ -52,6 +53,54 @@ def test_set_project_autostart(tmp_path: Path):
     assert json.loads(path.read_text())["projects"]["myproj"]["autostart"] is True
     set_project_autostart("myproj", False, path)
     assert json.loads(path.read_text())["projects"]["myproj"]["autostart"] is False
+
+
+def test_set_team_bot_autostart(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "teams": {
+            "acme": {
+                "path": "/a",
+                "group_chat_id": -1,
+                "bots": {"manager": {"telegram_bot_token": "t1"}},
+            }
+        }
+    }))
+    set_team_bot_autostart("acme", "manager", True, path)
+    raw = json.loads(path.read_text())
+    assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is True
+    # Preserves sibling fields
+    assert raw["teams"]["acme"]["bots"]["manager"]["telegram_bot_token"] == "t1"
+    assert raw["teams"]["acme"]["group_chat_id"] == -1
+
+    set_team_bot_autostart("acme", "manager", False, path)
+    raw = json.loads(path.read_text())
+    assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is False
+
+
+def test_set_team_bot_autostart_unknown_team_is_noop(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"teams": {}}))
+    set_team_bot_autostart("ghost", "manager", True, path)
+    raw = json.loads(path.read_text())
+    assert "ghost" not in raw.get("teams", {})
+
+
+def test_set_team_bot_autostart_unknown_role_is_noop(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "teams": {
+            "acme": {
+                "path": "/a",
+                "group_chat_id": -1,
+                "bots": {"manager": {"telegram_bot_token": "t1"}},
+            }
+        }
+    }))
+    set_team_bot_autostart("acme", "dev", True, path)
+    raw = json.loads(path.read_text())
+    assert "dev" not in raw["teams"]["acme"]["bots"]
+    assert "autostart" not in raw["teams"]["acme"]["bots"]["manager"]
 
 
 def test_trusted_user_id(tmp_path: Path):
