@@ -363,13 +363,13 @@ class ProjectBot(AuthMixin):
                     await live_text.finalize(error_text, render=False)
                 if live_thinking is not None:
                     await live_thinking.finalize(render=False)
-                self._group_state.halt(task.chat_id)
+                self._group_state.halt(self._chat_ref_for_task(task))
                 await self._send_to_chat(
                     task.chat_id,
                     "Hit Max usage cap. Pausing until reset. Will retry every 30 min.",
                     reply_to=task.message_id,
                 )
-                self._schedule_cap_probe(task.chat_id)
+                self._schedule_cap_probe(self._chat_ref_for_task(task))
                 return
             if live_text is not None:
                 await live_text.finalize(error_text, render=False)
@@ -378,19 +378,20 @@ class ProjectBot(AuthMixin):
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
 
-    def _schedule_cap_probe(self, chat_id: int, interval_s: int = 1800) -> None:
+    def _schedule_cap_probe(self, chat: ChatRef, interval_s: int = 1800) -> None:
         """Probe Claude every `interval_s` seconds; on success, resume the group."""
+        chat_id = int(chat.native_id)
         async def _probe() -> None:
             from .claude_client import ClaudeClient
-            while self._group_state.get(chat_id).halted:
+            while self._group_state.get(chat).halted:
                 await asyncio.sleep(interval_s)
-                if not self._group_state.get(chat_id).halted:
+                if not self._group_state.get(chat).halted:
                     return  # user manually resumed
                 try:
                     probe = ClaudeClient(project_path=self.path)
                     result = await probe.chat("ping")
                     if not result.startswith("Error:") and not is_usage_cap_error(result):
-                        self._group_state.resume(chat_id)
+                        self._group_state.resume(chat)
                         await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
                         return
                 except Exception:
@@ -589,13 +590,14 @@ class ProjectBot(AuthMixin):
                 return  # self-silence
             if not is_directed_at_me(msg, self.bot_username):
                 return  # not addressed to this bot
-            chat_id = msg.chat_id
+            from .transport.telegram import chat_ref_from_telegram
+            chat_ref = chat_ref_from_telegram(msg.chat)
             if is_from_other_bot(msg, self.bot_username):
                 # Bot-to-bot message: check halt before acting.
-                if self._group_state.get(chat_id).halted:
+                if self._group_state.get(chat_ref).halted:
                     return
-                self._group_state.note_bot_to_bot(chat_id)
-                if self._group_state.get(chat_id).halted:
+                self._group_state.note_bot_to_bot(chat_ref)
+                if self._group_state.get(chat_ref).halted:
                     # Cap tripped by this very message.
                     await msg.reply_text(
                         f"Auto-paused after {self._group_state.max_bot_rounds} bot-to-bot rounds. "
@@ -604,7 +606,7 @@ class ProjectBot(AuthMixin):
                     return
             else:
                 # Human (trusted user) message — reset the round counter and clear any halt.
-                self._group_state.resume(chat_id)
+                self._group_state.resume(chat_ref)
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
         if self._rate_limited(update.effective_user.id):
@@ -1137,7 +1139,8 @@ class ProjectBot(AuthMixin):
             return  # silently ignore — wrong group
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
-        self._group_state.halt(update.effective_chat.id)
+        from .transport.telegram import chat_ref_from_telegram
+        self._group_state.halt(chat_ref_from_telegram(update.effective_chat))
         await update.effective_message.reply_text("Halted. Use /resume to continue.")
 
     async def _on_resume(self, update, ctx) -> None:
@@ -1147,7 +1150,8 @@ class ProjectBot(AuthMixin):
             return  # silently ignore — wrong group
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
-        self._group_state.resume(update.effective_chat.id)
+        from .transport.telegram import chat_ref_from_telegram
+        self._group_state.resume(chat_ref_from_telegram(update.effective_chat))
         await update.effective_message.reply_text("Resumed.")
 
     async def _on_create_persona(self, ci) -> None:
