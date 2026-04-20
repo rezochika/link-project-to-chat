@@ -151,8 +151,13 @@ class LiveMessage:
             )
         except Exception:
             logger.warning("LiveMessage seal-edit failed (mid=%s)", self.message_id, exc_info=True)
-        # Open a new message with the tail as the initial content (or a placeholder if empty).
-        initial = tail or "…"
+        # Open a new message. If the tail still overflows, send just a
+        # placeholder — the caller's rotation loop will seal this one on the
+        # next iteration once it's edited with another max_chars worth.
+        if tail and len(self._prefix + tail) <= self._max_chars:
+            initial = tail
+        else:
+            initial = "…"
         msg = await self._bot.send_message(
             self.chat_id,
             self._prefix + initial,
@@ -186,6 +191,21 @@ class LiveMessage:
 
         if final_text is not None and final_text != "":
             self._buffer = final_text
+
+        # If the collected buffer is larger than one Telegram message can hold
+        # (can happen when streaming throttle skipped a flush and the final
+        # chunk landed everything at once), seal the current message and rotate
+        # to a new one — repeatedly — until what's left fits. Without this, a
+        # single giant edit_message_text would fail with Message_too_long and
+        # the placeholder would be stranded at "…".
+        while len(self._prefix + self._buffer) > self._max_chars:
+            try:
+                await self._rotate_once()
+            except Exception:
+                logger.exception(
+                    "LiveMessage.finalize rotation failed (mid=%s)", self.message_id
+                )
+                break
 
         text = self._prefix + self._buffer
         if not text.strip():

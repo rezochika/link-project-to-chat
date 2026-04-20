@@ -197,6 +197,91 @@ async def test_overflow_rotates_to_new_message():
 
 
 @pytest.mark.asyncio
+async def test_finalize_rotates_when_buffer_over_max_chars():
+    """Bug: if the pre-flush buffer is > max_chars at finalize time (e.g. Claude
+    emitted the final chunk faster than the throttle window), finalize must
+    split via rotation instead of failing with Message_too_long.
+    """
+    bot = FakeBot()
+    # Huge throttle so the streaming flush never fires — forces finalize to
+    # handle the whole overflow itself.
+    live = LiveMessage(bot=bot, chat_id=1, throttle=60.0, max_chars=50)
+    await live.start()
+    placeholder_mid = live.message_id
+    await live.append("y" * 120)  # 120 chars, well over 50-char cap
+
+    await live.finalize(render=False)
+
+    # All sends/edits combined must contain the full 120 chars. No single text
+    # may exceed max_chars. Placeholder message got sealed with the first slice.
+    texts = [s["text"] for s in bot.sent] + [e["text"] for e in bot.edits]
+    assert all(len(t) <= 50 for t in texts), (
+        f"some message exceeded max_chars=50: {[(len(t), t[:20]) for t in texts]}"
+    )
+    # The first message (placeholder) must have been sealed with 50 y's (not
+    # left at the "…" placeholder).
+    final_first = [e["text"] for e in bot.edits if e["message_id"] == placeholder_mid]
+    assert final_first and final_first[-1] == "y" * 50
+    # All 120 characters show up somewhere.
+    combined = "".join(
+        t for t in (
+            [e["text"] for e in bot.edits if e["message_id"] == placeholder_mid][-1:]
+            + [s["text"] for s in bot.sent[1:]]
+            + [e["text"] for e in bot.edits if e["message_id"] != placeholder_mid]
+        )
+    )
+    assert combined.count("y") >= 120
+
+
+@dataclass
+class RejectTooLongBot(FakeBot):
+    """Mirrors the real Telegram hard cap: editing > 4096 chars raises."""
+
+    hard_cap: int = 4096
+
+    async def edit_message_text(self, chat_id, message_id, text, **kw):
+        if len(text) > self.hard_cap:
+            raise RuntimeError(f"Message_too_long: {len(text)} > {self.hard_cap}")
+        return await super().edit_message_text(chat_id, message_id, text, **kw)
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None, **kw):
+        if len(text) > self.hard_cap:
+            raise RuntimeError(f"Message_too_long: {len(text)} > {self.hard_cap}")
+        return await super().send_message(
+            chat_id, text, reply_to_message_id=reply_to_message_id, **kw
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalize_does_not_strand_buffer_over_telegram_hard_cap():
+    """Regression: previously if the un-flushed buffer exceeded Telegram's 4096
+    hard cap at finalize time, both the HTML edit and the plain fallback raised
+    Message_too_long. The placeholder was stranded at '…' and the whole Claude
+    response was silently lost. finalize must rotate/split so the content lands.
+    """
+    bot = RejectTooLongBot(hard_cap=4096)
+    live = LiveMessage(bot=bot, chat_id=1, throttle=60.0)  # default max_chars=3800
+    await live.start()
+    placeholder_mid = live.message_id
+    # Worst-case: a single delta that is ~2x the max.
+    await live.append("z" * 7500)
+    await live.finalize(render=False)
+
+    # Every send/edit must be within the bot's hard cap (no Message_too_long).
+    texts = [s["text"] for s in bot.sent] + [e["text"] for e in bot.edits]
+    assert all(len(t) <= 4096 for t in texts), (
+        f"a message exceeded 4096 chars: {[(len(t), t[:30]) for t in texts]}"
+    )
+    # Placeholder must have been replaced with real content, not left at '…'.
+    placeholder_edits = [e["text"] for e in bot.edits if e["message_id"] == placeholder_mid]
+    assert placeholder_edits, "placeholder was never edited — buffer stranded at '…'"
+    assert placeholder_edits[-1] != "…", "placeholder still shows '…' after finalize"
+    # All 7500 z's must be distributed across the sent/edited messages.
+    total_z = sum(t.count("z") for t in texts)
+    assert total_z >= 7500, f"only {total_z} of 7500 z's reached Telegram"
+
+
+@pytest.mark.asyncio
 async def test_prefix_longer_than_max_chars_raises():
     bot = FakeBot()
     with pytest.raises(ValueError):
