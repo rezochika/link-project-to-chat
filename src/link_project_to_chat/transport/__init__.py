@@ -16,6 +16,7 @@ from .base import (
     MessageRef,
     Transport,
 )
+from .fake import EditedMessage, FakeTransport, SentFile, SentMessage
 
 __all__ = [
     "Button",
@@ -27,10 +28,14 @@ __all__ = [
     "ChatRef",
     "CommandHandler",
     "CommandInvocation",
+    "EditedMessage",
+    "FakeTransport",
     "Identity",
     "IncomingFile",
     "IncomingMessage",
     "MessageHandler",
     "MessageRef",
+    "SentFile",
+    "SentMessage",
     "Transport",
 ]
