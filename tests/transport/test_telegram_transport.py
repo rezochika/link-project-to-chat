@@ -179,6 +179,64 @@ async def test_edit_text_with_buttons_passes_inline_keyboard():
     assert kwargs["reply_markup"] is not None
 
 
+async def test_incoming_message_populates_files_from_document(tmp_path):
+    """Document attachments get downloaded and exposed as IncomingFile."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured: list = []
+
+    async def handler(msg):
+        captured.append(msg)
+
+    t.on_message(handler)
+
+    downloaded_bytes = b"hello doc"
+    target_path: list = []
+
+    async def fake_download_to_drive(path):
+        # Simulate telegram's download by writing bytes to the given path.
+        p = path if hasattr(path, "write_bytes") else __import__("pathlib").Path(str(path))
+        p.write_bytes(downloaded_bytes)
+        target_path.append(p)
+
+    tg_file_obj = SimpleNamespace(download_to_drive=fake_download_to_drive)
+
+    async def fake_get_file():
+        return tg_file_obj
+
+    tg_document = SimpleNamespace(
+        file_name="notes.txt",
+        mime_type="text/plain",
+        file_size=len(downloaded_bytes),
+        get_file=fake_get_file,
+    )
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=200,
+        chat=tg_chat,
+        from_user=tg_user,
+        text=None,
+        photo=None,
+        document=tg_document,
+        voice=None,
+        audio=None,
+        caption="see this file",
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(captured) == 1
+    assert len(captured[0].files) == 1
+    f = captured[0].files[0]
+    assert f.original_name == "notes.txt"
+    assert f.mime_type == "text/plain"
+    assert f.path.read_bytes() == downloaded_bytes
+    # Caption becomes the message text when no text is set.
+    assert captured[0].text == "see this file"
+
+
 async def test_on_button_fires_for_telegram_callback_query():
     t, _bot = _make_transport_with_mock_bot()
     captured: list = []

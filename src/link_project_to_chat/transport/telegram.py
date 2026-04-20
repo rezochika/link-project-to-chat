@@ -160,19 +160,56 @@ class TelegramTransport:
     async def _dispatch_message(self, update: Any, ctx: Any) -> None:
         """Convert a telegram Update into IncomingMessage and invoke handlers.
 
-        Called from the MessageHandler wired on the Application by bot.py
-        during the strangler port (Task 9). For now, tests call this directly.
+        Downloads photo/document attachments to a per-handler temp directory.
+        The tempdir is stashed on the native message so it lives until handler
+        completion; GC then cleans it up.
         """
+        import tempfile
+
         msg = update.effective_message
         user = update.effective_user
         if msg is None or user is None:
             return
-        from .base import IncomingMessage
+
+        from .base import IncomingFile, IncomingMessage
+
+        files: list[IncomingFile] = []
+
+        photo = getattr(msg, "photo", None)
+        if photo:
+            largest = photo[-1]
+            tmpdir = tempfile.TemporaryDirectory()
+            path = Path(tmpdir.name) / "photo.jpg"
+            tg_file = await largest.get_file()
+            await tg_file.download_to_drive(path)
+            files.append(IncomingFile(
+                path=path,
+                original_name="photo.jpg",
+                mime_type="image/jpeg",
+                size_bytes=getattr(largest, "file_size", 0) or 0,
+            ))
+            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
+
+        doc = getattr(msg, "document", None)
+        if doc is not None:
+            tmpdir = tempfile.TemporaryDirectory()
+            name = getattr(doc, "file_name", None) or "document"
+            path = Path(tmpdir.name) / name
+            tg_file = await doc.get_file()
+            await tg_file.download_to_drive(path)
+            files.append(IncomingFile(
+                path=path,
+                original_name=name,
+                mime_type=getattr(doc, "mime_type", None),
+                size_bytes=getattr(doc, "file_size", 0) or 0,
+            ))
+            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
+
         incoming = IncomingMessage(
             chat=chat_ref_from_telegram(msg.chat),
             sender=identity_from_telegram_user(user),
-            text=msg.text or "",
-            files=[],  # populated in Task 21
+            text=msg.text or getattr(msg, "caption", None) or "",
+            files=files,
             reply_to=(
                 message_ref_from_telegram(msg.reply_to_message)
                 if msg.reply_to_message is not None
