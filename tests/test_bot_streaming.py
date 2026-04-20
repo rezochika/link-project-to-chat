@@ -55,6 +55,8 @@ async def _stub_bot(show_thinking: bool = False):
     bot._typing_tasks = {}
     bot._live_text = {}
     bot._live_thinking = {}
+    bot._live_text_failed = set()
+    bot._live_thinking_failed = set()
     bot._thinking_buf = {}
     bot._thinking_store = {}
     bot._voice_tasks = set()
@@ -242,3 +244,131 @@ async def test_cancel_live_for_seals_both_messages():
     # Both messages received a final edit containing the cancellation note.
     cancel_texts = [e["text"] for e in bot._app.bot.edits if "(cancelled)" in e["text"]]
     assert len(cancel_texts) >= 2, f"expected 2 cancel edits, got edits={bot._app.bot.edits}"
+
+
+@dataclass
+class FailingStartBot(FakeBot):
+    """FakeBot that raises on every send_message call carrying a 💭 prefix.
+
+    Simulates the case where the thinking placeholder send fails (e.g. Telegram
+    rate limit / transient error), so the regular text placeholder still
+    succeeds but the thinking one does not.
+    """
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None, **kw):
+        if text.startswith("💭"):
+            raise RuntimeError("simulated Telegram failure for thinking placeholder")
+        return await super().send_message(
+            chat_id, text, reply_to_message_id=reply_to_message_id, **kw
+        )
+
+
+async def _stub_bot_with_bot(fake_bot, show_thinking: bool = False):
+    """Same as _stub_bot but with a caller-provided FakeBot variant."""
+    from link_project_to_chat.bot import ProjectBot
+    bot = ProjectBot.__new__(ProjectBot)
+    bot._app = SimpleNamespace(bot=fake_bot)
+    bot._typing_tasks = {}
+    bot._live_text = {}
+    bot._live_thinking = {}
+    bot._live_text_failed = set()
+    bot._live_thinking_failed = set()
+    bot._thinking_buf = {}
+    bot._thinking_store = {}
+    bot._voice_tasks = set()
+    bot.show_thinking = show_thinking
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_thinking_start_failure_falls_back_to_buffer():
+    """When LiveMessage.start() raises for the thinking placeholder, the
+    ThinkingDelta content must still be captured in _thinking_buf so the
+    post-completion 'Thinking' button still works. Without this fallback,
+    a transient Telegram error silently eats all subsequent thinking content.
+    """
+    failing_bot = FailingStartBot()
+    bot = await _stub_bot_with_bot(failing_bot, show_thinking=True)
+    task = _fake_task(task_id=40)
+
+    # First ThinkingDelta — start() will raise because the bot refuses the 💭 send.
+    await bot._on_stream_event(task, ThinkingDelta(text="first thought"))
+    # Second ThinkingDelta — we should not keep hammering start() and losing content.
+    await bot._on_stream_event(task, ThinkingDelta(text="second thought"))
+
+    # No dead LiveMessage should be left in _live_thinking.
+    assert task.id not in bot._live_thinking
+    # Both thinking chunks captured via the toggle-off fallback path.
+    assert bot._thinking_buf.get(task.id) == "first thought\n\nsecond thought"
+
+
+@dataclass
+class TextFailingBot(FakeBot):
+    """FakeBot whose send_message always raises — simulates Telegram refusing
+    the text placeholder. The bot should not crash; finalize should
+    gracefully fall back to _send_to_chat with task.result."""
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None, **kw):
+        raise RuntimeError("simulated Telegram failure for text placeholder")
+
+
+@pytest.mark.asyncio
+async def test_text_start_failure_does_not_crash_and_finalize_falls_back():
+    failing_bot = TextFailingBot()
+    bot = await _stub_bot_with_bot(failing_bot, show_thinking=False)
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    fallback_sends: list[tuple[int, str]] = []
+
+    async def fake_send(chat_id, text, reply_to=None):
+        fallback_sends.append((chat_id, text))
+
+    bot._send_to_chat = fake_send
+    task = _fake_task(task_id=42)
+    task.status = TaskStatus.DONE
+    task.result = "the final answer"
+
+    # Multiple TextDeltas — first fails start(), rest should be no-ops (not keep retrying).
+    await bot._on_stream_event(task, TextDelta(text="chunk1"))
+    await bot._on_stream_event(task, TextDelta(text="chunk2"))
+    await bot._on_stream_event(task, TextDelta(text="chunk3"))
+
+    # No live message was stored, and the failure flag short-circuits retries.
+    assert task.id not in bot._live_text
+    assert task.id in bot._live_text_failed
+    # Only ONE send_message attempt (the first start()), not three.
+    # FailingBot raises on every call; the failed-set prevents retries.
+    # We can't count raises directly, but we can verify finalize falls back cleanly.
+
+    await bot._finalize_claude_task(task)
+
+    # Fallback path sent task.result via _send_to_chat.
+    assert fallback_sends == [(task.chat_id, "the final answer")]
+    # Failed flag cleaned up for subsequent tasks.
+    assert task.id not in bot._live_text_failed
+
+
+@pytest.mark.asyncio
+async def test_thinking_start_failure_surfaces_via_thinking_button_after_finalize():
+    """End-to-end: after the task finalises, the buffered thinking lands in
+    `_thinking_store` so `/tasks → Thinking` shows it as a fallback."""
+    failing_bot = FailingStartBot()
+    bot = await _stub_bot_with_bot(failing_bot, show_thinking=True)
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+
+    async def fake_send(chat_id, text, reply_to=None):
+        pass
+
+    bot._send_to_chat = fake_send
+
+    task = _fake_task(task_id=41)
+    task.status = TaskStatus.DONE
+    task.result = "final answer"
+
+    await bot._on_stream_event(task, ThinkingDelta(text="hidden reasoning"))
+    await bot._on_stream_event(task, TextDelta(text="partial"))
+    await bot._finalize_claude_task(task)
+
+    # The Thinking button fallback kicks in because live thinking degraded to buffer.
+    assert bot._thinking_store.get(task.id) == "hidden reasoning"
