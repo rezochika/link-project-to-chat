@@ -549,6 +549,16 @@ class ProjectBot(AuthMixin):
 
         # 3. Text.
         if incoming.text.strip():
+            if self.group_mode:
+                handled = await self._handle_group_text(incoming)
+                if handled:
+                    return
+                # Bot-to-bot path bypasses auth; submit directly.
+                if incoming.is_relayed_bot_to_bot or incoming.sender.is_bot:
+                    await self._submit_group_message_to_claude(incoming)
+                    return
+                # Human message in group — fall through to legacy _on_text shim
+                # for the full auth/rate-limit/pending-skill/pending-persona flow.
             native = incoming.native
             if native is None:
                 return
@@ -646,50 +656,6 @@ class ProjectBot(AuthMixin):
         msg = update.effective_message
         if not msg:
             return
-        if self.group_mode:
-            # Auto-capture: if chat_id not yet bound (sentinel 0 or None), and sender is the trusted user,
-            # write this group's chat_id into the team config and update in-memory state.
-            if self.group_chat_id in (0, None):
-                if self._auth(update.effective_user) and self.team_name:
-                    new_chat_id = msg.chat_id
-                    patch_team(self.team_name, {"group_chat_id": new_chat_id})
-                    self.group_chat_id = new_chat_id
-                    # Fall through so this same message still gets processed normally.
-            elif msg.chat_id != self.group_chat_id:
-                return  # wrong group — silent ignore
-            # Transient IncomingMessage for group_filters — fully replaced by
-            # _on_text_from_transport dispatch in Task 8.
-            from .transport import IncomingMessage
-            from .transport.telegram import chat_ref_from_telegram, identity_from_telegram_user
-            _transient_incoming = IncomingMessage(
-                chat=chat_ref_from_telegram(msg.chat),
-                sender=identity_from_telegram_user(update.effective_user),
-                text=msg.text or "",
-                files=[],
-                reply_to=None,  # not needed for group_filters in this transient path; is_reply_to_bot uses native
-                native=msg,
-            )
-            from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
-            if is_from_self(_transient_incoming, self.bot_username):
-                return  # self-silence
-            if not is_directed_at_me(_transient_incoming, self.bot_username):
-                return  # not addressed to this bot
-            chat_ref = chat_ref_from_telegram(msg.chat)
-            if is_from_other_bot(_transient_incoming, self.bot_username):
-                # Bot-to-bot message: check halt before acting.
-                if self._group_state.get(chat_ref).halted:
-                    return
-                self._group_state.note_bot_to_bot(chat_ref)
-                if self._group_state.get(chat_ref).halted:
-                    # Cap tripped by this very message.
-                    await msg.reply_text(
-                        f"Auto-paused after {self._group_state.max_bot_rounds} bot-to-bot rounds. "
-                        "Send any message to resume."
-                    )
-                    return
-            else:
-                # Human (trusted user) message — reset the round counter and clear any halt.
-                self._group_state.resume(chat_ref)
         if not self._auth(update.effective_user):
             return await msg.reply_text("Unauthorized.")
         if self._rate_limited(update.effective_user.id):
