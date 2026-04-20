@@ -9,7 +9,7 @@ import pytest
 
 
 def test_find_peer_mention_returns_peer_when_addressed():
-    from link_project_to_chat.manager.team_relay import find_peer_mention
+    from link_project_to_chat.transport._telegram_relay import find_peer_mention
 
     text = "@acme_dev_bot please implement models.py"
     result = find_peer_mention(text, self_username="acme_mgr_bot", team_bot_usernames={"acme_mgr_bot", "acme_dev_bot"})
@@ -17,7 +17,7 @@ def test_find_peer_mention_returns_peer_when_addressed():
 
 
 def test_find_peer_mention_case_insensitive():
-    from link_project_to_chat.manager.team_relay import find_peer_mention
+    from link_project_to_chat.transport._telegram_relay import find_peer_mention
 
     result = find_peer_mention(
         "Hey @ACME_Dev_Bot ready to go",
@@ -28,7 +28,7 @@ def test_find_peer_mention_case_insensitive():
 
 
 def test_find_peer_mention_returns_none_when_self_mention():
-    from link_project_to_chat.manager.team_relay import find_peer_mention
+    from link_project_to_chat.transport._telegram_relay import find_peer_mention
 
     result = find_peer_mention(
         "I, @acme_mgr_bot, have finished my review",
@@ -39,7 +39,7 @@ def test_find_peer_mention_returns_none_when_self_mention():
 
 
 def test_find_peer_mention_returns_none_when_no_peer_mention():
-    from link_project_to_chat.manager.team_relay import find_peer_mention
+    from link_project_to_chat.transport._telegram_relay import find_peer_mention
 
     result = find_peer_mention(
         "Here is my update",
@@ -50,7 +50,7 @@ def test_find_peer_mention_returns_none_when_no_peer_mention():
 
 
 def test_is_relayed_text_detects_prefix():
-    from link_project_to_chat.manager.team_relay import is_relayed_text
+    from link_project_to_chat.transport._telegram_relay import is_relayed_text
 
     assert is_relayed_text("[auto-relay from acme_mgr_bot]\n\nHello @acme_dev_bot") is True
     assert is_relayed_text("@acme_dev_bot ready") is False
@@ -65,7 +65,7 @@ def test_relay_prefix_has_no_at_sign_to_avoid_self_mention():
     "addressed to me" and reply to itself — a self-reply feedback loop.
     Regression for the bug captured in the 2026-04-20 chat export.
     """
-    from link_project_to_chat.manager.team_relay import _RELAY_PREFIX
+    from link_project_to_chat.transport._telegram_relay import _RELAY_PREFIX
 
     assert "@" not in _RELAY_PREFIX
 
@@ -91,7 +91,7 @@ async def _mk_event(text: str, sender_username: str, sender_is_bot: bool):
 @pytest.mark.asyncio
 async def test_relay_ignores_user_messages():
     """A real user's message is not relayed — only bot-to-bot traffic needs the bridge."""
-    from link_project_to_chat.manager.team_relay import TeamRelay
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
 
     client = MagicMock()
     client.add_event_handler = MagicMock(return_value="handler")
@@ -109,7 +109,7 @@ async def test_relay_ignores_user_messages():
 
 @pytest.mark.asyncio
 async def test_relay_ignores_bot_messages_not_addressing_peer():
-    from link_project_to_chat.manager.team_relay import TeamRelay
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
 
     client = MagicMock()
     client.send_message = AsyncMock()
@@ -127,7 +127,7 @@ async def test_relay_ignores_bot_messages_not_addressing_peer():
 @pytest.mark.asyncio
 async def test_relay_ignores_already_relayed_text():
     """A relayed message must not be re-relayed (loop guard)."""
-    from link_project_to_chat.manager.team_relay import TeamRelay
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
 
     client = MagicMock()
     client.send_message = AsyncMock()
@@ -144,7 +144,7 @@ async def test_relay_ignores_already_relayed_text():
 
 @pytest.mark.asyncio
 async def test_relay_forwards_bot_to_bot_handoff():
-    from link_project_to_chat.manager.team_relay import TeamRelay
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
 
     client = MagicMock()
     client.send_message = AsyncMock()
@@ -171,7 +171,7 @@ async def test_relay_forwards_bot_to_bot_handoff():
 @pytest.mark.asyncio
 async def test_relay_ignores_message_from_unknown_bot():
     """A third-party bot's message shouldn't trigger a relay even if it @mentions a team bot."""
-    from link_project_to_chat.manager.team_relay import TeamRelay
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
 
     client = MagicMock()
     client.send_message = AsyncMock()

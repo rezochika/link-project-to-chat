@@ -1238,7 +1238,7 @@ class ManagerBot(AuthMixin):
             # Register a TeamRelay for this new team so bot-to-bot handoffs work
             # without restarting the manager service.
             try:
-                from .team_relay import TeamRelay
+                from ..transport._telegram_relay import TeamRelay
                 client_ = getattr(self, "_telethon_client", None)
                 relays_ = getattr(self, "_team_relays", None)
                 if client_ and relays_ is not None and prefix not in relays_:
@@ -1771,7 +1771,7 @@ class ManagerBot(AuthMixin):
             return
         try:
             from telethon import TelegramClient
-            from .team_relay import TeamRelay
+            from ..transport._telegram_relay import TeamRelay
         except ImportError:
             logger.info("Team relays skipped — telethon not installed")
             return

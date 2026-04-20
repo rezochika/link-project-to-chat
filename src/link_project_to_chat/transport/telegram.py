@@ -28,8 +28,8 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # Matches the prefix the Telethon relay prepends to forwarded bot-to-bot messages.
 # Format: "[auto-relay from <handle>]\n\n" — note there is no '@' on the handle.
 # That is intentional: '@handle' would make peer bots re-process the relayed
-# message as a self-mention. See manager/team_relay.py (moves to
-# transport/_telegram_relay.py in a later task) for where the prefix is written.
+# message as a self-mention. See transport/_telegram_relay.py for where the
+# prefix is written.
 _RELAY_PREFIX_RE = re.compile(r"^\[auto-relay from [A-Za-z][A-Za-z0-9_]*\]\n\n")
 
 
@@ -412,8 +412,7 @@ class TelegramTransport:
         text = msg.text or getattr(msg, "caption", None) or ""
         is_relayed = False
         # The Telethon relay posts messages with this prefix (no '@' on the handle —
-        # intentional, see manager/team_relay.py (moves to transport/_telegram_relay.py
-        # in a later task) comment). Detect and strip.
+        # intentional, see transport/_telegram_relay.py comment). Detect and strip.
         relay_match = _RELAY_PREFIX_RE.match(text)
         if relay_match:
             is_relayed = True
