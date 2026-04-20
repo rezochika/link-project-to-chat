@@ -50,6 +50,9 @@ def _make_telegram_transport_with_inject() -> TelegramTransport:
     bot.send_photo = AsyncMock(return_value=SimpleNamespace(
         message_id=3, chat=SimpleNamespace(id=1, type="private"),
     ))
+    bot.send_voice = AsyncMock(return_value=SimpleNamespace(
+        message_id=4, chat=SimpleNamespace(id=1, type="private"),
+    ))
     app = MagicMock()
     app.bot = bot
     app.initialize = AsyncMock()
@@ -183,3 +186,12 @@ async def test_on_button_fires_for_injected_click(transport):
     await transport.inject_button_click(ref, sender, value="go")
 
     assert seen == ["go"]
+
+
+async def test_send_voice_returns_usable_message_ref(transport, tmp_path):
+    chat = _chat(transport.TRANSPORT_ID)
+    p = tmp_path / "v.opus"
+    p.write_bytes(b"fake opus")
+    ref = await transport.send_voice(chat, p)
+    assert isinstance(ref, MessageRef)
+    assert ref.chat == chat
