@@ -21,6 +21,7 @@ from .base import (
     IncomingMessage,
     MessageHandler,
     MessageRef,
+    OnReadyCallback,
 )
 
 
@@ -73,7 +74,7 @@ class FakeTransport:
         self._message_handlers: list[MessageHandler] = []
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
-        self._on_ready_callbacks: list = []
+        self._on_ready_callbacks: list[OnReadyCallback] = []
         self._msg_counter = itertools.count(1)
         self._running = False
 
@@ -146,7 +147,7 @@ class FakeTransport:
     def on_button(self, handler: ButtonHandler) -> None:
         self._button_handlers.append(handler)
 
-    def on_ready(self, callback) -> None:
+    def on_ready(self, callback: OnReadyCallback) -> None:
         self._on_ready_callbacks.append(callback)
 
     # ── Test injection ────────────────────────────────────────────────────
