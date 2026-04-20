@@ -477,6 +477,25 @@ class ProjectBot(AuthMixin):
             f"Send a message to chat with Claude.\n{_CMD_HELP}"
         )
 
+    async def _on_text_from_transport(self, incoming) -> None:
+        """Bridge handler registered on TelegramTransport.on_message.
+
+        The heavy lifting stays in _on_text for now (which consumes telegram.Update).
+        This method converts IncomingMessage back into the Update shape expected
+        by _on_text — a temporary shim that goes away when _on_text is fully
+        ported to consume IncomingMessage directly (future task).
+        """
+        native = incoming.native  # the original telegram.Message
+        if native is None:
+            return
+        from types import SimpleNamespace
+        fake_update = SimpleNamespace(
+            effective_message=native,
+            effective_user=native.from_user,
+            effective_chat=native.chat,
+        )
+        await self._on_text(fake_update, None)
+
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         if not msg:
@@ -1652,6 +1671,8 @@ class ProjectBot(AuthMixin):
             "halt": self._on_halt,
             "resume": self._on_resume,
         }
+        assert self._transport is not None
+        self._transport.on_message(self._on_text_from_transport)
         if self.group_mode:
             # Group mode: accept commands and text from groups/supergroups only.
             chat_filter = filters.ChatType.GROUPS
@@ -1663,7 +1684,7 @@ class ProjectBot(AuthMixin):
                 & filters.TEXT
                 & ~filters.COMMAND
             )
-            app.add_handler(MessageHandler(text_filter, self._on_text))
+            app.add_handler(MessageHandler(text_filter, self._transport._dispatch_message))
             # Voice, files, and other media are disabled in group mode for v1.
         else:
             private = filters.ChatType.PRIVATE
@@ -1675,7 +1696,7 @@ class ProjectBot(AuthMixin):
                 & filters.TEXT
                 & ~filters.COMMAND
             )
-            app.add_handler(MessageHandler(text_filter, self._on_text))
+            app.add_handler(MessageHandler(text_filter, self._transport._dispatch_message))
             file_filter = private & (filters.Document.ALL | filters.PHOTO)
             app.add_handler(MessageHandler(file_filter, self._on_file))
             voice_filter = private & (filters.VOICE | filters.AUDIO)
