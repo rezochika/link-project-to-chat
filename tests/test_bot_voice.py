@@ -237,3 +237,20 @@ async def test_unified_dispatch_unsupported_unauthorized_ignored():
     )
     await bot._on_text_from_transport(incoming)
     assert bot._transport.sent_messages == []
+
+
+async def test_voice_long_transcript_truncated_in_status(tmp_path):
+    """Long transcripts are truncated to 200 chars in the status-edit display."""
+    bot = _make_project_bot_stub()
+    long_text = "x" * 500
+    bot._transcriber.transcribe = AsyncMock(return_value=long_text)
+    incoming = _audio_incoming(tmp_path)
+    await bot._on_voice_from_transport(incoming)
+    # The status edit should contain truncated text ending with "..."
+    edit_texts = [e.text for e in bot._transport.edited_messages]
+    truncated_edits = [t for t in edit_texts if "..." in t]
+    assert truncated_edits, "expected at least one edit with truncation marker"
+    # The truncated edit should be shorter than the full transcript wrapped in quotes.
+    for t in truncated_edits:
+        # "🎤 "text..."" format: the inner text portion should be 200 chars max
+        assert len(t) < 300  # 200 chars + wrapper/ellipsis
