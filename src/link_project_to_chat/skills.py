@@ -25,6 +25,8 @@ def _sanitize_name(name: str, kind: str = "skill") -> str:
 GLOBAL_SKILLS_DIR = Path.home() / ".link-project-to-chat" / "skills"
 GLOBAL_PERSONAS_DIR = Path.home() / ".link-project-to-chat" / "personas"
 CLAUDE_USER_SKILLS_DIR = Path.home() / ".claude" / "skills"
+# Personas shipped with the package (lowest priority; overridden by global/project).
+BUNDLED_PERSONAS_DIR = Path(__file__).parent / "personas"
 
 
 @dataclass
@@ -124,20 +126,22 @@ def delete_skill(name: str, project_path: Path, *, scope: str = "project") -> bo
 # --- Personas (per-message) ---
 
 def load_personas(project_path: Path) -> dict[str, Skill]:
-    """Load all personas. Priority: app global < project."""
-    personas = _load_from_dir(GLOBAL_PERSONAS_DIR, "global")
+    """Load all personas. Priority: bundled < app global < project."""
+    personas = _load_from_dir(BUNDLED_PERSONAS_DIR, "bundled")
+    personas.update(_load_from_dir(GLOBAL_PERSONAS_DIR, "global"))
     personas.update(_load_from_dir(project_personas_dir(project_path), "project"))
     return personas
 
 
 def load_persona(name: str, project_path: Path) -> Skill | None:
-    """Load a single persona by name. Project checked first, then global."""
+    """Load a single persona by name. Priority: project > global > bundled."""
     name = name.strip()
     if not _VALID_NAME_RE.match(name):
         return None
     for directory, source in (
         (project_personas_dir(project_path), "project"),
         (GLOBAL_PERSONAS_DIR, "global"),
+        (BUNDLED_PERSONAS_DIR, "bundled"),
     ):
         f = directory / f"{name}.md"
         if f.is_file():

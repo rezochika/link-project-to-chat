@@ -195,7 +195,9 @@ def test_load_skill_falls_back_to_claude(tmp_path: Path, monkeypatch):
 # --- Personas ---
 
 def test_load_personas_empty(tmp_path: Path, monkeypatch):
+    """With empty global/project AND no bundled dir, load_personas returns {}."""
     monkeypatch.setattr("link_project_to_chat.skills.GLOBAL_PERSONAS_DIR", tmp_path / "empty")
+    monkeypatch.setattr("link_project_to_chat.skills.BUNDLED_PERSONAS_DIR", tmp_path / "empty_bundled")
     personas = load_personas(tmp_path)
     assert personas == {}
 
