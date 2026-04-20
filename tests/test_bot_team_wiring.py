@@ -459,6 +459,35 @@ def test_team_bot_without_peer_username_leaves_note_unset(tmp_path):
     assert bot.task_manager.claude.team_system_note is None
 
 
+def test_team_system_note_pins_self_handle_after_refresh(tmp_path):
+    """After get_me() populates self.bot_username the note must pin *both*
+    the bot's own @handle and the peer's. Otherwise Claude invents an @handle
+    from the persona name (the 2026-04-20 export showed a bot greet itself as
+    ``@..._dev_claude_bot`` when the real handle was ``@..._dev_2_claude_bot``).
+    """
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_dev", path=tmp_path, token="t",
+        team_name="acme", role="dev", group_chat_id=-100_111,
+        peer_bot_username="acme_mgr_bot",
+    )
+    # Before get_me(): note carries peer only.
+    note_init = bot.task_manager.claude.team_system_note
+    assert note_init is not None
+    assert "@acme_mgr_bot" in note_init
+    assert "@acme_dev_2_bot" not in note_init  # self handle not known yet
+
+    # Simulate _post_init after get_me() returned our real handle.
+    bot.bot_username = "acme_dev_2_bot"
+    bot._refresh_team_system_note()
+
+    note_post = bot.task_manager.claude.team_system_note
+    assert note_post is not None
+    assert "@acme_dev_2_bot" in note_post  # self handle pinned
+    assert "@acme_mgr_bot" in note_post    # peer handle still there
+
+
 def test_backfill_own_bot_username_writes_to_team_config(tmp_path, monkeypatch):
     """On startup, a team bot writes its getMe username into TeamConfig if missing."""
     from link_project_to_chat.bot import ProjectBot

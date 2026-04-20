@@ -101,3 +101,24 @@ def test_directed_at_me_when_human_mentions_bot():
         entities={mention: "@acme_dev_bot"},
     )
     assert is_directed_at_me(msg, "acme_dev_bot") is True
+
+
+def test_reply_to_me_is_suppressed_when_user_mentions_other_bot():
+    """Regression: if the user replies to bot A's message but only @mentions
+    bot B, bot A must not respond (previously both woke up)."""
+    mention = MagicMock(type="mention")
+    msg = _msg(
+        text="@acme_manager_bot",
+        entities={mention: "@acme_manager_bot"},
+        reply_to_bot_username="acme_dev_bot",
+    )
+    # The dev bot is the reply target but the user pinged the manager → dev stays quiet.
+    assert is_directed_at_me(msg, "acme_dev_bot") is False
+    # The manager bot is explicitly mentioned → it still responds.
+    assert is_directed_at_me(msg, "acme_manager_bot") is True
+
+
+def test_reply_to_me_still_fires_without_any_mention():
+    """Sanity: a bare reply (no @mention) should still wake the replied-to bot."""
+    msg = _msg(text="yes please redo it", reply_to_bot_username="acme_dev_bot")
+    assert is_directed_at_me(msg, "acme_dev_bot") is True

@@ -148,17 +148,13 @@ class ProjectBot(AuthMixin):
         self.group_chat_id = group_chat_id
         self.role = role
         self.peer_bot_username = peer_bot_username
-        # Tell Claude about its peer so it uses the correct @handle instead of
-        # placeholders like "@developer" or "@manager".
-        if peer_bot_username:
-            peer_role = "developer" if role == "manager" else "manager"
-            self.task_manager.claude.team_system_note = (
-                f"You are the '{role}' role bot in a dual-agent team group. "
-                f"Your team peer (role: {peer_role}) in this group is @{peer_bot_username}. "
-                f"When directing work to the other role bot, use the exact @username "
-                f"'@{peer_bot_username}' — never a placeholder like '@developer' or '@manager'."
-            )
         self.bot_username: str = ""  # populated in _post_init via get_me()
+        # Tell Claude about its own + peer @handle so it uses the correct
+        # usernames instead of placeholders ("@developer") or hallucinating a
+        # pre-suffix-bump name it remembers from the persona. Called once here
+        # so existing peer info is available, and again in _post_init once
+        # get_me() has populated self.bot_username.
+        self._refresh_team_system_note()
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
         self._probe_tasks: set[asyncio.Task] = set()
@@ -852,6 +848,33 @@ class ProjectBot(AuthMixin):
         await update.effective_message.reply_text(f"Delete {icon} {skill.source} skill '{name}'?", reply_markup=keyboard)
 
     # --- Persona handlers ---
+
+    def _refresh_team_system_note(self) -> None:
+        """(Re)build the Claude system note that pins the bot's own + peer @handle.
+
+        Called from __init__ (self handle still unknown — note carries peer only)
+        and from _post_init after get_me() fills self.bot_username (note now
+        carries both). Without the self handle Claude tends to invent one from
+        the persona name — e.g. the pre-suffix-bump ``@..._dev_claude_bot``
+        when the real handle is ``@..._dev_2_claude_bot``.
+        """
+        if not self.peer_bot_username:
+            self.task_manager.claude.team_system_note = None
+            return
+        peer_role = "developer" if self.role == "manager" else "manager"
+        self_line = (
+            f"Your own Telegram @handle in this group is @{self.bot_username}. "
+            if self.bot_username
+            else ""
+        )
+        self.task_manager.claude.team_system_note = (
+            f"You are the '{self.role}' role bot in a dual-agent team group. "
+            f"{self_line}"
+            f"Your team peer (role: {peer_role}) in this group is @{self.peer_bot_username}. "
+            f"When referring to yourself or directing work to the peer, use these exact "
+            f"@handles — never placeholders like '@developer'/'@manager' and never a "
+            f"different suffix from what is pinned here."
+        )
 
     def _backfill_own_bot_username(self, config_path: Path | None = None) -> None:
         """One-time migration: write self.bot_username into TeamConfig if empty.
@@ -1575,6 +1598,9 @@ class ProjectBot(AuthMixin):
         # for teams created before bot_username was stored at /create_team time).
         if self.team_name and self.role and self.bot_username:
             self._backfill_own_bot_username()
+        # Now that we know our actual @handle from Telegram, re-pin it in the
+        # system note so Claude stops fabricating pre-suffix-bump usernames.
+        self._refresh_team_system_note()
         await app.bot.set_my_commands(COMMANDS)
         for uid in self._get_trusted_user_ids():
             try:

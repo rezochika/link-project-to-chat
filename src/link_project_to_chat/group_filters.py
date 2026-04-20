@@ -48,6 +48,26 @@ def is_reply_to_bot(msg, bot_username: str) -> bool:
     return sender == bot_username.lower()
 
 
+def _has_any_mention(msg) -> bool:
+    """True when the message carries at least one `@username` mention entity."""
+    if not getattr(msg, "text", None):
+        return False
+    try:
+        entities = msg.parse_entities(["mention"])
+    except Exception:
+        return False
+    return any(getattr(e, "type", None) == "mention" for e in entities)
+
+
 def is_directed_at_me(msg, my_username: str) -> bool:
-    """Top-level decision: treat the message as addressed to this bot."""
-    return mentions_bot(msg, my_username) or is_reply_to_bot(msg, my_username)
+    """Top-level decision: treat the message as addressed to this bot.
+
+    An explicit @mention always wins. A reply to this bot's prior message only
+    counts when the user did NOT @mention anyone else — otherwise replying to
+    bot A while pinging bot B would wake both A and B.
+    """
+    if mentions_bot(msg, my_username):
+        return True
+    if _has_any_mention(msg):
+        return False
+    return is_reply_to_bot(msg, my_username)

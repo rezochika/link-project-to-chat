@@ -28,7 +28,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-_RELAY_PREFIX = "[auto-relay from @"
+_RELAY_PREFIX = "[auto-relay from "
 
 
 def is_relayed_text(text: str) -> bool:
@@ -122,6 +122,11 @@ class TeamRelay:
             )
 
     async def _relay(self, sender_username: str, text: str) -> None:
+        # NOTE: the prefix deliberately writes the sender's username WITHOUT a
+        # leading "@". Telegram parses any `@handle` in plain message text as a
+        # mention entity, and the peer bots' routing treats any mention of
+        # themselves as "addressed to me" — so an `@sender` in the prefix used
+        # to feed the sender back its own message, triggering a self-reply loop.
         relayed_text = f"{_RELAY_PREFIX}{sender_username}]\n\n{text}"
         try:
             await self._client.send_message(self._group_chat_id, relayed_text)
