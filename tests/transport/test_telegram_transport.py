@@ -125,3 +125,19 @@ async def test_on_command_handler_fires_for_telegram_command():
     assert captured[0].name == "help"
     assert captured[0].args == []
     assert captured[0].raw_text == "/help"
+
+
+async def test_edit_text_calls_edit_message_text():
+    t, bot = _make_transport_with_mock_bot()
+    bot.edit_message_text = AsyncMock()
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    ref = MessageRef(transport_id=TRANSPORT_ID, native_id="99", chat=chat)
+
+    await t.edit_text(ref, "updated text")
+
+    bot.edit_message_text.assert_awaited_once()
+    kwargs = bot.edit_message_text.call_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["message_id"] == 99
+    assert kwargs["text"] == "updated text"

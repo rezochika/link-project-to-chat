@@ -91,7 +91,12 @@ class TelegramTransport:
     async def edit_text(
         self, msg: MessageRef, text: str, *, buttons: Buttons | None = None
     ) -> None:
-        raise NotImplementedError("Wired in Task 15")
+        # buttons handled in Task 17; ignore here.
+        await self._app.bot.edit_message_text(
+            chat_id=int(msg.chat.native_id),
+            message_id=int(msg.native_id),
+            text=text,
+        )
 
     async def send_file(
         self,
