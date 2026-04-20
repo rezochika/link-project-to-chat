@@ -1078,9 +1078,6 @@ class ProjectBot(AuthMixin):
         query = update.callback_query
         if not query or not query.data:
             return
-        if query.message and query.message.chat.type != "private":
-            await query.answer("Only available in private chats.")
-            return
         if not self._auth(query.from_user):
             await query.answer("Unauthorized.")
             return

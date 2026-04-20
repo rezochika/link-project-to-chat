@@ -197,6 +197,59 @@ async def test_overflow_rotates_to_new_message():
 
 
 @pytest.mark.asyncio
+async def test_rotated_seal_renders_markdown_as_html():
+    """Sealed intermediate messages must have markdown rendered, not stay plain.
+
+    Regression: long replies that rotated across multiple messages showed
+    literal '**Step 1:**' in every message except the last, because seal_text
+    was raw buffer.
+    """
+    bot = FakeBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05, max_chars=100)
+    await live.start()
+    placeholder_mid = live.message_id
+    # 150 chars of content with markdown bold, exceeds 100 → rotation.
+    payload = "**Step 1:** do thing " * 10  # ~200 chars, bold scattered throughout
+    await live.append(payload)
+    await asyncio.sleep(0.25)  # let flush + rotation complete
+
+    # First (sealed) message must be rendered HTML: contains <b> tags.
+    sealed = [e for e in bot.edits if e["message_id"] == placeholder_mid]
+    assert sealed, "placeholder was never edited"
+    assert "<b>Step 1:</b>" in sealed[-1]["text"], (
+        f"sealed message is still plain markdown: {sealed[-1]['text'][:80]!r}"
+    )
+    assert sealed[-1].get("parse_mode") == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_rotated_seal_falls_back_to_plain_when_html_rejected():
+    """If HTML-rendered seal is rejected by Telegram, fall back to plain text
+    (no dropped seal, no Message_too_long crash).
+    """
+
+    @dataclass
+    class RejectHtmlBot(FakeBot):
+        async def edit_message_text(self, chat_id, message_id, text, parse_mode=None, **kw):
+            if parse_mode == "HTML":
+                raise RuntimeError("simulated HTML parse failure")
+            return await super().edit_message_text(chat_id, message_id, text, **kw)
+
+    bot = RejectHtmlBot()
+    live = LiveMessage(bot=bot, chat_id=1, throttle=0.05, max_chars=50)
+    await live.start()
+    placeholder_mid = live.message_id
+    await live.append("**hello** " * 20)  # ~200 chars
+    await asyncio.sleep(0.25)
+
+    sealed = [e for e in bot.edits if e["message_id"] == placeholder_mid]
+    assert sealed, "placeholder was never sealed"
+    # HTML attempt rejected; fallback edit is plain text (parse_mode None).
+    assert sealed[-1].get("parse_mode") is None
+    assert "**hello**" in sealed[-1]["text"]
+
+
+@pytest.mark.asyncio
 async def test_finalize_rotates_when_buffer_over_max_chars():
     """Bug: if the pre-flush buffer is > max_chars at finalize time (e.g. Claude
     emitted the final chunk faster than the throttle window), finalize must

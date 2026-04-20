@@ -135,22 +135,60 @@ class LiveMessage:
             self._effective_throttle = self._throttle
 
     async def _rotate_once(self) -> None:
-        """Seal the current message at the max-char boundary and open a new one."""
-        # Compute how much of the current buffer fits in the current message.
+        """Seal the current message at the max-char boundary and open a new one.
+
+        Tries to render the sealed portion as HTML so intermediate messages get
+        the same markdown formatting the final message does. HTML rendering can
+        expand the text beyond ``max_chars``; when that happens, the raw head
+        is shrunk until rendered HTML fits. If every attempt still overflows,
+        seals as plain text at the full boundary.
+        """
         room = self._max_chars - len(self._prefix)
         if room <= 0:
             room = 0
-        head = self._buffer[:room]
-        tail = self._buffer[room:]
-        seal_text = self._prefix + head
-        try:
-            await self._bot.edit_message_text(
-                chat_id=self.chat_id,
-                message_id=self.message_id,
-                text=seal_text,
-            )
-        except Exception:
-            logger.warning("LiveMessage seal-edit failed (mid=%s)", self.message_id, exc_info=True)
+        # Find the largest head slice whose HTML render fits.
+        head_size = room
+        rendered: str | None = None
+        for _ in range(5):
+            candidate = self._prefix + md_to_telegram(self._buffer[:head_size])
+            if len(candidate) <= self._max_chars:
+                rendered = candidate
+                break
+            head_size = max(1, head_size * 3 // 4)
+        if rendered is None:
+            head_size = room  # HTML never fit; seal plain at full boundary.
+        head = self._buffer[:head_size]
+        tail = self._buffer[head_size:]
+
+        edited_html = False
+        if rendered is not None:
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=rendered,
+                    parse_mode="HTML",
+                )
+                edited_html = True
+            except Exception:
+                logger.warning(
+                    "LiveMessage seal-edit HTML failed (mid=%s); falling back to plain",
+                    self.message_id,
+                    exc_info=True,
+                )
+        if not edited_html:
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=self._prefix + head,
+                )
+            except Exception:
+                logger.warning(
+                    "LiveMessage seal-edit plain failed (mid=%s)",
+                    self.message_id,
+                    exc_info=True,
+                )
         # Open a new message. If the tail still overflows, send just a
         # placeholder — the caller's rotation loop will seal this one on the
         # next iteration once it's edited with another max_chars worth.
