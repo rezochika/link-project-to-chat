@@ -517,24 +517,48 @@ class ProjectBot(AuthMixin):
         await legacy_handler(update, ctx)
 
     async def _on_text_from_transport(self, incoming) -> None:
-        """Bridge handler registered on TelegramTransport.on_message.
+        """Unified entry point for inbound messages from the Transport.
 
-        If the message has files, route to the file handler. Otherwise bridge
-        to the legacy text handler via an Update-shaped shim.
+        Branch order:
+          1. Voice (audio mime) → _on_voice_from_transport
+          2. Non-audio files → _on_file_from_transport
+          3. Plain text → _on_text (legacy shim)
+          4. Nothing actionable → generic unsupported reply
         """
+        # 1. Voice (audio mime).
+        if incoming.files and any(
+            (f.mime_type or "").startswith("audio/") for f in incoming.files
+        ):
+            await self._on_voice_from_transport(incoming)
+            return
+
+        # 2. Non-audio files.
         if incoming.files:
             await self._on_file_from_transport(incoming)
             return
-        native = incoming.native  # the original telegram.Message
-        if native is None:
+
+        # 3. Text.
+        if incoming.text.strip():
+            native = incoming.native
+            if native is None:
+                return
+            from types import SimpleNamespace
+            fake_update = SimpleNamespace(
+                effective_message=native,
+                effective_user=native.from_user,
+                effective_chat=native.chat,
+            )
+            await self._on_text(fake_update, None)
             return
-        from types import SimpleNamespace
-        fake_update = SimpleNamespace(
-            effective_message=native,
-            effective_user=native.from_user,
-            effective_chat=native.chat,
+
+        # 4. Nothing actionable — unsupported.
+        if not self._auth_identity(incoming.sender):
+            return
+        assert self._transport is not None
+        await self._transport.send_text(
+            incoming.chat,
+            "This message type is not supported. Please send text, a voice message, or a file.",
         )
-        await self._on_text(fake_update, None)
 
     async def _on_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message

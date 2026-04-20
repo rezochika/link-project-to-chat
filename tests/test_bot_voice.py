@@ -192,3 +192,48 @@ async def test_voice_with_active_persona_formats_prompt(tmp_path, monkeypatch):
     kwargs = bot.task_manager.submit_claude.call_args.kwargs
     assert "[persona=You are a reviewer.]" in kwargs["prompt"]
     assert "transcribed text" in kwargs["prompt"]
+
+
+async def test_unified_dispatch_routes_audio_to_voice_handler(tmp_path):
+    """When IncomingMessage has audio file, _on_text_from_transport routes it
+    to the voice handler."""
+    bot = _make_project_bot_stub()
+    incoming = _audio_incoming(tmp_path)
+    await bot._on_text_from_transport(incoming)
+    # Voice flow fires: status message sent, transcript edited, task submitted.
+    assert any("Transcribing" in m.text for m in bot._transport.sent_messages)
+    bot.task_manager.submit_claude.assert_called_once()
+
+
+async def test_unified_dispatch_unsupported_fallback():
+    """When IncomingMessage has no text and no files, generic 'not supported' reply."""
+    bot = _make_project_bot_stub()
+    chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42", display_name="Alice",
+        handle="alice", is_bot=False,
+    )
+    incoming = IncomingMessage(
+        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+    )
+    await bot._on_text_from_transport(incoming)
+    assert any(
+        "not supported" in m.text.lower()
+        for m in bot._transport.sent_messages
+    )
+
+
+async def test_unified_dispatch_unsupported_unauthorized_ignored():
+    """Unsupported messages from unauthorized users are silently dropped."""
+    bot = _make_project_bot_stub()
+    bot._allowed_usernames = []  # fail-closed
+    chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42", display_name="Alice",
+        handle="alice", is_bot=False,
+    )
+    incoming = IncomingMessage(
+        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._transport.sent_messages == []
