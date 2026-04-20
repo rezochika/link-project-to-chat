@@ -615,6 +615,33 @@ class ProjectBot(AuthMixin):
         self._group_state.resume(incoming.chat)
         return False
 
+    async def _submit_group_message_to_claude(self, incoming) -> None:
+        """Bypass auth + rate-limit and submit a bot-to-bot message to Claude.
+
+        Called when _handle_group_text returned False AND the sender is a bot/relay
+        (so the message has already been validated as peer-bot-to-this-bot and
+        the round counter has been incremented).
+
+        Human messages in groups go through the full auth/rate-limit path via
+        the legacy _on_text shim — not through this method.
+        """
+        assert self._transport is not None
+        prompt = incoming.text
+        if self._active_persona:
+            from .skills import load_persona, format_persona_prompt
+            persona = load_persona(self._active_persona, self.path)
+            if persona:
+                prompt = format_persona_prompt(persona, prompt)
+        message_id_int = (
+            int(getattr(incoming.native, "message_id", 0))
+            if incoming.native is not None else 0
+        )
+        self.task_manager.submit_claude(
+            chat_id=int(incoming.chat.native_id),
+            message_id=message_id_int,
+            prompt=prompt,
+        )
+
     async def _on_text(self, update, ctx) -> None:
         msg = update.effective_message
         if not msg:
