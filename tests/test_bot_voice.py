@@ -1,12 +1,9 @@
 """Bot-level tests for the voice flow through the Transport abstraction."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-
-import pytest
 
 from link_project_to_chat.transport import (
     ChatKind,
