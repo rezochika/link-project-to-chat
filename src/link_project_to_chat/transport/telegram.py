@@ -103,6 +103,33 @@ class TelegramTransport:
     ) -> MessageRef:
         raise NotImplementedError("Wired in Task 22")
 
+    # ── Inbound dispatch ──────────────────────────────────────────────────
+    async def _dispatch_message(self, update: Any, ctx: Any) -> None:
+        """Convert a telegram Update into IncomingMessage and invoke handlers.
+
+        Called from the MessageHandler wired on the Application by bot.py
+        during the strangler port (Task 9). For now, tests call this directly.
+        """
+        msg = update.effective_message
+        user = update.effective_user
+        if msg is None or user is None:
+            return
+        from .base import IncomingMessage
+        incoming = IncomingMessage(
+            chat=chat_ref_from_telegram(msg.chat),
+            sender=identity_from_telegram_user(user),
+            text=msg.text or "",
+            files=[],  # populated in Task 21
+            reply_to=(
+                message_ref_from_telegram(msg.reply_to_message)
+                if msg.reply_to_message is not None
+                else None
+            ),
+            native=msg,
+        )
+        for h in self._message_handlers:
+            await h(incoming)
+
     # ── Inbound registration ──────────────────────────────────────────────
     def on_message(self, handler: MessageHandler) -> None:
         self._message_handlers.append(handler)
