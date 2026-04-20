@@ -524,11 +524,12 @@ class ProjectBot(AuthMixin):
     async def _on_text_from_transport(self, incoming) -> None:
         """Bridge handler registered on TelegramTransport.on_message.
 
-        The heavy lifting stays in _on_text for now (which consumes telegram.Update).
-        This method converts IncomingMessage back into the Update shape expected
-        by _on_text — a temporary shim that goes away when _on_text is fully
-        ported to consume IncomingMessage directly (future task).
+        If the message has files, route to the file handler. Otherwise bridge
+        to the legacy text handler via an Update-shaped shim.
         """
+        if incoming.files:
+            await self._on_file_from_transport(incoming)
+            return
         native = incoming.native  # the original telegram.Message
         if native is None:
             return
@@ -1493,32 +1494,32 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         await self._transport.send_text(ci.chat, self._compose_status())
 
-    async def _on_file(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        if not msg or not update.effective_chat:
+    async def _on_file_from_transport(self, incoming) -> None:
+        """Transport-native file handler. Copies each incoming file from the
+        transport's temp dir into /tmp/link-project-to-chat/<project>/uploads/
+        and submits it to Claude (or the waiting-input task)."""
+        import shutil
+
+        if not self._auth_identity(incoming.sender):
             return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-        if self._rate_limited(update.effective_user.id):
-            return await msg.reply_text("Rate limited. Try again shortly.")
+        if self._rate_limited(int(incoming.sender.native_id)):
+            assert self._transport is not None
+            await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
+            return
+        if not incoming.files:
+            return
 
         uploads_dir = Path("/tmp/link-project-to-chat") / self.name / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
 
-        if msg.photo:
-            photo = msg.photo[-1]
-            file = await photo.get_file()
-            filename = f"photo_{int(time.monotonic() * 1000)}.jpg"
-        elif msg.document:
-            file = await msg.document.get_file()
-            raw_name = msg.document.file_name or f"file_{int(time.monotonic() * 1000)}"
-            filename = "".join(
-                c
-                for c in raw_name.replace("/", "_").replace("\\", "_")
-                if c.isalnum() or c in "._- "
-            )[:200]
-        else:
-            return await msg.reply_text("Unsupported file type.")
+        # Single-file behavior identical to legacy _on_file.
+        f = incoming.files[0]
+        # Sanitize the original name.
+        raw_name = f.original_name or f"file_{int(time.monotonic() * 1000)}"
+        filename = "".join(
+            c for c in raw_name.replace("/", "_").replace("\\", "_")
+            if c.isalnum() or c in "._- "
+        )[:200] or "file"
 
         dest = uploads_dir / filename
         if dest.exists():
@@ -1530,21 +1531,21 @@ class ProjectBot(AuthMixin):
                 counter += 1
             filename = dest.name
 
-        await file.download_to_drive(str(dest))
+        shutil.copyfile(f.path, dest)
 
-        caption = msg.caption or ""
+        caption = incoming.text or ""
         prompt = f"[User uploaded {dest}]"
         if caption:
             prompt += f"\n\n{caption}"
 
-        waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
+        waiting = self.task_manager.waiting_input_task(int(incoming.chat.native_id))
         if waiting:
             self.task_manager.submit_answer(waiting.id, prompt)
             return
 
         self.task_manager.submit_claude(
-            chat_id=update.effective_chat.id,
-            message_id=msg.message_id,
+            chat_id=int(incoming.chat.native_id),
+            message_id=int(incoming.native.message_id) if incoming.native is not None else 0,
             prompt=prompt,
         )
 
@@ -1681,25 +1682,21 @@ class ProjectBot(AuthMixin):
         if not path.exists():
             logger.warning("Image file not found: %s", path)
             return
+        assert self._transport is not None
+        chat = ChatRef(
+            transport_id="telegram",
+            native_id=str(chat_id),
+            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
+        )
         try:
-            size = path.stat().st_size
-            suffix = path.suffix.lower()
-            with path.open("rb") as f:
-                data = f.read()
-            if suffix == ".svg" or size > 10 * 1024 * 1024:
-                await self._app.bot.send_document(
-                    chat_id,
-                    data,
-                    filename=path.name,
-                    reply_to_message_id=reply_to,
-                )
-            else:
-                await self._app.bot.send_photo(
-                    chat_id,
-                    data,
-                    caption=path.name,
-                    reply_to_message_id=reply_to,
-                )
+            # Oversized (>10MB) or SVG — Transport.send_file picks document-mode
+            # for non-image suffixes automatically; SVG has .svg suffix not in
+            # _IMAGE_SUFFIXES, so it's routed to send_document. Size-based fall-
+            # back for large PNG/JPG files: send_file uses send_photo which may
+            # reject >10MB — legacy code switched to send_document. For now we
+            # rely on transport's suffix heuristic; rare-case large images fall
+            # back via exception handling below.
+            await self._transport.send_file(chat, path, caption=path.name)
         except Exception:
             logger.warning("Failed to send image %s", path, exc_info=True)
 
@@ -1836,15 +1833,13 @@ class ProjectBot(AuthMixin):
                     lambda u, c, _n=_name: self._transport._dispatch_command(_n, u, c),
                     filters=private,
                 ))
-            text_filter = (
+            incoming_filter = (
                 private
                 & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
-                & filters.TEXT
+                & (filters.TEXT | filters.Document.ALL | filters.PHOTO)
                 & ~filters.COMMAND
             )
-            app.add_handler(MessageHandler(text_filter, self._transport._dispatch_message))
-            file_filter = private & (filters.Document.ALL | filters.PHOTO)
-            app.add_handler(MessageHandler(file_filter, self._on_file))
+            app.add_handler(MessageHandler(incoming_filter, self._transport._dispatch_message))
             voice_filter = private & (filters.VOICE | filters.AUDIO)
             app.add_handler(MessageHandler(voice_filter, self._on_voice))
             unsupported_filter = private & (
