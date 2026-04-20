@@ -384,3 +384,25 @@ async def test_incoming_message_populates_files_from_voice(tmp_path):
     f = captured[0].files[0]
     assert f.mime_type == "audio/ogg"
     assert f.path.read_bytes() == downloaded_bytes
+
+
+async def test_default_error_handler_logs_on_exception(caplog):
+    import logging
+    t, _bot = _make_transport_with_mock_bot()
+    update = SimpleNamespace()
+    ctx = SimpleNamespace(error=RuntimeError("boom"))
+    with caplog.at_level(logging.ERROR):
+        await t._default_error_handler(update, ctx)
+    assert any("boom" in rec.getMessage() for rec in caplog.records)
+
+
+async def test_default_error_handler_logs_conflict_as_warning(caplog):
+    import logging
+    t, _bot = _make_transport_with_mock_bot()
+    update = SimpleNamespace()
+    ctx = SimpleNamespace(error=RuntimeError("Conflict: another bot instance"))
+    with caplog.at_level(logging.WARNING):
+        await t._default_error_handler(update, ctx)
+    conflict_recs = [r for r in caplog.records if "Conflict" in r.getMessage()]
+    assert conflict_recs
+    assert all(r.levelno == logging.WARNING for r in conflict_recs)

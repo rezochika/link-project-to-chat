@@ -151,6 +151,7 @@ class TelegramTransport:
             ))
 
         self._app.add_handler(CallbackQueryHandler(self._dispatch_button))
+        self._app.add_error_handler(self._default_error_handler)
 
     @property
     def app(self) -> Any:
@@ -392,6 +393,22 @@ class TelegramTransport:
         )
         for h in self._button_handlers:
             await h(click)
+
+    async def _default_error_handler(self, update: Any, ctx: Any) -> None:
+        """Default handler for unhandled telegram update errors.
+
+        Specially treats 'Conflict' errors (another bot instance) as WARNING
+        rather than ERROR since they're usually operational, not bugs.
+        """
+        import logging
+        logger_ = logging.getLogger(__name__)
+        err = str(ctx.error)
+        if "Conflict" in err:
+            logger_.warning(
+                "Conflict error (another instance?): %s | update=%s", err, update,
+            )
+        else:
+            logger_.error("Update error: %s | update=%s", ctx.error, update)
 
     async def _dispatch_command(self, name: str, update: Any, ctx: Any) -> None:
         """Convert a telegram command Update into CommandInvocation and invoke the handler."""
