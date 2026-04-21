@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
-from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config
+from link_project_to_chat.config import Config, ProjectConfig, TeamBotConfig, TeamConfig, save_config
 from link_project_to_chat.manager.process import ProcessManager
+
+
+def _running_proc(pid: int, stop_return: int = 0) -> MagicMock:
+    proc = MagicMock()
+    proc.pid = pid
+    proc.poll.return_value = None
+    proc.stdout = iter(())
+
+    def _wait(timeout=None):
+        if timeout == 0.1:
+            raise subprocess.TimeoutExpired(cmd="test", timeout=timeout)
+        return stop_return
+
+    proc.wait.side_effect = _wait
+    return proc
 
 
 def test_start_team_unknown_team_returns_false(tmp_path):
@@ -32,11 +49,7 @@ def test_start_team_already_running_returns_false(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.poll.return_value = None  # still running
-        mock_proc.stdout = []
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(12345)
 
         pm = ProcessManager(project_config_path=cfg_path)
         assert pm.start_team("acme", "manager") is True
@@ -61,19 +74,53 @@ def test_start_team_builds_correct_cli_and_spawns(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.poll.return_value = None
-        mock_proc.stdout = []
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(12345)
 
         pm = ProcessManager(project_config_path=cfg_path)
         result = pm.start_team("acme", "manager")
         assert result is True
         call_args = mock_popen.call_args[0][0]
-        assert call_args[:2] == ["link-project-to-chat", "start"]
+        assert call_args[:6] == [
+            sys.executable,
+            "-m",
+            "link_project_to_chat.cli",
+            "--config",
+            str(cfg_path),
+            "start",
+        ]
         assert "--team" in call_args and "acme" in call_args
         assert "--role" in call_args and "manager" in call_args
+
+
+def test_start_project_uses_current_python_and_config_path(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    config = Config(
+        projects={
+            "alpha": ProjectConfig(
+                path=str(tmp_path),
+                telegram_bot_token="t1",
+            )
+        }
+    )
+    save_config(config, cfg_path)
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _running_proc(12345)
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        result = pm.start("alpha")
+        assert result is True
+        call_args = mock_popen.call_args[0][0]
+        assert call_args[:8] == [
+            sys.executable,
+            "-m",
+            "link_project_to_chat.cli",
+            "--config",
+            str(cfg_path),
+            "start",
+            "--project",
+            "alpha",
+        ]
 
 
 def test_start_team_uses_compound_process_key(tmp_path):
@@ -90,11 +137,7 @@ def test_start_team_uses_compound_process_key(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 12345
-        mock_proc.poll.return_value = None
-        mock_proc.stdout = []
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(12345)
 
         pm = ProcessManager(project_config_path=cfg_path)
         pm.start_team("acme", "manager")
@@ -115,11 +158,7 @@ def test_start_team_persists_autostart_true(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 1
-        mock_proc.poll.return_value = None
-        mock_proc.stdout = []
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(1)
 
         pm = ProcessManager(project_config_path=cfg_path)
         assert pm.start_team("acme", "manager") is True
@@ -142,12 +181,7 @@ def test_stop_team_key_persists_autostart_false(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 2
-        mock_proc.poll.return_value = None
-        mock_proc.stdout = []
-        mock_proc.wait.return_value = 0
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(2)
 
         pm = ProcessManager(project_config_path=cfg_path)
         pm.start_team("acme", "manager")
@@ -179,11 +213,7 @@ def test_start_autostart_starts_team_bots_with_autostart(tmp_path):
     save_config(config, cfg_path)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
-        mock_proc = MagicMock()
-        mock_proc.pid = 3
-        mock_proc.poll.return_value = None
-        mock_proc.stdout = []
-        mock_popen.return_value = mock_proc
+        mock_popen.return_value = _running_proc(3)
 
         pm = ProcessManager(project_config_path=cfg_path)
         count = pm.start_autostart()

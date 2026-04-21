@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import logging
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -13,20 +14,6 @@ from ..config import load_config
 logger = logging.getLogger(__name__)
 
 
-def _default_command_builder(project_name: str, project_config: dict) -> list[str]:
-    cmd = ["link-project-to-chat", "start", "--project", project_name]
-
-    permissions = project_config.get("permissions")
-    if permissions == "dangerously-skip-permissions":
-        cmd.append("--dangerously-skip-permissions")
-    elif permissions and permissions != "default":
-        cmd.extend(["--permission-mode", permissions])
-    model = project_config.get("model") or load_config().default_model
-    if model:
-        cmd.extend(["--model", model])
-    return cmd
-
-
 class ProcessManager:
     def __init__(
         self,
@@ -34,10 +21,31 @@ class ProcessManager:
         command_builder: Callable[[str, dict], list[str]] | None = None,
     ):
         self._project_config_path = project_config_path
-        self._command_builder = command_builder or _default_command_builder
+        self._command_builder = command_builder or self._default_command_builder
         self._processes: dict[str, subprocess.Popen] = {}
         self._logs: dict[str, collections.deque] = {}
         self._log_threads: dict[str, threading.Thread] = {}
+
+    def _base_cli_command(self) -> list[str]:
+        cmd = [sys.executable, "-m", "link_project_to_chat.cli"]
+        if self._project_config_path is not None:
+            cmd.extend(["--config", str(self._project_config_path)])
+        return cmd
+
+    def _default_command_builder(self, project_name: str, project_config: dict) -> list[str]:
+        cmd = self._base_cli_command()
+        cmd.extend(["start", "--project", project_name])
+
+        permissions = project_config.get("permissions")
+        if permissions == "dangerously-skip-permissions":
+            cmd.append("--dangerously-skip-permissions")
+        elif permissions and permissions != "default":
+            cmd.extend(["--permission-mode", permissions])
+        cfg = load_config(self._project_config_path) if self._project_config_path else load_config()
+        model = project_config.get("model") or cfg.default_model
+        if model:
+            cmd.extend(["--model", model])
+        return cmd
 
     def _load_projects(self) -> dict[str, dict]:
         if self._project_config_path is not None:
@@ -82,7 +90,9 @@ class ProcessManager:
         return True
 
     def _team_command_builder(self, team_name: str, role: str) -> list[str]:
-        return ["link-project-to-chat", "start", "--team", team_name, "--role", role]
+        cmd = self._base_cli_command()
+        cmd.extend(["start", "--team", team_name, "--role", role])
+        return cmd
 
     def start_team(self, team_name: str, role: str) -> bool:
         config = load_config(self._project_config_path) if self._project_config_path else load_config()
