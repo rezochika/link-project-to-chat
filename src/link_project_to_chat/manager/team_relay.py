@@ -34,7 +34,24 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-_EDIT_DEBOUNCE_SECONDS = 3.0
+_EDIT_DEBOUNCE_SECONDS = 6.0
+
+
+def _body_without_mention(text: str, peer: str) -> str:
+    """Strip the first `@peer` occurrence (case-insensitive) and return the rest.
+
+    Used to tell "message has real content" apart from "message is still just the
+    peer @mention on its own line." Matching is case-insensitive and also tolerates
+    a bare @ with any casing.
+    """
+    if not text or not peer:
+        return text.strip()
+    lower = text.lower()
+    needle = f"@{peer.lower()}"
+    idx = lower.find(needle)
+    if idx < 0:
+        return text.strip()
+    return (text[:idx] + text[idx + len(needle):]).strip()
 
 
 def find_peer_mention(text: str, self_username: str, team_bot_usernames: set[str]) -> str | None:
@@ -197,8 +214,17 @@ class TeamRelay:
         self._debounce_tasks.pop(msg_id, None)
         if msg_id in self._relayed_ids:
             return
-        if find_peer_mention(text, sender_username, self._bot_usernames) is None:
+        peer = find_peer_mention(text, sender_username, self._bot_usernames)
+        if peer is None:
             # The peer @mention disappeared during streaming (edge case).
+            return
+        # Skip relay while only the @mention has been written. Claude-driven
+        # bots follow a system note that starts every reply with the peer
+        # handle on its own line; during a tool-call pause mid-stream, the
+        # debounce can fire while the body is still empty. Returning here
+        # without marking `_relayed_ids` lets the next edit cycle try again
+        # once real content arrives.
+        if not _body_without_mention(text, peer):
             return
         await self._finalize_relay(msg_id, sender_username, text)
 
