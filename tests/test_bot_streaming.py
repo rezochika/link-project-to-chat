@@ -408,3 +408,56 @@ async def test_thinking_start_failure_surfaces_via_thinking_button_after_finaliz
 
     # The Thinking button fallback kicks in because live thinking degraded to buffer.
     assert bot._thinking_store.get(task.id) == "hidden reasoning"
+
+
+@pytest.mark.asyncio
+async def test_ask_answer_annotation_preserves_question_html():
+    """M5 regression: after user picks an option, the edit contains the original
+    question HTML + 'Selected: X', not just the selection suffix."""
+    from unittest.mock import MagicMock
+
+    from link_project_to_chat.stream import Question, QuestionOption
+    from link_project_to_chat.transport import (
+        ButtonClick,
+        ChatKind,
+        ChatRef,
+        Identity,
+        MessageRef,
+    )
+
+    bot = await _stub_bot()
+    bot._auth_identity = lambda _sender: True
+
+    # Prepare a fake task with one pending question.
+    task = _fake_task(task_id=77)
+    task.pending_questions = [Question(
+        question="Which option?",
+        header="Pick one",
+        options=[
+            QuestionOption(label="Option A", description="desc A"),
+            QuestionOption(label="Option B", description="desc B"),
+        ],
+    )]
+    task.status = TaskStatus.WAITING_INPUT
+    bot.task_manager = MagicMock()
+    bot.task_manager.get = MagicMock(return_value=task)
+    bot.task_manager.submit_answer = MagicMock(return_value=True)
+
+    chat = ChatRef(transport_id="telegram", native_id="12345", kind=ChatKind.DM)
+    msg_ref = MessageRef(transport_id="telegram", native_id="200", chat=chat)
+    sender = Identity(
+        transport_id="telegram", native_id="42",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    click = ButtonClick(chat=chat, message=msg_ref, sender=sender, value="ask_77_0_0")
+
+    await bot._on_button(click)
+
+    # Assert the edit contains both the question header AND "Selected:" annotation.
+    edits = bot._app.bot.edits
+    assert edits, "expected at least one edit after option click"
+    edit_text = edits[-1]["text"]
+    assert "Pick one" in edit_text
+    assert "Which option?" in edit_text
+    assert "Option A" in edit_text
+    assert "<i>Selected:</i> Option A" in edit_text

@@ -463,6 +463,31 @@ class ProjectBot(AuthMixin):
             ])
         return Buttons(rows=rows)
 
+    @staticmethod
+    def _render_question_html(question) -> str:
+        """Render an AskUserQuestion Question as Telegram-compatible HTML.
+
+        Used by _on_waiting_input (initial send) and _on_button (ask-answer
+        annotation after user picks an option).
+        """
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        header = question.header.strip() if question.header else ""
+        body = question.question.strip() or "(question)"
+        lines: list[str] = []
+        if header:
+            lines.append(f"<b>{_esc(header)}</b>")
+        lines.append(_esc(body))
+        if question.multi_select:
+            lines.append("<i>(Multi-select: tap an option or reply with comma-separated values.)</i>")
+        else:
+            lines.append("<i>(Tap an option or reply with free text.)</i>")
+        for opt in question.options:
+            if opt.description:
+                lines.append(f"• <b>{_esc(opt.label)}</b> — {_esc(opt.description)}")
+        return "\n".join(lines)
+
     async def _on_waiting_input(self, task: Task) -> None:
         """Render pending questions as Telegram messages with option buttons."""
         typing = self._typing_tasks.pop(task.id, None)
@@ -481,26 +506,10 @@ class ProjectBot(AuthMixin):
         if live_thinking is not None:
             await live_thinking.finalize(render=False)
 
-        def _esc(s: str) -> str:
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
         for q_idx, question in enumerate(task.pending_questions):
-            header = question.header.strip() if question.header else ""
-            body = question.question.strip() or "(question)"
-            lines = []
-            if header:
-                lines.append(f"<b>{_esc(header)}</b>")
-            lines.append(_esc(body))
-            if question.multi_select:
-                lines.append("<i>(Multi-select: tap an option or reply with comma-separated values.)</i>")
-            else:
-                lines.append("<i>(Tap an option or reply with free text.)</i>")
-            for opt in question.options:
-                if opt.description:
-                    lines.append(f"• <b>{_esc(opt.label)}</b> — {_esc(opt.description)}")
             await self._send_html(
                 task.chat_id,
-                "\n".join(lines),
+                self._render_question_html(question),
                 reply_to=task.message_id,
                 reply_markup=self._question_buttons(task.id, q_idx, question),
             )
@@ -1471,17 +1480,11 @@ class ProjectBot(AuthMixin):
             if self.task_manager.submit_answer(task_id, label):
                 # Annotate the selection into the existing message body.
                 try:
-                    # click.message.native carries the original telegram.Message,
-                    # giving us the rendered text_html. When it's a FakeMessage
-                    # in tests, this just no-ops.
-                    original = ""
-                    native = getattr(msg_ref, "native", None)
-                    if native is not None:
-                        original = getattr(native, "text_html", None) or getattr(native, "text", "") or ""
+                    original_html = self._render_question_html(question)
                     escaped = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                     await self._transport.edit_text(
                         msg_ref,
-                        f"{original}\n\n<i>Selected:</i> {escaped}",
+                        f"{original_html}\n\n<i>Selected:</i> {escaped}",
                         html=True,
                     )
                 except Exception:
