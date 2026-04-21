@@ -23,7 +23,7 @@ from .._auth import AuthMixin
 from ..transport import Button, Buttons
 
 if TYPE_CHECKING:
-    from ..transport import CommandInvocation
+    from ..transport import ButtonClick, CommandInvocation
 
 logger = logging.getLogger(__name__)
 
@@ -302,20 +302,8 @@ class ManagerBot(AuthMixin):
         running = sum(1 for _, st in projects if st == "running")
         return f"Projects ({running}/{len(projects)} running):"
 
-    def _list_markup(self) -> InlineKeyboardMarkup | None:
-        projects = self._pm.list_all()
-        if not projects:
-            return None
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                f"{'[+]' if status == 'running' else '[-]'} {name}",
-                callback_data=f"proj_info_{name}",
-            )]
-            for name, status in projects
-        ])
-
     def _list_buttons(self) -> Buttons | None:
-        """Transport-native counterpart of _list_markup."""
+        """Produce the transport-native project list keyboard."""
         projects = self._pm.list_all()
         if not projects:
             return None
@@ -362,21 +350,6 @@ class ManagerBot(AuthMixin):
             if self._pm.status(f"team:{team_name}:{role}") == "running"
         )
 
-    def _teams_list_markup(self) -> InlineKeyboardMarkup | None:
-        teams = self._load_teams()
-        if not teams:
-            return None
-        rows = []
-        for team_name in sorted(teams):
-            team = teams[team_name]
-            running = self._team_running_count(team_name, team)
-            total = len(team.bots)
-            rows.append([InlineKeyboardButton(
-                f"[{running}/{total}] {team_name}",
-                callback_data=f"team_info_{team_name}",
-            )])
-        return InlineKeyboardMarkup(rows)
-
     def _team_detail_text(self, team_name: str, team) -> str:
         lines = [f"Team '{team_name}':"]
         for role in sorted(team.bots):
@@ -384,22 +357,8 @@ class ManagerBot(AuthMixin):
             lines.append(f"  {role}: {status}")
         return "\n".join(lines)
 
-    def _team_detail_markup(self, team_name: str, team) -> InlineKeyboardMarkup:
-        running = self._team_running_count(team_name, team)
-        total = len(team.bots)
-        rows = []
-        if running < total:
-            rows.append([InlineKeyboardButton(
-                "Start" if running == 0 else "Start remaining",
-                callback_data=f"team_start_{team_name}",
-            )])
-        if running > 0:
-            rows.append([InlineKeyboardButton("Stop", callback_data=f"team_stop_{team_name}")])
-        rows.append([InlineKeyboardButton("« Back", callback_data="team_back")])
-        return InlineKeyboardMarkup(rows)
-
     def _teams_list_buttons(self) -> Buttons | None:
-        """Transport-native counterpart of _teams_list_markup."""
+        """Produce the transport-native team list keyboard."""
         teams = self._load_teams()
         if not teams:
             return None
@@ -432,17 +391,8 @@ class ManagerBot(AuthMixin):
             buttons=buttons,
         )
 
-    def _global_model_markup(self) -> InlineKeyboardMarkup:
-        from ..config import load_config
-        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
-        rows = []
-        for model_id, label in MODEL_OPTIONS:
-            prefix = "● " if current == model_id else ""
-            rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"global_model_{model_id}")])
-        return InlineKeyboardMarkup(rows)
-
     def _global_model_buttons(self) -> Buttons:
-        """Transport-native counterpart of _global_model_markup."""
+        """Produce the transport-native global default-model keyboard."""
         from ..config import load_config
         current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
         rows = []
@@ -1599,20 +1549,8 @@ class ManagerBot(AuthMixin):
         ctx.user_data.pop("pending_edit", None)
         await update.effective_message.reply_text("Edit cancelled.")
 
-    def _proj_detail_markup(self, name: str, status: str) -> InlineKeyboardMarkup:
-        rows = []
-        if status == "running":
-            rows.append([InlineKeyboardButton("Stop", callback_data=f"proj_stop_{name}")])
-            rows.append([InlineKeyboardButton("Logs", callback_data=f"proj_logs_{name}")])
-        else:
-            rows.append([InlineKeyboardButton("Start", callback_data=f"proj_start_{name}")])
-        rows.append([InlineKeyboardButton("Edit", callback_data=f"proj_edit_{name}")])
-        rows.append([InlineKeyboardButton("Remove", callback_data=f"proj_remove_{name}")])
-        rows.append([InlineKeyboardButton("« Back", callback_data="proj_back")])
-        return InlineKeyboardMarkup(rows)
-
     def _proj_detail_buttons(self, name: str, status: str) -> Buttons:
-        """Transport-native counterpart of _proj_detail_markup."""
+        """Produce the transport-native project-detail keyboard."""
         rows: list[list[Button]] = []
         if status == "running":
             rows.append([Button(label="Stop", value=f"proj_stop_{name}")])
@@ -1625,7 +1563,7 @@ class ManagerBot(AuthMixin):
         return Buttons(rows=rows)
 
     def _team_detail_buttons(self, team_name: str, team) -> Buttons:
-        """Transport-native counterpart of _team_detail_markup."""
+        """Produce the transport-native team-detail keyboard."""
         running = self._team_running_count(team_name, team)
         total = len(team.bots)
         rows: list[list[Button]] = []
@@ -1639,7 +1577,7 @@ class ManagerBot(AuthMixin):
         rows.append([Button(label="« Back", value="team_back")])
         return Buttons(rows=rows)
 
-    async def _on_button_from_transport(self, click) -> None:
+    async def _on_button_from_transport(self, click: "ButtonClick") -> None:
         """Transport-native callback dispatcher.
 
         Routes inline-button clicks based on click.value prefix. Replaces the
