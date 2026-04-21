@@ -64,7 +64,7 @@ You: /tasks
 
 ## How it works
 
-Claude messages and `/run` commands execute in **parallel** — they don't block each other. Claude messages share the same session context, so responses build on each other.
+`/run` commands execute in parallel with Claude work. Claude turns within a single bot session are now **serialized** so they keep one consistent shared session and can't step on each other during interactive follow-ups.
 
 ## Project bot commands
 
@@ -175,6 +175,8 @@ Users can also be managed from the Manager Bot via `/add_user` and `/remove_user
 
 The manager bot controls multiple project bots from a single Telegram chat — start, stop, view logs, add/remove projects, and create new projects automatically.
 
+Manager-started bots inherit the active `--config` path, so custom config files work consistently for project bots, team bots, personas, and team relay bootstrap.
+
 ### Setup
 
 ```bash
@@ -208,9 +210,12 @@ The `/create_project` command automates the full project setup:
 3. Clone the repo
 4. Configure everything
 
+When you later remove a project from the manager, manager-created projects are cleaned up on a best-effort basis: the manager will try to stop the bot, delete the owned repo checkout, and revoke the owned bot via BotFather. If the project path was changed after creation, the repo is left in place intentionally.
+
 **Requirements:**
 - GitHub: either `gh` CLI authenticated, or a GitHub PAT (set via `/setup`)
 - BotFather automation: Telegram API credentials + Telethon session
+- Team creation/deletion automation: install the optional create extras with `pipx install "link-project-to-chat[create]"`
 
 **Setup credentials:**
 
