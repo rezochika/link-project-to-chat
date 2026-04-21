@@ -13,14 +13,14 @@ def test_persona_keyboard_lists_discovered_personas(tmp_path):
     (personas_dir / "tester.md").write_text("# Tester")
 
     kb = _build_persona_keyboard(tmp_path, callback_prefix="team_persona_mgr")
-    buttons = [btn for row in kb.inline_keyboard for btn in row]
-    labels = {btn.text for btn in buttons}
+    buttons = [btn for row in kb.rows for btn in row]
+    labels = {btn.label for btn in buttons}
     # Assert at LEAST our two test personas appear (load_personas may also discover globals)
     assert "developer" in labels
     assert "tester" in labels
     # Callbacks are prefixed
     for btn in buttons:
-        assert btn.callback_data.startswith("team_persona_mgr:")
+        assert btn.value.startswith("team_persona_mgr:")
 
 
 import pytest
@@ -130,6 +130,8 @@ async def test_show_repo_page_supports_user_data_key(tmp_path, monkeypatch):
     """_show_repo_page must read/write to the key passed in, not hardcoded 'create'."""
     from link_project_to_chat.manager.bot import ManagerBot
     from link_project_to_chat.manager.process import ProcessManager
+    from link_project_to_chat.transport import ChatKind, ChatRef, MessageRef
+    from link_project_to_chat.transport.fake import FakeTransport
 
     cfg_path = tmp_path / "config.json"
     save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
@@ -140,10 +142,11 @@ async def test_show_repo_page_supports_user_data_key(tmp_path, monkeypatch):
         process_manager=ProcessManager(project_config_path=cfg_path),
         project_config_path=cfg_path,
     )
+    mb._transport = FakeTransport()
     ctx = MagicMock()
     ctx.user_data = {"create_team": {"config_path": str(cfg_path)}}
-    query = AsyncMock()
-    query.edit_message_text = AsyncMock()
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    msg_ref = MessageRef(transport_id="fake", native_id="1", chat=chat)
 
     # Monkeypatch GitHubClient.list_repos to avoid network
     async def fake_list_repos(self, *a, **kw):
@@ -160,7 +163,7 @@ async def test_show_repo_page_supports_user_data_key(tmp_path, monkeypatch):
         "link_project_to_chat.github_client.GitHubClient.list_repos", fake_list_repos
     )
 
-    await mb._show_repo_page(query, ctx, page=1, user_data_key="create_team")
+    await mb._show_repo_page(msg_ref, ctx, page=1, user_data_key="create_team")
     # Assert the repos landed in ctx.user_data["create_team"], not ["create"]
     assert "repos" in ctx.user_data["create_team"]
     assert "me/acme" in ctx.user_data["create_team"]["repos"]
@@ -233,6 +236,11 @@ async def test_create_bot_with_retry_backs_off_on_rate_limit(monkeypatch):
     assert sleeps and sleeps[0] >= 8.0
 
 
+def _dm_chat_ref(chat_id: int = 1):
+    from link_project_to_chat.transport import ChatKind, ChatRef
+    return ChatRef(transport_id="fake", native_id=str(chat_id), kind=ChatKind.DM)
+
+
 @pytest.mark.asyncio
 async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
     """Stops bots, deletes bots via BotFather, deletes group, rm -rf folder, removes config entry."""
@@ -241,6 +249,7 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
     from link_project_to_chat.config import (
         Config, TeamBotConfig, TeamConfig, save_config, load_config,
     )
+    from link_project_to_chat.transport.fake import FakeTransport
 
     # Set up on-disk config with one team + project folder.
     cfg_path = tmp_path / "config.json"
@@ -271,11 +280,7 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
 
     mb = ManagerBot.__new__(ManagerBot)
     mb._project_config_path = cfg_path
-    mb._app = MagicMock()
-    mb._app.bot = MagicMock()
-    mb._app.bot.send_message = AsyncMock(
-        return_value=MagicMock(edit_text=AsyncMock())
-    )
+    mb._transport = FakeTransport()
     mb._pm = MagicMock()
     mb._pm.stop = MagicMock()
     mb._telethon_client = MagicMock()
@@ -288,7 +293,7 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
         "link_project_to_chat.transport._telegram_group.delete_supergroup",
         new=AsyncMock(),
     ) as mock_delete_group:
-        await mb._delete_team_execute(chat_id=1, target="acme")
+        await mb._delete_team_execute(_dm_chat_ref(), target="acme")
 
     # Both bots stopped.
     assert mb._pm.stop.call_count == 2
@@ -301,29 +306,27 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
     # Team entry gone from config.
     assert "acme" not in load_config(cfg_path).teams
     # Success message sent.
-    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
-    assert any("fully deleted" in m for m in sent)
+    sent_texts = [m.text for m in mb._transport.sent_messages]
+    assert any("fully deleted" in t for t in sent_texts)
 
 
 @pytest.mark.asyncio
 async def test_delete_team_execute_unknown_target_is_noop(tmp_path):
     from link_project_to_chat.manager.bot import ManagerBot
     from link_project_to_chat.config import Config, save_config
+    from link_project_to_chat.transport.fake import FakeTransport
 
     cfg_path = tmp_path / "config.json"
     save_config(Config(), cfg_path)
 
     mb = ManagerBot.__new__(ManagerBot)
     mb._project_config_path = cfg_path
-    mb._app = MagicMock()
-    mb._app.bot = MagicMock()
-    mb._app.bot.send_message = AsyncMock()
+    mb._transport = FakeTransport()
 
-    await mb._delete_team_execute(chat_id=1, target="ghost")
+    await mb._delete_team_execute(_dm_chat_ref(), target="ghost")
     # Should send one message and not raise.
-    mb._app.bot.send_message.assert_awaited_once()
-    args, _ = mb._app.bot.send_message.call_args
-    assert "not found" in args[1]
+    assert len(mb._transport.sent_messages) == 1
+    assert "not found" in mb._transport.sent_messages[0].text
 
 
 @pytest.mark.asyncio
@@ -334,6 +337,7 @@ async def test_delete_team_execute_continues_on_individual_failures(tmp_path, mo
     from link_project_to_chat.config import (
         Config, TeamBotConfig, TeamConfig, save_config, load_config,
     )
+    from link_project_to_chat.transport.fake import FakeTransport
 
     cfg_path = tmp_path / "config.json"
     proj_dir = tmp_path / "acme"
@@ -357,9 +361,7 @@ async def test_delete_team_execute_continues_on_individual_failures(tmp_path, mo
 
     mb = ManagerBot.__new__(ManagerBot)
     mb._project_config_path = cfg_path
-    mb._app = MagicMock()
-    mb._app.bot = MagicMock()
-    mb._app.bot.send_message = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
+    mb._transport = FakeTransport()
     mb._pm = MagicMock()
     mb._telethon_client = MagicMock()
 
@@ -374,14 +376,14 @@ async def test_delete_team_execute_continues_on_individual_failures(tmp_path, mo
         "link_project_to_chat.transport._telegram_group.delete_supergroup",
         new=AsyncMock(),
     ):
-        await mb._delete_team_execute(chat_id=1, target="acme")
+        await mb._delete_team_execute(_dm_chat_ref(), target="acme")
 
     # Team still removed from config, folder still gone, but issues reported.
     assert "acme" not in load_config(cfg_path).teams
     assert not proj_dir.exists()
-    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
-    assert any("deleted with issues" in m for m in sent)
-    assert any("BotFather /deletebot @mgr_bot" in m for m in sent)
+    sent_texts = [m.text for m in mb._transport.sent_messages]
+    assert any("deleted with issues" in t for t in sent_texts)
+    assert any("BotFather /deletebot @mgr_bot" in t for t in sent_texts)
 
 
 @pytest.mark.asyncio
@@ -436,12 +438,28 @@ async def test_create_bot_with_retry_short_circuits_on_long_flood_wait(monkeypat
     assert sleeps == []
 
 
+def _make_update_for_team_execute(username: str = "alice"):
+    """Construct a telegram-like Update payload that _incoming_from_update can consume."""
+    update = MagicMock()
+    # effective_chat needs .id and .type for chat_ref_from_telegram
+    update.effective_chat = MagicMock(id=1)
+    update.effective_chat.type = "private"
+    # effective_user needs id/full_name/username/is_bot for identity_from_telegram_user
+    update.effective_user = MagicMock(id=42, full_name=username, username=username, is_bot=False)
+    # effective_message is read for text; force .text to an empty string (we're past command entry)
+    msg = MagicMock()
+    msg.text = ""
+    update.effective_message = msg
+    return update
+
+
 @pytest.mark.asyncio
 async def test_create_team_execute_partial_failure_report(tmp_path):
     """When orchestration aborts mid-flight, a partial-failure report is sent."""
     from unittest.mock import patch
 
     from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.transport.fake import FakeTransport
 
     cfg_path = tmp_path / "config.json"
     save_config(
@@ -452,16 +470,10 @@ async def test_create_team_execute_partial_failure_report(tmp_path):
     # Bypass __init__ to isolate the orchestrator from auth/process-manager wiring.
     mb = ManagerBot.__new__(ManagerBot)
     mb._project_config_path = cfg_path
-    mb._app = MagicMock()
-    mb._app.bot = MagicMock()
-    mb._app.bot.send_message = AsyncMock(
-        return_value=MagicMock(edit_text=AsyncMock())
-    )
+    mb._transport = FakeTransport()
     mb._pm = MagicMock()
 
-    update = MagicMock()
-    update.effective_chat = MagicMock(id=1)
-    update.effective_user = MagicMock(username="alice")
+    update = _make_update_for_team_execute()
     ctx = MagicMock()
     ctx.user_data = {
         "create_team": {
@@ -482,19 +494,18 @@ async def test_create_team_execute_partial_failure_report(tmp_path):
     from telegram.ext import ConversationHandler
 
     assert result == ConversationHandler.END
-    # The first send_message is the progress status; subsequent send_message calls
+    # The first send_text is the progress status; subsequent send_text calls
     # include the failure report.
-    sent_args = [c.args for c in mb._app.bot.send_message.call_args_list]
-    failure_msgs = [
-        args for args in sent_args if any("failed" in str(a).lower() for a in args)
-    ]
-    assert failure_msgs, f"Expected a failure report, got: {sent_args}"
+    sent_texts = [m.text for m in mb._transport.sent_messages]
+    failure_msgs = [t for t in sent_texts if "failed" in t.lower()]
+    assert failure_msgs, f"Expected a failure report, got: {sent_texts}"
 
 
 @pytest.mark.asyncio
 async def test_create_team_execute_partial_failure_after_bot1(tmp_path):
     """Verify the failure report includes bot1 details when failure happens AFTER bot1 succeeds."""
     from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.transport.fake import FakeTransport
     from unittest.mock import AsyncMock, MagicMock, patch
 
     cfg_path = tmp_path / "config.json"
@@ -503,14 +514,10 @@ async def test_create_team_execute_partial_failure_after_bot1(tmp_path):
 
     mb = ManagerBot.__new__(ManagerBot)
     mb._project_config_path = cfg_path
-    mb._app = MagicMock()
-    mb._app.bot = MagicMock()
-    mb._app.bot.send_message = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
+    mb._transport = FakeTransport()
     mb._pm = MagicMock()
 
-    update = MagicMock()
-    update.effective_chat = MagicMock(id=1)
-    update.effective_user = MagicMock(username="alice")
+    update = _make_update_for_team_execute()
     ctx = MagicMock()
     ctx.user_data = {
         "create_team": {
@@ -537,8 +544,8 @@ async def test_create_team_execute_partial_failure_after_bot1(tmp_path):
 
     from telegram.ext import ConversationHandler
     assert result == ConversationHandler.END
-    sent = [c.args[1] for c in mb._app.bot.send_message.call_args_list]
-    failure_msg = next((m for m in sent if "failed" in m.lower()), None)
+    sent_texts = [m.text for m in mb._transport.sent_messages]
+    failure_msg = next((t for t in sent_texts if "failed" in t.lower()), None)
     assert failure_msg is not None
     assert "Bot @" in failure_msg  # bot1 was completed; should appear in cleanup list
     assert "Safe to retry" in failure_msg  # config NOT committed

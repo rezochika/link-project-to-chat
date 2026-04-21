@@ -210,9 +210,10 @@ async def test_addproject_invalid_path(bot_env, tmp_path: Path):
 async def test_editproject_rename(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"oldname": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update(["oldname", "name", "newname"])
     await bot._on_edit_project(update, ctx)
-    assert "Renamed" in update.effective_message.reply_text.call_args[0][0]
+    assert "Renamed" in fake.sent_messages[-1].text
     projects = json.loads(proj_cfg.read_text())["projects"]
     assert "newname" in projects and "oldname" not in projects
 
@@ -222,9 +223,10 @@ async def test_editproject_change_path(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     new_path = tmp_path / "new"; new_path.mkdir()
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update(["myproj", "path", str(new_path)])
     await bot._on_edit_project(update, ctx)
-    assert "Updated" in update.effective_message.reply_text.call_args[0][0]
+    assert "Updated" in fake.sent_messages[-1].text
     assert json.loads(proj_cfg.read_text())["projects"]["myproj"]["path"] == str(new_path)
 
 
@@ -232,18 +234,20 @@ async def test_editproject_change_path(bot_env, tmp_path: Path):
 async def test_editproject_rename_conflict(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"a": {"path": str(tmp_path)}, "b": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update(["a", "name", "b"])
     await bot._on_edit_project(update, ctx)
-    assert "already exists" in update.effective_message.reply_text.call_args[0][0]
+    assert "already exists" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
 async def test_editproject_invalid_field(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update(["myproj", "color", "blue"])
     await bot._on_edit_project(update, ctx)
-    assert "Unknown field" in update.effective_message.reply_text.call_args[0][0]
+    assert "Unknown field" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
@@ -387,6 +391,7 @@ async def test_edit_field_rename_via_button(bot_env, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_edit_cancel(bot_env):
     bot, pm, proj_cfg = bot_env
+    _swap_fake_transport(bot)
     update, ctx = _make_update()
     ctx.user_data = {"pending_edit": {"name": "myproj", "field": "model"}}
     await bot._edit_cancel(update, ctx)

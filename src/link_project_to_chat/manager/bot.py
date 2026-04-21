@@ -6,7 +6,7 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -20,10 +20,10 @@ from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
 from ..config import DEFAULT_CONFIG
 from .._auth import AuthMixin
-from ..transport import Button, Buttons
+from ..transport import Button, Buttons, ChatRef, MessageRef
 
 if TYPE_CHECKING:
-    from ..transport import ButtonClick, CommandInvocation
+    from ..transport import ButtonClick, CommandInvocation, IncomingMessage
 
 logger = logging.getLogger(__name__)
 
@@ -58,20 +58,19 @@ MODEL_OPTIONS = [
 ]
 
 
-def _build_persona_keyboard(project_path: Path, callback_prefix: str) -> InlineKeyboardMarkup:
-    """Build an inline keyboard listing discovered personas for the given project.
+def _build_persona_keyboard(project_path: Path, callback_prefix: str) -> Buttons:
+    """Build a transport-native keyboard listing discovered personas.
 
-    Each button's callback_data is f'{callback_prefix}:{persona_name}'.
+    Each button's ``value`` is f'{callback_prefix}:{persona_name}'.
     """
     from ..skills import load_personas
     personas = load_personas(project_path)
     # load_personas may return a dict (name -> content) or a list of names
     names = sorted(personas.keys() if hasattr(personas, "keys") else personas)
-    buttons = [
-        [InlineKeyboardButton(name, callback_data=f"{callback_prefix}:{name}")]
+    return Buttons(rows=[
+        [Button(label=name, value=f"{callback_prefix}:{name}")]
         for name in names
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 
 def _parse_edit_callback(data: str) -> tuple[str, str] | None:
@@ -252,13 +251,20 @@ class ManagerBot(AuthMixin):
             save_project_configs(projects)
 
     async def _guard(self, update: Update) -> bool:
-        """Returns True if the user is authorized and not rate-limited."""
+        """Returns True if the user is authorized and not rate-limited.
+
+        Shim around the transport-native _guard_invocation: wizard entry points
+        still receive an Update from ConversationHandler, but the reply path
+        goes through the Transport so no telegram-native reply_text call
+        remains in manager/bot.py.
+        """
         user = update.effective_user
+        incoming = self._incoming_from_update(update)
         if not user or not self._auth(user):
-            await update.effective_message.reply_text("Unauthorized.")
+            await self._transport.send_text(incoming.chat, "Unauthorized.")
             return False
         if self._rate_limited(user.id):
-            await update.effective_message.reply_text("Rate limited. Try again shortly.")
+            await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return False
         return True
 
@@ -296,6 +302,16 @@ class ManagerBot(AuthMixin):
             reply_to=None,
             native=msg,
         )
+
+    def _msg_ref_from_query(self, query) -> MessageRef:
+        """Build a MessageRef from a telegram CallbackQuery's ``.message``.
+
+        Used by wizard-internal CallbackQueryHandler bodies (Task 14): the handler
+        itself must stay PTB-typed because ConversationHandler routes by state,
+        but its BODY can edit the underlying message through the Transport.
+        """
+        from ..transport.telegram import message_ref_from_telegram
+        return message_ref_from_telegram(query.message)
 
     def _projects_text(self) -> str:
         projects = self._pm.list_all()
@@ -629,46 +645,49 @@ class ManagerBot(AuthMixin):
     async def _on_edit_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
             return
+        incoming = self._incoming_from_update(update)
         if not ctx.args or len(ctx.args) < 3:
-            return await update.effective_message.reply_text(
-                f"Usage: /edit_project <name> <field> <value>\nFields: {', '.join(_EDITABLE_FIELDS)}"
+            await self._transport.send_text(
+                incoming.chat,
+                f"Usage: /edit_project <name> <field> <value>\nFields: {', '.join(_EDITABLE_FIELDS)}",
             )
+            return
         name, field, value = ctx.args[0], ctx.args[1], " ".join(ctx.args[2:])
-        await self._apply_edit(update, name, field, value)
+        await self._apply_edit(incoming.chat, name, field, value)
 
-    async def _apply_edit(self, update: Update, name: str, field: str, value: str) -> None:
+    async def _apply_edit(self, chat: ChatRef, name: str, field: str, value: str) -> None:
         """Apply a field edit and send a confirmation reply."""
         projects = self._load_projects()
         if name not in projects:
-            await update.effective_message.reply_text(f"Project '{name}' not found.")
+            await self._transport.send_text(chat, f"Project '{name}' not found.")
             return
 
         if field == "path":
             if not Path(value).exists():
-                await update.effective_message.reply_text(f"Path does not exist: {value}")
+                await self._transport.send_text(chat, f"Path does not exist: {value}")
                 return
             projects[name]["path"] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' path to {value}.")
+            await self._transport.send_text(chat, f"Updated '{name}' path to {value}.")
         elif field == "name":
             if value in projects:
-                await update.effective_message.reply_text(f"Project '{value}' already exists.")
+                await self._transport.send_text(chat, f"Project '{value}' already exists.")
                 return
             projects[value] = projects.pop(name)
             self._save_projects(projects)
             self._pm.rename(name, value)
-            await update.effective_message.reply_text(f"Renamed '{name}' to '{value}'.")
+            await self._transport.send_text(chat, f"Renamed '{name}' to '{value}'.")
         elif field == "token":
             projects[name]["telegram_bot_token"] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' token.")
+            await self._transport.send_text(chat, f"Updated '{name}' token.")
         elif field in ("username", "model", "permissions"):
             projects[name][field] = value
             self._save_projects(projects)
-            await update.effective_message.reply_text(f"Updated '{name}' {field} to {value}.")
+            await self._transport.send_text(chat, f"Updated '{name}' {field} to {value}.")
         else:
-            await update.effective_message.reply_text(
-                f"Unknown field. Use: {', '.join(_EDITABLE_FIELDS)}"
+            await self._transport.send_text(
+                chat, f"Unknown field. Use: {', '.join(_EDITABLE_FIELDS)}",
             )
 
     async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -684,11 +703,14 @@ class ManagerBot(AuthMixin):
         if not self._auth(update.effective_user):
             return
         ctx.user_data.pop("pending_edit")
-        await self._apply_edit(update, pending["name"], pending["field"], update.message.text.strip())
+        incoming = self._incoming_from_update(update)
+        await self._apply_edit(incoming.chat, pending["name"], pending["field"], incoming.text.strip())
 
     async def _handle_setup_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, awaiting: str) -> None:
         from ..config import load_config, save_config
-        text = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        chat = incoming.chat
+        text = incoming.text.strip()
         path = Path(ctx.user_data.get("setup_config_path", str(DEFAULT_CONFIG)))
 
         if awaiting == "github_pat":
@@ -696,17 +718,17 @@ class ManagerBot(AuthMixin):
             config = load_config(path)
             config.github_pat = text
             save_config(config, path)
-            await update.effective_message.reply_text("GitHub PAT saved. Use /setup to continue.")
+            await self._transport.send_text(chat, "GitHub PAT saved. Use /setup to continue.")
 
         elif awaiting == "api_id":
             try:
                 api_id = int(text)
             except ValueError:
-                await update.effective_message.reply_text("Invalid. Enter a numeric API ID:")
+                await self._transport.send_text(chat, "Invalid. Enter a numeric API ID:")
                 return
             ctx.user_data["setup_api_id"] = api_id
             ctx.user_data["setup_awaiting"] = "api_hash"
-            await update.effective_message.reply_text("Enter your Telegram API Hash:")
+            await self._transport.send_text(chat, "Enter your Telegram API Hash:")
 
         elif awaiting == "api_hash":
             api_id = ctx.user_data.pop("setup_api_id", 0)
@@ -715,7 +737,9 @@ class ManagerBot(AuthMixin):
             config.telegram_api_id = api_id
             config.telegram_api_hash = text
             save_config(config, path)
-            await update.effective_message.reply_text("Telegram API credentials saved. Use /setup to authenticate Telethon.")
+            await self._transport.send_text(
+                chat, "Telegram API credentials saved. Use /setup to authenticate Telethon.",
+            )
 
         elif awaiting == "phone":
             ctx.user_data["setup_phone"] = text
@@ -728,17 +752,17 @@ class ManagerBot(AuthMixin):
                 ctx.user_data["setup_bf_client"] = bf
                 client = await bf._ensure_client()
                 await client.send_code_request(text)
-                await update.effective_message.reply_text("Code sent to your Telegram. Enter the code:")
+                await self._transport.send_text(chat, "Code sent to your Telegram. Enter the code:")
             except Exception as e:
                 ctx.user_data.pop("setup_awaiting", None)
-                await update.effective_message.reply_text(f"Error: {e}")
+                await self._transport.send_text(chat, f"Error: {e}")
 
         elif awaiting == "code":
             bf = ctx.user_data.get("setup_bf_client")
             phone = ctx.user_data.get("setup_phone")
             if not bf or not phone:
                 ctx.user_data.pop("setup_awaiting", None)
-                await update.effective_message.reply_text("Session lost. Use /setup again.")
+                await self._transport.send_text(chat, "Session lost. Use /setup again.")
                 return
             try:
                 client = await bf._ensure_client()
@@ -746,20 +770,22 @@ class ManagerBot(AuthMixin):
                 ctx.user_data.pop("setup_awaiting")
                 ctx.user_data.pop("setup_bf_client", None)
                 ctx.user_data.pop("setup_phone", None)
-                await update.effective_message.reply_text("Authenticated! You can now use /create_project.")
+                await self._transport.send_text(
+                    chat, "Authenticated! You can now use /create_project.",
+                )
             except Exception as e:
                 if "Two-steps verification" in str(e) or "password" in str(e).lower():
                     ctx.user_data["setup_awaiting"] = "2fa"
-                    await update.effective_message.reply_text("2FA is enabled. Enter your password:")
+                    await self._transport.send_text(chat, "2FA is enabled. Enter your password:")
                 else:
                     ctx.user_data.pop("setup_awaiting", None)
-                    await update.effective_message.reply_text(f"Auth failed: {e}")
+                    await self._transport.send_text(chat, f"Auth failed: {e}")
 
         elif awaiting == "2fa":
             bf = ctx.user_data.get("setup_bf_client")
             if not bf:
                 ctx.user_data.pop("setup_awaiting", None)
-                await update.effective_message.reply_text("Session lost. Use /setup again.")
+                await self._transport.send_text(chat, "Session lost. Use /setup again.")
                 return
             try:
                 client = await bf._ensure_client()
@@ -767,10 +793,12 @@ class ManagerBot(AuthMixin):
                 ctx.user_data.pop("setup_awaiting")
                 ctx.user_data.pop("setup_bf_client", None)
                 ctx.user_data.pop("setup_phone", None)
-                await update.effective_message.reply_text("Authenticated with 2FA! You can now use /create_project.")
+                await self._transport.send_text(
+                    chat, "Authenticated with 2FA! You can now use /create_project.",
+                )
             except Exception as e:
                 ctx.user_data.pop("setup_awaiting", None)
-                await update.effective_message.reply_text(f"2FA auth failed: {e}")
+                await self._transport.send_text(chat, f"2FA auth failed: {e}")
 
         elif awaiting == "stt_backend":
             choice = text.strip().lower()
@@ -779,23 +807,24 @@ class ManagerBot(AuthMixin):
                 config.stt_backend = ""
                 save_config(config, path)
                 ctx.user_data.pop("setup_awaiting")
-                await update.effective_message.reply_text("Voice disabled. Use /setup to continue.")
+                await self._transport.send_text(chat, "Voice disabled. Use /setup to continue.")
             elif choice in ("whisper-api", "whisper-cli"):
                 config = load_config(path)
                 config.stt_backend = choice
                 save_config(config, path)
                 if choice == "whisper-api":
                     ctx.user_data["setup_awaiting"] = "openai_api_key"
-                    await update.effective_message.reply_text("Enter your OpenAI API key:")
+                    await self._transport.send_text(chat, "Enter your OpenAI API key:")
                 else:
                     ctx.user_data.pop("setup_awaiting")
-                    await update.effective_message.reply_text(
+                    await self._transport.send_text(
+                        chat,
                         "whisper-cli configured. Make sure `whisper` is on PATH.\n"
-                        "Use /setup to continue."
+                        "Use /setup to continue.",
                     )
             else:
-                await update.effective_message.reply_text(
-                    "Invalid. Type: whisper-api, whisper-cli, or off"
+                await self._transport.send_text(
+                    chat, "Invalid. Type: whisper-api, whisper-cli, or off",
                 )
 
         elif awaiting == "openai_api_key":
@@ -803,7 +832,7 @@ class ManagerBot(AuthMixin):
             config = load_config(path)
             config.openai_api_key = text.strip()
             save_config(config, path)
-            await update.effective_message.reply_text("OpenAI API key saved. Use /setup to continue.")
+            await self._transport.send_text(chat, "OpenAI API key saved. Use /setup to continue.")
 
     async def _on_create_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
@@ -857,14 +886,17 @@ class ManagerBot(AuthMixin):
         query = update.callback_query
         await query.answer()
         data = query.data
+        msg_ref = self._msg_ref_from_query(query)
         if data == "create_from_gh":
-            return await self._show_repo_page(query, ctx, page=1)
+            return await self._show_repo_page(msg_ref, ctx, page=1)
         elif data == "create_paste_url":
-            await query.edit_message_text("Paste the GitHub repo URL:")
+            await self._transport.edit_text(msg_ref, "Paste the GitHub repo URL:")
             return self.CREATE_REPO_URL
         return ConversationHandler.END
 
-    async def _show_repo_page(self, query, ctx, page: int, user_data_key: str = "create") -> int:
+    async def _show_repo_page(
+        self, msg: MessageRef, ctx, page: int, user_data_key: str = "create",
+    ) -> int:
         from ..github_client import GitHubClient
         from ..config import load_config
         path = Path(ctx.user_data[user_data_key]["config_path"])
@@ -873,31 +905,31 @@ class ManagerBot(AuthMixin):
         try:
             repos, has_next = await gh.list_repos(page=page, per_page=5)
         except Exception as e:
-            await query.edit_message_text(f"GitHub API error: {e}")
+            await self._transport.edit_text(msg, f"GitHub API error: {e}")
             return ConversationHandler.END
         finally:
             await gh.close()
         if not repos:
-            await query.edit_message_text("No repos found.")
+            await self._transport.edit_text(msg, "No repos found.")
             return ConversationHandler.END
         ctx.user_data[user_data_key]["repos"] = {r.full_name: r.__dict__ for r in repos}
         ctx.user_data[user_data_key]["page"] = page
-        buttons = [
-            [InlineKeyboardButton(
-                f"{'🔒 ' if r.private else ''}{r.name}",
-                callback_data=f"create_repo_{r.full_name}",
+        rows: list[list[Button]] = [
+            [Button(
+                label=f"{'🔒 ' if r.private else ''}{r.name}",
+                value=f"create_repo_{r.full_name}",
             )]
             for r in repos
         ]
-        nav = []
+        nav: list[Button] = []
         if page > 1:
-            nav.append(InlineKeyboardButton("« Prev", callback_data=f"create_page_{page - 1}"))
+            nav.append(Button(label="« Prev", value=f"create_page_{page - 1}"))
         if has_next:
-            nav.append(InlineKeyboardButton("Next »", callback_data=f"create_page_{page + 1}"))
+            nav.append(Button(label="Next »", value=f"create_page_{page + 1}"))
         if nav:
-            buttons.append(nav)
-        buttons.append([InlineKeyboardButton("Cancel", callback_data="create_cancel")])
-        await query.edit_message_text("Select a repo:", reply_markup=InlineKeyboardMarkup(buttons))
+            rows.append(nav)
+        rows.append([Button(label="Cancel", value="create_cancel")])
+        await self._transport.edit_text(msg, "Select a repo:", buttons=Buttons(rows=rows))
         return self.CREATE_TEAM_REPO_LIST if user_data_key == "create_team" else self.CREATE_REPO_LIST
 
     async def _create_repo_list_callback(
@@ -906,31 +938,32 @@ class ManagerBot(AuthMixin):
         query = update.callback_query
         await query.answer()
         data = query.data
+        msg_ref = self._msg_ref_from_query(query)
         if data.startswith("create_page_"):
             page = int(data.split("_")[-1])
-            return await self._show_repo_page(query, ctx, page, user_data_key=user_data_key)
+            return await self._show_repo_page(msg_ref, ctx, page, user_data_key=user_data_key)
         elif data.startswith("create_repo_"):
             full_name = data[len("create_repo_"):]
             repos = ctx.user_data[user_data_key].get("repos", {})
             if full_name not in repos:
-                await query.edit_message_text("Repo not found. Try again.")
+                await self._transport.edit_text(msg_ref, "Repo not found. Try again.")
                 return ConversationHandler.END
             repo_data = repos[full_name]
             ctx.user_data[user_data_key]["repo"] = repo_data
             suggested_name = repo_data["name"]
             ctx.user_data[user_data_key]["suggested_name"] = suggested_name
             if user_data_key == "create_team":
-                await query.edit_message_text("Short project name?")
+                await self._transport.edit_text(msg_ref, "Short project name?")
                 return self.CREATE_TEAM_NAME
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
-                [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
+            buttons = Buttons(rows=[
+                [Button(label=f'Use "{suggested_name}"', value="create_name_use")],
+                [Button(label="Custom name", value="create_name_custom")],
             ])
-            await query.edit_message_text(f"Project name?", reply_markup=markup)
+            await self._transport.edit_text(msg_ref, "Project name?", buttons=buttons)
             return self.CREATE_NAME
         elif data == "create_cancel":
             ctx.user_data.pop(user_data_key, None)
-            await query.edit_message_text("Cancelled.")
+            await self._transport.edit_text(msg_ref, "Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
 
@@ -973,16 +1006,19 @@ class ManagerBot(AuthMixin):
     async def _create_name_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         query = update.callback_query
         await query.answer()
+        msg_ref = self._msg_ref_from_query(query)
         if query.data == "create_name_use":
             name = ctx.user_data["create"]["suggested_name"]
             projects = self._load_projects()
             if name in projects:
-                await query.edit_message_text(f"'{name}' already exists. Enter a custom name:")
+                await self._transport.edit_text(
+                    msg_ref, f"'{name}' already exists. Enter a custom name:",
+                )
                 return self.CREATE_NAME_INPUT
             ctx.user_data["create"]["name"] = name
-            return await self._do_create_bot(query, ctx)
+            return await self._do_create_bot(msg_ref, ctx)
         elif query.data == "create_name_custom":
-            await query.edit_message_text("Enter the project name:")
+            await self._transport.edit_text(msg_ref, "Enter the project name:")
             return self.CREATE_NAME_INPUT
         return ConversationHandler.END
 
@@ -1000,16 +1036,17 @@ class ManagerBot(AuthMixin):
         await self._transport.send_text(incoming.chat, "Creating Telegram bot via BotFather...")
         return await self._do_create_bot_text(update, ctx)
 
-    async def _do_create_bot(self, query, ctx) -> int:
-        await query.edit_message_text("Creating Telegram bot via BotFather...")
+    async def _do_create_bot(self, msg: MessageRef, ctx) -> int:
+        await self._transport.edit_text(msg, "Creating Telegram bot via BotFather...")
         name = ctx.user_data["create"]["name"]
-        return await self._execute_bot_creation(query.message.chat_id, ctx, name)
+        return await self._execute_bot_creation(msg.chat, ctx, name)
 
     async def _do_create_bot_text(self, update, ctx) -> int:
         name = ctx.user_data["create"]["name"]
-        return await self._execute_bot_creation(update.effective_chat.id, ctx, name)
+        incoming = self._incoming_from_update(update)
+        return await self._execute_bot_creation(incoming.chat, ctx, name)
 
-    async def _execute_bot_creation(self, chat_id: int, ctx, name: str) -> int:
+    async def _execute_bot_creation(self, chat: ChatRef, ctx, name: str) -> int:
         from ..botfather import BotFatherClient, sanitize_bot_username
         from ..config import load_config
         path = Path(ctx.user_data["create"]["config_path"])
@@ -1021,15 +1058,19 @@ class ManagerBot(AuthMixin):
             token = await bf.create_bot(display_name=f"{name} Claude", username=bot_username)
             ctx.user_data["create"]["bot_token"] = token
             ctx.user_data["create"]["bot_username"] = bot_username
-            await self._app.bot.send_message(chat_id, f"Created @{bot_username}. Cloning repository...")
-            return await self._execute_clone(chat_id, ctx)
+            await self._transport.send_text(
+                chat, f"Created @{bot_username}. Cloning repository...",
+            )
+            return await self._execute_clone(chat, ctx)
         except Exception as e:
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Retry", callback_data="create_retry_bot")],
-                [InlineKeyboardButton("Enter token manually", callback_data="create_manual_token")],
-                [InlineKeyboardButton("Cancel", callback_data="create_cancel")],
+            buttons = Buttons(rows=[
+                [Button(label="Retry", value="create_retry_bot")],
+                [Button(label="Enter token manually", value="create_manual_token")],
+                [Button(label="Cancel", value="create_cancel")],
             ])
-            await self._app.bot.send_message(chat_id, f"Bot creation failed: {e}", reply_markup=markup)
+            await self._transport.send_text(
+                chat, f"Bot creation failed: {e}", buttons=buttons,
+            )
             return self.CREATE_BOT
         finally:
             await bf.disconnect()
@@ -1037,16 +1078,17 @@ class ManagerBot(AuthMixin):
     async def _create_bot_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         query = update.callback_query
         await query.answer()
+        msg_ref = self._msg_ref_from_query(query)
         if query.data == "create_retry_bot":
             name = ctx.user_data["create"]["name"]
-            await query.edit_message_text("Retrying bot creation...")
-            return await self._execute_bot_creation(query.message.chat_id, ctx, name)
+            await self._transport.edit_text(msg_ref, "Retrying bot creation...")
+            return await self._execute_bot_creation(msg_ref.chat, ctx, name)
         elif query.data == "create_manual_token":
-            await query.edit_message_text("Paste the bot token from BotFather:")
+            await self._transport.edit_text(msg_ref, "Paste the bot token from BotFather:")
             return self.CREATE_BOT
         elif query.data == "create_cancel":
             ctx.user_data.pop("create", None)
-            await query.edit_message_text("Cancelled.")
+            await self._transport.edit_text(msg_ref, "Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
 
@@ -1056,9 +1098,9 @@ class ManagerBot(AuthMixin):
         ctx.user_data["create"]["bot_token"] = token
         ctx.user_data["create"]["bot_username"] = "(manual)"
         await self._transport.send_text(incoming.chat, "Token saved. Cloning repository...")
-        return await self._execute_clone(update.effective_chat.id, ctx)
+        return await self._execute_clone(incoming.chat, ctx)
 
-    async def _execute_clone(self, chat_id: int, ctx) -> int:
+    async def _execute_clone(self, chat: ChatRef, ctx) -> int:
         from ..github_client import GitHubClient, RepoInfo
         from ..config import load_config
         path = Path(ctx.user_data["create"]["config_path"])
@@ -1072,29 +1114,30 @@ class ManagerBot(AuthMixin):
             await gh.clone_repo(repo, dest)
             ctx.user_data["create"]["clone_path"] = str(dest)
         except Exception as e:
-            markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Retry", callback_data="create_retry_clone")],
-                [InlineKeyboardButton("Cancel", callback_data="create_cancel")],
+            buttons = Buttons(rows=[
+                [Button(label="Retry", value="create_retry_clone")],
+                [Button(label="Cancel", value="create_cancel")],
             ])
-            await self._app.bot.send_message(chat_id, f"Clone failed: {e}", reply_markup=markup)
+            await self._transport.send_text(chat, f"Clone failed: {e}", buttons=buttons)
             return self.CREATE_CLONE
         finally:
             await gh.close()
-        return await self._finalize_create(chat_id, ctx)
+        return await self._finalize_create(chat, ctx)
 
     async def _create_clone_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         query = update.callback_query
         await query.answer()
+        msg_ref = self._msg_ref_from_query(query)
         if query.data == "create_retry_clone":
-            await query.edit_message_text("Retrying clone...")
-            return await self._execute_clone(query.message.chat_id, ctx)
+            await self._transport.edit_text(msg_ref, "Retrying clone...")
+            return await self._execute_clone(msg_ref.chat, ctx)
         elif query.data == "create_cancel":
             ctx.user_data.pop("create", None)
-            await query.edit_message_text("Cancelled.")
+            await self._transport.edit_text(msg_ref, "Cancelled.")
             return ConversationHandler.END
         return ConversationHandler.END
 
-    async def _finalize_create(self, chat_id: int, ctx) -> int:
+    async def _finalize_create(self, chat: ChatRef, ctx) -> int:
         create_data = ctx.user_data.pop("create", {})
         name = create_data["name"]
         repo = create_data["repo"]
@@ -1115,11 +1158,11 @@ class ManagerBot(AuthMixin):
             f"Path: {clone_path}\n"
             f"Bot: @{bot_username}"
         )
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Start Project", callback_data=f"proj_start_{name}")],
-            [InlineKeyboardButton("Done", callback_data="proj_back")],
+        buttons = Buttons(rows=[
+            [Button(label="Start Project", value=f"proj_start_{name}")],
+            [Button(label="Done", value="proj_back")],
         ])
-        await self._app.bot.send_message(chat_id, summary, reply_markup=markup)
+        await self._transport.send_text(chat, summary, buttons=buttons)
         return ConversationHandler.END
 
     async def _create_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1158,9 +1201,12 @@ class ManagerBot(AuthMixin):
         await query.answer()
         _, source = query.data.split(":", 1)
         ctx.user_data.setdefault("create_team", {})["source"] = source
+        msg_ref = self._msg_ref_from_query(query)
         if source == "github":
-            return await self._show_repo_page(query, ctx, page=1, user_data_key="create_team")
-        await query.edit_message_text("Paste the repo URL (e.g. https://github.com/owner/repo):")
+            return await self._show_repo_page(msg_ref, ctx, page=1, user_data_key="create_team")
+        await self._transport.edit_text(
+            msg_ref, "Paste the repo URL (e.g. https://github.com/owner/repo):",
+        )
         return self.CREATE_TEAM_REPO_URL
 
     async def _create_team_name(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1182,15 +1228,8 @@ class ManagerBot(AuthMixin):
         ctx.user_data["create_team"]["project_prefix"] = prefix
 
         # Persona picker — list global personas (no project path yet, since clone hasn't happened).
-        # Keep the PTB InlineKeyboardMarkup builder: it feeds a CallbackQueryHandler in the
-        # ConversationHandler.states map (wizard-internal callbacks stay on the PTB path until
-        # Task 14 revisits them). We adapt it to transport Buttons here.
         fake_path = Path(DEFAULT_CONFIG).parent
-        keyboard = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_mgr")
-        buttons = Buttons(rows=[
-            [Button(label=btn.text, value=btn.callback_data) for btn in row]
-            for row in keyboard.inline_keyboard
-        ])
+        buttons = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_mgr")
         await self._transport.send_text(
             incoming.chat,
             "Pick manager-role persona:",
@@ -1205,10 +1244,12 @@ class ManagerBot(AuthMixin):
         ctx.user_data["create_team"]["persona_mgr"] = persona
 
         fake_path = Path(DEFAULT_CONFIG).parent
-        keyboard = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_dev")
-        await query.edit_message_text(
+        buttons = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_dev")
+        msg_ref = self._msg_ref_from_query(query)
+        await self._transport.edit_text(
+            msg_ref,
             f"Manager persona: {persona}\n\nPick dev-role persona:",
-            reply_markup=keyboard,
+            buttons=buttons,
         )
         return self.CREATE_TEAM_PERSONA_DEV
 
@@ -1248,13 +1289,14 @@ class ManagerBot(AuthMixin):
 
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(cfg_path)
-        chat = update.effective_chat
+        incoming = self._incoming_from_update(update)
+        chat = incoming.chat
 
-        status = await self._app.bot.send_message(chat.id, "⟳ Creating bot 1...")
+        status_msg = await self._transport.send_text(chat, "⟳ Creating bot 1...")
 
         async def edit(text: str) -> None:
             try:
-                await status.edit_text(text)
+                await self._transport.edit_text(status_msg, text)
             except Exception:
                 pass
 
@@ -1351,7 +1393,7 @@ class ManagerBot(AuthMixin):
                 except Exception as exc:
                     logger.warning("Promote admin failed for %s: %s", username, exc)
 
-            requester = update.effective_user.username if update.effective_user else None
+            requester = incoming.sender.handle if incoming.sender else None
             if requester:
                 try:
                     await invite_user(client, group_id, requester)
@@ -1369,7 +1411,7 @@ class ManagerBot(AuthMixin):
 
         except Exception as exc:
             await self._send_partial_failure_report(
-                chat.id, exc, completed, config_committed=config_committed
+                chat, exc, completed, config_committed=config_committed
             )
         finally:
             try:
@@ -1381,7 +1423,7 @@ class ManagerBot(AuthMixin):
 
     async def _send_partial_failure_report(
         self,
-        chat_id: int,
+        chat: ChatRef,
         exc: Exception,
         completed: dict[str, str],
         config_committed: bool = False,
@@ -1416,7 +1458,7 @@ class ManagerBot(AuthMixin):
             )
         else:
             lines.append("Config not saved. Safe to retry with a different prefix.")
-        await self._app.bot.send_message(chat_id, "\n".join(lines))
+        await self._transport.send_text(chat, "\n".join(lines))
 
     # --- /delete_team -------------------------------------------------------
 
@@ -1426,10 +1468,11 @@ class ManagerBot(AuthMixin):
             return ConversationHandler.END
 
         from ..config import load_config
+        incoming = self._incoming_from_update(update)
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(cfg_path)
         if not config.teams:
-            await update.effective_message.reply_text("No teams configured.")
+            await self._transport.send_text(incoming.chat, "No teams configured.")
             return ConversationHandler.END
 
         target: str | None = None
@@ -1438,25 +1481,26 @@ class ManagerBot(AuthMixin):
 
         if target is None:
             # Show a keyboard of existing teams.
-            buttons = [
-                [InlineKeyboardButton(name, callback_data=f"dt_pick:{name}")]
+            rows: list[list[Button]] = [
+                [Button(label=name, value=f"dt_pick:{name}")]
                 for name in sorted(config.teams)
             ]
-            buttons.append([InlineKeyboardButton("Cancel", callback_data="dt_pick:__cancel__")])
-            await update.effective_message.reply_text(
+            rows.append([Button(label="Cancel", value="dt_pick:__cancel__")])
+            await self._transport.send_text(
+                incoming.chat,
                 "Pick a team to delete:",
-                reply_markup=InlineKeyboardMarkup(buttons),
+                buttons=Buttons(rows=rows),
             )
             return self.DELETE_TEAM_CONFIRM
 
         if target not in config.teams:
-            await update.effective_message.reply_text(f"Team `{target}` not found.")
+            await self._transport.send_text(incoming.chat, f"Team `{target}` not found.")
             return ConversationHandler.END
 
-        return await self._delete_team_show_confirm(update.effective_chat.id, target, ctx)
+        return await self._delete_team_show_confirm(incoming.chat, target, ctx)
 
     async def _delete_team_show_confirm(
-        self, chat_id: int, target: str, ctx: ContextTypes.DEFAULT_TYPE
+        self, chat: ChatRef, target: str, ctx: ContextTypes.DEFAULT_TYPE
     ) -> int:
         """Render the irreversible-action confirmation."""
         from ..config import load_config
@@ -1474,11 +1518,11 @@ class ManagerBot(AuthMixin):
             f"  • Remove the team entry from config.json\n\n"
             f"This cannot be undone. Proceed?"
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"Delete {target}", callback_data="dt_confirm")],
-            [InlineKeyboardButton("Cancel", callback_data="dt_cancel")],
+        buttons = Buttons(rows=[
+            [Button(label=f"Delete {target}", value="dt_confirm")],
+            [Button(label="Cancel", value="dt_cancel")],
         ])
-        await self._app.bot.send_message(chat_id, message, reply_markup=keyboard)
+        await self._transport.send_text(chat, message, buttons=buttons)
         return self.DELETE_TEAM_CONFIRM
 
     async def _delete_team_confirm_callback(
@@ -1488,29 +1532,30 @@ class ManagerBot(AuthMixin):
         query = update.callback_query
         await query.answer()
         data = query.data or ""
+        msg_ref = self._msg_ref_from_query(query)
         if data.startswith("dt_pick:"):
             target = data.split(":", 1)[1]
             if target == "__cancel__":
-                await query.edit_message_text("Cancelled.")
+                await self._transport.edit_text(msg_ref, "Cancelled.")
                 return ConversationHandler.END
-            await query.edit_message_text(f"Selected: `{target}`")
-            return await self._delete_team_show_confirm(query.message.chat_id, target, ctx)
+            await self._transport.edit_text(msg_ref, f"Selected: `{target}`")
+            return await self._delete_team_show_confirm(msg_ref.chat, target, ctx)
         if data == "dt_cancel":
             ctx.user_data.pop("delete_team", None)
-            await query.edit_message_text("Cancelled.")
+            await self._transport.edit_text(msg_ref, "Cancelled.")
             return ConversationHandler.END
         if data == "dt_confirm":
             target = ctx.user_data.get("delete_team", {}).get("target")
             if not target:
-                await query.edit_message_text("No team selected — cancelling.")
+                await self._transport.edit_text(msg_ref, "No team selected — cancelling.")
                 return ConversationHandler.END
-            await query.edit_message_text(f"⟳ Deleting team `{target}`...")
-            await self._delete_team_execute(query.message.chat_id, target)
+            await self._transport.edit_text(msg_ref, f"⟳ Deleting team `{target}`...")
+            await self._delete_team_execute(msg_ref.chat, target)
             ctx.user_data.pop("delete_team", None)
             return ConversationHandler.END
         return ConversationHandler.END
 
-    async def _delete_team_execute(self, chat_id: int, target: str) -> None:
+    async def _delete_team_execute(self, chat: ChatRef, target: str) -> None:
         """Best-effort cleanup. Partial-failure report lists whatever didn't work."""
         import shutil
         from ..config import load_config, patch_team
@@ -1521,14 +1566,16 @@ class ManagerBot(AuthMixin):
         config = load_config(cfg_path)
         team = config.teams.get(target)
         if team is None:
-            await self._app.bot.send_message(chat_id, f"Team `{target}` not found (already deleted?).")
+            await self._transport.send_text(
+                chat, f"Team `{target}` not found (already deleted?).",
+            )
             return
 
-        status_msg = await self._app.bot.send_message(chat_id, "⟳ Stopping bots...")
+        status_msg = await self._transport.send_text(chat, "⟳ Stopping bots...")
 
         async def edit(text: str) -> None:
             try:
-                await status_msg.edit_text(text)
+                await self._transport.edit_text(status_msg, text)
             except Exception:
                 pass
 
@@ -1605,12 +1652,12 @@ class ManagerBot(AuthMixin):
             )
         else:
             report = f"✓ Team `{target}` fully deleted."
-        await self._app.bot.send_message(chat_id, report)
+        await self._transport.send_text(chat, report)
 
-    @staticmethod
-    async def _edit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _edit_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.user_data.pop("pending_edit", None)
-        await update.effective_message.reply_text("Edit cancelled.")
+        incoming = self._incoming_from_update(update)
+        await self._transport.send_text(incoming.chat, "Edit cancelled.")
 
     def _proj_detail_buttons(self, name: str, status: str) -> Buttons:
         """Produce the transport-native project-detail keyboard."""
