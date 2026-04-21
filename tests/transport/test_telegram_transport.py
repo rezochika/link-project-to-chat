@@ -540,3 +540,12 @@ async def test_build_without_enable_team_relay_starts_and_stops_cleanly():
 
     await t.start()
     await t.stop()
+
+
+async def test_app_property_returns_underlying_application():
+    """TelegramTransport.app exposes the underlying telegram.ext.Application
+    so the manager bot can attach ConversationHandlers directly."""
+    t, _bot = _make_transport_with_mock_bot()
+    app = t.app
+    assert app is t._app  # exposes the same instance
+    assert hasattr(app, "add_handler")  # quacks like an Application

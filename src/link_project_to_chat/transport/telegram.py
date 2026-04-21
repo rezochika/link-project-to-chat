@@ -204,11 +204,11 @@ class TelegramTransport:
 
     @property
     def app(self) -> Any:
-        """Direct access to the underlying telegram.ext.Application.
+        """Expose the underlying telegram.ext.Application.
 
-        For legacy bot.py code that still needs to call bot methods directly
-        (e.g., set_my_commands at post_init time). New code should go through
-        the Transport interface.
+        TelegramTransport-specific accessor — NOT on the Transport Protocol.
+        Used by callers that need to attach legacy handlers (e.g.,
+        ConversationHandler) that don't yet have a Transport equivalent.
         """
         return self._app
 
