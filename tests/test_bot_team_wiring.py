@@ -599,3 +599,149 @@ def test_teambotconfig_round_trips_permissions_and_bot_username(tmp_path):
     # Dev has defaults — no permissions / no bot_username.
     assert dev.permissions is None
     assert dev.bot_username == ""
+
+
+# -----------------------------------------------------------------------------
+# Spec #0c Task 5: build() wires enable_team_relay from LP2C_TELETHON_SESSION.
+# -----------------------------------------------------------------------------
+def _make_team_bot_for_relay_test(tmp_path) -> ProjectBot:
+    """Construct a team-mode ProjectBot with minimum kwargs for build() tests."""
+    return ProjectBot(
+        name="acme_dev",
+        path=tmp_path,
+        token="t",
+        team_name="acme",
+        role="dev",
+        group_chat_id=-100123,
+        peer_bot_username="acme_manager_bot",
+    )
+
+
+def _make_solo_bot_for_relay_test(tmp_path) -> ProjectBot:
+    """Construct a solo-mode ProjectBot with no team_name."""
+    return ProjectBot(name="solo", path=tmp_path, token="t")
+
+
+def _stub_team_config_with_two_bots():
+    """Return a dict matching ``load_teams`` output with two bot usernames."""
+    from link_project_to_chat.config import TeamBotConfig, TeamConfig
+
+    return {
+        "acme": TeamConfig(
+            path="/tmp/acme",
+            group_chat_id=-100123,
+            bots={
+                "manager": TeamBotConfig(
+                    telegram_bot_token="mt",
+                    bot_username="acme_manager_bot",
+                ),
+                "dev": TeamBotConfig(
+                    telegram_bot_token="dt",
+                    bot_username="acme_dev_bot",
+                ),
+            },
+        )
+    }
+
+
+def _stub_config_with_api_creds():
+    """Return a minimal Config with telegram_api_id/telegram_api_hash set."""
+    from link_project_to_chat.config import Config
+
+    cfg = Config()
+    cfg.telegram_api_id = 12345
+    cfg.telegram_api_hash = "fakehash"
+    return cfg
+
+
+def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, monkeypatch):
+    """When LP2C_TELETHON_SESSION is set and the bot is team-mode,
+    build() constructs a TelegramClient and calls enable_team_relay.
+    """
+    from unittest.mock import MagicMock, patch
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ), patch("telethon.TelegramClient") as MockClient:
+        bot.build()
+
+    MockClient.assert_called_once()
+    # First positional arg: session path; then api_id, api_hash — mirrors manager.
+    args, _kwargs = MockClient.call_args
+    assert args[0] == str(session_path)
+    assert args[1] == 12345
+    assert args[2] == "fakehash"
+
+    mock_transport.enable_team_relay.assert_called_once()
+    call_kwargs = mock_transport.enable_team_relay.call_args.kwargs
+    assert call_kwargs["group_chat_id"] == -100123
+    assert call_kwargs["team_name"] == "acme"
+    usernames = call_kwargs["team_bot_usernames"]
+    assert "acme_manager_bot" in usernames
+    assert "acme_dev_bot" in usernames
+
+
+def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
+    """Without LP2C_TELETHON_SESSION, build() does NOT call enable_team_relay."""
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ), patch("telethon.TelegramClient") as MockClient:
+        bot.build()
+
+    MockClient.assert_not_called()
+    mock_transport.enable_team_relay.assert_not_called()
+
+
+def test_no_relay_when_solo_mode(tmp_path, monkeypatch):
+    """A solo-mode bot (no team_name) does NOT call enable_team_relay even if env set."""
+    from unittest.mock import MagicMock, patch
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    bot = _make_solo_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ), patch("telethon.TelegramClient") as MockClient:
+        bot.build()
+
+    MockClient.assert_not_called()
+    mock_transport.enable_team_relay.assert_not_called()
