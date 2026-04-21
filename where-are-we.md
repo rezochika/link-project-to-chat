@@ -64,6 +64,15 @@
   - Bot-side group logic moved into `_handle_group_text` + `_submit_group_message_to_claude` on the transport-native `_on_text_from_transport` dispatch
   - `TelegramTransport.enable_team_relay(telethon_client, team_bot_usernames, group_chat_id, team_name)` — relay lifecycle tied to start()/stop(); `team_relay.py` moved into `transport/_telegram_relay.py`. Manager bot still drives the relay directly until spec #0c.
   - Three cleanups: M4 hardcoded `transport_id="telegram"` → `self._transport.TRANSPORT_ID`; M5 ask-question annotation regression fixed via `_render_question_html` helper; M6 dead `LiveMessage` import removed
+- **Manager bot port — Transport-native** (spec #0c, v0.16.0):
+  - `manager/bot.py` uses `TelegramTransport` for command dispatch, inline buttons, and file ops; legacy `Application.builder()` gone
+  - `manager/telegram_group.py` moved to `transport/_telegram_group.py` — invariant: all `import telethon` lives in `transport/`
+  - `TelegramTransport.enable_team_relay` (shipped unused in #0a) now wired: project bots receive a Telethon session-file path via `LP2C_TELETHON_SESSION` env var, construct their own `TelegramClient` in `build()`, and call `enable_team_relay`. Manager loses `_team_relays` dict + `_start_team_relays`. Project bots own their relay.
+  - Wizard step bodies (`/add_project`, `/create_project`, `/create_team`, `/delete_team`, `/edit_project`) use `_incoming_from_update` shim — Transport-native reads/writes; `ConversationHandler` machinery (states, returns) preserved
+  - Wizard-internal CallbackQueryHandler bodies also ported: use `self._transport.edit_text(msg_ref, ...)` via new `_msg_ref_from_query` helper
+  - Internal helpers `_execute_bot_creation`, `_execute_clone`, `_finalize_create`, `_show_repo_page`, and `_create_team_execute` orchestrator ported to take `ChatRef` / use `self._transport.*`
+  - `tests/test_manager_lockout.py` enforces the residual telegram allowlist (Update + ConversationHandler family = 7 names)
+  - `TelegramTransport.app` accessor exposes the underlying `telegram.ext.Application` for ConversationHandler integration (TelegramTransport-specific, not on Protocol)
 
 ## Coding Style
 - Single-purpose functions
@@ -81,5 +90,4 @@
 - `chmod 0o600` missing from `clear_session()` write path
 - No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
-- Manager bot (`manager/bot.py`) still telegram-specific (pending spec #0c)
 - `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it
