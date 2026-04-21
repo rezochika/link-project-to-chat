@@ -257,6 +257,25 @@ class ManagerBot(AuthMixin):
             return False
         return True
 
+    def _incoming_from_update(self, update) -> "IncomingMessage":
+        """Build a transient IncomingMessage from a telegram Update.
+
+        Used by wizard step bodies (Tasks 11-14) to read message data through the
+        Transport-shaped contract while ConversationHandler still consumes Updates
+        at the boundary.
+        """
+        from ..transport import IncomingMessage
+        from ..transport.telegram import chat_ref_from_telegram, identity_from_telegram_user
+        msg = update.effective_message
+        return IncomingMessage(
+            chat=chat_ref_from_telegram(update.effective_chat),
+            sender=identity_from_telegram_user(update.effective_user),
+            text=(msg.text if msg else "") or "",
+            files=[],
+            reply_to=None,
+            native=msg,
+        )
+
     def _projects_text(self) -> str:
         projects = self._pm.list_all()
         running = sum(1 for _, st in projects if st == "running")
