@@ -1100,7 +1100,7 @@ class ManagerBot(AuthMixin):
         from ..config import load_config, patch_team
         from ..botfather import BotFatherClient, sanitize_bot_username
         from ..github_client import GitHubClient, RepoInfo
-        from .telegram_group import (
+        from ..transport._telegram_group import (
             create_supergroup,
             add_bot,
             promote_admin,
@@ -1402,7 +1402,7 @@ class ManagerBot(AuthMixin):
         import shutil
         from ..config import load_config, patch_team
         from ..botfather import BotFatherClient
-        from .telegram_group import delete_supergroup
+        from ..transport._telegram_group import delete_supergroup
 
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(cfg_path)

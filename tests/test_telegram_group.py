@@ -6,7 +6,7 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_create_supergroup_returns_negative_chat_id():
-    from link_project_to_chat.manager.telegram_group import create_supergroup
+    from link_project_to_chat.transport._telegram_group import create_supergroup
 
     # Mock Telethon response: channels.CreateChannelRequest returns an Updates object
     # whose .chats[0].id is a large positive int; caller must prepend -100 to get
@@ -25,7 +25,7 @@ async def test_create_supergroup_returns_negative_chat_id():
 
 @pytest.mark.asyncio
 async def test_add_bot_invokes_invite_to_channel():
-    from link_project_to_chat.manager.telegram_group import add_bot
+    from link_project_to_chat.transport._telegram_group import add_bot
     from telethon.tl.functions.channels import InviteToChannelRequest
 
     bot_entity = MagicMock()
@@ -48,7 +48,7 @@ async def test_add_bot_invokes_invite_to_channel():
 
 @pytest.mark.asyncio
 async def test_promote_admin_sets_correct_rights():
-    from link_project_to_chat.manager.telegram_group import promote_admin
+    from link_project_to_chat.transport._telegram_group import promote_admin
     from telethon.tl.functions.channels import EditAdminRequest
 
     bot_entity = MagicMock()
@@ -73,7 +73,7 @@ async def test_promote_admin_sets_correct_rights():
 
 @pytest.mark.asyncio
 async def test_invite_user_uses_invite_to_channel():
-    from link_project_to_chat.manager.telegram_group import invite_user
+    from link_project_to_chat.transport._telegram_group import invite_user
     from telethon.tl.functions.channels import InviteToChannelRequest
 
     user_entity = MagicMock()
@@ -95,11 +95,11 @@ async def test_invite_user_uses_invite_to_channel():
 
 @pytest.mark.asyncio
 async def test_flood_wait_under_30s_retries_once(monkeypatch):
-    from link_project_to_chat.manager.telegram_group import create_supergroup
+    from link_project_to_chat.transport._telegram_group import create_supergroup
     from telethon.errors import FloodWaitError
 
     monkeypatch.setattr(
-        "link_project_to_chat.manager.telegram_group.asyncio.sleep", AsyncMock()
+        "link_project_to_chat.transport._telegram_group.asyncio.sleep", AsyncMock()
     )
 
     mock_chat = MagicMock()
@@ -122,7 +122,7 @@ async def test_flood_wait_under_30s_retries_once(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_flood_wait_over_30s_aborts():
-    from link_project_to_chat.manager.telegram_group import create_supergroup
+    from link_project_to_chat.transport._telegram_group import create_supergroup
     from telethon.errors import FloodWaitError
 
     client = AsyncMock(side_effect=FloodWaitError(request=None, capture=180))

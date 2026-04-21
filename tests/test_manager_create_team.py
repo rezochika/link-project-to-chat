@@ -286,7 +286,7 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
         "link_project_to_chat.botfather.BotFatherClient.delete_bot",
         new=AsyncMock(),
     ) as mock_delete_bot, patch(
-        "link_project_to_chat.manager.telegram_group.delete_supergroup",
+        "link_project_to_chat.transport._telegram_group.delete_supergroup",
         new=AsyncMock(),
     ) as mock_delete_group:
         await mb._delete_team_execute(chat_id=1, target="acme")
@@ -373,7 +373,7 @@ async def test_delete_team_execute_continues_on_individual_failures(tmp_path, mo
         "link_project_to_chat.botfather.BotFatherClient.delete_bot",
         new=AsyncMock(side_effect=sometimes_fail),
     ), patch(
-        "link_project_to_chat.manager.telegram_group.delete_supergroup",
+        "link_project_to_chat.transport._telegram_group.delete_supergroup",
         new=AsyncMock(),
     ):
         await mb._delete_team_execute(chat_id=1, target="acme")
