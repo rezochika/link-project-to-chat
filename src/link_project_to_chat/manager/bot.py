@@ -7,7 +7,6 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -1809,13 +1808,16 @@ class ManagerBot(AuthMixin):
                 logger.exception("Failed to start TeamRelay for %s", name)
 
     def build(self):
-        app = (
-            ApplicationBuilder()
-            .token(self._token)
-            .post_init(self._post_init)
-            .build()
-        )
-        self._app = app
+        from ..transport.telegram import TelegramTransport
+        # concurrent_updates=False matches prior ApplicationBuilder default; the
+        # manager has not opted into concurrent updates. post_init is attached
+        # below because the manager's lifecycle is run_polling() (which runs
+        # the Application's post_init) rather than transport.start() (which
+        # runs the transport's own post-init logic).
+        self._transport = TelegramTransport.build(self._token, concurrent_updates=False)
+        self._app = self._transport.app  # alias preserves existing add_handler call sites
+        self._app.post_init = self._post_init
+        app = self._app
         for name, handler in {
             "projects": self._on_projects,
             "teams": self._on_teams,
