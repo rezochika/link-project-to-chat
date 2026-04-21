@@ -4,8 +4,10 @@ import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.error import Forbidden
 
 from link_project_to_chat.livestream import LiveMessage
 from link_project_to_chat.stream import TextDelta, ThinkingDelta
@@ -190,6 +192,58 @@ async def test_finalize_without_live_text_falls_back_to_send_to_chat():
     await bot._finalize_claude_task(task)
 
     assert sent_chats == [(task.chat_id, "tool-only answer")]
+
+
+@pytest.mark.asyncio
+async def test_on_task_complete_still_finalizes_when_session_persist_fails(caplog):
+    bot = await _stub_bot()
+    task = _fake_task(task_id=13)
+    task.status = TaskStatus.DONE
+    bot.task_manager = SimpleNamespace(claude=SimpleNamespace(session_id="sess-123"))
+    bot._patch_config = MagicMock(side_effect=RuntimeError("disk full"))
+    bot._finalize_claude_task = AsyncMock()
+
+    with caplog.at_level("ERROR", logger="link_project_to_chat.bot"):
+        await bot._on_task_complete(task)
+
+    bot._finalize_claude_task.assert_awaited_once_with(task)
+    assert "Failed to persist session_id for task #13" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_post_init_softens_forbidden_startup_message(caplog):
+    from link_project_to_chat.bot import COMMANDS, ProjectBot
+
+    init_bot = SimpleNamespace(
+        delete_webhook=AsyncMock(return_value=True),
+        get_me=AsyncMock(return_value=SimpleNamespace(username="demo_bot")),
+        set_my_commands=AsyncMock(),
+        send_message=AsyncMock(
+            side_effect=Forbidden("bot can't initiate conversation with a user")
+        ),
+    )
+    app = SimpleNamespace(bot=init_bot)
+    bot = ProjectBot.__new__(ProjectBot)
+    bot.name = "demo"
+    bot.path = "/tmp/demo"
+    bot.group_mode = False
+    bot.team_name = None
+    bot.role = None
+    bot.bot_username = ""
+    bot._get_trusted_user_ids = lambda: [8206818037]
+    bot._refresh_team_system_note = MagicMock()
+
+    with caplog.at_level("INFO", logger="link_project_to_chat.bot"):
+        await bot._post_init(app)
+
+    init_bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+    init_bot.set_my_commands.assert_awaited_once_with(COMMANDS)
+    init_bot.send_message.assert_awaited_once_with(
+        8206818037,
+        "Bot started.\nProject: demo\nPath: /tmp/demo",
+    )
+    assert "Skipping startup message to 8206818037" in caplog.text
+    assert "Failed to send startup message" not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -412,7 +413,14 @@ class ProjectBot(AuthMixin):
 
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
-                self._patch_config({"session_id": self.task_manager.claude.session_id})
+                try:
+                    self._patch_config(
+                        {"session_id": self.task_manager.claude.session_id}
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist session_id for task #%d", task.id
+                    )
             await self._finalize_claude_task(task)
         else:
             await self._finalize_command_task(task)
@@ -1610,6 +1618,12 @@ class ProjectBot(AuthMixin):
                 await app.bot.send_message(
                     uid,
                     f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+                )
+            except Forbidden as exc:
+                logger.info(
+                    "Skipping startup message to %d: %s",
+                    uid,
+                    exc,
                 )
             except Exception:
                 logger.error("Failed to send startup message to %d", uid, exc_info=True)
