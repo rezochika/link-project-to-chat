@@ -883,7 +883,8 @@ class ProjectBot(AuthMixin):
             f"@handles — never placeholders like '@developer'/'@manager' and never a "
             f"different suffix from what is pinned here. "
             f"IMPORTANT: Every single reply you send must begin with "
-            f"@{self.peer_bot_username} so your peer receives it via the group relay. "
+            f"@{self.peer_bot_username} on its own line (followed by a blank line, "
+            f"then your message content) so your peer receives it via the group relay. "
             f"Never send a reply without this @mention, even for short status updates."
         )
 
