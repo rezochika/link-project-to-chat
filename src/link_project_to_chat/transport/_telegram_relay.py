@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _RELAY_PREFIX = "[auto-relay from "
 
+# Shared with transport/telegram.py's _RELAY_PREFIX_RE — keep these in sync.
+# Telegram bot usernames are constrained to [A-Za-z][A-Za-z0-9_]*.
+_RELAY_HANDLE_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
+
 
 def is_relayed_text(text: str) -> bool:
     """Return True if this text was produced by TeamRelay, so downstream bots

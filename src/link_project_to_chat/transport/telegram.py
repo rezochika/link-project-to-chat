@@ -33,7 +33,8 @@ _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # That is intentional: '@handle' would make peer bots re-process the relayed
 # message as a self-mention. See transport/_telegram_relay.py for where the
 # prefix is written.
-_RELAY_PREFIX_RE = re.compile(r"^\[auto-relay from [A-Za-z][A-Za-z0-9_]*\]\n\n")
+from ._telegram_relay import _RELAY_HANDLE_PATTERN
+_RELAY_PREFIX_RE = re.compile(rf"^\[auto-relay from {_RELAY_HANDLE_PATTERN}\]\n\n")
 
 
 def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
