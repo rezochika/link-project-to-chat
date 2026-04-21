@@ -331,7 +331,7 @@ class ProjectBot(AuthMixin):
         if task.status == TaskStatus.DONE:
             if live_text is not None:
                 # Don't pass task.result — it contains only the LAST assistant text block.
-                # The LiveMessage buffer already holds every streamed text delta (narration
+                # The StreamingMessage buffer already holds every streamed text delta (narration
                 # + final answer); overwriting it would make intermediate narration vanish.
                 # Fall back to task.result only when the buffer is empty (stream dropped).
                 has_buffer = bool(live_text.buffer.strip())
