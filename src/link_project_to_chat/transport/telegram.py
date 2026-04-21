@@ -130,10 +130,6 @@ class TelegramTransport:
 
         Call once after build(), before start(). Relay lifecycle is tied to
         start()/stop() thereafter.
-
-        TODO(spec #0c): manager/bot.py still constructs TeamRelay directly via
-        the deferred-port compromise. Once the manager port lands, all relay
-        instantiation should funnel through this method.
         """
         from ._telegram_relay import TeamRelay
         self._team_relay = TeamRelay(

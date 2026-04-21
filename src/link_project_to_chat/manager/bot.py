@@ -2041,6 +2041,10 @@ class ManagerBot(AuthMixin):
         # Fully-ported commands (spec #0c Tasks 8-9) — consume CommandInvocation
         # directly. Registered on the transport; PTB is bridged via
         # _dispatch_command so the existing app.add_handler pathway still works.
+        # TODO(spec #1): Underscore-method access needed because the manager
+        # can't use attach_telegram_routing (conflicts with ConversationHandler
+        # CallbackQueryHandlers). Consider elevating _dispatch_{command,button}
+        # to public API in the Conversation-primitive spec.
         ported_commands = {
             "projects": self._on_projects_from_transport,
             "teams": self._on_teams_from_transport,
@@ -2157,6 +2161,10 @@ class ManagerBot(AuthMixin):
         # transport. PTB is bridged so wizard-internal CallbackQueryHandlers (which
         # ConversationHandler routes by state) keep ownership of their clicks; this
         # last-position handler picks up everything else.
+        # TODO(spec #1): Underscore-method access needed because the manager
+        # can't use attach_telegram_routing (conflicts with ConversationHandler
+        # CallbackQueryHandlers). Consider elevating _dispatch_{command,button}
+        # to public API in the Conversation-primitive spec.
         self._transport.on_button(self._on_button_from_transport)
         app.add_handler(CallbackQueryHandler(
             lambda u, c: self._transport._dispatch_button(u, c)

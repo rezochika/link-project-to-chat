@@ -1199,7 +1199,7 @@ class ProjectBot(AuthMixin):
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         from .transport.telegram import chat_ref_from_telegram
-        # TODO(spec #0c): port to CommandInvocation; chat_ref is currently telegram-only.
+        # TODO(spec #1): port to CommandInvocation once Conversation primitive ships.
         self._group_state.halt(chat_ref_from_telegram(update.effective_chat))
         await update.effective_message.reply_text("Halted. Use /resume to continue.")
 
@@ -1211,7 +1211,7 @@ class ProjectBot(AuthMixin):
         if not self._auth(update.effective_user):
             return await update.effective_message.reply_text("Unauthorized.")
         from .transport.telegram import chat_ref_from_telegram
-        # TODO(spec #0c): port to CommandInvocation; chat_ref is currently telegram-only.
+        # TODO(spec #1): port to CommandInvocation once Conversation primitive ships.
         self._group_state.resume(chat_ref_from_telegram(update.effective_chat))
         await update.effective_message.reply_text("Resumed.")
 
