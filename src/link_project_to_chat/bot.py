@@ -881,7 +881,10 @@ class ProjectBot(AuthMixin):
             f"Your team peer (role: {peer_role}) in this group is @{self.peer_bot_username}. "
             f"When referring to yourself or directing work to the peer, use these exact "
             f"@handles — never placeholders like '@developer'/'@manager' and never a "
-            f"different suffix from what is pinned here."
+            f"different suffix from what is pinned here. "
+            f"IMPORTANT: Every single reply you send must begin with "
+            f"@{self.peer_bot_username} so your peer receives it via the group relay. "
+            f"Never send a reply without this @mention, even for short status updates."
         )
 
     def _backfill_own_bot_username(self, config_path: Path | None = None) -> None:
