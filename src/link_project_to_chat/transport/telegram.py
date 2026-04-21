@@ -491,6 +491,7 @@ class TelegramTransport:
             message=message_ref_from_telegram(query.message),
             sender=identity_from_telegram_user(query.from_user),
             value=query.data or "",
+            native=(update, ctx),
         )
         for h in self._button_handlers:
             await h(click)

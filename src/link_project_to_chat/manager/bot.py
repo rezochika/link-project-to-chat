@@ -1611,72 +1611,128 @@ class ManagerBot(AuthMixin):
         rows.append([InlineKeyboardButton("« Back", callback_data="proj_back")])
         return InlineKeyboardMarkup(rows)
 
-    async def _on_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
-        if not query or not query.data:
-            return
-        if not self._auth(query.from_user):
-            await query.answer("Unauthorized.")
-            return
-        await query.answer()
-        # Any button press cancels a pending inline edit
-        ctx.user_data.pop("pending_edit", None)
+    def _proj_detail_buttons(self, name: str, status: str) -> Buttons:
+        """Transport-native counterpart of _proj_detail_markup."""
+        rows: list[list[Button]] = []
+        if status == "running":
+            rows.append([Button(label="Stop", value=f"proj_stop_{name}")])
+            rows.append([Button(label="Logs", value=f"proj_logs_{name}")])
+        else:
+            rows.append([Button(label="Start", value=f"proj_start_{name}")])
+        rows.append([Button(label="Edit", value=f"proj_edit_{name}")])
+        rows.append([Button(label="Remove", value=f"proj_remove_{name}")])
+        rows.append([Button(label="« Back", value="proj_back")])
+        return Buttons(rows=rows)
 
-        data = query.data
+    def _team_detail_buttons(self, team_name: str, team) -> Buttons:
+        """Transport-native counterpart of _team_detail_markup."""
+        running = self._team_running_count(team_name, team)
+        total = len(team.bots)
+        rows: list[list[Button]] = []
+        if running < total:
+            rows.append([Button(
+                label="Start" if running == 0 else "Start remaining",
+                value=f"team_start_{team_name}",
+            )])
+        if running > 0:
+            rows.append([Button(label="Stop", value=f"team_stop_{team_name}")])
+        rows.append([Button(label="« Back", value="team_back")])
+        return Buttons(rows=rows)
 
-        if data.startswith("proj_info_"):
-            name = data[len("proj_info_"):]
+    async def _on_button_from_transport(self, click) -> None:
+        """Transport-native callback dispatcher.
+
+        Routes inline-button clicks based on click.value prefix. Replaces the
+        legacy _on_callback(update, ctx) PTB handler. Wizard-internal callbacks
+        (inside ConversationHandler.states) remain PTB-typed; this handler owns
+        the GLOBAL ladder previously served by app.add_handler(CallbackQueryHandler).
+        """
+        if not self._auth_identity(click.sender):
+            return  # silent for unauthorized callbacks (don't reveal handler structure)
+
+        # Any button press cancels a pending inline edit. The pending_edit
+        # state lives in PTB's per-user storage because the follow-up text
+        # input still flows through PTB's MessageHandler (_edit_field_save).
+        # Reach through native=(update, ctx) to clear it; falls back to a
+        # no-op on transports that don't carry PTB state (FakeTransport).
+        native = click.native
+        ctx_user_data = None
+        if isinstance(native, tuple) and len(native) >= 2:
+            ctx = native[1]
+            ctx_user_data = getattr(ctx, "user_data", None)
+        if ctx_user_data is not None:
+            ctx_user_data.pop("pending_edit", None)
+
+        value = click.value
+
+        if value.startswith("proj_info_"):
+            name = value[len("proj_info_"):]
             status = self._pm.status(name)
-            await query.edit_message_text(
-                f"{name}: {status}", reply_markup=self._proj_detail_markup(name, status)
+            await self._transport.edit_text(
+                click.message,
+                f"{name}: {status}",
+                buttons=self._proj_detail_buttons(name, status),
             )
 
-        elif data == "proj_back":
-            markup = self._list_markup()
-            await query.edit_message_text(
-                self._projects_text() if markup else "No projects configured.", reply_markup=markup
+        elif value == "proj_back":
+            buttons = self._list_buttons()
+            await self._transport.edit_text(
+                click.message,
+                self._projects_text() if buttons else "No projects configured.",
+                buttons=buttons,
             )
 
-        elif data.startswith("proj_start_"):
-            name = data[len("proj_start_"):]
+        elif value.startswith("proj_start_"):
+            name = value[len("proj_start_"):]
             self._pm.start(name)
             status = self._pm.status(name)
-            await query.edit_message_text(
-                f"{name}: {status}", reply_markup=self._proj_detail_markup(name, status)
+            await self._transport.edit_text(
+                click.message,
+                f"{name}: {status}",
+                buttons=self._proj_detail_buttons(name, status),
             )
 
-        elif data.startswith("proj_stop_"):
-            name = data[len("proj_stop_"):]
+        elif value.startswith("proj_stop_"):
+            name = value[len("proj_stop_"):]
             self._pm.stop(name)
             status = self._pm.status(name)
-            await query.edit_message_text(
-                f"{name}: {status}", reply_markup=self._proj_detail_markup(name, status)
+            await self._transport.edit_text(
+                click.message,
+                f"{name}: {status}",
+                buttons=self._proj_detail_buttons(name, status),
             )
 
-        elif data.startswith("proj_logs_"):
-            name = data[len("proj_logs_"):]
+        elif value.startswith("proj_logs_"):
+            name = value[len("proj_logs_"):]
             output = self._pm.logs(name)
             if len(output) > 3500:
                 output = output[-3500:]
             escaped = output.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            rows = [[InlineKeyboardButton("« Back", callback_data=f"proj_info_{name}")]]
-            await query.edit_message_text(
-                f"<pre>{escaped}</pre>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+            await self._transport.edit_text(
+                click.message,
+                f"<pre>{escaped}</pre>",
+                buttons=Buttons(rows=[[Button(label="« Back", value=f"proj_info_{name}")]]),
+                html=True,
             )
 
-        elif data.startswith("proj_edit_"):
-            name = data[len("proj_edit_"):]
-            rows = [
-                [InlineKeyboardButton(field.capitalize().replace("_", " "), callback_data=f"proj_efld_{field}_{name}")]
+        elif value.startswith("proj_edit_"):
+            name = value[len("proj_edit_"):]
+            rows: list[list[Button]] = [
+                [Button(
+                    label=field.capitalize().replace("_", " "),
+                    value=f"proj_efld_{field}_{name}",
+                )]
                 for field in _BUTTON_EDIT_FIELDS
             ]
-            rows.append([InlineKeyboardButton("« Back", callback_data=f"proj_info_{name}")])
-            await query.edit_message_text(
-                f"Edit '{name}' — choose field:", reply_markup=InlineKeyboardMarkup(rows)
+            rows.append([Button(label="« Back", value=f"proj_info_{name}")])
+            await self._transport.edit_text(
+                click.message,
+                f"Edit '{name}' — choose field:",
+                buttons=Buttons(rows=rows),
             )
 
-        elif data.startswith("proj_efld_"):
-            parsed = _parse_edit_callback(data)
+        elif value.startswith("proj_efld_"):
+            parsed = _parse_edit_callback(value)
             if parsed:
                 field, name = parsed
                 if field == "model":
@@ -1685,20 +1741,26 @@ class ManagerBot(AuthMixin):
                     rows = []
                     for model_id, label in MODEL_OPTIONS:
                         prefix = "● " if current == model_id else ""
-                        rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"proj_model_{model_id}_{name}")])
-                    rows.append([InlineKeyboardButton("« Back", callback_data=f"proj_edit_{name}")])
-                    await query.edit_message_text(
+                        rows.append([Button(
+                            label=f"{prefix}{label}",
+                            value=f"proj_model_{model_id}_{name}",
+                        )])
+                    rows.append([Button(label="« Back", value=f"proj_edit_{name}")])
+                    await self._transport.edit_text(
+                        click.message,
                         f"Select model for '{name}':\nCurrent: {current or 'default'}",
-                        reply_markup=InlineKeyboardMarkup(rows),
+                        buttons=Buttons(rows=rows),
                     )
                 else:
-                    ctx.user_data["pending_edit"] = {"name": name, "field": field}
-                    await query.edit_message_text(
-                        f"Enter new value for {field} of '{name}':\n(/cancel to abort)"
+                    if ctx_user_data is not None:
+                        ctx_user_data["pending_edit"] = {"name": name, "field": field}
+                    await self._transport.edit_text(
+                        click.message,
+                        f"Enter new value for {field} of '{name}':\n(/cancel to abort)",
                     )
 
-        elif data.startswith("proj_model_"):
-            rest = data[len("proj_model_"):]
+        elif value.startswith("proj_model_"):
+            rest = value[len("proj_model_"):]
             valid_ids = {m[0] for m in MODEL_OPTIONS}
             model_id = None
             name = None
@@ -1716,16 +1778,20 @@ class ManagerBot(AuthMixin):
                 rows = []
                 for mid, label in MODEL_OPTIONS:
                     prefix = "● " if current == mid else ""
-                    rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"proj_model_{mid}_{name}")])
-                rows.append([InlineKeyboardButton("« Back", callback_data=f"proj_edit_{name}")])
+                    rows.append([Button(
+                        label=f"{prefix}{label}",
+                        value=f"proj_model_{mid}_{name}",
+                    )])
+                rows.append([Button(label="« Back", value=f"proj_edit_{name}")])
                 label = next((l for m, l in MODEL_OPTIONS if m == model_id), model_id)
-                await query.edit_message_text(
+                await self._transport.edit_text(
+                    click.message,
                     f"Model for '{name}' set to: {label}\nRestart the project to apply.",
-                    reply_markup=InlineKeyboardMarkup(rows),
+                    buttons=Buttons(rows=rows),
                 )
 
-        elif data.startswith("global_model_"):
-            model_id = data[len("global_model_"):]
+        elif value.startswith("global_model_"):
+            model_id = value[len("global_model_"):]
             valid_ids = {m[0] for m in MODEL_OPTIONS}
             if model_id in valid_ids:
                 from ..config import load_config, save_config
@@ -1734,97 +1800,121 @@ class ManagerBot(AuthMixin):
                 cfg.default_model = model_id
                 save_config(cfg, cfg_path)
                 label = next((l for m, l in MODEL_OPTIONS if m == model_id), model_id)
-                await query.edit_message_text(
+                await self._transport.edit_text(
+                    click.message,
                     f"Default model set to: {label}\nRestart projects to apply.",
-                    reply_markup=self._global_model_markup(),
+                    buttons=self._global_model_buttons(),
                 )
 
-        elif data.startswith("proj_remove_"):
-            name = data[len("proj_remove_"):]
+        elif value.startswith("proj_remove_"):
+            name = value[len("proj_remove_"):]
             projects = self._load_projects()
             if name in projects:
                 self._pm.stop(name)
                 del projects[name]
                 self._save_projects(projects)
-            markup = self._list_markup()
-            await query.edit_message_text(
-                self._projects_text() if markup else "No projects configured.", reply_markup=markup
+            buttons = self._list_buttons()
+            await self._transport.edit_text(
+                click.message,
+                self._projects_text() if buttons else "No projects configured.",
+                buttons=buttons,
             )
 
-        elif data == "team_back":
-            markup = self._teams_list_markup()
-            if markup is None:
-                await query.edit_message_text("No teams configured.")
+        elif value == "team_back":
+            buttons = self._teams_list_buttons()
+            if buttons is None:
+                await self._transport.edit_text(click.message, "No teams configured.")
             else:
                 teams = self._load_teams()
-                await query.edit_message_text(
-                    f"Teams ({len(teams)}):", reply_markup=markup
+                await self._transport.edit_text(
+                    click.message, f"Teams ({len(teams)}):", buttons=buttons,
                 )
 
-        elif data.startswith("team_info_"):
-            team_name = data[len("team_info_"):]
+        elif value.startswith("team_info_"):
+            team_name = value[len("team_info_"):]
             teams = self._load_teams()
             team = teams.get(team_name)
             if team is None:
-                await query.edit_message_text(f"Team '{team_name}' not found.")
+                await self._transport.edit_text(
+                    click.message, f"Team '{team_name}' not found.",
+                )
             else:
-                await query.edit_message_text(
+                await self._transport.edit_text(
+                    click.message,
                     self._team_detail_text(team_name, team),
-                    reply_markup=self._team_detail_markup(team_name, team),
+                    buttons=self._team_detail_buttons(team_name, team),
                 )
 
-        elif data.startswith("team_start_"):
-            team_name = data[len("team_start_"):]
+        elif value.startswith("team_start_"):
+            team_name = value[len("team_start_"):]
             teams = self._load_teams()
             team = teams.get(team_name)
             if team is None:
-                await query.edit_message_text(f"Team '{team_name}' not found.")
+                await self._transport.edit_text(
+                    click.message, f"Team '{team_name}' not found.",
+                )
             else:
                 for role in team.bots:
                     self._pm.start_team(team_name, role)
-                await query.edit_message_text(
+                await self._transport.edit_text(
+                    click.message,
                     self._team_detail_text(team_name, team),
-                    reply_markup=self._team_detail_markup(team_name, team),
+                    buttons=self._team_detail_buttons(team_name, team),
                 )
 
-        elif data.startswith("team_stop_"):
-            team_name = data[len("team_stop_"):]
+        elif value.startswith("team_stop_"):
+            team_name = value[len("team_stop_"):]
             teams = self._load_teams()
             team = teams.get(team_name)
             if team is None:
-                await query.edit_message_text(f"Team '{team_name}' not found.")
+                await self._transport.edit_text(
+                    click.message, f"Team '{team_name}' not found.",
+                )
             else:
                 for role in team.bots:
                     self._pm.stop(f"team:{team_name}:{role}")
-                await query.edit_message_text(
+                await self._transport.edit_text(
+                    click.message,
                     self._team_detail_text(team_name, team),
-                    reply_markup=self._team_detail_markup(team_name, team),
+                    buttons=self._team_detail_buttons(team_name, team),
                 )
 
-        elif data == "setup_gh":
-            ctx.user_data["setup_awaiting"] = "github_pat"
-            await query.edit_message_text("Paste your GitHub Personal Access Token:")
+        elif value == "setup_gh":
+            if ctx_user_data is not None:
+                ctx_user_data["setup_awaiting"] = "github_pat"
+            await self._transport.edit_text(
+                click.message, "Paste your GitHub Personal Access Token:",
+            )
 
-        elif data == "setup_api":
-            ctx.user_data["setup_awaiting"] = "api_id"
-            await query.edit_message_text("Enter your Telegram API ID (from my.telegram.org):")
+        elif value == "setup_api":
+            if ctx_user_data is not None:
+                ctx_user_data["setup_awaiting"] = "api_id"
+            await self._transport.edit_text(
+                click.message, "Enter your Telegram API ID (from my.telegram.org):",
+            )
 
-        elif data == "setup_telethon":
-            ctx.user_data["setup_awaiting"] = "phone"
-            await query.edit_message_text("Enter your phone number (with country code, e.g. +1234567890):")
+        elif value == "setup_telethon":
+            if ctx_user_data is not None:
+                ctx_user_data["setup_awaiting"] = "phone"
+            await self._transport.edit_text(
+                click.message,
+                "Enter your phone number (with country code, e.g. +1234567890):",
+            )
 
-        elif data == "setup_voice":
-            ctx.user_data["setup_awaiting"] = "stt_backend"
-            await query.edit_message_text(
+        elif value == "setup_voice":
+            if ctx_user_data is not None:
+                ctx_user_data["setup_awaiting"] = "stt_backend"
+            await self._transport.edit_text(
+                click.message,
                 "Choose STT backend:\n"
                 "• whisper-api — OpenAI Whisper API (recommended)\n"
                 "• whisper-cli — Local whisper.cpp\n"
                 "• off — Disable voice\n\n"
-                "Type your choice:"
+                "Type your choice:",
             )
 
-        elif data == "setup_done":
-            await query.edit_message_text("Setup complete.")
+        elif value == "setup_done":
+            await self._transport.edit_text(click.message, "Setup complete.")
 
     async def _post_init(self, app) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -2007,5 +2097,12 @@ class ManagerBot(AuthMixin):
 
         app.add_handler(CommandHandler("cancel", self._edit_cancel))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._edit_field_save))
-        app.add_handler(CallbackQueryHandler(self._on_callback))
+        # Spec #0c Task 10: global inline-button menus consume ButtonClick via the
+        # transport. PTB is bridged so wizard-internal CallbackQueryHandlers (which
+        # ConversationHandler routes by state) keep ownership of their clicks; this
+        # last-position handler picks up everything else.
+        self._transport.on_button(self._on_button_from_transport)
+        app.add_handler(CallbackQueryHandler(
+            lambda u, c: self._transport._dispatch_button(u, c)
+        ))
         return app

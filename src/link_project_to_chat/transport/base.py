@@ -66,6 +66,7 @@ class ButtonClick:
     message: MessageRef
     sender: Identity
     value: str
+    native: Any = None
 
 
 @dataclass(frozen=True)

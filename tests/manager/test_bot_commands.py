@@ -9,6 +9,7 @@ import pytest
 from link_project_to_chat.manager.bot import ManagerBot
 from link_project_to_chat.manager.process import ProcessManager
 from link_project_to_chat.transport import (
+    ButtonClick,
     ChatKind,
     ChatRef,
     CommandInvocation,
@@ -67,19 +68,37 @@ def _swap_fake_transport(bot: ManagerBot) -> FakeTransport:
     return fake
 
 
-def _make_callback(data: str, user_id: int = 1, username: str = "testuser"):
-    user = MagicMock()
-    user.id = user_id
-    user.username = username
-    query = AsyncMock()
-    query.data = data
-    query.from_user = user
-    query.answer = AsyncMock()
-    query.edit_message_text = AsyncMock()
-    update = MagicMock()
-    update.callback_query = query
+def _make_button_click(
+    value: str,
+    *,
+    user_id: int = 1,
+    username: str = "testuser",
+    user_data: dict | None = None,
+) -> tuple[ButtonClick, dict]:
+    """Build a ButtonClick suitable for _on_button_from_transport.
+
+    Returns (click, user_data) where user_data is a real dict that mirrors
+    what PTB's per-user storage provides via click.native[1].user_data.
+    The caller can mutate it to seed pending_edit / setup_awaiting before the
+    handler runs and read it after to assert state mutations.
+    """
+    chat = ChatRef(transport_id="fake", native_id=str(user_id), kind=ChatKind.DM)
+    msg = MessageRef(transport_id="fake", native_id="1", chat=chat)
+    sender = Identity(
+        transport_id="fake",
+        native_id=str(user_id),
+        display_name=username,
+        handle=username,
+        is_bot=False,
+    )
+    state = user_data if user_data is not None else {}
     ctx = MagicMock()
-    return update, ctx, query
+    ctx.user_data = state
+    update = MagicMock()
+    click = ButtonClick(
+        chat=chat, message=msg, sender=sender, value=value, native=(update, ctx),
+    )
+    return click, state
 
 
 @pytest.fixture
@@ -221,11 +240,11 @@ async def test_editproject_invalid_field(bot_env, tmp_path: Path):
 async def test_callback_proj_info(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    update, ctx, query = _make_callback("proj_info_myproj")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
-    text = query.edit_message_text.call_args[0][0]
-    assert "myproj" in text
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_info_myproj")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
+    assert "myproj" in fake.edited_messages[-1].text
 
 
 @pytest.mark.asyncio
@@ -233,9 +252,10 @@ async def test_callback_proj_start(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     pm._command_builder = lambda name, cfg: ["sleep", "60"]
-    update, ctx, query = _make_callback("proj_start_myproj")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_start_myproj")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
     assert pm.status("myproj") == "running"
     pm.stop("myproj")
 
@@ -247,9 +267,10 @@ async def test_callback_proj_stop(bot_env, tmp_path: Path):
     pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
     assert pm.status("myproj") == "running"
-    update, ctx, query = _make_callback("proj_stop_myproj")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_stop_myproj")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
     assert pm.status("myproj") == "stopped"
 
 
@@ -259,9 +280,10 @@ async def test_callback_proj_remove(bot_env, tmp_path: Path):
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
     pm._command_builder = lambda name, cfg: ["sleep", "60"]
     pm.start("myproj")
-    update, ctx, query = _make_callback("proj_remove_myproj")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_remove_myproj")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
     assert "myproj" not in json.loads(proj_cfg.read_text())["projects"]
     assert pm.status("myproj") == "stopped"
 
@@ -269,18 +291,24 @@ async def test_callback_proj_remove(bot_env, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_callback_proj_back(bot_env):
     bot, pm, proj_cfg = bot_env
-    update, ctx, query = _make_callback("proj_back")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_back")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
 
 
 @pytest.mark.asyncio
 async def test_callback_unauthorized(bot_env):
+    """Unauthorized button clicks are silent — no edit, no reveal of dispatch
+    structure. Behaviour shifted from the legacy popup ('Unauthorized.') because
+    Transport doesn't expose answer-with-text; transport.on_button auto-answers
+    silently before the handler runs. See spec #0c Task 10 self-review."""
     bot, pm, proj_cfg = bot_env
-    update, ctx, query = _make_callback("proj_back", user_id=999, username="hacker")
-    await bot._on_callback(update, ctx)
-    query.answer.assert_called_with("Unauthorized.")
-    query.edit_message_text.assert_not_called()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_back", user_id=999, username="hacker")
+    await bot._on_button_from_transport(click)
+    assert fake.edited_messages == []
+    assert fake.sent_messages == []
 
 
 @pytest.mark.asyncio
@@ -296,36 +324,35 @@ async def test_projects_header_shows_count(bot_env, tmp_path: Path):
 async def test_callback_proj_edit_shows_fields(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    update, ctx, query = _make_callback("proj_edit_myproj")
-    await bot._on_callback(update, ctx)
-    query.edit_message_text.assert_called_once()
-    text = query.edit_message_text.call_args[0][0]
-    assert "myproj" in text
-    markup = query.edit_message_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert any("proj_efld_path_myproj" == d for d in button_datas)
-    assert any("proj_efld_model_myproj" == d for d in button_datas)
-    assert any("proj_info_myproj" == d for d in button_datas)  # Back button
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_edit_myproj")
+    await bot._on_button_from_transport(click)
+    assert len(fake.edited_messages) == 1
+    edited = fake.edited_messages[-1]
+    assert "myproj" in edited.text
+    assert edited.buttons is not None
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "proj_efld_path_myproj" in button_values
+    assert "proj_efld_model_myproj" in button_values
+    assert "proj_info_myproj" in button_values  # Back button
 
 
 @pytest.mark.asyncio
 async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
 
     # Clicking the "model" field button shows a model picker (not pending_edit)
-    update, ctx, query = _make_callback("proj_efld_model_myproj")
-    ctx.user_data = {}
-    await bot._on_callback(update, ctx)
-    assert "pending_edit" not in ctx.user_data
-    query.edit_message_text.assert_called_once()
-    call_text = query.edit_message_text.call_args[0][0]
-    assert "Select model" in call_text
+    click, state = _make_button_click("proj_efld_model_myproj")
+    await bot._on_button_from_transport(click)
+    assert "pending_edit" not in state
+    assert len(fake.edited_messages) == 1
+    assert "Select model" in fake.edited_messages[-1].text
 
     # Clicking a model option saves it
-    update2, ctx2, query2 = _make_callback("proj_model_opus_myproj")
-    ctx2.user_data = {}
-    await bot._on_callback(update2, ctx2)
+    click2, _ = _make_button_click("proj_model_opus_myproj")
+    await bot._on_button_from_transport(click2)
     assert json.loads(proj_cfg.read_text())["projects"]["myproj"].get("model") == "opus"
 
 
@@ -333,13 +360,15 @@ async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
 async def test_edit_field_rename_via_button(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    _swap_fake_transport(bot)
 
-    update, ctx, query = _make_callback("proj_efld_name_myproj")
-    ctx.user_data = {}
-    await bot._on_callback(update, ctx)
+    click, state = _make_button_click("proj_efld_name_myproj")
+    await bot._on_button_from_transport(click)
 
+    # pending_edit persists in the same user_data dict, so route the followup text
+    # through _edit_field_save with the same state to complete the rename.
     save_update, save_ctx = _make_update(text="renamed")
-    save_ctx.user_data = ctx.user_data
+    save_ctx.user_data = state
     await bot._edit_field_save(save_update, save_ctx)
     projects = json.loads(proj_cfg.read_text())["projects"]
     assert "renamed" in projects and "myproj" not in projects
@@ -358,18 +387,17 @@ async def test_edit_cancel(bot_env):
 async def test_button_click_cancels_pending_edit(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    _swap_fake_transport(bot)
 
     # Start a non-model edit (e.g. "name") — this still uses pending_edit
-    update, ctx, query = _make_callback("proj_efld_name_myproj")
-    ctx.user_data = {}
-    await bot._on_callback(update, ctx)
-    assert "pending_edit" in ctx.user_data
+    click, state = _make_button_click("proj_efld_name_myproj")
+    await bot._on_button_from_transport(click)
+    assert "pending_edit" in state
 
-    # Click back — clears pending_edit
-    update2, ctx2, query2 = _make_callback("proj_back")
-    ctx2.user_data = ctx.user_data
-    await bot._on_callback(update2, ctx2)
-    assert "pending_edit" not in ctx2.user_data
+    # Click back — clears pending_edit (reusing the same user_data dict)
+    click2, _ = _make_button_click("proj_back", user_data=state)
+    await bot._on_button_from_transport(click2)
+    assert "pending_edit" not in state
 
 
 @pytest.mark.asyncio
@@ -438,15 +466,16 @@ async def test_callback_team_info_shows_start_and_per_bot_status(bot_env):
         "manager": {"telegram_bot_token": "t1"},
         "dev":     {"telegram_bot_token": "t2"},
     })
-    update, ctx, query = _make_callback("team_info_acme")
-    await bot._on_callback(update, ctx)
-    text = query.edit_message_text.call_args[0][0]
-    assert "acme" in text
-    assert "manager" in text and "dev" in text
-    markup = query.edit_message_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert "team_start_acme" in button_datas
-    assert "team_back" in button_datas
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_info_acme")
+    await bot._on_button_from_transport(click)
+    edited = fake.edited_messages[-1]
+    assert "acme" in edited.text
+    assert "manager" in edited.text and "dev" in edited.text
+    assert edited.buttons is not None
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "team_start_acme" in button_values
+    assert "team_back" in button_values
 
 
 @pytest.mark.asyncio
@@ -458,13 +487,14 @@ async def test_callback_team_start_invokes_start_team_for_each_bot(bot_env):
     })
     pm.start_team = MagicMock(return_value=True)
     pm.status = MagicMock(return_value="running")
-    update, ctx, query = _make_callback("team_start_acme")
-    await bot._on_callback(update, ctx)
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_start_acme")
+    await bot._on_button_from_transport(click)
     calls = {c.args for c in pm.start_team.call_args_list}
     assert calls == {("acme", "manager"), ("acme", "dev")}
-    markup = query.edit_message_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert "team_stop_acme" in button_datas
+    edited = fake.edited_messages[-1]
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "team_stop_acme" in button_values
 
 
 @pytest.mark.asyncio
@@ -476,21 +506,23 @@ async def test_callback_team_stop_invokes_stop_for_each_bot(bot_env):
     })
     pm.stop = MagicMock(return_value=True)
     pm.status = MagicMock(return_value="stopped")
-    update, ctx, query = _make_callback("team_stop_acme")
-    await bot._on_callback(update, ctx)
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_stop_acme")
+    await bot._on_button_from_transport(click)
     stopped_keys = {c.args[0] for c in pm.stop.call_args_list}
     assert stopped_keys == {"team:acme:manager", "team:acme:dev"}
-    markup = query.edit_message_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert "team_start_acme" in button_datas
+    edited = fake.edited_messages[-1]
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "team_start_acme" in button_values
 
 
 @pytest.mark.asyncio
 async def test_callback_team_back_relists_teams(bot_env):
     bot, pm, proj_cfg = bot_env
     _write_team(proj_cfg, "acme", {"manager": {"telegram_bot_token": "t1"}})
-    update, ctx, query = _make_callback("team_back")
-    await bot._on_callback(update, ctx)
-    markup = query.edit_message_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert "team_info_acme" in button_datas
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_back")
+    await bot._on_button_from_transport(click)
+    edited = fake.edited_messages[-1]
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "team_info_acme" in button_values
