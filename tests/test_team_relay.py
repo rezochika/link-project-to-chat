@@ -80,10 +80,11 @@ def _fake_sender(username: str, is_bot: bool):
     return s
 
 
-async def _mk_event(text: str, sender_username: str, sender_is_bot: bool):
+async def _mk_event(text: str, sender_username: str, sender_is_bot: bool, chat_id: int | None = -100_111):
     event = MagicMock()
     event.message = MagicMock()
     event.message.message = text
+    event.message.chat_id = chat_id
     event.get_sender = AsyncMock(return_value=_fake_sender(sender_username, sender_is_bot))
     return event
 
