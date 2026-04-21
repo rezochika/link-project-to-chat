@@ -4,6 +4,7 @@ import logging
 import time
 import warnings
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -19,6 +20,10 @@ from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
 from ..config import DEFAULT_CONFIG
 from .._auth import AuthMixin
+from ..transport import Button, Buttons
+
+if TYPE_CHECKING:
+    from ..transport import CommandInvocation
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +262,22 @@ class ManagerBot(AuthMixin):
             return False
         return True
 
+    async def _guard_invocation(self, invocation: "CommandInvocation") -> bool:
+        """Transport-native counterpart of _guard.
+
+        Sends replies via the transport and reads auth state from the
+        CommandInvocation's Identity. Preserves the same Unauthorized./
+        Rate limited. reply contract as _guard.
+        """
+        sender = invocation.sender
+        if not sender or not self._auth_identity(sender):
+            await self._transport.send_text(invocation.chat, "Unauthorized.")
+            return False
+        if self._rate_limited(int(sender.native_id)):
+            await self._transport.send_text(invocation.chat, "Rate limited. Try again shortly.")
+            return False
+        return True
+
     def _incoming_from_update(self, update) -> "IncomingMessage":
         """Build a transient IncomingMessage from a telegram Update.
 
@@ -293,13 +314,28 @@ class ManagerBot(AuthMixin):
             for name, status in projects
         ])
 
-    async def _on_projects(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    def _list_buttons(self) -> Buttons | None:
+        """Transport-native counterpart of _list_markup."""
+        projects = self._pm.list_all()
+        if not projects:
+            return None
+        return Buttons(rows=[
+            [Button(
+                label=f"{'[+]' if status == 'running' else '[-]'} {name}",
+                value=f"proj_info_{name}",
+            )]
+            for name, status in projects
+        ])
+
+    async def _on_projects_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /projects."""
+        if not await self._guard_invocation(invocation):
             return
-        markup = self._list_markup()
-        await update.effective_message.reply_text(
-            self._projects_text() if markup else "No projects configured.",
-            reply_markup=markup,
+        buttons = self._list_buttons()
+        await self._transport.send_text(
+            invocation.chat,
+            self._projects_text() if buttons else "No projects configured.",
+            buttons=buttons,
         )
 
     async def _on_start_all(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,18 +396,38 @@ class ManagerBot(AuthMixin):
         rows.append([InlineKeyboardButton("« Back", callback_data="team_back")])
         return InlineKeyboardMarkup(rows)
 
-    async def _on_teams(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    def _teams_list_buttons(self) -> Buttons | None:
+        """Transport-native counterpart of _teams_list_markup."""
+        teams = self._load_teams()
+        if not teams:
+            return None
+        rows = []
+        for team_name in sorted(teams):
+            team = teams[team_name]
+            running = self._team_running_count(team_name, team)
+            total = len(team.bots)
+            rows.append([Button(
+                label=f"[{running}/{total}] {team_name}",
+                value=f"team_info_{team_name}",
+            )])
+        return Buttons(rows=rows)
+
+    async def _on_teams_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /teams."""
+        if not await self._guard_invocation(invocation):
             return
-        markup = self._teams_list_markup()
-        if markup is None:
-            await update.effective_message.reply_text(
-                "No teams configured. Use /create_team to create one."
+        buttons = self._teams_list_buttons()
+        if buttons is None:
+            await self._transport.send_text(
+                invocation.chat,
+                "No teams configured. Use /create_team to create one.",
             )
             return
         teams = self._load_teams()
-        await update.effective_message.reply_text(
-            f"Teams ({len(teams)}):", reply_markup=markup
+        await self._transport.send_text(
+            invocation.chat,
+            f"Teams ({len(teams)}):",
+            buttons=buttons,
         )
 
     def _global_model_markup(self) -> InlineKeyboardMarkup:
@@ -394,17 +450,22 @@ class ManagerBot(AuthMixin):
             reply_markup=self._global_model_markup(),
         )
 
-    async def _on_version(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_version_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /version."""
+        if not await self._guard_invocation(invocation):
             return
         from .. import __version__
-        await update.effective_message.reply_text(f"link-project-to-chat v{__version__}")
+        await self._transport.send_text(
+            invocation.chat, f"link-project-to-chat v{__version__}"
+        )
 
-    async def _on_help(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_help_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /help."""
+        if not await self._guard_invocation(invocation):
             return
-        await update.effective_message.reply_text(
-            "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+        await self._transport.send_text(
+            invocation.chat,
+            "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS),
         )
 
     # ConversationHandler states for /add_project
@@ -480,14 +541,16 @@ class ManagerBot(AuthMixin):
         await update.effective_message.reply_text(f"Added project '{name}'.")
         return ConversationHandler.END
 
-    async def _on_users(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_users_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /users."""
+        if not await self._guard_invocation(invocation):
             return
         usernames = self._get_allowed_usernames()
         if not usernames:
-            return await update.effective_message.reply_text("No authorized users.")
+            await self._transport.send_text(invocation.chat, "No authorized users.")
+            return
         text = "Authorized users:\n" + "\n".join(f"  @{u}" for u in usernames)
-        await update.effective_message.reply_text(text)
+        await self._transport.send_text(invocation.chat, text)
 
     async def _on_add_user(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._guard(update):
@@ -1796,16 +1859,31 @@ class ManagerBot(AuthMixin):
         self._app = self._transport.app  # alias preserves existing add_handler call sites
         self._app.post_init = self._post_init
         app = self._app
+
+        # Fully-ported commands (spec #0c Task 8) — consume CommandInvocation
+        # directly. Registered on the transport; PTB is bridged via
+        # _dispatch_command so the existing app.add_handler pathway still works.
+        ported_commands = {
+            "projects": self._on_projects_from_transport,
+            "teams": self._on_teams_from_transport,
+            "version": self._on_version_from_transport,
+            "help": self._on_help_from_transport,
+            "users": self._on_users_from_transport,
+        }
+        for name, handler in ported_commands.items():
+            self._transport.on_command(name, handler)
+            app.add_handler(CommandHandler(
+                name,
+                lambda u, c, _n=name: self._transport._dispatch_command(_n, u, c),
+            ))
+
+        # Legacy commands — still use Update/ctx internals; bridged to PTB
+        # directly until their respective tasks port them.
         for name, handler in {
-            "projects": self._on_projects,
-            "teams": self._on_teams,
             "start_all": self._on_start_all,
             "stop_all": self._on_stop_all,
             "model": self._on_model,
-            "version": self._on_version,
-            "help": self._on_help,
             "edit_project": self._on_edit_project,
-            "users": self._on_users,
             "add_user": self._on_add_user,
             "remove_user": self._on_remove_user,
             "setup": self._on_setup,

@@ -8,6 +8,14 @@ import pytest
 
 from link_project_to_chat.manager.bot import ManagerBot
 from link_project_to_chat.manager.process import ProcessManager
+from link_project_to_chat.transport import (
+    ChatKind,
+    ChatRef,
+    CommandInvocation,
+    Identity,
+    MessageRef,
+)
+from link_project_to_chat.transport.fake import FakeTransport
 
 
 def _make_update(args: list[str] | None = None, user_id: int = 1, username: str = "testuser", text: str = ""):
@@ -25,6 +33,38 @@ def _make_update(args: list[str] | None = None, user_id: int = 1, username: str 
     ctx.args = args if args is not None else []
     ctx.user_data = {}
     return update, ctx
+
+
+def _make_invocation(
+    name: str,
+    *,
+    args: list[str] | None = None,
+    user_id: int = 1,
+    username: str = "testuser",
+) -> CommandInvocation:
+    chat = ChatRef(transport_id="fake", native_id=str(user_id), kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake",
+        native_id=str(user_id),
+        display_name=username,
+        handle=username,
+        is_bot=False,
+    )
+    return CommandInvocation(
+        chat=chat,
+        sender=sender,
+        name=name,
+        args=list(args or []),
+        raw_text=f"/{name}",
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+    )
+
+
+def _swap_fake_transport(bot: ManagerBot) -> FakeTransport:
+    """Replace the bot's transport with a FakeTransport for assertions."""
+    fake = FakeTransport()
+    bot._transport = fake
+    return fake
 
 
 def _make_callback(data: str, user_id: int = 1, username: str = "testuser"):
@@ -247,10 +287,9 @@ async def test_callback_unauthorized(bot_env):
 async def test_projects_header_shows_count(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    update, ctx = _make_update()
-    await bot._on_projects(update, ctx)
-    text = update.effective_message.reply_text.call_args[0][0]
-    assert "0/1" in text
+    fake = _swap_fake_transport(bot)
+    await bot._on_projects_from_transport(_make_invocation("projects"))
+    assert "0/1" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
@@ -360,12 +399,13 @@ async def test_on_teams_lists_one_button_per_team(bot_env):
         "dev":     {"telegram_bot_token": "t2"},
     })
     _write_team(proj_cfg, "beta", {"manager": {"telegram_bot_token": "t3"}})
-    update, ctx = _make_update()
-    await bot._on_teams(update, ctx)
-    update.effective_message.reply_text.assert_called_once()
-    markup = update.effective_message.reply_text.call_args[1]["reply_markup"]
-    button_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
-    assert button_datas == ["team_info_acme", "team_info_beta"]
+    fake = _swap_fake_transport(bot)
+    await bot._on_teams_from_transport(_make_invocation("teams"))
+    assert len(fake.sent_messages) == 1
+    buttons = fake.sent_messages[-1].buttons
+    assert buttons is not None
+    button_values = [btn.value for row in buttons.rows for btn in row]
+    assert button_values == ["team_info_acme", "team_info_beta"]
 
 
 @pytest.mark.asyncio
@@ -375,20 +415,20 @@ async def test_on_teams_button_label_shows_running_count(bot_env):
         "manager": {"telegram_bot_token": "t1"},
         "dev":     {"telegram_bot_token": "t2"},
     })
-    update, ctx = _make_update()
-    await bot._on_teams(update, ctx)
-    markup = update.effective_message.reply_text.call_args[1]["reply_markup"]
-    labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    fake = _swap_fake_transport(bot)
+    await bot._on_teams_from_transport(_make_invocation("teams"))
+    buttons = fake.sent_messages[-1].buttons
+    assert buttons is not None
+    labels = [btn.label for row in buttons.rows for btn in row]
     assert any("0/2" in label and "acme" in label for label in labels)
 
 
 @pytest.mark.asyncio
 async def test_on_teams_empty_no_markup(bot_env):
     bot, pm, proj_cfg = bot_env
-    update, ctx = _make_update()
-    await bot._on_teams(update, ctx)
-    text = update.effective_message.reply_text.call_args[0][0]
-    assert "No teams" in text
+    fake = _swap_fake_transport(bot)
+    await bot._on_teams_from_transport(_make_invocation("teams"))
+    assert "No teams" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
