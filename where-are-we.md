@@ -66,7 +66,7 @@
   - Three cleanups: M4 hardcoded `transport_id="telegram"` → `self._transport.TRANSPORT_ID`; M5 ask-question annotation regression fixed via `_render_question_html` helper; M6 dead `LiveMessage` import removed
 - **Manager bot port — Transport-native** (spec #0c, v0.16.0):
   - `manager/bot.py` uses `TelegramTransport` for command dispatch, inline buttons, and file ops; legacy `Application.builder()` gone
-  - `manager/telegram_group.py` moved to `transport/_telegram_group.py` — invariant: all `import telethon` lives in `transport/`
+  - `manager/telegram_group.py` moved to `transport/_telegram_group.py` (Telethon TL helpers grouped with their sibling `_telegram_relay.py`)
   - `TelegramTransport.enable_team_relay` (shipped unused in #0a) now wired: project bots receive a Telethon session-file path via `LP2C_TELETHON_SESSION` env var, construct their own `TelegramClient` in `build()`, and call `enable_team_relay`. Manager loses `_team_relays` dict + `_start_team_relays`. Project bots own their relay.
   - Wizard step bodies (`/add_project`, `/create_project`, `/create_team`, `/delete_team`, `/edit_project`) use `_incoming_from_update` shim — Transport-native reads/writes; `ConversationHandler` machinery (states, returns) preserved
   - Wizard-internal CallbackQueryHandler bodies also ported: use `self._transport.edit_text(msg_ref, ...)` via new `_msg_ref_from_query` helper
