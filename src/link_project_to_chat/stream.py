@@ -80,21 +80,37 @@ def parse_stream_line(line: str) -> list[StreamEvent]:
             )
         ]
 
+    if event_type == "stream_event":
+        # Partial-message stream (requires `claude -p --include-partial-messages`).
+        # Text and thinking arrive here as content_block_delta events; we emit
+        # them one chunk at a time so live messages can update incrementally.
+        # Tool input (input_json_delta) is intentionally not reassembled here —
+        # the final `assistant` event carries the complete, parsed tool call.
+        sub = data.get("event", {})
+        if sub.get("type") != "content_block_delta":
+            return []
+        delta = sub.get("delta", {})
+        delta_type = delta.get("type")
+        if delta_type == "text_delta":
+            text = delta.get("text", "")
+            return [TextDelta(text=text)] if text else []
+        if delta_type == "thinking_delta":
+            text = delta.get("thinking", "")
+            return [ThinkingDelta(text=text)] if text else []
+        return []
+
     if event_type == "assistant":
+        # Text and thinking have already been streamed via `stream_event`
+        # content_block_delta events (see above); re-emitting them here would
+        # double every character of the final answer. Only tool_use is parsed
+        # from this event, since tool input doesn't come through as a single
+        # reconstructed block via partial-message deltas.
         message = data.get("message", {})
         content = message.get("content", [])
         events: list[StreamEvent] = []
         for item in content:
             item_type = item.get("type")
-            if item_type == "thinking":
-                text = item.get("thinking", "")
-                if text:
-                    events.append(ThinkingDelta(text=text))
-            elif item_type == "text":
-                text = item.get("text", "")
-                if text:
-                    events.append(TextDelta(text=text))
-            elif item_type == "tool_use":
+            if item_type == "tool_use":
                 tool_name = item.get("name", "unknown")
                 tool_input = item.get("input", {})
                 if tool_name == "AskUserQuestion":

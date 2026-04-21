@@ -55,6 +55,15 @@ def test_team_system_note_injected_into_append_system_prompt():
     assert "@acme_dev_bot" in prompt
 
 
+def test_partial_messages_flag_is_passed():
+    """Without --include-partial-messages the CLI only emits a final assistant
+    event per turn, so thinking arrives in one block at the end instead of
+    live. parse_stream_line relies on the stream_event deltas this flag enables.
+    """
+    client = ClaudeClient(project_path=Path("/tmp"))
+    assert "--include-partial-messages" in client._build_cmd()
+
+
 def test_team_system_note_survives_active_skill():
     """A later /use <skill> sets append_system_prompt; team note must still be present."""
     client = ClaudeClient(project_path=Path("/tmp"))
