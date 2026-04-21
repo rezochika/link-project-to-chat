@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 import time
 import uuid
@@ -1860,7 +1861,6 @@ class ProjectBot(AuthMixin):
         # exposes the session-file absolute path via LP2C_TELETHON_SESSION when
         # spawning team-mode subprocesses (see manager/process.py).
         if self.team_name and self.group_chat_id:
-            import os
             session_env = os.environ.get("LP2C_TELETHON_SESSION")
             if session_env:
                 # Lazy import — telethon is an optional dep; solo-mode installs
@@ -1872,17 +1872,24 @@ class ProjectBot(AuthMixin):
                 team_bot_usernames = {
                     b.bot_username for b in team.bots.values() if b.bot_username
                 } if team else set()
-                client = TelegramClient(
-                    session_env,
-                    config.telegram_api_id,
-                    config.telegram_api_hash,
-                )
-                self._transport.enable_team_relay(
-                    telethon_client=client,
-                    team_bot_usernames=team_bot_usernames,
-                    group_chat_id=self.group_chat_id,
-                    team_name=self.team_name,
-                )
+                if not team_bot_usernames:
+                    logger.warning(
+                        "Team %r missing from config or has no bot usernames; "
+                        "skipping enable_team_relay (bot will operate without relay).",
+                        self.team_name,
+                    )
+                else:
+                    client = TelegramClient(
+                        session_env,
+                        config.telegram_api_id,
+                        config.telegram_api_hash,
+                    )
+                    self._transport.enable_team_relay(
+                        telethon_client=client,
+                        team_bot_usernames=team_bot_usernames,
+                        group_chat_id=self.group_chat_id,
+                        team_name=self.team_name,
+                    )
 
         return app
 

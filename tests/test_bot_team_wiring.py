@@ -745,3 +745,41 @@ def test_no_relay_when_solo_mode(tmp_path, monkeypatch):
 
     MockClient.assert_not_called()
     mock_transport.enable_team_relay.assert_not_called()
+
+
+def test_no_relay_when_team_missing_from_config(tmp_path, monkeypatch):
+    """Defensive: if team_name is set but load_teams() doesn't have an entry,
+    enable_team_relay is NOT called (logged as warning instead of silent no-op)."""
+    from unittest.mock import MagicMock, patch
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    # team_name="missing_team" is intentionally not in the load_teams() stub.
+    bot = ProjectBot(
+        name="missing_team_dev",
+        path=tmp_path,
+        token="t",
+        team_name="missing_team",
+        role="dev",
+        group_chat_id=-100123,
+        peer_bot_username="missing_team_manager_bot",
+    )
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value={},  # no entry for "missing_team"
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ), patch("telethon.TelegramClient") as MockClient:
+        bot.build()
+
+    # No relay enabled, no client constructed (we skip both when usernames empty).
+    mock_transport.enable_team_relay.assert_not_called()
+    MockClient.assert_not_called()
