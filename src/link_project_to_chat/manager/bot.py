@@ -808,34 +808,49 @@ class ManagerBot(AuthMixin):
     async def _on_create_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
             return ConversationHandler.END
+        incoming = self._incoming_from_update(update)
         try:
             from ..github_client import GitHubClient, _gh_available
             from ..botfather import BotFatherClient
         except ImportError:
-            await update.effective_message.reply_text(
-                "Missing dependencies. Install with:\npip install link-project-to-chat[create]"
+            await self._transport.send_text(
+                incoming.chat,
+                "Missing dependencies. Install with:\npip install link-project-to-chat[create]",
             )
             return ConversationHandler.END
         from ..config import load_config
         path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(path)
         if not config.github_pat and not _gh_available():
-            await update.effective_message.reply_text("GitHub not configured. Run /setup to set a PAT, or install gh CLI.")
+            await self._transport.send_text(
+                incoming.chat,
+                "GitHub not configured. Run /setup to set a PAT, or install gh CLI.",
+            )
             return ConversationHandler.END
         if not config.telegram_api_id or not config.telegram_api_hash:
-            await update.effective_message.reply_text("Telegram API not configured. Run /setup first.")
+            await self._transport.send_text(
+                incoming.chat,
+                "Telegram API not configured. Run /setup first.",
+            )
             return ConversationHandler.END
         session_path = path.parent / "telethon.session"
         if not session_path.exists():
-            await update.effective_message.reply_text("Telethon not authenticated. Run /setup first.")
+            await self._transport.send_text(
+                incoming.chat,
+                "Telethon not authenticated. Run /setup first.",
+            )
             return ConversationHandler.END
 
         ctx.user_data["create"] = {"config_path": str(path)}
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("From GitHub", callback_data="create_from_gh")],
-            [InlineKeyboardButton("Paste URL", callback_data="create_paste_url")],
+        buttons = Buttons(rows=[
+            [Button(label="From GitHub", value="create_from_gh")],
+            [Button(label="Paste URL", value="create_paste_url")],
         ])
-        await update.effective_message.reply_text("Create project — choose repo source:", reply_markup=markup)
+        await self._transport.send_text(
+            incoming.chat,
+            "Create project — choose repo source:",
+            buttons=buttons,
+        )
         return self.CREATE_SOURCE
 
     async def _create_source_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -922,7 +937,8 @@ class ManagerBot(AuthMixin):
     async def _create_repo_url(
         self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, user_data_key: str = "create"
     ) -> int:
-        url = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        url = incoming.text.strip()
         from ..github_client import GitHubClient
         from ..config import load_config
         path = Path(ctx.user_data[user_data_key]["config_path"])
@@ -931,24 +947,27 @@ class ManagerBot(AuthMixin):
         try:
             repo = await gh.validate_repo_url(url)
         except Exception as e:
-            await update.effective_message.reply_text(f"Error: {e}\nTry again or /cancel:")
+            await self._transport.send_text(incoming.chat, f"Error: {e}\nTry again or /cancel:")
             return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
         finally:
             await gh.close()
         if not repo:
-            await update.effective_message.reply_text("Invalid or not found. Paste a valid GitHub URL:")
+            await self._transport.send_text(
+                incoming.chat,
+                "Invalid or not found. Paste a valid GitHub URL:",
+            )
             return self.CREATE_TEAM_REPO_URL if user_data_key == "create_team" else self.CREATE_REPO_URL
         ctx.user_data[user_data_key]["repo"] = repo.__dict__
         suggested_name = repo.name
         ctx.user_data[user_data_key]["suggested_name"] = suggested_name
         if user_data_key == "create_team":
-            await update.effective_message.reply_text("Short project name?")
+            await self._transport.send_text(incoming.chat, "Short project name?")
             return self.CREATE_TEAM_NAME
-        markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f'Use "{suggested_name}"', callback_data="create_name_use")],
-            [InlineKeyboardButton("Custom name", callback_data="create_name_custom")],
+        buttons = Buttons(rows=[
+            [Button(label=f'Use "{suggested_name}"', value="create_name_use")],
+            [Button(label="Custom name", value="create_name_custom")],
         ])
-        await update.effective_message.reply_text(f"Project name?", reply_markup=markup)
+        await self._transport.send_text(incoming.chat, "Project name?", buttons=buttons)
         return self.CREATE_NAME
 
     async def _create_name_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -968,13 +987,17 @@ class ManagerBot(AuthMixin):
         return ConversationHandler.END
 
     async def _create_name_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        name = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        name = incoming.text.strip()
         projects = self._load_projects()
         if name in projects:
-            await update.effective_message.reply_text(f"'{name}' already exists. Try another name:")
+            await self._transport.send_text(
+                incoming.chat,
+                f"'{name}' already exists. Try another name:",
+            )
             return self.CREATE_NAME_INPUT
         ctx.user_data["create"]["name"] = name
-        await update.effective_message.reply_text("Creating Telegram bot via BotFather...")
+        await self._transport.send_text(incoming.chat, "Creating Telegram bot via BotFather...")
         return await self._do_create_bot_text(update, ctx)
 
     async def _do_create_bot(self, query, ctx) -> int:
@@ -1028,10 +1051,11 @@ class ManagerBot(AuthMixin):
         return ConversationHandler.END
 
     async def _create_bot_token_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        token = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        token = incoming.text.strip()
         ctx.user_data["create"]["bot_token"] = token
         ctx.user_data["create"]["bot_username"] = "(manual)"
-        await update.effective_message.reply_text("Token saved. Cloning repository...")
+        await self._transport.send_text(incoming.chat, "Token saved. Cloning repository...")
         return await self._execute_clone(update.effective_chat.id, ctx)
 
     async def _execute_clone(self, chat_id: int, ctx) -> int:
@@ -1099,8 +1123,9 @@ class ManagerBot(AuthMixin):
         return ConversationHandler.END
 
     async def _create_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        incoming = self._incoming_from_update(update)
         ctx.user_data.pop("create", None)
-        await update.effective_message.reply_text("Project creation cancelled.")
+        await self._transport.send_text(incoming.chat, "Project creation cancelled.")
         return ConversationHandler.END
 
     async def _on_create_team(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
