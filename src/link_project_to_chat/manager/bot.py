@@ -257,14 +257,22 @@ class ManagerBot(AuthMixin):
         still receive an Update from ConversationHandler, but the reply path
         goes through the Transport so no telegram-native reply_text call
         remains in manager/bot.py.
+
+        Derives the reply ``ChatRef`` directly from ``update.effective_chat``
+        rather than routing through ``_incoming_from_update``, because the
+        latter unconditionally reads fields off ``effective_user`` and would
+        raise on None (anonymous channel admins, service messages, etc.).
         """
+        from ..transport.telegram import chat_ref_from_telegram
         user = update.effective_user
-        incoming = self._incoming_from_update(update)
+        chat = chat_ref_from_telegram(update.effective_chat) if update.effective_chat else None
         if not user or not self._auth(user):
-            await self._transport.send_text(incoming.chat, "Unauthorized.")
+            if chat is not None:
+                await self._transport.send_text(chat, "Unauthorized.")
             return False
         if self._rate_limited(user.id):
-            await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
+            if chat is not None:
+                await self._transport.send_text(chat, "Rate limited. Try again shortly.")
             return False
         return True
 

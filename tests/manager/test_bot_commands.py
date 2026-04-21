@@ -541,3 +541,23 @@ async def test_callback_team_back_relists_teams(bot_env):
     edited = fake.edited_messages[-1]
     button_values = [btn.value for row in edited.buttons.rows for btn in row]
     assert "team_info_acme" in button_values
+
+
+@pytest.mark.asyncio
+async def test_guard_returns_false_when_effective_user_is_none(bot_env):
+    """Regression: _guard must not crash when update.effective_user is None
+    (anonymous channel admins, service messages, etc.)."""
+    from types import SimpleNamespace
+
+    bot, _pm, _cfg = bot_env
+    fake = _swap_fake_transport(bot)
+
+    update = SimpleNamespace(
+        effective_user=None,
+        effective_chat=SimpleNamespace(id=12345, type="private"),
+        effective_message=SimpleNamespace(text=""),
+    )
+
+    allowed = await bot._guard(update)
+    assert allowed is False
+    assert any("Unauthorized" in m.text for m in fake.sent_messages)
