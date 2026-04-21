@@ -7,10 +7,9 @@ Telethon session and — whenever a team bot posts a message that mentions
 another team bot — reposts the same text as the trusted user so the peer bot
 receives it through the normal user-message path.
 
-The relayed message is auto-deleted shortly after sending so the group chat
-stays clean: the peer bot's long-polling picks the message up almost
-immediately, and humans are spared a duplicate of what the source bot just
-posted. Loop prevention is inherent — the relay sends as the trusted user
+The relay sends the raw bot text without any prefix, so humans see a clean
+duplicate of the handoff message rather than an ugly `[auto-relay from ...]`
+banner. Loop prevention is inherent — the relay sends as the trusted user
 (not a bot), and the handler ignores non-bot senders.
 
 The relay does NOT try to preserve the bot-to-bot round counter that lives on
@@ -36,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 
 _EDIT_DEBOUNCE_SECONDS = 3.0
-_AUTO_DELETE_SECONDS = 3.0
 
 
 def find_peer_mention(text: str, self_username: str, team_bot_usernames: set[str]) -> str | None:
@@ -220,21 +218,4 @@ class TeamRelay:
             logger.exception(
                 "TeamRelay send failed (team=%s from=@%s)",
                 self._team_name, sender_username,
-            )
-            return
-        # Auto-delete after a short delay: the peer bot receives the message via
-        # Bot API long polling in well under a second, so a few seconds is plenty.
-        # Deleting keeps the group chat from filling with duplicates of what the
-        # source bot just posted.
-        asyncio.create_task(self._delete_after_delay(sent))
-
-    async def _delete_after_delay(self, sent: Any) -> None:
-        try:
-            await asyncio.sleep(_AUTO_DELETE_SECONDS)
-            await sent.delete()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "TeamRelay auto-delete failed (team=%s)", self._team_name, exc_info=True,
             )

@@ -109,9 +109,7 @@ async def test_relay_forwards_bot_to_bot_handoff():
     from link_project_to_chat.manager.team_relay import TeamRelay
 
     client = MagicMock()
-    sent = MagicMock()
-    sent.delete = AsyncMock()
-    client.send_message = AsyncMock(return_value=sent)
+    client.send_message = AsyncMock()
     relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
 
     event = await _mk_event(
@@ -124,44 +122,9 @@ async def test_relay_forwards_bot_to_bot_handoff():
     args, _ = client.send_message.call_args
     chat_id, text = args
     assert chat_id == -100_111
-    # The relay forwards the raw text — no prefix, so humans aren't shown a
-    # duplicate framed as "[auto-relay from ...]". The peer bot still sees the
-    # @mention and acts on it before auto-delete kicks in.
+    # The relay forwards the raw text — no "[auto-relay from ...]" prefix.
     assert text.startswith("@acme_dev_bot")
     assert "src/models.py" in text
-
-
-@pytest.mark.asyncio
-async def test_relay_auto_deletes_sent_message():
-    """The relay message is deleted after a short delay so it doesn't clutter the group."""
-    import asyncio
-
-    from link_project_to_chat.manager import team_relay
-    from link_project_to_chat.manager.team_relay import TeamRelay
-
-    client = MagicMock()
-    sent = MagicMock()
-    sent.delete = AsyncMock()
-    client.send_message = AsyncMock(return_value=sent)
-    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
-
-    # Make auto-delete immediate for the test.
-    original_delay = team_relay._AUTO_DELETE_SECONDS
-    team_relay._AUTO_DELETE_SECONDS = 0
-    try:
-        event = await _mk_event(
-            "@acme_dev_bot go",
-            sender_username="acme_mgr_bot",
-            sender_is_bot=True,
-        )
-        await relay._on_new_message(event)
-        # Yield so the auto-delete task can run.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-    finally:
-        team_relay._AUTO_DELETE_SECONDS = original_delay
-
-    sent.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
