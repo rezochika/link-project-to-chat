@@ -37,20 +37,6 @@ def _build_project_bot_env(team_name: str | None, config_dir: Path) -> dict[str,
     return env
 
 
-def _default_command_builder(project_name: str, project_config: dict) -> list[str]:
-    cmd = ["link-project-to-chat", "start", "--project", project_name]
-
-    permissions = project_config.get("permissions")
-    if permissions == "dangerously-skip-permissions":
-        cmd.append("--dangerously-skip-permissions")
-    elif permissions and permissions != "default":
-        cmd.extend(["--permission-mode", permissions])
-    model = project_config.get("model") or load_config().default_model
-    if model:
-        cmd.extend(["--model", model])
-    return cmd
-
-
 class ProcessManager:
     def __init__(
         self,
@@ -58,7 +44,7 @@ class ProcessManager:
         command_builder: Callable[[str, dict], list[str]] | None = None,
     ):
         self._project_config_path = project_config_path
-        self._command_builder = command_builder or _default_command_builder
+        self._command_builder = command_builder or self._default_command_builder
         self._processes: dict[str, subprocess.Popen] = {}
         self._logs: dict[str, collections.deque] = {}
         self._log_threads: dict[str, threading.Thread] = {}
@@ -71,6 +57,26 @@ class ProcessManager:
     def _config_dir(self) -> Path:
         """Directory containing the manager's config.json (and telethon.session)."""
         return (self._project_config_path or DEFAULT_CONFIG).parent
+
+    def _base_cli(self) -> list[str]:
+        cmd = ["link-project-to-chat"]
+        if self._project_config_path is not None:
+            cmd.extend(["--config", str(self._project_config_path.resolve())])
+        return cmd
+
+    def _default_command_builder(self, project_name: str, project_config: dict) -> list[str]:
+        cmd = self._base_cli() + ["start", "--project", project_name]
+
+        permissions = project_config.get("permissions")
+        if permissions == "dangerously-skip-permissions":
+            cmd.append("--dangerously-skip-permissions")
+        elif permissions and permissions != "default":
+            cmd.extend(["--permission-mode", permissions])
+        config = load_config(self._project_config_path) if self._project_config_path else load_config()
+        model = project_config.get("model") or config.default_model
+        if model:
+            cmd.extend(["--model", model])
+        return cmd
 
     def _capture_output(self, name: str, proc: subprocess.Popen) -> None:
         buf = self._logs[name]
@@ -98,7 +104,7 @@ class ProcessManager:
         return True
 
     def _team_command_builder(self, team_name: str, role: str) -> list[str]:
-        return ["link-project-to-chat", "start", "--team", team_name, "--role", role]
+        return self._base_cli() + ["start", "--team", team_name, "--role", role]
 
     def start_team(self, team_name: str, role: str) -> bool:
         config = load_config(self._project_config_path) if self._project_config_path else load_config()

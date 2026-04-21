@@ -5,13 +5,40 @@ from pathlib import Path
 
 import click
 
+from .claude_client import PERMISSION_MODES
 from .config import (
     DEFAULT_CONFIG,
     add_project_trusted_user_id,
     load_config,
+    resolve_project_auth_scope,
     resolve_permissions,
     save_config,
 )
+
+
+_PERMISSION_VALUES = set(PERMISSION_MODES) | {"dangerously-skip-permissions"}
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off"}
+
+
+def _normalize_permissions_edit(field: str, value: str) -> str:
+    if field == "dangerously_skip_permissions":
+        lowered = value.strip().lower()
+        if lowered in _TRUTHY:
+            return "dangerously-skip-permissions"
+        if lowered in _FALSEY:
+            return "default"
+        raise SystemExit(
+            "dangerously_skip_permissions expects one of: true, false, yes, no, on, off, 1, 0."
+        )
+
+    if value not in _PERMISSION_VALUES:
+        allowed = ", ".join(PERMISSION_MODES)
+        raise SystemExit(
+            "Invalid permissions value. Use one of: "
+            f"{allowed}, dangerously-skip-permissions"
+        )
+    return value
 
 
 @click.group()
@@ -122,10 +149,23 @@ def projects_remove(ctx, name: str):
 @click.argument("value")
 @click.pass_context
 def projects_edit(ctx, name: str, field: str, value: str):
-    """Edit a project field (name, path, token, username, model, permission_mode, dangerously_skip_permissions)."""
+    """Edit a project field.
+
+    Modern permissions use the `permissions` field. Legacy `permission_mode`
+    and `dangerously_skip_permissions` aliases are accepted and normalized.
+    """
     from .manager.config import load_project_configs, save_project_configs
 
-    _EDITABLE = ("name", "path", "token", "username", "model", "permission_mode", "dangerously_skip_permissions")
+    _EDITABLE = (
+        "name",
+        "path",
+        "token",
+        "username",
+        "model",
+        "permissions",
+        "permission_mode",
+        "dangerously_skip_permissions",
+    )
     cfg_path = ctx.obj["config_path"]
     projects = load_project_configs(cfg_path)
     if name not in projects:
@@ -147,10 +187,16 @@ def projects_edit(ctx, name: str, field: str, value: str):
         projects[name]["telegram_bot_token"] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' token.")
-    elif field in ("username", "model", "permission_mode", "dangerously_skip_permissions"):
+    elif field in ("username", "model"):
         projects[name][field] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' {field} to {value}.")
+    elif field in ("permissions", "permission_mode", "dangerously_skip_permissions"):
+        projects[name]["permissions"] = _normalize_permissions_edit(field, value)
+        projects[name].pop("permission_mode", None)
+        projects[name].pop("dangerously_skip_permissions", None)
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' permissions to {projects[name]['permissions']}.")
     else:
         raise SystemExit(f"Unknown field. Use: {', '.join(_EDITABLE)}")
 
@@ -358,14 +404,17 @@ def start(
         if project not in config.projects:
             raise SystemExit(f"Project '{project}' not found.")
         proj = config.projects[project]
-        effective_usernames = proj.allowed_usernames or config.allowed_usernames
-        effective_trusted_ids = proj.trusted_user_ids or config.trusted_user_ids
+        effective_usernames, effective_trusted_ids = resolve_project_auth_scope(
+            proj,
+            config,
+            username_override=username,
+        )
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             project,
             Path(proj.path),
             proj.telegram_bot_token,
-            allowed_usernames=effective_usernames if not username else [username.lower().lstrip("@")],
+            allowed_usernames=effective_usernames,
             trusted_user_ids=effective_trusted_ids,
             session_id=session_id,
             model=model or proj.model,

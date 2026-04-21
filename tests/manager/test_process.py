@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
+from link_project_to_chat.config import Config, ProjectConfig, save_config
 from link_project_to_chat.manager.process import ProcessManager
 
 
@@ -82,3 +84,36 @@ def test_stale_process_detected(tmp_path: Path):
     pm.start("fast")
     time.sleep(0.3)
     assert pm.status("fast") == "stopped"
+
+
+def test_start_uses_custom_config_path_and_default_model(tmp_path: Path):
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            default_model="opus[1m]",
+            projects={
+                "proj": ProjectConfig(path=str(tmp_path), telegram_bot_token="tok"),
+            },
+        ),
+        cfg_path,
+    )
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.pid = 123
+        mock_proc.poll.return_value = None
+        mock_proc.stdout = []
+        mock_popen.return_value = mock_proc
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        assert pm.start("proj") is True
+
+    call_args = mock_popen.call_args[0][0]
+    assert call_args[:4] == [
+        "link-project-to-chat",
+        "--config",
+        str(cfg_path.resolve()),
+        "start",
+    ]
+    assert "--project" in call_args and "proj" in call_args
+    assert "--model" in call_args and "opus[1m]" in call_args

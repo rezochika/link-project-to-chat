@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
+import sys
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
+import link_project_to_chat.task_manager as task_manager_module
 from link_project_to_chat.stream import (
     AskQuestion,
     Question,
@@ -24,6 +30,10 @@ def _noop_manager(tmp_path) -> TaskManager:
         on_complete=_noop,
         on_task_started=_noop,
     )
+
+
+def _long_running_command() -> str:
+    return f'"{sys.executable}" -c "import time; time.sleep(30)"'
 
 
 # --- Task unit tests (no async needed) ---
@@ -133,7 +143,7 @@ async def test_run_command_cancel(tmp_path):
         pass
 
     tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
-    task = tm.run_command(chat_id=1, message_id=1, command="sleep 30")
+    task = tm.run_command(chat_id=1, message_id=1, command=_long_running_command())
     await asyncio.sleep(0.1)
     assert task.cancel() is True
     assert task.status == TaskStatus.CANCELLED
@@ -145,11 +155,137 @@ async def test_cancel_all(tmp_path):
         pass
 
     tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
-    tm.run_command(chat_id=1, message_id=1, command="sleep 30")
-    tm.run_command(chat_id=1, message_id=2, command="sleep 30")
+    tm.run_command(chat_id=1, message_id=1, command=_long_running_command())
+    tm.run_command(chat_id=1, message_id=2, command=_long_running_command())
     await asyncio.sleep(0.1)
     count = tm.cancel_all()
     assert count == 2
+
+
+def test_task_cancel_running_uses_process_tree_termination(monkeypatch):
+    task = Task(id=1, chat_id=1, message_id=1, type=TaskType.COMMAND, input="x", name="x")
+    task.status = TaskStatus.RUNNING
+    proc = MagicMock()
+    proc.poll.return_value = None
+    task._proc = proc
+    task._asyncio_task = MagicMock()
+    task._asyncio_task.done.return_value = False
+
+    calls = []
+    monkeypatch.setattr(task_manager_module, "_terminate_process_tree", lambda p: calls.append(p))
+
+    assert task.cancel() is True
+    assert calls == [proc]
+    task._asyncio_task.cancel.assert_called_once()
+    assert task.status == TaskStatus.CANCELLED
+
+
+def test_command_popen_kwargs_enable_process_groups(tmp_path):
+    tm = _noop_manager(tmp_path)
+    kwargs = tm._command_popen_kwargs()
+    if os.name == "nt":
+        assert kwargs == {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    else:
+        assert kwargs == {"start_new_session": True}
+
+
+def test_terminate_process_tree_uses_platform_strategy(monkeypatch):
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 4321
+            self.terminated = False
+            self._kill_process_tree = True
+            self.kill_calls = 0
+            self.wait_timeout = None
+
+        def poll(self):
+            return 0 if self.terminated else None
+
+        def kill(self):
+            self.kill_calls += 1
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            self.wait_timeout = timeout
+            self.terminated = True
+            return 0
+
+    proc = _FakeProc()
+
+    if os.name == "nt":
+        calls = {}
+
+        def fake_run(args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            proc.terminated = True
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(task_manager_module.subprocess, "run", fake_run)
+        task_manager_module._terminate_process_tree(proc)
+        assert calls["args"] == ["taskkill", "/T", "/F", "/PID", str(proc.pid)]
+        assert calls["kwargs"]["stdout"] is subprocess.DEVNULL
+        assert calls["kwargs"]["stderr"] is subprocess.DEVNULL
+        assert proc.kill_calls == 0
+    else:
+        calls = {}
+
+        monkeypatch.setattr(task_manager_module.os, "getpgid", lambda pid: 9876)
+
+        def fake_killpg(pgid, sig):
+            calls["pgid"] = pgid
+            calls["sig"] = sig
+            proc.terminated = True
+
+        monkeypatch.setattr(task_manager_module.os, "killpg", fake_killpg)
+        task_manager_module._terminate_process_tree(proc)
+        assert calls == {"pgid": 9876, "sig": signal.SIGKILL}
+
+    assert proc.wait_timeout == 5
+
+
+@pytest.mark.asyncio
+async def test_exec_command_uses_process_group_spawn_kwargs(tmp_path, monkeypatch):
+    calls = {}
+
+    class _FakeProc:
+        def __init__(self):
+            self.pid = 123
+            self.stdout = iter([b"hello\n"])
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            return self.returncode
+
+    def fake_popen(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return _FakeProc()
+
+    async def _noop(task):
+        pass
+
+    monkeypatch.setattr(task_manager_module.subprocess, "Popen", fake_popen)
+
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    task = tm.run_command(chat_id=1, message_id=1, command="echo hello")
+    await asyncio.wait_for(task._asyncio_task, timeout=5)
+
+    assert calls["args"] == ("echo hello",)
+    assert calls["kwargs"]["shell"] is True
+    if os.name == "nt":
+        assert calls["kwargs"]["creationflags"] == getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        assert calls["kwargs"]["start_new_session"] is True
+    assert task.status == TaskStatus.DONE
+    assert task.result == "hello"
 
 
 @pytest.mark.asyncio
@@ -310,7 +446,7 @@ async def test_find_by_message(tmp_path):
         pass
 
     tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
-    task = tm.run_command(chat_id=1, message_id=99, command="sleep 30")
+    task = tm.run_command(chat_id=1, message_id=99, command=_long_running_command())
     await asyncio.sleep(0.05)
     found = tm.find_by_message(99)
     assert task in found

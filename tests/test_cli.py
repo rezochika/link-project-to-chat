@@ -180,6 +180,75 @@ def test_edit_project_not_found(runner, cfg):
     assert "not found" in result.output
 
 
+def test_edit_project_permission_mode_updates_unified_permissions_field(runner, cfg):
+    p, _ = cfg
+    data = json.loads(p.read_text())
+    data["projects"]["existing"]["permissions"] = "default"
+    p.write_text(json.dumps(data))
+
+    result = runner.invoke(
+        main,
+        ["--config", str(p), "projects", "edit", "existing", "permission_mode", "plan"],
+    )
+
+    assert result.exit_code == 0
+    proj = json.loads(p.read_text())["projects"]["existing"]
+    assert proj["permissions"] == "plan"
+    assert "permission_mode" not in proj
+    assert "dangerously_skip_permissions" not in proj
+
+
+def test_edit_project_permissions_field_supported(runner, cfg):
+    p, _ = cfg
+    result = runner.invoke(
+        main,
+        ["--config", str(p), "projects", "edit", "existing", "permissions", "dangerously-skip-permissions"],
+    )
+
+    assert result.exit_code == 0
+    proj = json.loads(p.read_text())["projects"]["existing"]
+    assert proj["permissions"] == "dangerously-skip-permissions"
+
+
+def test_edit_project_dangerously_skip_permissions_boolean_alias(runner, cfg):
+    p, _ = cfg
+    result = runner.invoke(
+        main,
+        ["--config", str(p), "projects", "edit", "existing", "dangerously_skip_permissions", "true"],
+    )
+
+    assert result.exit_code == 0
+    proj = json.loads(p.read_text())["projects"]["existing"]
+    assert proj["permissions"] == "dangerously-skip-permissions"
+
+
+def test_edit_project_dangerously_skip_permissions_false_resets_to_default(runner, cfg):
+    p, _ = cfg
+    data = json.loads(p.read_text())
+    data["projects"]["existing"]["permissions"] = "dangerously-skip-permissions"
+    p.write_text(json.dumps(data))
+
+    result = runner.invoke(
+        main,
+        ["--config", str(p), "projects", "edit", "existing", "dangerously_skip_permissions", "false"],
+    )
+
+    assert result.exit_code == 0
+    proj = json.loads(p.read_text())["projects"]["existing"]
+    assert proj["permissions"] == "default"
+
+
+def test_edit_project_invalid_permissions_value_fails(runner, cfg):
+    p, _ = cfg
+    result = runner.invoke(
+        main,
+        ["--config", str(p), "projects", "edit", "existing", "permissions", "wildwest"],
+    )
+
+    assert result.exit_code != 0
+    assert "Invalid permissions value" in result.output
+
+
 # --- configure --manager-token ---
 
 def test_configure_manager_token(runner, cfg):
@@ -343,3 +412,112 @@ def test_start_team_wrong_role_errors(tmp_path, monkeypatch):
     assert result.exit_code != 0
     # dev is a valid click.Choice value, so the error is from our "Role not in team" guard
     assert "not in team" in (result.output or str(result.exception)) or "dev" in (result.output or str(result.exception))
+
+
+def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, ProjectConfig, save_config
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            allowed_usernames=["alice"],
+            trusted_user_ids=[101],
+            projects={
+                "demo": ProjectConfig(
+                    path=str(tmp_path),
+                    telegram_bot_token="tok",
+                    allowed_usernames=["bob"],
+                )
+            },
+        ),
+        cfg_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(cfg_path), "start", "--project", "demo"],
+    )
+
+    assert result.exit_code == 0, result.output
+    _, kwargs = calls[0]
+    assert kwargs["allowed_usernames"] == ["bob"]
+    assert kwargs["trusted_user_ids"] == []
+
+
+def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, ProjectConfig, save_config
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            allowed_usernames=["alice"],
+            trusted_user_ids=[101],
+            projects={
+                "demo": ProjectConfig(
+                    path=str(tmp_path),
+                    telegram_bot_token="tok",
+                    allowed_usernames=["bob"],
+                    trusted_user_ids=[202],
+                )
+            },
+        ),
+        cfg_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(cfg_path), "start", "--project", "demo", "--username", "carol"],
+    )
+
+    assert result.exit_code == 0, result.output
+    _, kwargs = calls[0]
+    assert kwargs["allowed_usernames"] == ["carol"]
+    assert kwargs["trusted_user_ids"] == []
+
+
+def test_start_single_project_without_project_flag_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, ProjectConfig, save_config
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            allowed_usernames=["alice"],
+            trusted_user_ids=[101],
+            projects={
+                "demo": ProjectConfig(
+                    path=str(tmp_path),
+                    telegram_bot_token="tok",
+                    allowed_usernames=["bob"],
+                )
+            },
+        ),
+        cfg_path,
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    result = CliRunner().invoke(cli.main, ["--config", str(cfg_path), "start"])
+
+    assert result.exit_code == 0, result.output
+    _, kwargs = calls[0]
+    assert kwargs["allowed_usernames"] == ["bob"]
+    assert kwargs["trusted_user_ids"] == []

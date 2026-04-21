@@ -40,6 +40,24 @@ def test_save_project_configs_preserves_other_keys(tmp_path: Path):
     assert raw["allowed_username"] == "someone"
 
 
+def test_save_project_configs_preserves_teams(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "projects": {},
+        "teams": {
+            "acme": {
+                "path": "/a",
+                "group_chat_id": -1,
+                "bots": {"manager": {"telegram_bot_token": "t1"}},
+            }
+        },
+    }))
+    save_project_configs({"newproj": {"path": "/new"}}, path)
+    raw = json.loads(path.read_text())
+    assert raw["projects"]["newproj"]["path"] == "/new"
+    assert raw["teams"]["acme"]["bots"]["manager"]["telegram_bot_token"] == "t1"
+
+
 def test_save_project_configs_creates_file(tmp_path: Path):
     path = tmp_path / "config.json"
     save_project_configs({"proj": {"path": "/p"}}, path)

@@ -71,7 +71,12 @@ def test_start_team_builds_correct_cli_and_spawns(tmp_path):
         result = pm.start_team("acme", "manager")
         assert result is True
         call_args = mock_popen.call_args[0][0]
-        assert call_args[:2] == ["link-project-to-chat", "start"]
+        assert call_args[:4] == [
+            "link-project-to-chat",
+            "--config",
+            str(cfg_path.resolve()),
+            "start",
+        ]
         assert "--team" in call_args and "acme" in call_args
         assert "--role" in call_args and "manager" in call_args
 

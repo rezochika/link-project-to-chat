@@ -75,6 +75,26 @@ class Config:
     teams: dict[str, TeamConfig] = field(default_factory=dict)
 
 
+def resolve_project_auth_scope(
+    project: ProjectConfig,
+    config: Config,
+    username_override: str | None = None,
+) -> tuple[list[str], list[int]]:
+    """Return the effective usernames and trusted IDs for a project bot.
+
+    Project-specific allowlists must not inherit unrelated global trusted IDs:
+    once a project narrows ``allowed_usernames``, only its own trusted IDs
+    should be honored. Likewise, a CLI ``--username`` override is a hard
+    override and intentionally starts with no trusted IDs.
+    """
+    if username_override:
+        return [username_override.lower().lstrip("@")], []
+    if project.allowed_usernames:
+        return list(project.allowed_usernames), list(project.trusted_user_ids)
+    trusted_user_ids = project.trusted_user_ids or config.trusted_user_ids
+    return list(config.allowed_usernames), list(trusted_user_ids)
+
+
 def _load_permissions(proj: dict) -> str | None:
     """Read permissions from a project dict, with backward compat for old keys."""
     if "permissions" in proj:

@@ -23,6 +23,7 @@ from .config import (
     patch_project,
     patch_team,
     resolve_permissions,
+    resolve_project_auth_scope,
     save_session,
     add_trusted_user_id,
     add_project_trusted_user_id,
@@ -1583,8 +1584,9 @@ class ProjectBot(AuthMixin):
 
     async def _on_file_from_transport(self, incoming) -> None:
         """Transport-native file handler. Copies each incoming file from the
-        transport's temp dir into /tmp/link-project-to-chat/<project>/uploads/
-        and submits it to Claude (or the waiting-input task)."""
+        transport's temp dir into the platform temp root under
+        link-project-to-chat/<project>/uploads/ and submits it to Claude (or
+        the waiting-input task)."""
         import shutil
 
         if not self._auth_identity(incoming.sender):
@@ -1596,7 +1598,12 @@ class ProjectBot(AuthMixin):
         if not incoming.files:
             return
 
-        uploads_dir = Path("/tmp/link-project-to-chat") / self.name / "uploads"
+        uploads_dir = (
+            Path(tempfile.gettempdir())
+            / "link-project-to-chat"
+            / self.name
+            / "uploads"
+        )
         uploads_dir.mkdir(parents=True, exist_ok=True)
 
         # Single-file behavior identical to legacy _on_file.
@@ -1969,8 +1976,10 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        effective_usernames = proj.allowed_usernames or config.allowed_usernames
-        effective_trusted_ids = proj.trusted_user_ids or config.trusted_user_ids
+        effective_usernames, effective_trusted_ids = resolve_project_auth_scope(
+            proj,
+            config,
+        )
         on_trust = None
         if config_path:
             _name = name

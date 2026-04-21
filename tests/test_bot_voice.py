@@ -66,6 +66,27 @@ def _audio_incoming(tmp_path, text: str = "") -> IncomingMessage:
     )
 
 
+def _file_incoming(tmp_path, text: str = "") -> IncomingMessage:
+    upload_path = tmp_path / "report.txt"
+    upload_path.write_text("report body", encoding="utf-8")
+    chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42", display_name="Alice",
+        handle="alice", is_bot=False,
+    )
+    return IncomingMessage(
+        chat=chat,
+        sender=sender,
+        text=text,
+        files=[IncomingFile(
+            path=upload_path, original_name="report.txt",
+            mime_type="text/plain", size_bytes=11,
+        )],
+        reply_to=None,
+        native=SimpleNamespace(message_id=7, reply_to_message=None),
+    )
+
+
 async def test_voice_message_sends_transcribing_status(tmp_path):
     bot = _make_project_bot_stub()
     incoming = _audio_incoming(tmp_path)
@@ -234,6 +255,27 @@ async def test_unified_dispatch_unsupported_unauthorized_ignored():
     )
     await bot._on_text_from_transport(incoming)
     assert bot._transport.sent_messages == []
+
+
+async def test_file_upload_uses_platform_temp_root(tmp_path, monkeypatch):
+    bot = _make_project_bot_stub()
+    incoming = _file_incoming(tmp_path, text="please review")
+    temp_root = tmp_path / "platform-temp"
+
+    from link_project_to_chat import bot as bot_module
+
+    monkeypatch.setattr(bot_module.tempfile, "gettempdir", lambda: str(temp_root))
+
+    await bot._on_file_from_transport(incoming)
+
+    expected = temp_root / "link-project-to-chat" / "proj" / "uploads" / "report.txt"
+    assert expected.read_text(encoding="utf-8") == "report body"
+
+    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    assert kwargs["chat_id"] == 12345
+    assert kwargs["message_id"] == 7
+    assert str(expected) in kwargs["prompt"]
+    assert kwargs["prompt"].endswith("please review")
 
 
 async def test_voice_long_transcript_truncated_in_status(tmp_path):

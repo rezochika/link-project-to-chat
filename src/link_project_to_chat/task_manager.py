@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import enum
 import logging
+import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -14,6 +17,41 @@ from .claude_client import ClaudeClient
 from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta, ThinkingDelta
 
 logger = logging.getLogger(__name__)
+
+
+def _command_popen_kwargs() -> dict[str, object]:
+    if os.name == "nt":
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+
+    if os.name == "nt":
+        with contextlib.suppress(OSError):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+    else:
+        if getattr(proc, "_kill_process_tree", False):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
 
 
 class TaskType(enum.Enum):
@@ -84,7 +122,7 @@ class Task:
             return True
         if self.status in (TaskStatus.RUNNING, TaskStatus.WAITING_INPUT):
             if self._proc and self._proc.poll() is None:
-                self._proc.kill()
+                _terminate_process_tree(self._proc)
             self.status = TaskStatus.CANCELLED
             self.finished_at = time.monotonic()
             if self._asyncio_task and not self._asyncio_task.done():
@@ -127,6 +165,9 @@ class TaskManager:
     @property
     def claude(self) -> ClaudeClient:
         return self._claude
+
+    def _command_popen_kwargs(self) -> dict[str, object]:
+        return _command_popen_kwargs()
 
     def _submit(self, task: Task) -> Task:
         self._tasks[task.id] = task
@@ -200,7 +241,7 @@ class TaskManager:
             self._claude.close_interactive()
         except asyncio.CancelledError:
             if task._proc and task._proc.poll() is None:
-                task._proc.kill()
+                _terminate_process_tree(task._proc)
             task.status = TaskStatus.CANCELLED
             self._claude.close_interactive()
         except Exception as e:
@@ -333,7 +374,9 @@ class TaskManager:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            **self._command_popen_kwargs(),
         )
+        setattr(proc, "_kill_process_tree", True)
         task._proc = proc
         logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
 
@@ -350,10 +393,10 @@ class TaskManager:
             await asyncio.to_thread(proc.wait)
         except asyncio.CancelledError:
             if proc.poll() is None:
-                proc.kill()
-                proc.wait()
+                _terminate_process_tree(proc)
             task.status = TaskStatus.CANCELLED
             task.finished_at = time.monotonic()
+            task._proc = None
             return
 
         task.finished_at = time.monotonic()
