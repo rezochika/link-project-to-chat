@@ -544,3 +544,137 @@ async def test_create_team_execute_partial_failure_after_bot1(tmp_path):
     assert failure_msg is not None
     assert "Bot @" in failure_msg  # bot1 was completed; should appear in cleanup list
     assert "Safe to retry" in failure_msg  # config NOT committed
+
+
+@pytest.mark.asyncio
+async def test_create_team_execute_adopts_new_telethon_client_for_relay(tmp_path, monkeypatch):
+    """A freshly created team should get a relay immediately, even before any manager restart."""
+    import sys
+    import types
+
+    from telegram.ext import ConversationHandler
+    from link_project_to_chat.manager.bot import ManagerBot
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path
+    )
+    (cfg_path.parent / "telethon.session").write_text("x")
+
+    shared_client = MagicMock()
+    disconnect_ownership: list[bool] = []
+    started_relays: list[tuple[object, str, int, set[str]]] = []
+
+    class FakeBotFatherClient:
+        def __init__(self, api_id, api_hash, session_path, client=None):
+            self._client = client
+            self._owns_client = client is None
+
+        async def create_bot(self, display_name: str, username: str) -> str:
+            return f"TOKEN_FOR_{username}"
+
+        async def disable_privacy(self, username: str) -> None:
+            return None
+
+        async def _ensure_client(self):
+            if self._client is None:
+                self._client = shared_client
+            return self._client
+
+        async def disconnect(self) -> None:
+            disconnect_ownership.append(self._owns_client)
+
+    class FakeGitHubClient:
+        def __init__(self, pat=None):
+            self.pat = pat
+
+        async def clone_repo(self, repo, dest):
+            dest.mkdir(parents=True, exist_ok=True)
+
+        async def close(self) -> None:
+            return None
+
+    class FakeTeamRelay:
+        def __init__(self, client, team_name, group_chat_id, bot_usernames):
+            self._client = client
+            self._team_name = team_name
+            self._group_chat_id = group_chat_id
+            self._bot_usernames = set(bot_usernames)
+
+        async def start(self) -> None:
+            started_relays.append(
+                (
+                    self._client,
+                    self._team_name,
+                    self._group_chat_id,
+                    self._bot_usernames,
+                )
+            )
+
+    async def fake_create_supergroup(client, title: str) -> int:
+        assert client is shared_client
+        return -100_111
+
+    async def fake_add_bot(client, chat_id: int, bot_username: str) -> None:
+        return None
+
+    async def fake_promote_admin(client, chat_id: int, bot_username: str) -> None:
+        return None
+
+    async def fake_invite_user(client, chat_id: int, username: str) -> None:
+        return None
+
+    fake_telegram_group = types.ModuleType("link_project_to_chat.manager.telegram_group")
+    fake_telegram_group.create_supergroup = fake_create_supergroup
+    fake_telegram_group.add_bot = fake_add_bot
+    fake_telegram_group.promote_admin = fake_promote_admin
+    fake_telegram_group.invite_user = fake_invite_user
+
+    fake_team_relay = types.ModuleType("link_project_to_chat.manager.team_relay")
+    fake_team_relay.TeamRelay = FakeTeamRelay
+
+    monkeypatch.setattr("link_project_to_chat.botfather.BotFatherClient", FakeBotFatherClient)
+    monkeypatch.setattr("link_project_to_chat.github_client.GitHubClient", FakeGitHubClient)
+    monkeypatch.setitem(sys.modules, "link_project_to_chat.manager.telegram_group", fake_telegram_group)
+    monkeypatch.setitem(sys.modules, "link_project_to_chat.manager.team_relay", fake_team_relay)
+
+    mb = ManagerBot.__new__(ManagerBot)
+    mb._project_config_path = cfg_path
+    mb._app = MagicMock()
+    mb._app.bot = MagicMock()
+    mb._app.bot.send_message = AsyncMock(
+        return_value=MagicMock(edit_text=AsyncMock())
+    )
+    mb._pm = MagicMock()
+    mb._team_relays = {}
+    mb._telethon_client = None
+
+    update = MagicMock()
+    update.effective_chat = MagicMock(id=1)
+    update.effective_user = MagicMock(username="alice")
+    ctx = MagicMock()
+    ctx.user_data = {
+        "create_team": {
+            "project_prefix": "acme",
+            "persona_mgr": "developer",
+            "persona_dev": "tester",
+            "repo": MagicMock(),
+        }
+    }
+
+    result = await mb._create_team_execute(update, ctx)
+
+    assert result == ConversationHandler.END
+    assert mb._telethon_client is shared_client
+    assert "acme" in mb._team_relays
+    assert started_relays == [
+        (
+            shared_client,
+            "acme",
+            -100_111,
+            {"acme_mgr_claude_bot", "acme_dev_claude_bot"},
+        )
+    ]
+    assert disconnect_ownership == [False]
+    calls = {c.args for c in mb._pm.start_team.call_args_list}
+    assert calls == {("acme", "manager"), ("acme", "dev")}

@@ -1235,6 +1235,13 @@ class ManagerBot(AuthMixin):
             await edit("✓ Group wired | ⟳ Starting both bots...")
             self._pm.start_team(prefix, "manager")
             self._pm.start_team(prefix, "dev")
+            if getattr(self, "_telethon_client", None) is None:
+                # Fresh manager processes may not have a persistent Telethon
+                # client yet (for example right after the very first /create_team).
+                # Promote the authenticated client we just used so the new team's
+                # relay can start immediately without requiring a manager restart.
+                self._telethon_client = client
+                bfc._owns_client = False
             # Register a TeamRelay for this new team so bot-to-bot handoffs work
             # without restarting the manager service.
             try:
