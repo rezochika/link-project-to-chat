@@ -48,9 +48,21 @@ class ProcessManager:
         buf = self._logs[name]
         try:
             for raw_line in proc.stdout:
-                buf.append(raw_line.decode("utf-8", errors="replace").rstrip("\n"))
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                buf.append(line)
+                logger.info("[%s] %s", name, line)
         except (ValueError, OSError):
             pass
+        try:
+            returncode = proc.wait(timeout=0.1)
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            return
+        self._processes.pop(name, None)
+        self._log_threads.pop(name, None)
+        if returncode == 0:
+            logger.info("%s exited cleanly", name)
+        else:
+            logger.warning("%s exited with code %d", name, returncode)
 
     def start(self, project_name: str) -> bool:
         if project_name in self._processes and self._processes[project_name].poll() is None:

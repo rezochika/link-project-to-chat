@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sys
 import time
 from pathlib import Path
 
@@ -82,3 +84,36 @@ def test_stale_process_detected(tmp_path: Path):
     pm.start("fast")
     time.sleep(0.3)
     assert pm.status("fast") == "stopped"
+
+
+def test_child_output_is_forwarded_to_logger(tmp_path: Path, caplog):
+    pm = _pm(
+        tmp_path,
+        {"echo": {"path": str(tmp_path)}},
+        command_builder=lambda n, c: [
+            sys.executable,
+            "-c",
+            "import sys,time; print('hello from child', flush=True); time.sleep(0.2)",
+        ],
+    )
+    with caplog.at_level(logging.INFO):
+        pm.start("echo")
+        time.sleep(0.4)
+    assert any("[echo] hello from child" in rec.getMessage() for rec in caplog.records)
+
+
+def test_child_exit_is_logged(tmp_path: Path, caplog):
+    pm = _pm(
+        tmp_path,
+        {"boom": {"path": str(tmp_path)}},
+        command_builder=lambda n, c: [
+            sys.executable,
+            "-c",
+            "import sys; print('about to fail', flush=True); sys.exit(7)",
+        ],
+    )
+    with caplog.at_level(logging.INFO):
+        pm.start("boom")
+        time.sleep(0.4)
+    assert any("boom exited with code 7" in rec.getMessage() for rec in caplog.records)
+    assert pm.status("boom") == "stopped"
