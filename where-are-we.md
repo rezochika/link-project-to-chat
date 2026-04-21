@@ -57,6 +57,13 @@
   - Unsupported message types (sticker, video_note, location, contact, etc.) collapse to a single generic fallback reply
   - `_on_error` and `_post_init` moved into TelegramTransport; bot.py registers `_after_ready` via `Transport.on_ready`
   - **bot.py has zero telegram imports.** Lockout test enforces empty allowlist.
+- **Group/team port — Transport-native** (spec #0a, v0.15.0):
+  - `IncomingMessage.is_relayed_bot_to_bot` field — TelegramTransport detects the `[auto-relay from <handle>]` prefix and strips it; bot increments round counter on relayed paths (fixes the v1 tradeoff)
+  - `group_state.py` re-keyed by `ChatRef` (was int chat_id)
+  - `group_filters.py` ported to consume `IncomingMessage`; new `extract_mentions` regex helper (with non-word-boundary anchor to avoid email false-positives)
+  - Bot-side group logic moved into `_handle_group_text` + `_submit_group_message_to_claude` on the transport-native `_on_text_from_transport` dispatch
+  - `TelegramTransport.enable_team_relay(telethon_client, team_bot_usernames, group_chat_id, team_name)` — relay lifecycle tied to start()/stop(); `team_relay.py` moved into `transport/_telegram_relay.py`. Manager bot still drives the relay directly until spec #0c.
+  - Three cleanups: M4 hardcoded `transport_id="telegram"` → `self._transport.TRANSPORT_ID`; M5 ask-question annotation regression fixed via `_render_question_html` helper; M6 dead `LiveMessage` import removed
 
 ## Coding Style
 - Single-purpose functions
@@ -74,6 +81,5 @@
 - `chmod 0o600` missing from `clear_session()` write path
 - No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
-- Group/team features (team_relay, group_filters, group_state) still telegram-specific (pending spec #0a)
 - Manager bot (`manager/bot.py`) still telegram-specific (pending spec #0c)
 - `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it
