@@ -338,17 +338,19 @@ class ManagerBot(AuthMixin):
             buttons=buttons,
         )
 
-    async def _on_start_all(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_start_all_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /start_all."""
+        if not await self._guard_invocation(invocation):
             return
         count = self._pm.start_all()
-        await update.effective_message.reply_text(f"Started {count} project(s).")
+        await self._transport.send_text(invocation.chat, f"Started {count} project(s).")
 
-    async def _on_stop_all(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_stop_all_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /stop_all."""
+        if not await self._guard_invocation(invocation):
             return
         count = self._pm.stop_all()
-        await update.effective_message.reply_text(f"Stopped {count} project(s).")
+        await self._transport.send_text(invocation.chat, f"Stopped {count} project(s).")
 
     def _load_teams(self) -> dict:
         from ..config import load_config
@@ -439,15 +441,27 @@ class ManagerBot(AuthMixin):
             rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"global_model_{model_id}")])
         return InlineKeyboardMarkup(rows)
 
-    async def _on_model(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    def _global_model_buttons(self) -> Buttons:
+        """Transport-native counterpart of _global_model_markup."""
+        from ..config import load_config
+        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
+        rows = []
+        for model_id, label in MODEL_OPTIONS:
+            prefix = "● " if current == model_id else ""
+            rows.append([Button(label=f"{prefix}{label}", value=f"global_model_{model_id}")])
+        return Buttons(rows=rows)
+
+    async def _on_model_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /model."""
+        if not await self._guard_invocation(invocation):
             return
         from ..config import load_config
         current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
         label = next((l for m, l in MODEL_OPTIONS if m == current), current or "not set")
-        await update.effective_message.reply_text(
+        await self._transport.send_text(
+            invocation.chat,
             f"Default model: {label}\nApplies to projects without a per-project model override.",
-            reply_markup=self._global_model_markup(),
+            buttons=self._global_model_buttons(),
         )
 
     async def _on_version_from_transport(self, invocation: "CommandInvocation") -> None:
@@ -552,15 +566,18 @@ class ManagerBot(AuthMixin):
         text = "Authorized users:\n" + "\n".join(f"  @{u}" for u in usernames)
         await self._transport.send_text(invocation.chat, text)
 
-    async def _on_add_user(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_add_user_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /add_user."""
+        if not await self._guard_invocation(invocation):
             return
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /add_user <username>")
-        new_user = ctx.args[0].lower().lstrip("@")
+        if not invocation.args:
+            await self._transport.send_text(invocation.chat, "Usage: /add_user <username>")
+            return
+        new_user = invocation.args[0].lower().lstrip("@")
         usernames = self._get_allowed_usernames()
         if new_user in usernames:
-            return await update.effective_message.reply_text(f"@{new_user} is already authorized.")
+            await self._transport.send_text(invocation.chat, f"@{new_user} is already authorized.")
+            return
         if not self._allowed_usernames:
             self._allowed_usernames = list(usernames)
         self._allowed_usernames.append(new_user)
@@ -570,17 +587,20 @@ class ManagerBot(AuthMixin):
         if new_user not in config.allowed_usernames:
             config.allowed_usernames.append(new_user)
             save_config(config, path)
-        await update.effective_message.reply_text(f"Added @{new_user}.")
+        await self._transport.send_text(invocation.chat, f"Added @{new_user}.")
 
-    async def _on_remove_user(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_remove_user_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /remove_user."""
+        if not await self._guard_invocation(invocation):
             return
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /remove_user <username>")
-        rm_user = ctx.args[0].lower().lstrip("@")
+        if not invocation.args:
+            await self._transport.send_text(invocation.chat, "Usage: /remove_user <username>")
+            return
+        rm_user = invocation.args[0].lower().lstrip("@")
         usernames = self._get_allowed_usernames()
         if rm_user not in usernames:
-            return await update.effective_message.reply_text(f"@{rm_user} is not authorized.")
+            await self._transport.send_text(invocation.chat, f"@{rm_user} is not authorized.")
+            return
         if not self._allowed_usernames:
             self._allowed_usernames = list(usernames)
         self._allowed_usernames.remove(rm_user)
@@ -590,10 +610,11 @@ class ManagerBot(AuthMixin):
         if rm_user in config.allowed_usernames:
             config.allowed_usernames.remove(rm_user)
             save_config(config, path)
-        await update.effective_message.reply_text(f"Removed @{rm_user}.")
+        await self._transport.send_text(invocation.chat, f"Removed @{rm_user}.")
 
-    async def _on_setup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+    async def _on_setup_from_transport(self, invocation: "CommandInvocation") -> None:
+        """Transport-native handler for /setup."""
+        if not await self._guard_invocation(invocation):
             return
         from ..config import load_config
         path = self._project_config_path or DEFAULT_CONFIG
@@ -607,17 +628,28 @@ class ManagerBot(AuthMixin):
         lines.append(f"  Telethon session: {'exists' if session_path.exists() else 'not authenticated'}")
         lines.append(f"  Voice STT: {config.stt_backend or 'disabled'}")
 
-        buttons = []
-        buttons.append([InlineKeyboardButton("Set GitHub Token", callback_data="setup_gh")])
-        buttons.append([InlineKeyboardButton("Set Telegram API", callback_data="setup_api")])
+        rows: list[list[Button]] = []
+        rows.append([Button(label="Set GitHub Token", value="setup_gh")])
+        rows.append([Button(label="Set Telegram API", value="setup_api")])
         if config.telegram_api_id and config.telegram_api_hash:
-            buttons.append([InlineKeyboardButton("Authenticate Telethon", callback_data="setup_telethon")])
-        buttons.append([InlineKeyboardButton("Set Voice STT", callback_data="setup_voice")])
-        buttons.append([InlineKeyboardButton("Done", callback_data="setup_done")])
+            rows.append([Button(label="Authenticate Telethon", value="setup_telethon")])
+        rows.append([Button(label="Set Voice STT", value="setup_voice")])
+        rows.append([Button(label="Done", value="setup_done")])
 
-        ctx.user_data["setup_config_path"] = str(path)
-        await update.effective_message.reply_text(
-            "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons)
+        # Stash the config path on PTB's per-user storage so the subsequent
+        # setup_* callback handlers (still PTB-native in this task) can read it.
+        # Moving the follow-up handlers off PTB is out of scope for spec #0c
+        # Task 9; until then we reuse the existing ctx.user_data slot via the
+        # Update/ctx pair the Telegram transport stashes in invocation.native.
+        native = invocation.native
+        if isinstance(native, tuple) and len(native) >= 2:
+            ctx = native[1]
+            user_data = getattr(ctx, "user_data", None)
+            if user_data is not None:
+                user_data["setup_config_path"] = str(path)
+
+        await self._transport.send_text(
+            invocation.chat, "\n".join(lines), buttons=Buttons(rows=rows)
         )
 
     async def _on_edit_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1860,7 +1892,7 @@ class ManagerBot(AuthMixin):
         self._app.post_init = self._post_init
         app = self._app
 
-        # Fully-ported commands (spec #0c Task 8) — consume CommandInvocation
+        # Fully-ported commands (spec #0c Tasks 8-9) — consume CommandInvocation
         # directly. Registered on the transport; PTB is bridged via
         # _dispatch_command so the existing app.add_handler pathway still works.
         ported_commands = {
@@ -1869,6 +1901,12 @@ class ManagerBot(AuthMixin):
             "version": self._on_version_from_transport,
             "help": self._on_help_from_transport,
             "users": self._on_users_from_transport,
+            "start_all": self._on_start_all_from_transport,
+            "stop_all": self._on_stop_all_from_transport,
+            "model": self._on_model_from_transport,
+            "add_user": self._on_add_user_from_transport,
+            "remove_user": self._on_remove_user_from_transport,
+            "setup": self._on_setup_from_transport,
         }
         for name, handler in ported_commands.items():
             self._transport.on_command(name, handler)
@@ -1880,13 +1918,7 @@ class ManagerBot(AuthMixin):
         # Legacy commands — still use Update/ctx internals; bridged to PTB
         # directly until their respective tasks port them.
         for name, handler in {
-            "start_all": self._on_start_all,
-            "stop_all": self._on_stop_all,
-            "model": self._on_model,
             "edit_project": self._on_edit_project,
-            "add_user": self._on_add_user,
-            "remove_user": self._on_remove_user,
-            "setup": self._on_setup,
         }.items():
             app.add_handler(CommandHandler(name, handler))
 
