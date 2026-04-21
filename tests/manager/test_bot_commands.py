@@ -23,12 +23,19 @@ def _make_update(args: list[str] | None = None, user_id: int = 1, username: str 
     user = MagicMock()
     user.id = user_id
     user.username = username
+    user.full_name = username
+    user.is_bot = False
+    chat = MagicMock()
+    chat.id = user_id
+    chat.type = "private"
     message = AsyncMock()
     message.reply_text = AsyncMock()
     message.text = text
+    message.chat = chat
     update = MagicMock()
     update.effective_user = user
     update.effective_message = message
+    update.effective_chat = chat
     update.message = message
     ctx = MagicMock()
     ctx.args = args if args is not None else []
@@ -113,6 +120,7 @@ def bot_env(tmp_path: Path):
 async def _run_add_dialogue(bot, tmp_path, name="myproj", token="/skip", username="/skip", model="/skip"):
     proj_path = tmp_path / name
     proj_path.mkdir(exist_ok=True)
+    fake = _swap_fake_transport(bot)
 
     update, ctx = _make_update()
     result = await bot._on_add_project(update, ctx)
@@ -140,16 +148,16 @@ async def _run_add_dialogue(bot, tmp_path, name="myproj", token="/skip", usernam
     final_ctx = MagicMock()
     final_ctx.user_data = ctx.user_data
     result = await bot._add_model(u, final_ctx)
-    return result, u, str(proj_path)
+    return result, fake, str(proj_path)
 
 
 @pytest.mark.asyncio
 async def test_addproject_success(bot_env, tmp_path: Path):
     from telegram.ext import ConversationHandler
     bot, pm, proj_cfg = bot_env
-    result, last_update, proj_path = await _run_add_dialogue(bot, tmp_path)
+    result, fake, proj_path = await _run_add_dialogue(bot, tmp_path)
     assert result == ConversationHandler.END
-    assert "Added" in last_update.effective_message.reply_text.call_args[0][0]
+    assert "Added" in fake.sent_messages[-1].text
     assert "myproj" in json.loads(proj_cfg.read_text())["projects"]
 
 
@@ -171,6 +179,7 @@ async def test_addproject_already_exists(bot_env, tmp_path: Path):
     existing = tmp_path / "existing"
     existing.mkdir()
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(existing)}}}))
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update()
     await bot._on_add_project(update, ctx)
     u, _ = _make_update(text="myproj")
@@ -178,12 +187,13 @@ async def test_addproject_already_exists(bot_env, tmp_path: Path):
     step_ctx.user_data = ctx.user_data
     result = await bot._add_name(u, step_ctx)
     assert result == bot.ADD_NAME
-    assert "already exists" in u.effective_message.reply_text.call_args[0][0]
+    assert "already exists" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
 async def test_addproject_invalid_path(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
     update, ctx = _make_update()
     await bot._on_add_project(update, ctx)
     u1, _ = _make_update(text="newproj")
@@ -193,7 +203,7 @@ async def test_addproject_invalid_path(bot_env, tmp_path: Path):
     c2 = MagicMock(); c2.user_data = ctx.user_data
     result = await bot._add_path(u2, c2)
     assert result == bot.ADD_PATH
-    assert "not exist" in u2.effective_message.reply_text.call_args[0][0]
+    assert "not exist" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio

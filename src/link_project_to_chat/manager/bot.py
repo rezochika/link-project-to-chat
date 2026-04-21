@@ -454,55 +454,79 @@ class ManagerBot(AuthMixin):
     async def _on_add_project(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not await self._guard(update):
             return ConversationHandler.END
+        incoming = self._incoming_from_update(update)
         ctx.user_data["new_project"] = {}
-        await update.effective_message.reply_text("Let's add a new project.\n\nWhat is the project name?")
+        await self._transport.send_text(
+            incoming.chat,
+            "Let's add a new project.\n\nWhat is the project name?",
+        )
         return self.ADD_NAME
 
     async def _add_name(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        name = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        name = incoming.text.strip()
         if name in self._load_projects():
-            await update.effective_message.reply_text(f"Project '{name}' already exists. Try a different name:")
+            await self._transport.send_text(
+                incoming.chat,
+                f"Project '{name}' already exists. Try a different name:",
+            )
             return self.ADD_NAME
         ctx.user_data["new_project"]["name"] = name
-        await update.effective_message.reply_text("Enter the project path:")
+        await self._transport.send_text(incoming.chat, "Enter the project path:")
         return self.ADD_PATH
 
     async def _add_path(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        path = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        path = incoming.text.strip()
         if not Path(path).exists():
-            await update.effective_message.reply_text(f"Path does not exist: {path}\nTry again:")
+            await self._transport.send_text(
+                incoming.chat,
+                f"Path does not exist: {path}\nTry again:",
+            )
             return self.ADD_PATH
         ctx.user_data["new_project"]["path"] = path
-        await update.effective_message.reply_text("Enter the Telegram bot token (or /skip):")
+        await self._transport.send_text(
+            incoming.chat,
+            "Enter the Telegram bot token (or /skip):",
+        )
         return self.ADD_TOKEN
 
     async def _add_token(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        text = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        text = incoming.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["telegram_bot_token"] = text
-        await update.effective_message.reply_text("Enter the allowed username (or /skip):")
+        await self._transport.send_text(
+            incoming.chat,
+            "Enter the allowed username (or /skip):",
+        )
         return self.ADD_USERNAME
 
     async def _add_username(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        text = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        text = incoming.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["username"] = text
-        await update.effective_message.reply_text("Enter the model name (or /skip):")
+        await self._transport.send_text(
+            incoming.chat,
+            "Enter the model name (or /skip):",
+        )
         return self.ADD_MODEL
 
     async def _add_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        text = update.message.text.strip()
+        incoming = self._incoming_from_update(update)
+        text = incoming.text.strip()
         if text != "/skip":
             ctx.user_data["new_project"]["model"] = text
         data = ctx.user_data.pop("new_project", {})
         name = data.pop("name", None)
         if not name:
-            await update.effective_message.reply_text("Something went wrong. Try again.")
+            await self._transport.send_text(incoming.chat, "Something went wrong. Try again.")
             return ConversationHandler.END
         projects = self._load_projects()
         projects[name] = data
         self._save_projects(projects)
-        await update.effective_message.reply_text(f"Added project '{name}'.")
+        await self._transport.send_text(incoming.chat, f"Added project '{name}'.")
         return ConversationHandler.END
 
     async def _on_users_from_transport(self, invocation: "CommandInvocation") -> None:
