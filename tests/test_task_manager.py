@@ -451,3 +451,81 @@ async def test_find_by_message(tmp_path):
     found = tm.find_by_message(99)
     assert task in found
     task.cancel()
+
+
+class _BlockingClaude:
+    def __init__(self, release_first: asyncio.Event):
+        self.release_first = release_first
+        self.session_id = None
+        self.inputs = []
+        self.closed = 0
+
+    def chat_stream(self, user_message, on_proc=None):
+        self.inputs.append(user_message)
+
+        async def _gen():
+            if user_message == "first":
+                await self.release_first.wait()
+                yield Result(text="first done", session_id="s1", model=None)
+            else:
+                yield Result(text=f"{user_message} done", session_id="s1", model=None)
+
+        return _gen()
+
+    def close_interactive(self):
+        self.closed += 1
+
+
+@pytest.mark.asyncio
+async def test_second_claude_task_waits_for_first_to_finish(tmp_path):
+    async def _noop(task):
+        pass
+
+    gate = asyncio.Event()
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm._claude = _BlockingClaude(gate)
+
+    first = tm.submit_claude(chat_id=1, message_id=1, prompt="first")
+    await asyncio.sleep(0.1)
+    second = tm.submit_claude(chat_id=1, message_id=2, prompt="second")
+    await asyncio.sleep(0.1)
+
+    assert first.status == TaskStatus.RUNNING
+    assert second.status == TaskStatus.WAITING
+    assert tm._claude.inputs == ["first"]
+
+    gate.set()
+    await asyncio.wait_for(first._asyncio_task, timeout=2)
+    await asyncio.wait_for(second._asyncio_task, timeout=2)
+
+    assert second.status == TaskStatus.DONE
+    assert tm._claude.inputs == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiting_input_task_releases_next_claude_task(tmp_path):
+    question = Question(
+        question="Pick one",
+        header="Choice",
+        options=[QuestionOption(label="Yes", description="")],
+    )
+    turns = [
+        [AskQuestion(questions=[question]), Result(text="", session_id="s1", model=None)],
+        [Result(text="next done", session_id="s1", model=None)],
+    ]
+    tm = _make_tm_with_fake(tmp_path, turns)
+
+    first = tm.submit_claude(chat_id=1, message_id=1, prompt="start")
+    await asyncio.wait_for(first._asyncio_task, timeout=2)
+    assert first.status == TaskStatus.WAITING_INPUT
+
+    second = tm.submit_claude(chat_id=1, message_id=2, prompt="next")
+    await asyncio.sleep(0.1)
+    assert second.status == TaskStatus.WAITING
+
+    assert tm.cancel(first.id) is True
+    await asyncio.wait_for(second._asyncio_task, timeout=2)
+
+    assert second.status == TaskStatus.DONE
+    assert tm._claude.inputs == ["start", "next"]
+    assert tm._claude.closed == 2

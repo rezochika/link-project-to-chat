@@ -153,7 +153,8 @@ def _render_table(table_text: str) -> str:
         if ri == 0:
             lines.append("  ".join("─" * w for w in widths))
 
-    return f"<pre>{_escape_html('\n'.join(lines))}</pre>"
+    joined_lines = '\n'.join(lines)
+    return f"<pre>{_escape_html(joined_lines)}</pre>"
 
 
 def _escape_html(text: str) -> str:

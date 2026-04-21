@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import os
+import signal
 import subprocess
 import threading
 from collections.abc import Callable
@@ -12,6 +14,41 @@ from .config import load_project_configs, set_project_autostart, set_team_bot_au
 from ..config import DEFAULT_CONFIG, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def _process_popen_kwargs() -> dict[str, object]:
+    if os.name == "nt":
+        return {
+            "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        }
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+
+    if os.name == "nt":
+        with contextlib.suppress(OSError):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+    else:
+        if getattr(proc, "_kill_process_tree", False):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            with contextlib.suppress(OSError):
+                proc.kill()
+
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
 
 
 def _build_project_bot_env(team_name: str | None, config_dir: Path) -> dict[str, str]:
@@ -93,7 +130,14 @@ class ProcessManager:
         if project_name not in projects:
             return False
         cmd = self._command_builder(project_name, projects[project_name])
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            **_process_popen_kwargs(),
+        )
+        setattr(proc, "_kill_process_tree", True)
         self._processes[project_name] = proc
         self._logs[project_name] = collections.deque(maxlen=200)
         thread = threading.Thread(target=self._capture_output, args=(project_name, proc), daemon=True)
@@ -125,7 +169,9 @@ class ProcessManager:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             env=env,
+            **_process_popen_kwargs(),
         )
+        setattr(proc, "_kill_process_tree", True)
         self._processes[key] = proc
         self._logs[key] = collections.deque(maxlen=200)
         thread = threading.Thread(target=self._capture_output, args=(key, proc), daemon=True)
@@ -140,12 +186,7 @@ class ProcessManager:
         if not proc or proc.poll() is not None:
             self._processes.pop(project_name, None)
             return False
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _terminate_process_tree(proc)
         self._processes.pop(project_name, None)
         self._log_threads.pop(project_name, None)
         logger.info("Stopped %s", project_name)

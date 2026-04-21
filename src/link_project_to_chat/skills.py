@@ -27,6 +27,7 @@ GLOBAL_PERSONAS_DIR = Path.home() / ".link-project-to-chat" / "personas"
 CLAUDE_USER_SKILLS_DIR = Path.home() / ".claude" / "skills"
 # Personas shipped with the package (lowest priority; overridden by global/project).
 BUNDLED_PERSONAS_DIR = Path(__file__).parent / "personas"
+_TEXT_ENCODING = "utf-8"
 
 
 @dataclass
@@ -52,7 +53,7 @@ def _load_from_dir(directory: Path, source: str) -> dict[str, Skill]:
     # Flat .md files (e.g. reviewer.md)
     for f in sorted(directory.glob("*.md")):
         name = f.stem
-        content = f.read_text().strip()
+        content = f.read_text(encoding=_TEXT_ENCODING).strip()
         if content:
             skills[name] = Skill(name=name, content=content, source=source, path=f)
     # Claude Code directory format (e.g. reviewer/SKILL.md)
@@ -61,7 +62,7 @@ def _load_from_dir(directory: Path, source: str) -> dict[str, Skill]:
             skill_file = d / "SKILL.md"
             if skill_file.is_file():
                 name = d.name
-                content = skill_file.read_text().strip()
+                content = skill_file.read_text(encoding=_TEXT_ENCODING).strip()
                 if content and name not in skills:
                     skills[name] = Skill(name=name, content=content, source=source, path=skill_file)
     return skills
@@ -90,13 +91,13 @@ def load_skill(name: str, project_path: Path) -> Skill | None:
         # Flat .md file
         f = directory / f"{name}.md"
         if f.is_file():
-            content = f.read_text().strip()
+            content = f.read_text(encoding=_TEXT_ENCODING).strip()
             if content:
                 return Skill(name=name, content=content, source=source, path=f)
         # Directory with SKILL.md
         f = directory / name / "SKILL.md"
         if f.is_file():
-            content = f.read_text().strip()
+            content = f.read_text(encoding=_TEXT_ENCODING).strip()
             if content:
                 return Skill(name=name, content=content, source=source, path=f)
     return None
@@ -108,7 +109,7 @@ def save_skill(name: str, content: str, project_path: Path, *, scope: str = "pro
     d = GLOBAL_SKILLS_DIR if scope == "global" else project_skills_dir(project_path)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
-    p.write_text(content)
+    p.write_text(content, encoding=_TEXT_ENCODING)
     return p
 
 
@@ -145,7 +146,7 @@ def load_persona(name: str, project_path: Path) -> Skill | None:
     ):
         f = directory / f"{name}.md"
         if f.is_file():
-            content = f.read_text().strip()
+            content = f.read_text(encoding=_TEXT_ENCODING).strip()
             if content:
                 return Skill(name=name, content=content, source=source, path=f)
     return None
@@ -157,7 +158,7 @@ def save_persona(name: str, content: str, project_path: Path, *, scope: str = "p
     d = GLOBAL_PERSONAS_DIR if scope == "global" else project_personas_dir(project_path)
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"{name}.md"
-    p.write_text(content)
+    p.write_text(content, encoding=_TEXT_ENCODING)
     return p
 
 

@@ -25,7 +25,8 @@ class ProjectConfig:
     path: str
     telegram_bot_token: str
     allowed_usernames: list[str] = field(default_factory=list)  # per-project override
-    trusted_user_ids: list[int] = field(default_factory=list)  # per-project; falls back to Config.trusted_user_ids
+    trusted_users: dict[str, int] = field(default_factory=dict)
+    trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     model: str | None = None
     effort: str | None = None
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
@@ -58,7 +59,8 @@ class TeamConfig:
 @dataclass
 class Config:
     allowed_usernames: list[str] = field(default_factory=list)
-    trusted_user_ids: list[int] = field(default_factory=list)  # global fallback (also used by manager bot)
+    trusted_users: dict[str, int] = field(default_factory=dict)
+    trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     github_pat: str = ""
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
@@ -79,8 +81,8 @@ def resolve_project_auth_scope(
     project: ProjectConfig,
     config: Config,
     username_override: str | None = None,
-) -> tuple[list[str], list[int]]:
-    """Return the effective usernames and trusted IDs for a project bot.
+) -> tuple[list[str], dict[str, int]]:
+    """Return the effective usernames and trusted-user bindings for a project bot.
 
     Project-specific allowlists must not inherit unrelated global trusted IDs:
     once a project narrows ``allowed_usernames``, only its own trusted IDs
@@ -88,11 +90,29 @@ def resolve_project_auth_scope(
     override and intentionally starts with no trusted IDs.
     """
     if username_override:
-        return [username_override.lower().lstrip("@")], []
+        return [_normalize_username(username_override)], {}
     if project.allowed_usernames:
-        return list(project.allowed_usernames), list(project.trusted_user_ids)
-    trusted_user_ids = project.trusted_user_ids or config.trusted_user_ids
-    return list(config.allowed_usernames), list(trusted_user_ids)
+        return list(project.allowed_usernames), _effective_trusted_users(
+            project.allowed_usernames,
+            trusted_users=project.trusted_users,
+            trusted_user_ids=project.trusted_user_ids,
+        )
+    trusted_users = _effective_trusted_users(
+        config.allowed_usernames,
+        trusted_users=project.trusted_users,
+        trusted_user_ids=project.trusted_user_ids,
+    )
+    if not trusted_users:
+        trusted_users = _effective_trusted_users(
+            config.allowed_usernames,
+            trusted_users=config.trusted_users,
+            trusted_user_ids=config.trusted_user_ids,
+        )
+    return list(config.allowed_usernames), trusted_users
+
+
+def _normalize_username(username: str) -> str:
+    return username.lower().lstrip("@")
 
 
 def _load_permissions(proj: dict) -> str | None:
@@ -116,10 +136,10 @@ def resolve_permissions(permissions: str | None) -> tuple[bool, str | None]:
 def _migrate_usernames(raw: dict, list_key: str, singular_key: str) -> list[str]:
     """Load a list of usernames, migrating from old singular key if needed."""
     if list_key in raw:
-        return [u.lower().lstrip("@") for u in raw[list_key]]
+        return [_normalize_username(u) for u in raw[list_key]]
     singular = raw.get(singular_key, "")
     if singular:
-        return [singular.lower().lstrip("@")]
+        return [_normalize_username(singular)]
     return []
 
 
@@ -133,12 +153,78 @@ def _migrate_user_ids(raw: dict, list_key: str, singular_key: str) -> list[int]:
     return []
 
 
+def _effective_trusted_users(
+    allowed_usernames: list[str],
+    *,
+    trusted_users: dict[str, int] | None = None,
+    trusted_user_ids: list[int] | None = None,
+) -> dict[str, int]:
+    normalized_allowed = [_normalize_username(username) for username in allowed_usernames]
+    allowed_set = set(normalized_allowed)
+    if trusted_users:
+        effective: dict[str, int] = {}
+        for username, user_id in trusted_users.items():
+            normalized = _normalize_username(username)
+            if normalized in allowed_set:
+                effective[normalized] = int(user_id)
+        if effective:
+            return effective
+    return {
+        username: int(user_id)
+        for username, user_id in zip(normalized_allowed, trusted_user_ids or [])
+    }
+
+
+def _migrate_trusted_users(
+    raw: dict,
+    allowed_usernames: list[str],
+    map_key: str,
+    list_key: str,
+    singular_key: str,
+) -> dict[str, int]:
+    trusted_users = raw.get(map_key)
+    if isinstance(trusted_users, dict):
+        return _effective_trusted_users(
+            allowed_usernames,
+            trusted_users=trusted_users,
+        )
+    return _effective_trusted_users(
+        allowed_usernames,
+        trusted_user_ids=_migrate_user_ids(raw, list_key, singular_key),
+    )
+
+
+def _write_raw_trusted_users(
+    raw: dict,
+    trusted_users: dict[str, int],
+    *,
+    map_key: str,
+    list_key: str,
+    singular_key: str,
+) -> None:
+    if trusted_users:
+        raw[map_key] = trusted_users
+    else:
+        raw.pop(map_key, None)
+    raw.pop(list_key, None)
+    raw.pop(singular_key, None)
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     config = Config()
     if path.exists():
         raw = json.loads(path.read_text())
         config.allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
         config.trusted_user_ids = _migrate_user_ids(raw, "trusted_user_ids", "trusted_user_id")
+        config.trusted_users = _migrate_trusted_users(
+            raw,
+            config.allowed_usernames,
+            "trusted_users",
+            "trusted_user_ids",
+            "trusted_user_id",
+        )
+        if not config.trusted_user_ids and config.trusted_users:
+            config.trusted_user_ids = list(config.trusted_users.values())
         config.github_pat = raw.get("github_pat", "")
         config.telegram_api_id = raw.get("telegram_api_id", 0)
         config.telegram_api_hash = raw.get("telegram_api_hash", "")
@@ -165,10 +251,19 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     file=sys.stderr,
                 )
                 continue
+            project_allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
+            trust_scope_usernames = project_allowed_usernames or config.allowed_usernames
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
-                allowed_usernames=_migrate_usernames(proj, "allowed_usernames", "username"),
+                allowed_usernames=project_allowed_usernames,
+                trusted_users=_migrate_trusted_users(
+                    proj,
+                    trust_scope_usernames,
+                    "trusted_users",
+                    "trusted_user_ids",
+                    "trusted_user_id",
+                ),
                 trusted_user_ids=_migrate_user_ids(proj, "trusted_user_ids", "trusted_user_id"),
                 model=proj.get("model"),
                 effort=proj.get("effort"),
@@ -178,6 +273,13 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 active_persona=proj.get("active_persona"),
                 show_thinking=proj.get("show_thinking", False),
             )
+            if (
+                not config.projects[name].trusted_user_ids
+                and config.projects[name].trusted_users
+            ):
+                config.projects[name].trusted_user_ids = list(
+                    config.projects[name].trusted_users.values()
+                )
         for name, team in raw.get("teams", {}).items():
             config.teams[name] = TeamConfig(
                 path=team["path"],
@@ -216,8 +318,17 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     # Write new plural keys, remove old singular keys
     raw["allowed_usernames"] = config.allowed_usernames
     raw.pop("allowed_username", None)
-    raw["trusted_user_ids"] = config.trusted_user_ids
-    raw.pop("trusted_user_id", None)
+    _write_raw_trusted_users(
+        raw,
+        _effective_trusted_users(
+            config.allowed_usernames,
+            trusted_users=config.trusted_users,
+            trusted_user_ids=config.trusted_user_ids,
+        ),
+        map_key="trusted_users",
+        list_key="trusted_user_ids",
+        singular_key="trusted_user_id",
+    )
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.github_pat:
@@ -274,8 +385,18 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         # Write new plural keys, remove old singular keys
         proj["allowed_usernames"] = p.allowed_usernames
         proj.pop("username", None)
-        proj["trusted_user_ids"] = p.trusted_user_ids
-        proj.pop("trusted_user_id", None)
+        trust_scope_usernames = p.allowed_usernames or config.allowed_usernames
+        _write_raw_trusted_users(
+            proj,
+            _effective_trusted_users(
+                trust_scope_usernames,
+                trusted_users=p.trusted_users,
+                trusted_user_ids=p.trusted_user_ids,
+            ),
+            map_key="trusted_users",
+            list_key="trusted_user_ids",
+            singular_key="trusted_user_id",
+        )
         if p.model:
             proj["model"] = p.model
         if p.effort:
@@ -494,4 +615,125 @@ def add_project_trusted_user_id(project_name: str, user_id: int, path: Path = DE
         if user_id not in ids:
             ids.append(user_id)
         proj["trusted_user_ids"] = ids
+    _patch_json(_patch, path)
+
+
+def bind_trusted_user(username: str, user_id: int, path: Path = DEFAULT_CONFIG) -> None:
+    """Bind a trusted user ID to a specific allowed username."""
+    normalized = _normalize_username(username)
+
+    def _patch(raw: dict) -> None:
+        allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
+        trusted_users = _migrate_trusted_users(
+            raw,
+            allowed_usernames,
+            "trusted_users",
+            "trusted_user_ids",
+            "trusted_user_id",
+        )
+        trusted_users[normalized] = int(user_id)
+        _write_raw_trusted_users(
+            raw,
+            trusted_users,
+            map_key="trusted_users",
+            list_key="trusted_user_ids",
+            singular_key="trusted_user_id",
+        )
+
+    _patch_json(_patch, path)
+
+
+def bind_project_trusted_user(
+    project_name: str,
+    username: str,
+    user_id: int,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Bind a trusted user ID to a specific allowed username for one project."""
+    normalized = _normalize_username(username)
+
+    def _patch(raw: dict) -> None:
+        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
+        allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
+        trust_scope_usernames = allowed_usernames or _migrate_usernames(
+            raw,
+            "allowed_usernames",
+            "allowed_username",
+        )
+        trusted_users = _migrate_trusted_users(
+            proj,
+            trust_scope_usernames,
+            "trusted_users",
+            "trusted_user_ids",
+            "trusted_user_id",
+        )
+        trusted_users[normalized] = int(user_id)
+        _write_raw_trusted_users(
+            proj,
+            trusted_users,
+            map_key="trusted_users",
+            list_key="trusted_user_ids",
+            singular_key="trusted_user_id",
+        )
+
+    _patch_json(_patch, path)
+
+
+def unbind_trusted_user(username: str, path: Path = DEFAULT_CONFIG) -> None:
+    """Remove a trusted-user binding for a username."""
+    normalized = _normalize_username(username)
+
+    def _patch(raw: dict) -> None:
+        allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
+        trusted_users = _migrate_trusted_users(
+            raw,
+            allowed_usernames,
+            "trusted_users",
+            "trusted_user_ids",
+            "trusted_user_id",
+        )
+        trusted_users.pop(normalized, None)
+        _write_raw_trusted_users(
+            raw,
+            trusted_users,
+            map_key="trusted_users",
+            list_key="trusted_user_ids",
+            singular_key="trusted_user_id",
+        )
+
+    _patch_json(_patch, path)
+
+
+def unbind_project_trusted_user(
+    project_name: str,
+    username: str,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Remove a per-project trusted-user binding for a username."""
+    normalized = _normalize_username(username)
+
+    def _patch(raw: dict) -> None:
+        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
+        allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
+        trust_scope_usernames = allowed_usernames or _migrate_usernames(
+            raw,
+            "allowed_usernames",
+            "allowed_username",
+        )
+        trusted_users = _migrate_trusted_users(
+            proj,
+            trust_scope_usernames,
+            "trusted_users",
+            "trusted_user_ids",
+            "trusted_user_id",
+        )
+        trusted_users.pop(normalized, None)
+        _write_raw_trusted_users(
+            proj,
+            trusted_users,
+            map_key="trusted_users",
+            list_key="trusted_user_ids",
+            singular_key="trusted_user_id",
+        )
+
     _patch_json(_patch, path)

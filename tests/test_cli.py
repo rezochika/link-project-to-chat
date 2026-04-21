@@ -263,6 +263,26 @@ def test_configure_manager_token(runner, cfg):
     assert "projects" in data
 
 
+def test_configure_remove_username_revokes_trusted_binding(runner, tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(
+        json.dumps(
+            {
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 42},
+                "projects": {},
+            }
+        )
+    )
+
+    result = runner.invoke(main, ["--config", str(p), "configure", "--remove-username", "alice"])
+
+    assert result.exit_code == 0
+    data = json.loads(p.read_text())
+    assert data["allowed_usernames"] == []
+    assert "trusted_users" not in data
+
+
 def test_configure_no_args_fails(runner, cfg):
     p, _ = cfg
     result = runner.invoke(main, ["--config", str(p), "configure"])
@@ -448,7 +468,7 @@ def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
     assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_user_ids"] == []
+    assert kwargs["trusted_users"] == {}
 
 
 def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatch):
@@ -486,7 +506,7 @@ def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatc
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
     assert kwargs["allowed_usernames"] == ["carol"]
-    assert kwargs["trusted_user_ids"] == []
+    assert kwargs["trusted_users"] == {}
 
 
 def test_start_single_project_without_project_flag_uses_project_trusted_ids_only(tmp_path, monkeypatch):
@@ -520,4 +540,35 @@ def test_start_single_project_without_project_flag_uses_project_trusted_ids_only
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
     assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_user_ids"] == []
+    assert kwargs["trusted_users"] == {}
+
+
+def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+
+    project_path = tmp_path / "adhoc"
+    project_path.mkdir()
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    result = CliRunner().invoke(
+        cli.main,
+        [
+            "start",
+            "--path",
+            str(project_path),
+            "--token",
+            "tok",
+            "--username",
+            "alice",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    _, kwargs = calls[0]
+    assert kwargs["allowed_usernames"] == ["alice"]
+    assert kwargs.get("on_trust") is None
+    assert kwargs.get("trusted_users") is None

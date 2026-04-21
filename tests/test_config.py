@@ -13,6 +13,8 @@ from link_project_to_chat.config import (
     TeamConfig,
     add_project_trusted_user_id,
     add_trusted_user_id,
+    bind_project_trusted_user,
+    bind_trusted_user,
     clear_session,
     clear_trusted_user_id,
     load_config,
@@ -24,6 +26,7 @@ from link_project_to_chat.config import (
     save_project_trusted_user_id,
     save_session,
     save_trusted_user_id,
+    unbind_trusted_user,
 )
 
 
@@ -313,6 +316,7 @@ def test_save_config_removes_old_singular_keys(tmp_path: Path):
     raw = json.loads(p.read_text())
     assert "allowed_username" not in raw
     assert "trusted_user_id" not in raw
+    assert raw["trusted_users"] == {"alice": 42}
     assert "username" not in raw["projects"]["proj"]
 
 
@@ -344,6 +348,46 @@ def test_add_project_trusted_user_id(tmp_path: Path):
     add_project_trusted_user_id("proj", 20, p)
     raw = json.loads(p.read_text())
     assert raw["projects"]["proj"]["trusted_user_ids"] == [10, 20]
+
+
+def test_bind_trusted_user_writes_canonical_mapping(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"allowed_usernames": ["alice"], "trusted_user_ids": [10]}))
+    bind_trusted_user("alice", 42, p)
+    raw = json.loads(p.read_text())
+    assert raw["trusted_users"] == {"alice": 42}
+    assert "trusted_user_ids" not in raw
+
+
+def test_bind_project_trusted_user_writes_canonical_mapping(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "proj": {
+                        "path": "/p",
+                        "telegram_bot_token": "T",
+                        "allowed_usernames": ["alice"],
+                        "trusted_user_ids": [10],
+                    }
+                }
+            }
+        )
+    )
+    bind_project_trusted_user("proj", "alice", 42, p)
+    raw = json.loads(p.read_text())
+    assert raw["projects"]["proj"]["trusted_users"] == {"alice": 42}
+    assert "trusted_user_ids" not in raw["projects"]["proj"]
+
+
+def test_unbind_trusted_user_removes_legacy_binding(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"allowed_usernames": ["alice"], "trusted_user_ids": [10]}))
+    unbind_trusted_user("alice", p)
+    raw = json.loads(p.read_text())
+    assert "trusted_users" not in raw
+    assert "trusted_user_ids" not in raw
 
 
 def test_load_config_voice_fields(tmp_path: Path):

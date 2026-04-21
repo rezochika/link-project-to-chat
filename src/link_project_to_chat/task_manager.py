@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .claude_client import ClaudeClient
-from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta, ThinkingDelta
+from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,8 @@ class Task:
         if self.status == TaskStatus.WAITING:
             self.status = TaskStatus.CANCELLED
             self.finished_at = time.monotonic()
+            if self._asyncio_task and not self._asyncio_task.done():
+                self._asyncio_task.cancel()
             return True
         if self.status in (TaskStatus.RUNNING, TaskStatus.WAITING_INPUT):
             if self._proc and self._proc.poll() is None:
@@ -161,10 +163,20 @@ class TaskManager:
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
+        self._claude_owner_task_id: int | None = None
 
     @property
     def claude(self) -> ClaudeClient:
         return self._claude
+
+    async def _acquire_claude_slot(self, task_id: int) -> None:
+        while self._claude_owner_task_id not in (None, task_id):
+            await asyncio.sleep(0.05)
+        self._claude_owner_task_id = task_id
+
+    def _release_claude_slot(self, task_id: int) -> None:
+        if self._claude_owner_task_id == task_id:
+            self._claude_owner_task_id = None
 
     def _command_popen_kwargs(self) -> dict[str, object]:
         return _command_popen_kwargs()
@@ -222,10 +234,13 @@ class TaskManager:
     # ------------------------------------------------------------------
 
     async def _exec_claude(self, task: Task) -> None:
-        task.status = TaskStatus.RUNNING
-        task.started_at = time.monotonic()
-        await self._safe_callback(self._on_task_started, task)
+        claimed_slot = False
         try:
+            await self._acquire_claude_slot(task.id)
+            claimed_slot = True
+            task.status = TaskStatus.RUNNING
+            task.started_at = time.monotonic()
+            await self._safe_callback(self._on_task_started, task)
             if task._compact:
                 task.result = await self._do_compact()
             else:
@@ -243,15 +258,19 @@ class TaskManager:
             if task._proc and task._proc.poll() is None:
                 _terminate_process_tree(task._proc)
             task.status = TaskStatus.CANCELLED
-            self._claude.close_interactive()
+            if claimed_slot:
+                self._claude.close_interactive()
         except Exception as e:
             logger.exception("Claude task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
-            self._claude.close_interactive()
+            if claimed_slot:
+                self._claude.close_interactive()
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
+            if claimed_slot and task.status != TaskStatus.WAITING_INPUT:
+                self._release_claude_slot(task.id)
 
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
@@ -290,6 +309,8 @@ class TaskManager:
         if not task or task.status != TaskStatus.WAITING_INPUT:
             return
 
+        if self._claude_owner_task_id != task.id:
+            await self._acquire_claude_slot(task.id)
         task.status = TaskStatus.RUNNING
         task.input = answer  # set input for _run_claude_turn
 
@@ -314,6 +335,8 @@ class TaskManager:
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
+            if task.status != TaskStatus.WAITING_INPUT:
+                self._release_claude_slot(task.id)
 
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
@@ -450,7 +473,11 @@ class TaskManager:
         task = self._tasks.get(task_id)
         if not task:
             return False
-        return task.cancel()
+        cancelled = task.cancel()
+        if cancelled and task.type == TaskType.CLAUDE and self._claude_owner_task_id == task.id:
+            self._claude.close_interactive()
+            self._release_claude_slot(task.id)
+        return cancelled
 
     def cancel_all(self) -> int:
         return sum(1 for t in list(self._tasks.values()) if t.cancel())

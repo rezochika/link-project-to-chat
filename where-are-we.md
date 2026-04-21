@@ -85,9 +85,6 @@
 - No over-engineering: minimum complexity for the current task
 
 ## Pending
-- Stream state (`_stream_messages`, `_stream_text`) not cleaned up on cancel
 - `_proc` on `ClaudeClient` is a single slot — concurrent Claude tasks could overwrite it
-- `chmod 0o600` missing from `clear_session()` write path
-- No `chmod 0o600` on `save_trusted_user_id()` in main config.py
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
 - `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it

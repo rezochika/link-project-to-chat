@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import DEFAULT_CONFIG
+from ..config import DEFAULT_CONFIG, bind_trusted_user, unbind_trusted_user
 from .._auth import AuthMixin
 from ..transport import Button, Buttons, ChatRef, MessageRef
 
@@ -56,6 +56,45 @@ MODEL_OPTIONS = [
     ("sonnet", "Sonnet 4.6"),
     ("haiku", "Haiku 4.5"),
 ]
+
+_CREATE_DEPS_MESSAGE = (
+    "Missing dependencies. Install with:\n"
+    "pip install link-project-to-chat[create]"
+)
+
+
+def _load_botfather_dependency():
+    from ..botfather import BotFatherClient
+
+    return BotFatherClient
+
+
+def _load_team_create_dependencies():
+    from ..botfather import sanitize_bot_username
+    from ..github_client import GitHubClient, RepoInfo
+    from ..transport._telegram_group import (
+        add_bot,
+        create_supergroup,
+        invite_user,
+        promote_admin,
+    )
+
+    return (
+        _load_botfather_dependency(),
+        GitHubClient,
+        RepoInfo,
+        add_bot,
+        create_supergroup,
+        invite_user,
+        promote_admin,
+        sanitize_bot_username,
+    )
+
+
+def _load_team_delete_dependencies():
+    from ..transport._telegram_group import delete_supergroup
+
+    return _load_botfather_dependency(), delete_supergroup
 
 
 def _build_persona_keyboard(project_path: Path, callback_prefix: str) -> Buttons:
@@ -212,17 +251,20 @@ class ManagerBot(AuthMixin):
         process_manager: ProcessManager,
         allowed_username: str = "",
         allowed_usernames: list[str] | None = None,
+        trusted_users: dict[str, int] | None = None,
         trusted_user_id: int | None = None,
         trusted_user_ids: list[int] | None = None,
         project_config_path: Path | None = None,
     ):
         self._token = token
         self._pm = process_manager
-        if allowed_usernames:
+        if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
         else:
             self._allowed_username = allowed_username
-        if trusted_user_ids:
+        if trusted_users is not None:
+            self._trusted_users = dict(trusted_users)
+        if trusted_user_ids is not None:
             self._trusted_user_ids = trusted_user_ids
         else:
             self._trusted_user_id = trusted_user_id
@@ -234,10 +276,9 @@ class ManagerBot(AuthMixin):
         self._telethon_client = None
         self._init_auth()
 
-    def _on_trust(self, user_id: int) -> None:
-        from ..config import add_trusted_user_id
+    def _on_trust(self, user_id: int, username: str) -> None:
         path = self._project_config_path or DEFAULT_CONFIG
-        add_trusted_user_id(user_id, path)
+        bind_trusted_user(username, user_id, path)
 
     def _load_projects(self) -> dict[str, dict]:
         path = self._project_config_path
@@ -249,6 +290,54 @@ class ManagerBot(AuthMixin):
             save_project_configs(projects, path)
         else:
             save_project_configs(projects)
+
+    async def _cleanup_managed_project_resources(
+        self, project: dict
+    ) -> tuple[list[str], list[str]]:
+        import shutil
+        from ..config import load_config
+
+        notes: list[str] = []
+        failures: list[str] = []
+
+        if not project.get("managed_by_manager"):
+            return notes, failures
+
+        repo_path_raw = project.get("managed_repo_path")
+        current_path_raw = project.get("path")
+        if repo_path_raw:
+            repo_path = Path(repo_path_raw)
+            if current_path_raw and Path(current_path_raw) != repo_path:
+                notes.append("left repo on disk because the project path was changed later")
+            elif repo_path.exists():
+                try:
+                    shutil.rmtree(repo_path)
+                    notes.append(f"deleted repo at {repo_path}")
+                except Exception as exc:
+                    failures.append(f"delete repo {repo_path}: {exc}")
+
+        bot_username = (project.get("managed_bot_username") or "").lstrip("@")
+        if bot_username:
+            try:
+                BotFatherClient = _load_botfather_dependency()
+                cfg_path = self._project_config_path or DEFAULT_CONFIG
+                config = load_config(cfg_path)
+                bfc = BotFatherClient(
+                    api_id=config.telegram_api_id,
+                    api_hash=config.telegram_api_hash,
+                    session_path=cfg_path.parent / "telethon.session",
+                )
+                await bfc.delete_bot(bot_username)
+                notes.append(f"deleted @{bot_username} via BotFather")
+            except ImportError:
+                failures.append(
+                    "could not delete the Telegram bot automatically "
+                    "(install link-project-to-chat[create] for BotFather cleanup)"
+                )
+            except Exception as exc:
+                failures.append(f"delete @{bot_username} via BotFather: {exc}")
+
+        return notes, failures
 
     async def _guard(self, update: Update) -> bool:
         """Returns True if the user is authorized and not rate-limited.
@@ -602,12 +691,16 @@ class ManagerBot(AuthMixin):
         if not self._allowed_usernames:
             self._allowed_usernames = list(usernames)
         self._allowed_usernames.remove(rm_user)
+        self._revoke_user(rm_user)
         from ..config import load_config, save_config
         path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(path)
         if rm_user in config.allowed_usernames:
             config.allowed_usernames.remove(rm_user)
-            save_config(config, path)
+        config.trusted_users.pop(rm_user, None)
+        config.trusted_user_ids = list(config.trusted_users.values())
+        unbind_trusted_user(rm_user, path)
+        save_config(config, path)
         await self._transport.send_text(invocation.chat, f"Removed @{rm_user}.")
 
     async def _on_setup_from_transport(self, invocation: "CommandInvocation") -> None:
@@ -850,10 +943,7 @@ class ManagerBot(AuthMixin):
             from ..github_client import GitHubClient, _gh_available
             from ..botfather import BotFatherClient
         except ImportError:
-            await self._transport.send_text(
-                incoming.chat,
-                "Missing dependencies. Install with:\npip install link-project-to-chat[create]",
-            )
+            await self._transport.send_text(incoming.chat, _CREATE_DEPS_MESSAGE)
             return ConversationHandler.END
         from ..config import load_config
         path = self._project_config_path or DEFAULT_CONFIG
@@ -1157,6 +1247,9 @@ class ManagerBot(AuthMixin):
             "path": clone_path,
             "telegram_bot_token": bot_token,
             "autostart": False,
+            "managed_by_manager": True,
+            "managed_repo_path": clone_path,
+            "managed_bot_username": bot_username,
         }
         self._save_projects(projects)
         summary = (
@@ -1273,14 +1366,21 @@ class ManagerBot(AuthMixin):
     async def _create_team_execute(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         """F7 orchestrator: create both bots, clone repo, build group, commit config, spawn."""
         from ..config import load_config, patch_team
-        from ..botfather import BotFatherClient, sanitize_bot_username
-        from ..github_client import GitHubClient, RepoInfo
-        from ..transport._telegram_group import (
-            create_supergroup,
-            add_bot,
-            promote_admin,
-            invite_user,
-        )
+        try:
+            (
+                BotFatherClient,
+                GitHubClient,
+                RepoInfo,
+                add_bot,
+                create_supergroup,
+                invite_user,
+                promote_admin,
+                sanitize_bot_username,
+            ) = _load_team_create_dependencies()
+        except ImportError:
+            incoming = self._incoming_from_update(update)
+            await self._transport.send_text(incoming.chat, _CREATE_DEPS_MESSAGE)
+            return ConversationHandler.END
 
         data = ctx.user_data["create_team"]
         prefix = data["project_prefix"]
@@ -1566,9 +1666,12 @@ class ManagerBot(AuthMixin):
     async def _delete_team_execute(self, chat: ChatRef, target: str) -> None:
         """Best-effort cleanup. Partial-failure report lists whatever didn't work."""
         import shutil
-        from ..config import load_config, patch_team
-        from ..botfather import BotFatherClient
-        from ..transport._telegram_group import delete_supergroup
+        from ..config import load_config
+        try:
+            BotFatherClient, delete_supergroup = _load_team_delete_dependencies()
+        except ImportError:
+            await self._transport.send_text(chat, _CREATE_DEPS_MESSAGE)
+            return
 
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(cfg_path)
@@ -1865,14 +1968,28 @@ class ManagerBot(AuthMixin):
         elif value.startswith("proj_remove_"):
             name = value[len("proj_remove_"):]
             projects = self._load_projects()
+            removal_text = None
             if name in projects:
                 self._pm.stop(name)
+                notes, failures = await self._cleanup_managed_project_resources(projects[name])
                 del projects[name]
                 self._save_projects(projects)
+                if failures:
+                    removal_text = (
+                        f"Removed '{name}', but cleanup had issues:\n- "
+                        + "\n- ".join(failures)
+                    )
+                    if notes:
+                        removal_text += "\n\nCompleted:\n- " + "\n- ".join(notes)
+                elif notes:
+                    removal_text = (
+                        f"Removed '{name}' and cleaned up manager-owned resources:\n- "
+                        + "\n- ".join(notes)
+                    )
             buttons = self._list_buttons()
             await self._transport.edit_text(
                 click.message,
-                self._projects_text() if buttons else "No projects configured.",
+                removal_text or (self._projects_text() if buttons else "No projects configured."),
                 buttons=buttons,
             )
 

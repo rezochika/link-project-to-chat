@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -107,3 +109,64 @@ async def test_list_repos_gh_no_next_page(gh_client):
         repos, has_next = await gh_client.list_repos(page=1, per_page=5)
     assert repos == []
     assert has_next is False
+
+
+class _FakeProc:
+    def __init__(self, returncode: int, stderr: bytes = b"", stdout: bytes = b""):
+        self.returncode = returncode
+        self._stderr = stderr
+        self._stdout = stdout
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+
+async def test_clone_repo_api_mode_keeps_pat_out_of_argv(client, tmp_path: Path):
+    repo = RepoInfo(
+        name="repo1",
+        full_name="user/repo1",
+        html_url="https://github.com/user/repo1",
+        clone_url="https://github.com/user/repo1.git",
+        description="",
+        private=True,
+    )
+
+    with patch(
+        "link_project_to_chat.github_client.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=_FakeProc(0)),
+    ) as mock_exec:
+        await client.clone_repo(repo, tmp_path / "repo1")
+
+    args = mock_exec.await_args.args
+    kwargs = mock_exec.await_args.kwargs
+    assert args[:3] == ("git", "clone", "https://github.com/user/repo1.git")
+    assert all("ghp_test123" not in str(arg) for arg in args)
+    env = kwargs["env"]
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraHeader"
+    assert env["GIT_CONFIG_VALUE_0"] == (
+        "AUTHORIZATION: basic "
+        + base64.b64encode(b"x-access-token:ghp_test123").decode()
+    )
+
+
+async def test_clone_repo_api_mode_redacts_pat_in_errors(client, tmp_path: Path):
+    repo = RepoInfo(
+        name="repo1",
+        full_name="user/repo1",
+        html_url="https://github.com/user/repo1",
+        clone_url="https://github.com/user/repo1.git",
+        description="",
+        private=True,
+    )
+    stderr = b"fatal: could not read from https://ghp_test123@github.com/user/repo1.git"
+
+    with patch(
+        "link_project_to_chat.github_client.asyncio.create_subprocess_exec",
+        AsyncMock(return_value=_FakeProc(1, stderr=stderr)),
+    ):
+        with pytest.raises(Exception, match="git clone failed") as exc_info:
+            await client.clone_repo(repo, tmp_path / "repo1")
+
+    assert "ghp_test123" not in str(exc_info.value)
+    assert "[REDACTED]" in str(exc_info.value)

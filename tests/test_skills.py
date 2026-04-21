@@ -71,6 +71,18 @@ def test_load_skill_single(tmp_path: Path):
     assert skill.content == "You are a debugger."
 
 
+def test_load_skill_reads_utf8_markdown(tmp_path: Path):
+    d = tmp_path / ".claude" / "skills"
+    d.mkdir(parents=True)
+    text = "გამარჯობა, revisión"
+    (d / "unicode.md").write_bytes(text.encode("utf-8"))
+
+    skill = load_skill("unicode", tmp_path)
+
+    assert skill is not None
+    assert skill.content == text
+
+
 def test_load_skill_not_found(tmp_path: Path):
     assert load_skill("nonexistent", tmp_path) is None
 
@@ -80,6 +92,12 @@ def test_save_skill(tmp_path: Path):
     assert path.exists()
     assert path.read_text() == "Skill content here."
     assert path.name == "myskill.md"
+
+
+def test_save_skill_writes_utf8(tmp_path: Path):
+    text = "árvíztűrő tükörfúrógép"
+    path = save_skill("unicode", text, tmp_path)
+    assert path.read_bytes() == text.encode("utf-8")
 
 
 def test_delete_skill(tmp_path: Path):
@@ -239,6 +257,24 @@ def test_save_persona(tmp_path: Path):
     assert path.exists()
     assert path.read_text() == "Persona content."
     assert path.parent == tmp_path / ".claude" / "personas"
+
+
+def test_load_persona_reads_utf8_markdown(tmp_path: Path):
+    d = tmp_path / ".claude" / "personas"
+    d.mkdir(parents=True)
+    text = "მასწავლებელი persona"
+    (d / "teacher.md").write_bytes(text.encode("utf-8"))
+
+    persona = load_persona("teacher", tmp_path)
+
+    assert persona is not None
+    assert persona.content == text
+
+
+def test_save_persona_writes_utf8(tmp_path: Path):
+    text = "français persona"
+    path = save_persona("teacher", text, tmp_path)
+    assert path.read_bytes() == text.encode("utf-8")
 
 
 def test_save_persona_global(tmp_path: Path, monkeypatch):

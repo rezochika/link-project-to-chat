@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -73,6 +74,10 @@ def _swap_fake_transport(bot: ManagerBot) -> FakeTransport:
     fake = FakeTransport()
     bot._transport = fake
     return fake
+
+
+def _sleep_cmd() -> list[str]:
+    return [sys.executable, "-c", "import time; time.sleep(60)"]
 
 
 def _make_button_click(
@@ -174,6 +179,32 @@ async def test_addproject_with_all_options(bot_env, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_finalize_create_stores_manager_cleanup_metadata(bot_env, tmp_path: Path):
+    from telegram.ext import ConversationHandler
+
+    bot, _pm, proj_cfg = bot_env
+    _swap_fake_transport(bot)
+    ctx = MagicMock()
+    ctx.user_data = {
+        "create": {
+            "name": "myproj",
+            "repo": {"html_url": "https://github.com/acme/myproj"},
+            "clone_path": str(tmp_path / "repos" / "myproj"),
+            "bot_token": "TOKEN",
+            "bot_username": "myproj_bot",
+        }
+    }
+
+    result = await bot._finalize_create(_make_invocation("create_project").chat, ctx)
+
+    assert result == ConversationHandler.END
+    proj = json.loads(proj_cfg.read_text())["projects"]["myproj"]
+    assert proj["managed_by_manager"] is True
+    assert proj["managed_repo_path"] == str(tmp_path / "repos" / "myproj")
+    assert proj["managed_bot_username"] == "myproj_bot"
+
+
+@pytest.mark.asyncio
 async def test_addproject_already_exists(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     existing = tmp_path / "existing"
@@ -265,7 +296,7 @@ async def test_callback_proj_info(bot_env, tmp_path: Path):
 async def test_callback_proj_start(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: _sleep_cmd()
     fake = _swap_fake_transport(bot)
     click, _ = _make_button_click("proj_start_myproj")
     await bot._on_button_from_transport(click)
@@ -278,7 +309,7 @@ async def test_callback_proj_start(bot_env, tmp_path: Path):
 async def test_callback_proj_stop(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: _sleep_cmd()
     pm.start("myproj")
     assert pm.status("myproj") == "running"
     fake = _swap_fake_transport(bot)
@@ -292,7 +323,7 @@ async def test_callback_proj_stop(bot_env, tmp_path: Path):
 async def test_callback_proj_remove(bot_env, tmp_path: Path):
     bot, pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
-    pm._command_builder = lambda name, cfg: ["sleep", "60"]
+    pm._command_builder = lambda name, cfg: _sleep_cmd()
     pm.start("myproj")
     fake = _swap_fake_transport(bot)
     click, _ = _make_button_click("proj_remove_myproj")
@@ -300,6 +331,69 @@ async def test_callback_proj_remove(bot_env, tmp_path: Path):
     assert len(fake.edited_messages) == 1
     assert "myproj" not in json.loads(proj_cfg.read_text())["projects"]
     assert pm.status("myproj") == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_callback_proj_remove_managed_project_runs_cleanup(bot_env, tmp_path: Path):
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "myproj": {
+                        "path": str(tmp_path),
+                        "managed_by_manager": True,
+                        "managed_repo_path": str(tmp_path),
+                        "managed_bot_username": "myproj_bot",
+                    }
+                }
+            }
+        )
+    )
+    cleanup = AsyncMock(return_value=(["deleted repo"], []))
+    bot._cleanup_managed_project_resources = cleanup
+    fake = _swap_fake_transport(bot)
+
+    click, _ = _make_button_click("proj_remove_myproj")
+    await bot._on_button_from_transport(click)
+
+    cleanup.assert_awaited_once()
+    assert "cleaned up manager-owned resources" in fake.edited_messages[-1].text
+
+
+@pytest.mark.asyncio
+async def test_create_team_execute_missing_dependencies_returns_install_hint(bot_env, monkeypatch):
+    from telegram.ext import ConversationHandler
+
+    bot, _pm, _proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
+
+    def _boom():
+        raise ImportError("missing")
+
+    monkeypatch.setattr("link_project_to_chat.manager.bot._load_team_create_dependencies", _boom)
+
+    update, ctx = _make_update()
+    ctx.user_data = {"create_team": {}}
+    result = await bot._create_team_execute(update, ctx)
+
+    assert result == ConversationHandler.END
+    assert "Missing dependencies" in fake.sent_messages[-1].text
+
+
+@pytest.mark.asyncio
+async def test_delete_team_execute_missing_dependencies_returns_install_hint(bot_env, monkeypatch):
+    bot, _pm, _proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
+
+    def _boom():
+        raise ImportError("missing")
+
+    monkeypatch.setattr("link_project_to_chat.manager.bot._load_team_delete_dependencies", _boom)
+
+    await bot._delete_team_execute(_make_invocation("delete_team").chat, "acme")
+
+    assert "Missing dependencies" in fake.sent_messages[-1].text
 
 
 @pytest.mark.asyncio
@@ -561,3 +655,36 @@ async def test_guard_returns_false_when_effective_user_is_none(bot_env):
     allowed = await bot._guard(update)
     assert allowed is False
     assert any("Unauthorized" in m.text for m in fake.sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(
+        json.dumps(
+            {
+                "allowed_usernames": ["testuser", "alice"],
+                "trusted_users": {"alice": 42},
+                "projects": {},
+            }
+        )
+    )
+    bot._allowed_usernames = ["testuser", "alice"]
+    bot._trusted_users = {"alice": 42}
+    fake = _swap_fake_transport(bot)
+
+    invocation = _make_invocation("remove_user", args=["alice"])
+    await bot._on_remove_user_from_transport(invocation)
+
+    assert fake.sent_messages[-1].text == "Removed @alice."
+    raw = json.loads(proj_cfg.read_text())
+    assert raw["allowed_usernames"] == ["testuser"]
+    assert raw["trusted_users"] == {"testuser": 1}
+    revoked = Identity(
+        transport_id="fake",
+        native_id="42",
+        display_name="alice",
+        handle="alice",
+        is_bot=False,
+    )
+    assert bot._auth_identity(revoked) is False

@@ -8,11 +8,12 @@ import click
 from .claude_client import PERMISSION_MODES
 from .config import (
     DEFAULT_CONFIG,
-    add_project_trusted_user_id,
+    bind_project_trusted_user,
     load_config,
     resolve_project_auth_scope,
     resolve_permissions,
     save_config,
+    unbind_trusted_user,
 )
 
 
@@ -219,11 +220,14 @@ def configure(ctx, username: str | None, remove_username: str | None, manager_to
         click.echo(f"Added username: @{new_username}")
     if remove_username:
         rm = remove_username.lower().lstrip("@")
+        config.trusted_users.pop(rm, None)
+        config.trusted_user_ids = list(config.trusted_users.values())
         if rm in config.allowed_usernames:
             config.allowed_usernames.remove(rm)
             click.echo(f"Removed username: @{rm}")
         else:
             click.echo(f"Username @{rm} not found.")
+        unbind_trusted_user(rm, cfg_path)
     if manager_token:
         config.manager_telegram_bot_token = manager_token
         click.echo(f"Configured manager token: ***{manager_token[-4:]}")
@@ -363,7 +367,7 @@ def start(
             raise SystemExit(f"Role '{role}' not in team '{team}'. Known roles: {list(t.bots)}")
         bot_cfg = t.bots[role]
         effective_usernames = config.allowed_usernames
-        effective_trusted_ids = config.trusted_user_ids
+        effective_trusted_users = config.trusted_users
         # Team bots run unattended in a group — a Claude tool-permission prompt
         # would block forever. Default to dangerously-skip-permissions unless
         # the team config explicitly overrides.
@@ -381,7 +385,7 @@ def start(
             Path(t.path),
             bot_cfg.telegram_bot_token,
             allowed_usernames=effective_usernames,
-            trusted_user_ids=effective_trusted_ids,
+            trusted_users=effective_trusted_users,
             transcriber=transcriber,
             synthesizer=synthesizer,
             team_name=team,
@@ -392,6 +396,7 @@ def start(
             skip_permissions=team_skip,
             permission_mode=team_pm,
             peer_bot_username=peer_username,
+            config_path=cfg_path,
         )
         return
 
@@ -404,7 +409,7 @@ def start(
         if project not in config.projects:
             raise SystemExit(f"Project '{project}' not found.")
         proj = config.projects[project]
-        effective_usernames, effective_trusted_ids = resolve_project_auth_scope(
+        effective_usernames, effective_trusted_users = resolve_project_auth_scope(
             proj,
             config,
             username_override=username,
@@ -415,7 +420,6 @@ def start(
             Path(proj.path),
             proj.telegram_bot_token,
             allowed_usernames=effective_usernames,
-            trusted_user_ids=effective_trusted_ids,
             session_id=session_id,
             model=model or proj.model,
             effort=proj.effort,
@@ -423,11 +427,18 @@ def start(
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
-            on_trust=lambda uid: add_project_trusted_user_id(project, uid, cfg_path),
+            on_trust=lambda uid, trusted_username: bind_project_trusted_user(
+                project,
+                trusted_username,
+                uid,
+                cfg_path,
+            ),
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
             show_thinking=proj.show_thinking,
+            trusted_users=effective_trusted_users,
+            config_path=cfg_path,
         )
     else:
         run_bots(
@@ -672,7 +683,7 @@ def start_manager(ctx):
     bot = ManagerBot(
         token, pm,
         allowed_usernames=main_config.allowed_usernames,
-        trusted_user_ids=main_config.trusted_user_ids,
+        trusted_users=main_config.trusted_users,
         project_config_path=cfg_path,
     )
     click.echo("Manager bot started.")

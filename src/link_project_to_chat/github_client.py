@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ class RepoInfo:
 
 
 _GITHUB_URL_RE = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+_GITHUB_CREDENTIAL_URL_RE = re.compile(r"https://[^/@\s]+@github\.com")
 
 
 def _gh_available() -> bool:
@@ -42,6 +45,31 @@ async def _run_gh(*args: str) -> tuple[int, str, str]:
     )
     stdout, stderr = await proc.communicate()
     return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+
+
+def _git_auth_env(pat: str) -> dict[str, str]:
+    """Inject a one-shot GitHub auth header via env, not argv."""
+    env = os.environ.copy()
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    auth = base64.b64encode(f"x-access-token:{pat}".encode()).decode()
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    env[f"GIT_CONFIG_KEY_{count}"] = "http.https://github.com/.extraHeader"
+    env[f"GIT_CONFIG_VALUE_{count}"] = f"AUTHORIZATION: basic {auth}"
+    return env
+
+
+def _redact_secrets(text: str, *secrets: str) -> str:
+    redacted = text
+    for secret in secrets:
+        if not secret:
+            continue
+        redacted = redacted.replace(secret, "[REDACTED]")
+        encoded = base64.b64encode(f"x-access-token:{secret}".encode()).decode()
+        redacted = redacted.replace(encoded, "[REDACTED]")
+    return _GITHUB_CREDENTIAL_URL_RE.sub("https://[REDACTED]@github.com", redacted)
 
 
 class GitHubClient:
@@ -159,15 +187,19 @@ class GitHubClient:
                 raise Exception(f"gh repo clone failed: {stderr.decode().strip()}")
         else:
             clone_url = repo.clone_url
+            env = None
             if self._pat:
-                clone_url = clone_url.replace("https://", f"https://{self._pat}@")
+                env = _git_auth_env(self._pat)
             proc = await asyncio.create_subprocess_exec(
                 "git", "clone", clone_url, str(dest),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                raise Exception(f"git clone failed: {stderr.decode().strip()}")
+                raise Exception(
+                    f"git clone failed: {_redact_secrets(stderr.decode().strip(), self._pat)}"
+                )
 
     async def close(self) -> None:
         if self._client:

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from .config import (
     Config,
     DEFAULT_CONFIG,
+    bind_project_trusted_user,
     clear_session,
     load_config,
     load_sessions,
@@ -25,8 +26,6 @@ from .config import (
     resolve_permissions,
     resolve_project_auth_scope,
     save_session,
-    add_trusted_user_id,
-    add_project_trusted_user_id,
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
@@ -79,12 +78,13 @@ class ProjectBot(AuthMixin):
         token: str,
         allowed_username: str = "",
         trusted_user_id: int | None = None,
-        on_trust: Callable[[int], None] | None = None,
+        on_trust: Callable[[int, str], None] | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         allowed_usernames: list[str] | None = None,
+        trusted_users: dict[str, int] | None = None,
         trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
@@ -94,14 +94,18 @@ class ProjectBot(AuthMixin):
         group_chat_id: int | None = None,
         role: str | None = None,
         peer_bot_username: str = "",
+        config_path: Path | None = None,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
+        self._config_path = config_path
         if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
         else:
             self._allowed_username = allowed_username
+        if trusted_users is not None:
+            self._trusted_users = dict(trusted_users)
         if trusted_user_ids is not None:
             self._trusted_user_ids = trusted_user_ids
         else:
@@ -153,11 +157,12 @@ class ProjectBot(AuthMixin):
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
         self._probe_tasks: set[asyncio.Task] = set()
 
-    def _on_trust(self, user_id: int) -> None:
+    def _effective_config_path(self) -> Path:
+        return self._config_path or DEFAULT_CONFIG
+
+    def _on_trust(self, user_id: int, username: str) -> None:
         if self._on_trust_fn:
-            self._on_trust_fn(user_id)
-        else:
-            add_trusted_user_id(user_id)
+            self._on_trust_fn(user_id, username)
 
     async def _on_task_started(self, task: Task) -> None:
         # Only show typing indicator for Claude tasks, not /run commands
@@ -452,7 +457,11 @@ class ProjectBot(AuthMixin):
 
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
-                save_session(self.name, self.task_manager.claude.session_id)
+                save_session(
+                    self.name,
+                    self.task_manager.claude.session_id,
+                    self._effective_config_path(),
+                )
             await self._finalize_claude_task(task)
         else:
             await self._finalize_command_task(task)
@@ -604,7 +613,11 @@ class ProjectBot(AuthMixin):
         if self.group_chat_id in (0, None):
             if self._auth_identity(incoming.sender) and self.team_name:
                 new_chat_id = int(incoming.chat.native_id)
-                patch_team(self.team_name, {"group_chat_id": new_chat_id})
+                patch_team(
+                    self.team_name,
+                    {"group_chat_id": new_chat_id},
+                    self._effective_config_path(),
+                )
                 self.group_chat_id = new_chat_id
                 # Fall through so this message still gets processed.
         elif int(incoming.chat.native_id) != self.group_chat_id:
@@ -848,7 +861,11 @@ class ProjectBot(AuthMixin):
             arg = args[0].lower()
             if arg in ("on", "off"):
                 self.show_thinking = arg == "on"
-                patch_project(self.name, {"show_thinking": self.show_thinking})
+                patch_project(
+                    self.name,
+                    {"show_thinking": self.show_thinking},
+                    self._effective_config_path(),
+                )
                 await self._transport.send_text(
                     ci.chat, f"Live thinking: {self._current_thinking()}"
                 )
@@ -1079,7 +1096,7 @@ class ProjectBot(AuthMixin):
         this lets the next team-bot startup discover each bot's @handle and
         populate it in config.json so the peer role can read it.
         """
-        cfg = config_path or DEFAULT_CONFIG
+        cfg = config_path or self._effective_config_path()
         teams = load_teams(cfg)
         team = teams.get(self.team_name or "")
         if team is None:
@@ -1115,9 +1132,9 @@ class ProjectBot(AuthMixin):
         a stray projects entry and never touch the real team config, so the
         team path re-serialises the full ``bots`` dict via ``patch_team``.
 
-        ``config_path`` is for tests; production uses DEFAULT_CONFIG.
+        ``config_path`` is primarily for tests; production uses this bot's active config.
         """
-        cfg = config_path or DEFAULT_CONFIG
+        cfg = config_path or self._effective_config_path()
         if self.team_name:
             teams = load_teams(cfg)
             team = teams.get(self.team_name)
@@ -1332,7 +1349,7 @@ class ProjectBot(AuthMixin):
             if name in valid:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
-                patch_project(self.name, {"model": name})
+                patch_project(self.name, {"model": name}, self._effective_config_path())
             await self._transport.edit_text(
                 msg_ref,
                 f"Select model\nCurrent: {self._current_model()}",
@@ -1342,7 +1359,7 @@ class ProjectBot(AuthMixin):
             level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self.task_manager.claude.effort = level
-                patch_project(self.name, {"effort": level})
+                patch_project(self.name, {"effort": level}, self._effective_config_path())
             await self._transport.edit_text(
                 msg_ref,
                 f"Effort: {self._current_effort()}",
@@ -1352,7 +1369,11 @@ class ProjectBot(AuthMixin):
             val = value[len("thinking_set_"):]
             if val in ("on", "off"):
                 self.show_thinking = val == "on"
-                patch_project(self.name, {"show_thinking": self.show_thinking})
+                patch_project(
+                    self.name,
+                    {"show_thinking": self.show_thinking},
+                    self._effective_config_path(),
+                )
             await self._transport.edit_text(
                 msg_ref,
                 f"Live thinking: {self._current_thinking()}",
@@ -1364,7 +1385,11 @@ class ProjectBot(AuthMixin):
                 skip, pm = resolve_permissions(mode)
                 self.task_manager.claude.skip_permissions = skip
                 self.task_manager.claude.permission_mode = pm
-                patch_project(self.name, {"permissions": mode if mode != "default" else None})
+                patch_project(
+                    self.name,
+                    {"permissions": mode if mode != "default" else None},
+                    self._effective_config_path(),
+                )
             await self._transport.edit_text(
                 msg_ref,
                 f"Permissions: {self._current_permission()}",
@@ -1399,7 +1424,7 @@ class ProjectBot(AuthMixin):
             self._active_skill = None
             self._active_persona = None
             self.task_manager.claude.append_system_prompt = None
-            clear_session(self.name)
+            clear_session(self.name, self._effective_config_path())
             await self._transport.edit_text(msg_ref, "Session reset.")
         elif value == "reset_cancel":
             await self._transport.edit_text(msg_ref, "Reset cancelled.")
@@ -1873,8 +1898,9 @@ class ProjectBot(AuthMixin):
                 # Lazy import — telethon is an optional dep; solo-mode installs
                 # don't need it and must still be able to import bot.py.
                 from telethon import TelegramClient
-                config = load_config()
-                teams = load_teams()
+                cfg_path = self._effective_config_path()
+                config = load_config(cfg_path)
+                teams = load_teams(cfg_path)
                 team = teams.get(self.team_name)
                 team_bot_usernames = {
                     b.bot_username for b in team.bots.values() if b.bot_username
@@ -1914,8 +1940,9 @@ def run_bot(
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
     trusted_user_id: int | None = None,
-    on_trust: Callable[[int], None] | None = None,
+    on_trust: Callable[[int, str], None] | None = None,
     allowed_usernames: list[str] | None = None,
+    trusted_users: dict[str, int] | None = None,
     trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
@@ -1925,6 +1952,7 @@ def run_bot(
     group_chat_id: int | None = None,
     role: str | None = None,
     peer_bot_username: str = "",
+    config_path: Path | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -1932,10 +1960,11 @@ def run_bot(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
     if session_id:
-        save_session(name, session_id)
+        save_session(name, session_id, config_path or DEFAULT_CONFIG)
     bot = ProjectBot(
         name, path, token,
         allowed_usernames=effective_usernames,
+        trusted_users=trusted_users,
         trusted_user_ids=trusted_user_ids or ([trusted_user_id] if trusted_user_id else []),
         on_trust=on_trust,
         skip_permissions=skip_permissions,
@@ -1950,8 +1979,11 @@ def run_bot(
         group_chat_id=group_chat_id,
         role=role,
         peer_bot_username=peer_bot_username,
+        config_path=config_path,
     )
-    bot.task_manager.claude.session_id = session_id or load_sessions().get(name)
+    bot.task_manager.claude.session_id = session_id or load_sessions(
+        config_path or DEFAULT_CONFIG
+    ).get(name)
     if model:
         bot.task_manager.claude.model = model
     if effort:
@@ -1976,7 +2008,7 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        effective_usernames, effective_trusted_ids = resolve_project_auth_scope(
+        effective_usernames, effective_trusted_users = resolve_project_auth_scope(
             proj,
             config,
         )
@@ -1984,7 +2016,7 @@ def run_bots(
         if config_path:
             _name = name
             _path = config_path
-            on_trust = lambda uid: add_project_trusted_user_id(_name, uid, _path)
+            on_trust = lambda uid, username: bind_project_trusted_user(_name, username, uid, _path)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         run_bot(
             name,
@@ -1998,11 +2030,12 @@ def run_bots(
             disallowed_tools=disallowed_tools,
             on_trust=on_trust,
             allowed_usernames=effective_usernames,
-            trusted_user_ids=effective_trusted_ids,
+            trusted_users=effective_trusted_users,
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
             show_thinking=proj.show_thinking,
+            config_path=config_path,
         )
     else:
         names = ", ".join(config.projects.keys())
