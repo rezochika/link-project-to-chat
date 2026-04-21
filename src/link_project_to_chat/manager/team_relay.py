@@ -54,6 +54,31 @@ def _body_without_mention(text: str, peer: str) -> str:
     return (text[:idx] + text[idx + len(needle):]).strip()
 
 
+def _normalize_mention_spacing(text: str, peer: str) -> str:
+    """Ensure the first `@peer` is followed by a blank line.
+
+    Bot messages rendered via Telegram HTML (<pre>, <code>, etc.) can end up
+    with the @mention glued to the next token in the plain-text representation
+    that Telethon reads back. When the relay re-posts that plain text, the
+    concatenation turns `@peer` + `hash` into a single malformed handle. Force
+    a `\\n\\n` separator so the re-sent message keeps the mention on its own
+    line regardless of the source formatting.
+    """
+    if not text or not peer:
+        return text
+    lower = text.lower()
+    needle = f"@{peer.lower()}"
+    idx = lower.find(needle)
+    if idx < 0:
+        return text
+    end = idx + len(needle)
+    head = text[:end]
+    tail = text[end:].lstrip()
+    if not tail:
+        return head
+    return f"{head}\n\n{tail}"
+
+
 def find_peer_mention(text: str, self_username: str, team_bot_usernames: set[str]) -> str | None:
     """Return the first peer bot's @username mentioned in `text`, else None.
 
@@ -229,6 +254,9 @@ class TeamRelay:
         await self._finalize_relay(msg_id, sender_username, text)
 
     async def _finalize_relay(self, msg_id: int | None, sender_username: str, text: str) -> None:
+        peer = find_peer_mention(text, sender_username, self._bot_usernames)
+        if peer is not None:
+            text = _normalize_mention_spacing(text, peer)
         await self._relay(sender_username, text)
         if msg_id is not None:
             self._relayed_ids.add(msg_id)
