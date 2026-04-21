@@ -1132,22 +1132,24 @@ class ManagerBot(AuthMixin):
         """Entry point for /create_team — pick repo source (GitHub browse vs paste URL)."""
         if not await self._guard(update):
             return ConversationHandler.END
+        incoming = self._incoming_from_update(update)
 
         # Cred-only pre-flight (prefix isn't known yet; full collision check runs in NAME state).
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         err = _create_team_preflight(cfg_path, prefix=None)
         if err:
-            await update.effective_message.reply_text(err)
+            await self._transport.send_text(incoming.chat, err)
             return ConversationHandler.END
 
         ctx.user_data["create_team"] = {"config_path": str(cfg_path)}
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Browse my GitHub repos", callback_data="ct_source:github")],
-            [InlineKeyboardButton("Paste a URL", callback_data="ct_source:url")],
+        buttons = Buttons(rows=[
+            [Button(label="Browse my GitHub repos", value="ct_source:github")],
+            [Button(label="Paste a URL", value="ct_source:url")],
         ])
-        await update.effective_message.reply_text(
+        await self._transport.send_text(
+            incoming.chat,
             "How would you like to pick the repo?",
-            reply_markup=keyboard,
+            buttons=buttons,
         )
         return self.CREATE_TEAM_SOURCE
 
@@ -1162,25 +1164,37 @@ class ManagerBot(AuthMixin):
         return self.CREATE_TEAM_REPO_URL
 
     async def _create_team_name(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-        prefix = update.message.text.strip().lower()
+        incoming = self._incoming_from_update(update)
+        prefix = incoming.text.strip().lower()
         if not prefix.isidentifier() or not prefix.isascii():
-            await update.message.reply_text("Prefix must be lowercase ascii word characters only. Try again:")
+            await self._transport.send_text(
+                incoming.chat,
+                "Prefix must be lowercase ascii word characters only. Try again:",
+            )
             return self.CREATE_TEAM_NAME
 
         cfg_path = self._project_config_path or DEFAULT_CONFIG
         err = _create_team_preflight(cfg_path, prefix)
         if err:
-            await update.message.reply_text(f"✗ {err}")
+            await self._transport.send_text(incoming.chat, f"✗ {err}")
             return ConversationHandler.END
 
         ctx.user_data["create_team"]["project_prefix"] = prefix
 
         # Persona picker — list global personas (no project path yet, since clone hasn't happened).
+        # Keep the PTB InlineKeyboardMarkup builder: it feeds a CallbackQueryHandler in the
+        # ConversationHandler.states map (wizard-internal callbacks stay on the PTB path until
+        # Task 14 revisits them). We adapt it to transport Buttons here.
         fake_path = Path(DEFAULT_CONFIG).parent
         keyboard = _build_persona_keyboard(fake_path, callback_prefix="ct_persona_mgr")
-        await update.message.reply_text(
+        buttons = Buttons(rows=[
+            [Button(label=btn.text, value=btn.callback_data) for btn in row]
+            for row in keyboard.inline_keyboard
+        ])
+        await self._transport.send_text(
+            incoming.chat,
             "Pick manager-role persona:",
-            reply_markup=keyboard,
+            buttons=buttons,
         )
         return self.CREATE_TEAM_PERSONA_MGR
 
