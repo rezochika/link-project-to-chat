@@ -15,15 +15,6 @@ def test_new_group_defaults():
     assert s.bot_to_bot_rounds == 0
 
 
-def test_user_message_resets_round_counter():
-    reg = GroupStateRegistry(max_bot_rounds=20)
-    chat = _chat()
-    s = reg.get(chat)
-    s.bot_to_bot_rounds = 5
-    reg.note_user_message(chat)
-    assert reg.get(chat).bot_to_bot_rounds == 0
-
-
 def test_bot_to_bot_increment():
     reg = GroupStateRegistry(max_bot_rounds=20)
     chat = _chat()

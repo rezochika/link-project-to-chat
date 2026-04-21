@@ -6,8 +6,7 @@ restarts — a process restart is itself a reset.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from time import time
+from dataclasses import dataclass
 
 from .transport import ChatRef
 
@@ -16,7 +15,6 @@ from .transport import ChatRef
 class GroupState:
     halted: bool = False
     bot_to_bot_rounds: int = 0
-    last_user_activity_ts: float = field(default_factory=time)
 
 
 class GroupStateRegistry:
@@ -34,11 +32,6 @@ class GroupStateRegistry:
 
     def get(self, chat: ChatRef) -> GroupState:
         return self._states.setdefault(self._key(chat), GroupState())
-
-    def note_user_message(self, chat: ChatRef) -> None:
-        s = self.get(chat)
-        s.bot_to_bot_rounds = 0
-        s.last_user_activity_ts = time()
 
     def note_bot_to_bot(self, chat: ChatRef) -> None:
         """Increment the bot-to-bot round counter. Halts the group if cap reached."""
