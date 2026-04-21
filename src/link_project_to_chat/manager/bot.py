@@ -1808,11 +1808,27 @@ class ManagerBot(AuthMixin):
             except Exception:
                 logger.exception("Failed to start TeamRelay for %s", name)
 
+    async def _post_stop(self, app) -> None:
+        """Called automatically by python-telegram-bot upon shutdown."""
+        # Clean up relays to remove Telethon event handlers.
+        for name, relay in list(self._team_relays.items()):
+            try:
+                await relay.stop()
+            except Exception:
+                logger.exception("Failed to stop TeamRelay for %s", name)
+        
+        if self._telethon_client is not None:
+            try:
+                await self._telethon_client.disconnect()
+            except Exception:
+                logger.exception("Failed to elegantly disconnect Telethon client on shutdown")
+
     def build(self):
         app = (
             ApplicationBuilder()
             .token(self._token)
             .post_init(self._post_init)
+            .post_stop(self._post_stop)
             .build()
         )
         self._app = app

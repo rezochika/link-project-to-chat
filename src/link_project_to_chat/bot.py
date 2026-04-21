@@ -412,7 +412,7 @@ class ProjectBot(AuthMixin):
 
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
-                save_session(self.name, self.task_manager.claude.session_id)
+                self._patch_config({"session_id": self.task_manager.claude.session_id})
             await self._finalize_claude_task(task)
         else:
             await self._finalize_command_task(task)
@@ -681,7 +681,7 @@ class ProjectBot(AuthMixin):
             arg = args[0].lower()
             if arg in ("on", "off"):
                 self.show_thinking = arg == "on"
-                patch_project(self.name, {"show_thinking": self.show_thinking})
+                self._patch_config({"show_thinking": self.show_thinking})
                 return await update.effective_message.reply_text(
                     f"Live thinking: {self._current_thinking()}"
                 )
@@ -911,46 +911,49 @@ class ProjectBot(AuthMixin):
             self.bot_username, self.team_name, self.role,
         )
 
-    def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
-        """Persist this bot's active_persona.
-
-        Team bots live under ``config.teams[team].bots[role]``; solo bots under
-        ``config.projects[name]``. ``patch_project`` on a team bot would create
-        a stray projects entry and never touch the real team config, so the
-        team path re-serialises the full ``bots`` dict via ``patch_team``.
-
-        ``config_path`` is for tests; production uses DEFAULT_CONFIG.
-        """
+    def _patch_config(self, fields: dict, config_path: Path | None = None) -> None:
+        """Persist config fields for this bot, routing to team or project config."""
         cfg = config_path or DEFAULT_CONFIG
         if self.team_name:
             teams = load_teams(cfg)
             team = teams.get(self.team_name)
             if team is None:
-                logger.warning(
-                    "Team %r not in config; persona change not persisted.", self.team_name
-                )
+                logger.warning("Team %r not in config; change %r not persisted.", self.team_name, fields)
                 return
             bots_dict: dict[str, dict] = {}
             for role, bot in team.bots.items():
                 entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
-                if role == self.role:
-                    if name is not None:
-                        entry["active_persona"] = name
-                else:
-                    if bot.active_persona:
-                        entry["active_persona"] = bot.active_persona
-                # Preserve the other fields so patch_team's whole-bots-dict
-                # rewrite doesn't drop them.
+                if bot.active_persona is not None:
+                    entry["active_persona"] = bot.active_persona
                 if bot.autostart:
                     entry["autostart"] = True
-                if bot.permissions:
+                if bot.permissions is not None:
                     entry["permissions"] = bot.permissions
                 if bot.bot_username:
                     entry["bot_username"] = bot.bot_username
+                if bot.session_id is not None:
+                    entry["session_id"] = bot.session_id
+                if bot.model is not None:
+                    entry["model"] = bot.model
+                if bot.effort is not None:
+                    entry["effort"] = bot.effort
+                if bot.show_thinking:
+                    entry["show_thinking"] = True
+
+                if role == self.role:
+                    for k, v in fields.items():
+                        if v is None:
+                            entry.pop(k, None)
+                        else:
+                            entry[k] = v
                 bots_dict[role] = entry
             patch_team(self.team_name, {"bots": bots_dict}, cfg)
         else:
-            patch_project(self.name, {"active_persona": name}, cfg)
+            patch_project(self.name, fields, cfg)
+
+    def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
+        """Persist this bot's active_persona."""
+        self._patch_config({"active_persona": name}, config_path)
 
     async def _on_persona(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._auth(update.effective_user):
@@ -1112,7 +1115,7 @@ class ProjectBot(AuthMixin):
             if name in valid:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
-                patch_project(self.name, {"model": name})
+                self._patch_config({"model": name})
             await query.edit_message_text(
                 f"Select model\nCurrent: {self._current_model()}",
                 reply_markup=self._model_markup(),
@@ -1121,7 +1124,7 @@ class ProjectBot(AuthMixin):
             level = query.data[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self.task_manager.claude.effort = level
-                patch_project(self.name, {"effort": level})
+                self._patch_config({"effort": level})
             await query.edit_message_text(
                 f"Effort: {self._current_effort()}",
                 reply_markup=self._effort_markup(),
@@ -1130,7 +1133,7 @@ class ProjectBot(AuthMixin):
             value = query.data[len("thinking_set_"):]
             if value in ("on", "off"):
                 self.show_thinking = value == "on"
-                patch_project(self.name, {"show_thinking": self.show_thinking})
+                self._patch_config({"show_thinking": self.show_thinking})
             await query.edit_message_text(
                 f"Live thinking: {self._current_thinking()}",
                 reply_markup=self._thinking_markup(),
@@ -1141,7 +1144,7 @@ class ProjectBot(AuthMixin):
                 skip, pm = resolve_permissions(mode)
                 self.task_manager.claude.skip_permissions = skip
                 self.task_manager.claude.permission_mode = pm
-                patch_project(self.name, {"permissions": mode if mode != "default" else None})
+                self._patch_config({"permissions": mode if mode != "default" else None})
             await query.edit_message_text(
                 f"Permissions: {self._current_permission()}",
                 reply_markup=self._permissions_markup(),
@@ -1718,7 +1721,8 @@ def run_bot(
         raise SystemExit(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
-    if session_id:
+    if session_id and not team_name:
+        # For solo projects, save it immediately (backward compat for CLI startup)
         save_session(name, session_id)
     bot = ProjectBot(
         name, path, token,

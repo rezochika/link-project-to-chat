@@ -698,6 +698,21 @@ def test_load_config_skips_phantom_project_without_path(tmp_path: Path, capsys):
     assert "acme_manager" in err
 
 
+def test_load_config_self_heals_phantom_project_without_path(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "projects": {
+            "good": {"path": "/x", "telegram_bot_token": "T"},
+            "acme_manager": {"active_persona": "software_manager"},
+        },
+        "future_key": "kept",
+    }))
+    load_config(p)
+    raw = json.loads(p.read_text())
+    assert raw["projects"] == {"good": {"path": "/x", "telegram_bot_token": "T"}}
+    assert raw["future_key"] == "kept"
+
+
 def test_save_config_drops_phantom_project_on_next_write(tmp_path: Path):
     """After a tolerant load, saving the config removes the phantom entry from disk."""
     p = tmp_path / "cfg.json"
