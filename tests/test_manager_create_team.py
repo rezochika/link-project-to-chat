@@ -278,7 +278,6 @@ async def test_delete_team_execute_happy_path(tmp_path, monkeypatch):
     )
     mb._pm = MagicMock()
     mb._pm.stop = MagicMock()
-    mb._team_relays = {}
     mb._telethon_client = MagicMock()
 
     # Patch the heavy bits.
@@ -362,7 +361,6 @@ async def test_delete_team_execute_continues_on_individual_failures(tmp_path, mo
     mb._app.bot = MagicMock()
     mb._app.bot.send_message = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
     mb._pm = MagicMock()
-    mb._team_relays = {}
     mb._telethon_client = MagicMock()
 
     async def sometimes_fail(username):
