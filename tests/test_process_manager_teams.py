@@ -215,3 +215,46 @@ def test_start_autostart_skips_teams_with_sentinel_chat_id(tmp_path):
     assert count == 0
     assert "team:pending:manager" not in pm._processes
     mock_popen.assert_not_called()
+
+
+def test_team_bot_spawn_passes_telethon_session_env_var(tmp_path):
+    """Team-mode bot subprocess gets LP2C_TELETHON_SESSION pointing at the
+    manager's Telethon session file so the project bot can attach a relay."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    env = _build_project_bot_env(team_name="acme", config_dir=tmp_path)
+    assert env.get("LP2C_TELETHON_SESSION") == str(session_path)
+
+
+def test_solo_bot_spawn_does_not_set_telethon_session_env_var(tmp_path):
+    """Solo-mode bots (team_name=None) don't get the Telethon session env var
+    even if the file exists — they don't need the relay."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    (tmp_path / "telethon.session").touch()
+    env = _build_project_bot_env(team_name=None, config_dir=tmp_path)
+    assert "LP2C_TELETHON_SESSION" not in env
+
+
+def test_team_bot_spawn_without_session_file_does_not_set_env_var(tmp_path):
+    """Team-mode bot launched before /setup (no session file yet) doesn't
+    get the env var — pointing at a missing file would be misleading."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    # Don't touch session_path — file absent.
+    env = _build_project_bot_env(team_name="acme", config_dir=tmp_path)
+    assert "LP2C_TELETHON_SESSION" not in env
+
+
+def test_build_project_bot_env_does_not_mutate_os_environ(tmp_path, monkeypatch):
+    """Helper returns a fresh copy of os.environ — no shared state across spawns."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
+    (tmp_path / "telethon.session").touch()
+    env = _build_project_bot_env(team_name="acme", config_dir=tmp_path)
+    assert env.get("LP2C_TELETHON_SESSION") is not None
+    import os
+    assert "LP2C_TELETHON_SESSION" not in os.environ

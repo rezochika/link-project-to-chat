@@ -2,15 +2,39 @@ from __future__ import annotations
 
 import collections
 import logging
+import os
 import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
 
 from .config import load_project_configs, set_project_autostart, set_team_bot_autostart
-from ..config import load_config
+from ..config import DEFAULT_CONFIG, load_config
 
 logger = logging.getLogger(__name__)
+
+
+def _build_project_bot_env(team_name: str | None, config_dir: Path) -> dict[str, str]:
+    """Build the env dict for a project-bot subprocess.
+
+    Returns a fresh copy of ``os.environ`` so callers can mutate it without
+    leaking state into the parent process. When the bot is team-mode AND the
+    manager's Telethon session file exists, exposes its absolute path via
+    ``LP2C_TELETHON_SESSION`` so the project bot can construct its own
+    Telethon client and call ``enable_team_relay`` (spec #0c).
+
+    A solo-mode bot (``team_name is None``) never receives the env var — it
+    has no relay to attach. A team-mode bot whose ``telethon.session`` file
+    is absent (i.e. ``/setup`` hasn't run yet) also doesn't receive the var,
+    so the project bot can detect "no session" by env-var absence rather than
+    by stat'ing a missing path.
+    """
+    env = os.environ.copy()
+    if team_name is not None:
+        session_path = config_dir / "telethon.session"
+        if session_path.exists():
+            env["LP2C_TELETHON_SESSION"] = str(session_path)
+    return env
 
 
 def _default_command_builder(project_name: str, project_config: dict) -> list[str]:
@@ -43,6 +67,10 @@ class ProcessManager:
         if self._project_config_path is not None:
             return load_project_configs(self._project_config_path)
         return load_project_configs()
+
+    def _config_dir(self) -> Path:
+        """Directory containing the manager's config.json (and telethon.session)."""
+        return (self._project_config_path or DEFAULT_CONFIG).parent
 
     def _capture_output(self, name: str, proc: subprocess.Popen) -> None:
         buf = self._logs[name]
@@ -84,7 +112,14 @@ class ProcessManager:
         if key in self._processes and self._processes[key].poll() is None:
             return False
         cmd = self._team_command_builder(team_name, role)
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        env = _build_project_bot_env(team_name=team_name, config_dir=self._config_dir())
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
         self._processes[key] = proc
         self._logs[key] = collections.deque(maxlen=200)
         thread = threading.Thread(target=self._capture_output, args=(key, proc), daemon=True)
