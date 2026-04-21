@@ -31,7 +31,7 @@ def _build_project_bot_env(team_name: str | None, config_dir: Path) -> dict[str,
     """
     env = os.environ.copy()
     if team_name is not None:
-        session_path = config_dir / "telethon.session"
+        session_path = (config_dir / "telethon.session").resolve()
         if session_path.exists():
             env["LP2C_TELETHON_SESSION"] = str(session_path)
     return env

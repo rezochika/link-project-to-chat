@@ -258,3 +258,18 @@ def test_build_project_bot_env_does_not_mutate_os_environ(tmp_path, monkeypatch)
     assert env.get("LP2C_TELETHON_SESSION") is not None
     import os
     assert "LP2C_TELETHON_SESSION" not in os.environ
+
+
+def test_build_project_bot_env_uses_absolute_session_path(tmp_path, monkeypatch):
+    """Even if config_dir is relative, the env var carries an absolute path
+    so subprocess cwd changes can't desync the relay session."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+    from pathlib import Path
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "telethon.session").touch()
+    env = _build_project_bot_env(team_name="acme", config_dir=Path("."))
+    assert "LP2C_TELETHON_SESSION" in env
+    session = Path(env["LP2C_TELETHON_SESSION"])
+    assert session.is_absolute()
+    assert session == (tmp_path / "telethon.session").resolve()
