@@ -61,6 +61,14 @@ class AuthMixin:
             self._trusted_user_id = user_id
 
     def _auth(self, user) -> bool:
+        """Return True if *user* is authorised to use this bot.
+
+        Flow: fail-closed if no usernames configured → brute-force lockout (5
+        failures) → trusted-ID fast path → username match (locks in user.id so
+        subsequent messages skip the username lookup). Multi-user mode uses
+        _allowed_usernames (list); legacy single-user mode wraps _allowed_username
+        in a list automatically via _get_allowed_usernames().
+        """
         allowed = self._get_allowed_usernames()
         if not allowed:
             return False  # fail-closed

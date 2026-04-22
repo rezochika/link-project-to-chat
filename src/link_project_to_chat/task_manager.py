@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import enum
+import heapq
 import logging
 import re
 import subprocess
@@ -425,7 +426,7 @@ class TaskManager:
         tasks = list(self._tasks.values())
         if chat_id is not None:
             tasks = [t for t in tasks if t.chat_id == chat_id]
-        return sorted(tasks, key=lambda t: t.id, reverse=True)[:limit]
+        return heapq.nlargest(limit, tasks, key=lambda t: t.id)
 
     def cancel(self, task_id: int) -> bool:
         task = self._tasks.get(task_id)
