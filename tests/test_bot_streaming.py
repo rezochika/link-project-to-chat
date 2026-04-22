@@ -104,6 +104,104 @@ async def test_text_delta_in_group_mode_skips_live_message():
 
 
 @pytest.mark.asyncio
+async def test_team_bot_sends_placeholder_at_task_start():
+    """Team bots must post a placeholder immediately at `_on_task_started` so
+    `team_relay._delete_pending_for_peer` runs on the placeholder's NewMessage
+    and drops the forwarded trigger before the 60s fallback timer deletes it.
+    Without an early placeholder, long finalize calls crash with
+    `BadRequest: Message to be replied not found`.
+    """
+    bot = await _stub_bot()
+    bot.group_mode = True
+    bot._app.bot.get_chat = AsyncMock(return_value=MagicMock())
+    bot._keep_typing = AsyncMock()
+    task = _fake_task(task_id=60)
+
+    await bot._on_task_started(task)
+
+    assert task.id in bot._live_text
+    assert len(bot._app.bot.sent) == 1
+    assert bot._app.bot.sent[0]["reply_to"] == task.message_id
+
+
+@pytest.mark.asyncio
+async def test_non_team_bot_does_not_send_placeholder_at_task_start():
+    """The early placeholder is a team-mode workaround. Regular bots keep
+    the lazy behavior: LiveMessage is created on the first TextDelta."""
+    bot = await _stub_bot()
+    bot.group_mode = False
+    bot._app.bot.get_chat = AsyncMock(return_value=MagicMock())
+    bot._keep_typing = AsyncMock()
+    task = _fake_task(task_id=61)
+
+    await bot._on_task_started(task)
+
+    assert task.id not in bot._live_text
+    assert len(bot._app.bot.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_team_bot_finalize_edits_placeholder_no_new_send():
+    """End-to-end: placeholder at task start, no edits during stream, finalize
+    *edits* the placeholder in place. Because it's an edit (not a send),
+    reply_to is never re-validated against a possibly-deleted forward.
+    """
+    bot = await _stub_bot()
+    bot.group_mode = True
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    bot._app.bot.get_chat = AsyncMock(return_value=MagicMock())
+    bot._keep_typing = AsyncMock()
+    task = _fake_task(task_id=62)
+    task.status = TaskStatus.DONE
+    task.result = "final delegation text"
+
+    await bot._on_task_started(task)
+    sent_after_start = len(bot._app.bot.sent)
+    # TextDeltas during group_mode are no-ops on the stream side — task.result
+    # is what reaches finalize.
+    await bot._on_stream_event(task, TextDelta(text="streamed chunk "))
+    await bot._on_stream_event(task, TextDelta(text="not appended"))
+
+    await bot._finalize_claude_task(task)
+
+    # No new send_message during finalize — only the placeholder was sent.
+    assert len(bot._app.bot.sent) == sent_after_start
+    assert any("final delegation text" in e["text"] for e in bot._app.bot.edits)
+    assert task.id not in bot._live_text
+
+
+@pytest.mark.asyncio
+async def test_send_html_retries_without_reply_to_when_target_deleted():
+    """If the reply target has been deleted (relay auto-delete, user manual
+    delete), `_send_html` retries once without `reply_to` so the bot's output
+    still lands instead of the finalize callback crashing."""
+    from telegram.error import BadRequest
+
+    bot = await _stub_bot()
+    calls: list[dict] = []
+
+    async def flaky_send(chat_id, text, reply_to_message_id=None, parse_mode=None, reply_markup=None, **kw):
+        calls.append({"reply_to": reply_to_message_id, "parse_mode": parse_mode})
+        if reply_to_message_id is not None:
+            raise BadRequest("Message to be replied not found")
+        result = MagicMock()
+        result.message_id = 999
+        return result
+
+    bot._app.bot.send_message = flaky_send
+
+    result = await bot._send_html(chat_id=42, html="<b>hi</b>", reply_to=100)
+
+    assert len(calls) == 2
+    assert calls[0]["reply_to"] == 100
+    assert calls[1]["reply_to"] is None
+    # HTML parse_mode preserved on retry — we aren't silently downgrading to plain.
+    assert calls[1]["parse_mode"] == "HTML"
+    assert result == 999
+
+
+@pytest.mark.asyncio
 async def test_thinking_delta_in_group_mode_uses_buffer_not_livestream():
     """Even with show_thinking=True, team bots skip the thinking livestream
     and fall through to `_thinking_buf` (which feeds the Thinking button).

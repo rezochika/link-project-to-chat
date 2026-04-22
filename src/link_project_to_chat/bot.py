@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import Forbidden
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -172,6 +172,31 @@ class ProjectBot(AuthMixin):
             return
         chat = await self._app.bot.get_chat(task.chat_id)
         self._typing_tasks[task.id] = asyncio.create_task(self._keep_typing(chat))
+        # Team bots skip per-delta livestreaming (_on_stream_event returns
+        # early), but we still need to emit *one* message early so the relay's
+        # event-driven auto-delete (_delete_pending_for_peer) can drop the
+        # forwarded trigger message before its 60-second fallback deletes it.
+        # Sending the placeholder now — while the forward still exists —
+        # means `reply_to` resolves; finalize() later *edits* this same
+        # message, so reply_to is never re-validated against a vanished
+        # target.
+        if self.group_mode and task.id not in self._live_text:
+            live = LiveMessage(
+                bot=self._app.bot,
+                chat_id=task.chat_id,
+                reply_to_message_id=task.message_id,
+            )
+            try:
+                await live.start()
+            except Exception:
+                logger.exception(
+                    "LiveMessage.start failed for team placeholder (task #%d); "
+                    "falling back to send-at-finalize",
+                    task.id,
+                )
+                self._live_text_failed.add(task.id)
+                return
+            self._live_text[task.id] = live
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, TextDelta):
@@ -255,18 +280,67 @@ class ProjectBot(AuthMixin):
                     chat_id, chunk, parse_mode="HTML", reply_to_message_id=reply_to, reply_markup=km
                 )
                 last_id = msg.message_id
+            except BadRequest as e:
+                # The reply target can disappear while a long task runs — the
+                # team_relay auto-deletes forwards, and users can delete their
+                # own messages. Drop reply_to and retry once so the bot's
+                # output still lands instead of the whole finalize crashing.
+                if reply_to is not None and "message to be replied" in str(e).lower():
+                    logger.warning(
+                        "reply target %s missing; retrying HTML send without reply_to",
+                        reply_to,
+                    )
+                    try:
+                        msg = await self._app.bot.send_message(
+                            chat_id, chunk, parse_mode="HTML", reply_markup=km
+                        )
+                        last_id = msg.message_id
+                        continue
+                    except Exception:
+                        logger.warning("HTML send retry without reply_to failed", exc_info=True)
+                logger.warning("HTML send failed, falling back to plain", exc_info=True)
+                plain = strip_html(chunk).replace("\x00", "")
+                if plain.strip():
+                    msg = await self._send_plain_with_retry(
+                        chat_id, plain, reply_to, km,
+                    )
+                    if msg is not None:
+                        last_id = msg.message_id
             except Exception:
                 logger.warning("HTML send failed, falling back to plain", exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    msg = await self._app.bot.send_message(
-                        chat_id,
-                        plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to_message_id=reply_to,
-                        reply_markup=km,
+                    msg = await self._send_plain_with_retry(
+                        chat_id, plain, reply_to, km,
                     )
-                    last_id = msg.message_id
+                    if msg is not None:
+                        last_id = msg.message_id
         return last_id
+
+    async def _send_plain_with_retry(
+        self, chat_id: int, plain: str, reply_to: int | None, reply_markup,
+    ):
+        """Plain-text fallback send that tolerates a vanished reply target."""
+        capped = plain[:4096] if len(plain) > 4096 else plain
+        try:
+            return await self._app.bot.send_message(
+                chat_id, capped, reply_to_message_id=reply_to, reply_markup=reply_markup,
+            )
+        except BadRequest as e:
+            if reply_to is not None and "message to be replied" in str(e).lower():
+                logger.warning(
+                    "reply target %s missing on plain fallback; retrying without reply_to",
+                    reply_to,
+                )
+                try:
+                    return await self._app.bot.send_message(
+                        chat_id, capped, reply_markup=reply_markup,
+                    )
+                except Exception:
+                    logger.exception("plain send retry without reply_to failed")
+                    return None
+            logger.exception("plain send failed")
+            return None
 
     async def _send_to_chat(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
         html = md_to_telegram(text or "[No output]").replace("\x00", "")
