@@ -7,15 +7,17 @@ Telethon session and — whenever a team bot posts a message that mentions
 another team bot — reposts the same text as the trusted user so the peer bot
 receives it through the normal user-message path.
 
-The relay sends the raw bot text without any prefix, so humans see a clean
-duplicate of the handoff message rather than an ugly `[auto-relay from ...]`
-banner. Loop prevention is inherent — the relay sends as the trusted user
-(not a bot), and the handler ignores non-bot senders.
+The relay owns the loop guard: because relayed messages appear to come from the
+trusted user, the per-bot round counter in ProjectBot sees `is_bot=False` and
+never increments. The relay is the single choke point for bot-to-bot traffic,
+so it counts consecutive forwards here. When the cap is reached, the relay
+stops forwarding (silently drops bot messages) and posts a one-time "paused"
+notice. Any non-bot message in the group — other than the relay's own echoes —
+resets the counter and clears the halt.
 
-The relay does NOT try to preserve the bot-to-bot round counter that lives on
-each ProjectBot. Since relayed messages appear to come from the trusted user,
-each relay resets the peer's counter. This is documented as a v1 tradeoff —
-the user can still `/halt` a runaway loop manually.
+The relay also deletes each forward after the peer bot answers (event-driven)
+so the group chat is not cluttered with duplicates. A fallback timer deletes
+forwards whose peer never responded (bot crashed, error, end of task).
 """
 from __future__ import annotations
 
@@ -35,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 _EDIT_DEBOUNCE_SECONDS = 6.0
+_MAX_CONSECUTIVE_BOT_RELAYS = 10
+_FALLBACK_DELETE_SECONDS = 60.0
 
 
 def _body_without_mention(text: str, peer: str) -> str:
@@ -105,6 +109,8 @@ class TeamRelay:
         team_name: str,
         group_chat_id: int,
         bot_usernames: set[str],
+        *,
+        max_consecutive_bot_relays: int = _MAX_CONSECUTIVE_BOT_RELAYS,
     ) -> None:
         if events is None:
             raise ImportError(
@@ -123,6 +129,22 @@ class TeamRelay:
         # Pending debounced relay tasks, keyed by message_id. The livestream
         # emits many edits per reply; we only relay once the stream goes quiet.
         self._debounce_tasks: dict[int, asyncio.Task] = {}
+        # Loop guard: count consecutive bot-to-bot forwards since last user
+        # activity. Halts when `_max_rounds` is reached.
+        self._max_rounds = max_consecutive_bot_relays
+        self._rounds = 0
+        self._halted = False
+        # Telegram message IDs the relay itself has sent (forwards + halt
+        # notices). Needed because Telethon delivers our own sends back as
+        # NewMessage events with `is_bot=False`, which would otherwise look
+        # like user activity and reset the loop guard.
+        self._own_relay_ids: set[int] = set()
+        # Event-driven auto-delete: `_pending_deletes[sent_id] = peer_username`.
+        # When that peer posts anything, we delete the relayed `sent_id`.
+        # A fallback timer in `_pending_delete_timers` deletes after a timeout
+        # if the peer never responds.
+        self._pending_deletes: dict[int, str] = {}
+        self._pending_delete_timers: dict[int, asyncio.Task] = {}
 
     async def start(self) -> None:
         """Register NewMessage + MessageEdited handlers on the shared Telethon client.
@@ -157,6 +179,10 @@ class TeamRelay:
         for task in list(self._debounce_tasks.values()):
             task.cancel()
         self._debounce_tasks.clear()
+        for task in list(self._pending_delete_timers.values()):
+            task.cancel()
+        self._pending_delete_timers.clear()
+        self._pending_deletes.clear()
         if self._handler is not None:
             try:
                 self._client.remove_event_handler(self._on_new_message)
@@ -195,18 +221,36 @@ class TeamRelay:
         if getattr(msg, "chat_id", None) != self._group_chat_id:
             return
         msg_id = getattr(msg, "id", None)
+        # Ignore our own relay posts bouncing back as events.
+        if msg_id is not None and msg_id in self._own_relay_ids:
+            return
         if msg_id in self._relayed_ids:
             return  # already relayed this message once
-        text = msg.message or ""
         sender = await event.get_sender()
-        if sender is None or not getattr(sender, "bot", False):
+        if sender is None:
+            return
+        if not getattr(sender, "bot", False):
+            # Non-bot activity in the group (not our echo) — user is engaged,
+            # so clear the loop guard. Only fresh messages count; edits may
+            # just be the user cleaning up a prior message.
+            if not is_edit:
+                self._rounds = 0
+                self._halted = False
             return
         sender_username = (getattr(sender, "username", "") or "").lower()
         if sender_username not in self._bot_usernames:
             return
+        # A team bot posted — if we had a pending relay-delete waiting for
+        # this exact peer to respond, fire it now (only on NewMessage to
+        # avoid firing on every streaming edit of the response).
+        if not is_edit:
+            await self._delete_pending_for_peer(sender_username)
+        text = msg.message or ""
         peer = find_peer_mention(text, sender_username, self._bot_usernames)
         if peer is None:
             return
+        if self._halted:
+            return  # silently drop; user must post to resume
 
         if is_edit:
             # Edits come in rapid-fire during streaming. Debounce: cancel any
@@ -254,22 +298,88 @@ class TeamRelay:
         await self._finalize_relay(msg_id, sender_username, text)
 
     async def _finalize_relay(self, msg_id: int | None, sender_username: str, text: str) -> None:
+        if self._halted:
+            return
         peer = find_peer_mention(text, sender_username, self._bot_usernames)
         if peer is not None:
             text = _normalize_mention_spacing(text, peer)
-        await self._relay(sender_username, text)
+        sent_id = await self._relay(sender_username, text)
         if msg_id is not None:
             self._relayed_ids.add(msg_id)
+        # Track this forward for event-driven auto-delete when `peer` responds.
+        if sent_id is not None and peer is not None:
+            self._pending_deletes[sent_id] = peer
+            self._pending_delete_timers[sent_id] = asyncio.create_task(
+                self._fallback_delete(sent_id)
+            )
+        self._rounds += 1
+        if self._rounds >= self._max_rounds and not self._halted:
+            self._halted = True
+            await self._send_halt_notice()
 
-    async def _relay(self, sender_username: str, text: str) -> None:
+    async def _relay(self, sender_username: str, text: str) -> int | None:
         try:
             sent = await self._client.send_message(self._group_chat_id, text)
+            sent_id = getattr(sent, "id", None)
+            if isinstance(sent_id, int):
+                self._own_relay_ids.add(sent_id)
             logger.info(
                 "Relayed bot-to-bot message: team=%s from=@%s",
                 self._team_name, sender_username,
             )
+            return sent_id if isinstance(sent_id, int) else None
         except Exception:
             logger.exception(
                 "TeamRelay send failed (team=%s from=@%s)",
                 self._team_name, sender_username,
             )
+            return None
+
+    async def _send_halt_notice(self) -> None:
+        notice = (
+            f"Bot-to-bot relay paused after {self._rounds} consecutive rounds "
+            f"in team '{self._team_name}'. Send any message to resume."
+        )
+        try:
+            sent = await self._client.send_message(self._group_chat_id, notice)
+            sent_id = getattr(sent, "id", None)
+            if isinstance(sent_id, int):
+                self._own_relay_ids.add(sent_id)
+        except Exception:
+            logger.exception(
+                "TeamRelay halt notice send failed (team=%s)", self._team_name,
+            )
+
+    async def _delete_pending_for_peer(self, sender_username: str) -> None:
+        """Delete any relay forwards that were waiting for `sender_username` to respond."""
+        to_delete = [
+            mid for mid, peer in self._pending_deletes.items()
+            if peer == sender_username
+        ]
+        for mid in to_delete:
+            self._pending_deletes.pop(mid, None)
+            timer = self._pending_delete_timers.pop(mid, None)
+            if timer is not None and not timer.done():
+                timer.cancel()
+            await self._delete_relay_message(mid)
+
+    async def _delete_relay_message(self, msg_id: int) -> None:
+        try:
+            await self._client.delete_messages(self._group_chat_id, [msg_id])
+            self._own_relay_ids.discard(msg_id)
+        except Exception:
+            logger.warning(
+                "TeamRelay delete failed (mid=%s team=%s)",
+                msg_id, self._team_name, exc_info=True,
+            )
+
+    async def _fallback_delete(self, msg_id: int) -> None:
+        try:
+            await asyncio.sleep(_FALLBACK_DELETE_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if msg_id not in self._pending_deletes:
+            return  # peer already responded; the event-driven path handled it
+        self._pending_deletes.pop(msg_id, None)
+        self._pending_delete_timers.pop(msg_id, None)
+        await self._delete_relay_message(msg_id)
