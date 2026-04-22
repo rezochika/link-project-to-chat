@@ -18,3 +18,5 @@ config.json
 
 # Git worktrees
 .worktrees/
+.idea
+/.claude/
