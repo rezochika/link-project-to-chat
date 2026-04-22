@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 _EDIT_DEBOUNCE_SECONDS = 6.0
 _MAX_CONSECUTIVE_BOT_RELAYS = 5
 _FALLBACK_DELETE_SECONDS = 60.0
+# Telegram splits bot messages longer than 4096 chars into separate parts,
+# each delivered as its own NewMessage event. Without coalescing, each part
+# becomes an independent forward and spawns its own task in the peer bot's
+# queue (the garbled-parallel-output failure mode). Parts share the same
+# sender and reply_to_message_id; we buffer by (sender, reply_to) for this
+# many seconds before forwarding the combined text once.
+_COALESCE_WINDOW_SECONDS = 3.0
 
 
 # Messages whose body (after stripping the leading @peer mention) matches one
@@ -135,6 +142,21 @@ def find_peer_mention(text: str, self_username: str, team_bot_usernames: set[str
     return None
 
 
+class _CoalescePending:
+    """Buffer for consecutive bot messages that share a reply_to target.
+
+    Used by TeamRelay to merge split-message parts (and any other rapid-fire
+    multi-part posts) into a single forward, so the peer bot sees one logical
+    delegation rather than N independent tasks.
+    """
+
+    __slots__ = ("parts", "timer")
+
+    def __init__(self) -> None:
+        self.parts: list[tuple[int, str]] = []  # (msg_id, text)
+        self.timer: asyncio.Task | None = None
+
+
 class TeamRelay:
     """Watches one team's group chat and relays bot-to-bot handoffs."""
 
@@ -180,6 +202,9 @@ class TeamRelay:
         # if the peer never responds.
         self._pending_deletes: dict[int, str] = {}
         self._pending_delete_timers: dict[int, asyncio.Task] = {}
+        # Coalesce buffer keyed by (sender_username, reply_to_msg_id). See
+        # `_COALESCE_WINDOW_SECONDS` for rationale.
+        self._coalesce_pending: dict[tuple[str, int | None], _CoalescePending] = {}
 
     async def start(self) -> None:
         """Register NewMessage + MessageEdited handlers on the shared Telethon client.
@@ -214,6 +239,10 @@ class TeamRelay:
         for task in list(self._debounce_tasks.values()):
             task.cancel()
         self._debounce_tasks.clear()
+        for pending in list(self._coalesce_pending.values()):
+            if pending.timer is not None and not pending.timer.done():
+                pending.timer.cancel()
+        self._coalesce_pending.clear()
         for task in list(self._pending_delete_timers.values()):
             task.cancel()
         self._pending_delete_timers.clear()
@@ -281,6 +310,24 @@ class TeamRelay:
         if not is_edit:
             await self._delete_pending_for_peer(sender_username)
         text = msg.message or ""
+        reply_to = getattr(msg, "reply_to_msg_id", None)
+
+        # Continuation of a coalescing message: append regardless of whether
+        # this chunk carries its own @peer mention. Telegram splits long bot
+        # messages past 4096 chars into separate parts; usually only the first
+        # part contains the @peer mention.
+        if not is_edit:
+            coalesce_key = (sender_username, reply_to)
+            pending = self._coalesce_pending.get(coalesce_key)
+            if pending is not None:
+                if self._halted:
+                    return
+                pending.parts.append((msg_id, text))
+                if pending.timer is not None and not pending.timer.done():
+                    pending.timer.cancel()
+                pending.timer = asyncio.create_task(self._coalesce_flush(coalesce_key))
+                return
+
         peer = find_peer_mention(text, sender_username, self._bot_usernames)
         if peer is None:
             return
@@ -297,7 +344,39 @@ class TeamRelay:
                 self._debounced_relay(msg_id, sender_username)
             )
         else:
-            await self._finalize_relay(msg_id, sender_username, text)
+            # Start a new coalesce buffer; the timer flushes it once no more
+            # parts arrive within `_COALESCE_WINDOW_SECONDS`. Single-part
+            # messages still pay the delay but behave identically otherwise.
+            coalesce_key = (sender_username, reply_to)
+            new_pending = _CoalescePending()
+            new_pending.parts.append((msg_id, text))
+            new_pending.timer = asyncio.create_task(self._coalesce_flush(coalesce_key))
+            self._coalesce_pending[coalesce_key] = new_pending
+
+    async def _coalesce_flush(self, key: tuple[str, int | None]) -> None:
+        """Forward the buffered parts for `key` as a single relay message.
+
+        Called from the timer armed in `_handle_event`. If the timer was
+        cancelled (another part arrived and restarted it), this coroutine
+        exits silently; only the last timer's flush takes effect.
+        """
+        try:
+            await asyncio.sleep(_COALESCE_WINDOW_SECONDS)
+        except asyncio.CancelledError:
+            return
+        pending = self._coalesce_pending.pop(key, None)
+        if pending is None or not pending.parts:
+            return
+        sender_username, _ = key
+        combined = "\n\n".join(text for _, text in pending.parts if text)
+        first_msg_id = pending.parts[0][0]
+        # Every input msg_id belongs to this one logical delegation; mark the
+        # trailing parts as relayed so later edits or duplicate events can't
+        # re-trigger. `_finalize_relay` marks `first_msg_id` itself.
+        for mid, _ in pending.parts[1:]:
+            if mid is not None:
+                self._relayed_ids.add(mid)
+        await self._finalize_relay(first_msg_id, sender_username, combined)
 
     async def _debounced_relay(self, msg_id: int, sender_username: str) -> None:
         try:

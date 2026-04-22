@@ -175,6 +175,13 @@ class ProjectBot(AuthMixin):
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, TextDelta):
+            # Team bots do not livestream to the group chat. Streaming edits
+            # produce partial content that team_relay forwards before the
+            # message is complete; disabling livestream here means task.result
+            # is built from collected_text in task_manager and sent once at
+            # finalize via _send_to_chat, eliminating the partial-relay race.
+            if self.group_mode:
+                return
             live = self._live_text.get(task.id)
             if live is None and task.id not in self._live_text_failed:
                 live = LiveMessage(
@@ -199,7 +206,7 @@ class ProjectBot(AuthMixin):
             if live is not None:
                 await live.append(event.text)
         elif isinstance(event, ThinkingDelta):
-            if self.show_thinking and task.id not in self._live_thinking_failed:
+            if self.show_thinking and task.id not in self._live_thinking_failed and not self.group_mode:
                 live = self._live_thinking.get(task.id)
                 if live is None:
                     live = LiveMessage(
@@ -226,7 +233,7 @@ class ProjectBot(AuthMixin):
                 if live is not None:
                     await live.append(event.text)
                     return
-            # Toggle-off path, OR toggle-on with failed live start.
+            # Toggle-off path, group-mode path, OR toggle-on with failed live start.
             buf = self._thinking_buf.setdefault(task.id, "")
             sep = "\n\n" if buf else ""
             self._thinking_buf[task.id] = buf + sep + event.text

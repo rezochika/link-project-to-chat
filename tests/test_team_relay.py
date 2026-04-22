@@ -1,8 +1,44 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fast_coalesce(monkeypatch):
+    """Make the coalesce window instant so tests don't wait 3 real seconds.
+
+    Each NewMessage routed through the relay now enters a coalesce buffer that
+    normally waits `_COALESCE_WINDOW_SECONDS` before forwarding. Tests below
+    use `_dispatch()` to await the flush; this fixture just shrinks the window
+    to zero so the flush runs as soon as the event loop yields.
+    """
+    import link_project_to_chat.manager.team_relay as tr
+
+    monkeypatch.setattr(tr, "_COALESCE_WINDOW_SECONDS", 0.0)
+
+
+async def _dispatch(relay, event):
+    """Route `event` through the relay and let any coalesce flush complete.
+
+    The relay schedules the forward as a task; without waiting for that task,
+    assertions on `send_message` would race with the timer.
+    """
+    await relay._on_new_message(event)
+    while relay._coalesce_pending:
+        timers = [
+            p.timer for p in list(relay._coalesce_pending.values())
+            if p.timer is not None and not p.timer.done()
+        ]
+        if not timers:
+            break
+        for t in timers:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 # --- pure helpers ---
@@ -59,12 +95,23 @@ def _fake_sender(username: str, is_bot: bool):
     return s
 
 
-async def _mk_event(text: str, sender_username: str, sender_is_bot: bool, chat_id: int | None = -100_111, msg_id: int | None = None):
+async def _mk_event(
+    text: str,
+    sender_username: str,
+    sender_is_bot: bool,
+    chat_id: int | None = -100_111,
+    msg_id: int | None = None,
+    reply_to: int | None = None,
+):
     event = MagicMock()
     event.message = MagicMock()
     event.message.message = text
     event.message.chat_id = chat_id
     event.message.id = msg_id
+    # Pin reply_to_msg_id explicitly; without this, MagicMock auto-creates a
+    # fresh child mock per attribute access, which would make every coalesce
+    # key unique and defeat the (sender, reply_to) buffering logic.
+    event.message.reply_to_msg_id = reply_to
     event.get_sender = AsyncMock(return_value=_fake_sender(sender_username, sender_is_bot))
     return event
 
@@ -101,7 +148,7 @@ async def test_relay_ignores_user_messages():
         sender_username="rezoc666",
         sender_is_bot=False,
     )
-    await relay._on_new_message(event)
+    await _dispatch(relay,event)
     client.send_message.assert_not_called()
 
 
@@ -118,7 +165,7 @@ async def test_relay_ignores_bot_messages_not_addressing_peer():
         sender_username="acme_mgr_bot",
         sender_is_bot=True,
     )
-    await relay._on_new_message(event)
+    await _dispatch(relay,event)
     client.send_message.assert_not_called()
 
 
@@ -135,7 +182,7 @@ async def test_relay_forwards_bot_to_bot_handoff():
         sender_username="acme_mgr_bot",
         sender_is_bot=True,
     )
-    await relay._on_new_message(event)
+    await _dispatch(relay,event)
     client.send_message.assert_awaited_once()
     args, _ = client.send_message.call_args
     chat_id, text = args
@@ -159,7 +206,7 @@ async def test_relay_ignores_message_from_unknown_bot():
         sender_username="random_3rd_party_bot",
         sender_is_bot=True,
     )
-    await relay._on_new_message(event)
+    await _dispatch(relay,event)
     client.send_message.assert_not_called()
 
 
@@ -180,7 +227,7 @@ async def test_relay_halts_after_max_consecutive_rounds():
     for i, sender in enumerate(["acme_mgr_bot", "acme_dev_bot", "acme_mgr_bot"]):
         peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
         event = await _mk_event(f"@{peer} round {i}", sender_username=sender, sender_is_bot=True, msg_id=100 + i)
-        await relay._on_new_message(event)
+        await _dispatch(relay,event)
     # At this point cap is hit; forwards so far = 3, plus exactly one halt notice.
     forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
     notices = [c for c in client.send_message.await_args_list if "paused" in c.args[1].lower()]
@@ -188,7 +235,7 @@ async def test_relay_halts_after_max_consecutive_rounds():
     assert len(notices) == 1
     # A fourth bot-to-bot message must NOT produce another forward.
     event = await _mk_event("@acme_dev_bot round 4", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=104)
-    await relay._on_new_message(event)
+    await _dispatch(relay,event)
     forwards_after = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
     assert len(forwards_after) == 3  # still three; halted
 
@@ -208,10 +255,10 @@ async def test_relay_halt_notice_is_sent_only_once():
         sender = "acme_mgr_bot" if i % 2 == 0 else "acme_dev_bot"
         peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
         ev = await _mk_event(f"@{peer} x{i}", sender_username=sender, sender_is_bot=True, msg_id=200 + i)
-        await relay._on_new_message(ev)
+        await _dispatch(relay,ev)
     # Another bot message after halt
     ev = await _mk_event("@acme_dev_bot still going", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=210)
-    await relay._on_new_message(ev)
+    await _dispatch(relay,ev)
     notices = [c for c in client.send_message.await_args_list if "paused" in c.args[1].lower()]
     assert len(notices) == 1
 
@@ -231,17 +278,17 @@ async def test_relay_resumes_when_user_posts_in_group():
         sender = "acme_mgr_bot" if i % 2 == 0 else "acme_dev_bot"
         peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
         ev = await _mk_event(f"@{peer} x{i}", sender_username=sender, sender_is_bot=True, msg_id=300 + i)
-        await relay._on_new_message(ev)
+        await _dispatch(relay,ev)
     assert relay._halted is True
     # Trusted user posts
     user_ev = await _mk_event("ping back online", sender_username="rezoc666", sender_is_bot=False, msg_id=310)
-    await relay._on_new_message(user_ev)
+    await _dispatch(relay,user_ev)
     assert relay._halted is False
     assert relay._rounds == 0
     # Now a bot message should forward again
     ev = await _mk_event("@acme_dev_bot resumed", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=311)
     before = client.send_message.await_count
-    await relay._on_new_message(ev)
+    await _dispatch(relay,ev)
     # A new send happened, and the counter started fresh.
     assert client.send_message.await_count == before + 1
     assert relay._rounds == 1
@@ -264,11 +311,11 @@ async def test_relay_does_not_reset_on_its_own_echoed_posts():
     )
     # Forward one bot message (consumes send_message → sent.id=500)
     ev1 = await _mk_event("@acme_dev_bot one", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=400)
-    await relay._on_new_message(ev1)
+    await _dispatch(relay,ev1)
     # Simulate the same message bouncing back as a NewMessage from the trusted user
     # (this is what Telethon will deliver for the relay's own send).
     echo = await _mk_event("@acme_dev_bot one", sender_username="rezoc666", sender_is_bot=False, msg_id=500)
-    await relay._on_new_message(echo)
+    await _dispatch(relay,echo)
     # Counter must not have reset.
     assert relay._rounds == 1
 
@@ -285,11 +332,11 @@ async def test_relay_deletes_forward_when_peer_bot_responds():
     relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
     # Bot A forwards a handoff to bot B (relay sends as user → sent.id=700)
     ev_a = await _mk_event("@acme_dev_bot please X", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=600)
-    await relay._on_new_message(ev_a)
+    await _dispatch(relay,ev_a)
     client.delete_messages.assert_not_called()  # not yet — peer hasn't responded
     # Bot B responds (no relay needed for this test, but forces the delete path)
     ev_b = await _mk_event("@acme_mgr_bot done", sender_username="acme_dev_bot", sender_is_bot=True, msg_id=601)
-    await relay._on_new_message(ev_b)
+    await _dispatch(relay,ev_b)
     # The relay forward (sent.id=700) must now be deleted.
     client.delete_messages.assert_awaited()
     call = client.delete_messages.await_args_list[0]
@@ -348,7 +395,7 @@ async def test_relay_skips_ack_only_bot_messages():
         "@acme_dev_bot Understood!",
     ]):
         ev = await _mk_event(text, sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=1100 + i)
-        await relay._on_new_message(ev)
+        await _dispatch(relay,ev)
     # Not a single forward should have happened.
     forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@acme_dev_bot")]
     assert forwards == []
@@ -367,7 +414,7 @@ async def test_relay_still_forwards_substantive_messages():
         "@acme_dev_bot Please implement src/models.py per docs/spec.md §2",
         sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=1200,
     )
-    await relay._on_new_message(ev)
+    await _dispatch(relay,ev)
     forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@acme_dev_bot")]
     assert len(forwards) == 1
     assert relay._rounds == 1
@@ -392,10 +439,93 @@ async def test_relay_fallback_deletes_forward_after_timeout(monkeypatch):
     client = _mk_client_with_ids(start_id=900)
     relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
     ev = await _mk_event("@acme_dev_bot ping", sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=800)
-    await relay._on_new_message(ev)
+    await _dispatch(relay,ev)
     # Let the fallback timer fire.
-    import asyncio as _asyncio
-    await _asyncio.sleep(0.05)
+    await asyncio.sleep(0.05)
     client.delete_messages.assert_awaited()
     call = client.delete_messages.await_args_list[0]
     assert 900 in list(call.args[1])
+
+
+# --- coalesce of split/multi-part bot messages ---
+
+
+@pytest.mark.asyncio
+async def test_relay_coalesces_split_bot_message_into_one_forward():
+    """Telegram splits >4096-char bot messages into parts sharing reply_to.
+
+    Only the first part usually carries the @peer mention; continuations are
+    raw text. Without coalescing, each part becomes its own forward and spawns
+    a separate task in the peer bot. Verify: two parts → exactly one forward.
+    """
+    from link_project_to_chat.manager.team_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+
+    ev1 = await _mk_event(
+        "@acme_dev_bot implement P1-1 per docs/plan.md. Start with tests...",
+        sender_username="acme_mgr_bot", sender_is_bot=True,
+        msg_id=10_001, reply_to=42,
+    )
+    await relay._on_new_message(ev1)  # don't drain yet — second part is coming
+    ev2 = await _mk_event(
+        "...and make sure to cover auth, then CSP in P1-3.",
+        sender_username="acme_mgr_bot", sender_is_bot=True,
+        msg_id=10_002, reply_to=42,
+    )
+    await _dispatch(relay, ev2)
+
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
+    assert len(forwards) == 1
+    assert "implement P1-1" in forwards[0].args[1]
+    assert "CSP in P1-3" in forwards[0].args[1]
+    # Both input msg_ids must be recorded as relayed so late edits don't re-fire.
+    assert 10_001 in relay._relayed_ids
+    assert 10_002 in relay._relayed_ids
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_coalesce_unrelated_reply_targets():
+    """Two bot messages that reply to DIFFERENT user messages are separate
+    delegations and must each produce their own forward."""
+    from link_project_to_chat.manager.team_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+
+    ev1 = await _mk_event(
+        "@acme_dev_bot do task A", sender_username="acme_mgr_bot",
+        sender_is_bot=True, msg_id=11_001, reply_to=100,
+    )
+    await _dispatch(relay, ev1)
+    ev2 = await _mk_event(
+        "@acme_dev_bot do task B", sender_username="acme_mgr_bot",
+        sender_is_bot=True, msg_id=11_002, reply_to=101,
+    )
+    await _dispatch(relay, ev2)
+
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
+    assert len(forwards) == 2
+
+
+@pytest.mark.asyncio
+async def test_relay_ignores_continuation_without_prior_peer_mention():
+    """A continuation-shaped message (no @peer, not a recognized split) is dropped.
+
+    Without a prior part that opened a coalesce buffer, the relay has no way to
+    know this text is a follow-on to anything — so it behaves like any other
+    bot message without a peer @mention: ignored.
+    """
+    from link_project_to_chat.manager.team_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+
+    ev = await _mk_event(
+        "just trailing text with no peer mention",
+        sender_username="acme_mgr_bot", sender_is_bot=True,
+        msg_id=12_001, reply_to=200,
+    )
+    await _dispatch(relay, ev)
+    client.send_message.assert_not_called()
