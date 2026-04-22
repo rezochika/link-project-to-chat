@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -254,6 +255,12 @@ class ClaudeClient:
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        _SCRUB_PATTERNS = (
+            "*_TOKEN", "*_KEY", "*_SECRET",
+            "AWS_*", "OPENAI_*", "GITHUB_*", "DATABASE_*", "PASSWORD*",
+        )
+        for key in [k for k in env if any(fnmatch.fnmatch(k, p) for p in _SCRUB_PATTERNS)]:
+            del env[key]
 
         proc = subprocess.Popen(
             cmd,

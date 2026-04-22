@@ -110,9 +110,8 @@ async def test_send_image_blocks_symlink_outside_project(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(strict=True, reason="H2 not yet fixed: str.startswith allows sibling-dir bypass")
 async def test_send_image_blocks_sibling_dir_prefix_bypass(tmp_path):
-    """str.startswith('/tmp/proj') is True for '/tmp/projextra/evil' — H2 fix needed."""
+    """Sibling-dir prefix bypass: is_relative_to rejects paths that share a string prefix."""
     project = tmp_path / "proj"
     project.mkdir()
     sibling = tmp_path / "projextra"
@@ -133,9 +132,8 @@ async def test_send_image_blocks_sibling_dir_prefix_bypass(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="H3 not yet implemented: sensitive env vars still forwarded")
 def test_claude_subprocess_env_scrubs_sensitive_vars(tmp_path):
-    """After H3: AWS_*, GITHUB_TOKEN, OPENAI_API_KEY must not reach Claude subprocess."""
+    """AWS_*, GITHUB_TOKEN, OPENAI_API_KEY must not reach Claude subprocess."""
     from unittest.mock import patch as _patch
     from link_project_to_chat.claude_client import ClaudeClient
 

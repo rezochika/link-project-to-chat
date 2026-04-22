@@ -1633,7 +1633,7 @@ class ProjectBot(AuthMixin):
         except (OSError, ValueError):
             logger.warning("Invalid image path: %s", file_path)
             return
-        if not str(resolved).startswith(str(self.path.resolve())):
+        if not resolved.is_relative_to(self.path.resolve()):
             logger.warning("Image path traversal blocked: %s", file_path)
             return
         if not path.exists():
