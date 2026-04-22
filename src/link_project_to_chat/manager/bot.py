@@ -2143,6 +2143,18 @@ class ManagerBot(AuthMixin):
             self._telethon_client = None
             return
 
+    async def _post_stop(self, app) -> None:
+        """Called by python-telegram-bot on shutdown — disconnect Telethon client.
+
+        Project bots own their own TeamRelay instances (see #0c), so the manager
+        no longer has relays to stop here.
+        """
+        if self._telethon_client is not None:
+            try:
+                await self._telethon_client.disconnect()
+            except Exception:
+                logger.exception("Failed to disconnect Telethon client on shutdown")
+
     def build(self):
         from ..transport.telegram import TelegramTransport
         # concurrent_updates=False matches prior ApplicationBuilder default; the
@@ -2153,6 +2165,7 @@ class ManagerBot(AuthMixin):
         self._transport = TelegramTransport.build(self._token, concurrent_updates=False)
         self._app = self._transport.app  # alias preserves existing add_handler call sites
         self._app.post_init = self._post_init
+        self._app.post_stop = self._post_stop
         app = self._app
 
         # Fully-ported commands (spec #0c Tasks 8-9) — consume CommandInvocation

@@ -64,7 +64,6 @@ COMMANDS = [
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
-_UNSET = object()
 
 
 def _parse_task_id(data: str) -> int:
@@ -458,13 +457,18 @@ class ProjectBot(AuthMixin):
 
         if task.type == TaskType.CLAUDE:
             if self.task_manager.claude.session_id:
-                save_session(
-                    self.name,
-                    self.task_manager.claude.session_id,
-                    self._effective_config_path(),
-                    team_name=self.team_name,
-                    role=self.role,
-                )
+                try:
+                    save_session(
+                        self.name,
+                        self.task_manager.claude.session_id,
+                        self._effective_config_path(),
+                        team_name=self.team_name,
+                        role=self.role,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist session_id for task #%d", task.id
+                    )
             await self._finalize_claude_task(task)
         else:
             await self._finalize_command_task(task)
@@ -864,11 +868,7 @@ class ProjectBot(AuthMixin):
             arg = args[0].lower()
             if arg in ("on", "off"):
                 self.show_thinking = arg == "on"
-                patch_project(
-                    self.name,
-                    {"show_thinking": self.show_thinking},
-                    self._effective_config_path(),
-                )
+                self._patch_config({"show_thinking": self.show_thinking})
                 await self._transport.send_text(
                     ci.chat, f"Live thinking: {self._current_thinking()}"
                 )
@@ -1089,7 +1089,11 @@ class ProjectBot(AuthMixin):
             f"Your team peer (role: {peer_role}) in this group is @{self.peer_bot_username}. "
             f"When referring to yourself or directing work to the peer, use these exact "
             f"@handles — never placeholders like '@developer'/'@manager' and never a "
-            f"different suffix from what is pinned here."
+            f"different suffix from what is pinned here. "
+            f"IMPORTANT: Every single reply you send must begin with "
+            f"@{self.peer_bot_username} on its own line (followed by a blank line, "
+            f"then your message content) so your peer receives it via the group relay. "
+            f"Never send a reply without this @mention, even for short status updates."
         )
 
     def _backfill_own_bot_username(self, config_path: Path | None = None) -> None:
@@ -1107,72 +1111,61 @@ class ProjectBot(AuthMixin):
         bot = team.bots.get(self.role or "")
         if bot is None or bot.bot_username == self.bot_username:
             return
-        bots_dict: dict[str, dict] = {}
-        for role, b in team.bots.items():
-            bot_username = self.bot_username if role == self.role else b.bot_username
-            bots_dict[role] = self._serialize_team_bot_entry(
-                b,
-                bot_username=bot_username,
-            )
-        patch_team(self.team_name, {"bots": bots_dict}, cfg)
+        self._patch_config({"bot_username": self.bot_username}, cfg)
         logger.info(
             "Backfilled bot_username=%s for team=%s role=%s in config",
             self.bot_username, self.team_name, self.role,
         )
 
-    @staticmethod
-    def _serialize_team_bot_entry(
-        bot,
-        *,
-        active_persona=_UNSET,
-        bot_username=_UNSET,
-        session_id=_UNSET,
-    ) -> dict:
-        entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
-        persona = bot.active_persona if active_persona is _UNSET else active_persona
-        username = bot.bot_username if bot_username is _UNSET else bot_username
-        persisted_session = bot.session_id if session_id is _UNSET else session_id
-        if persona:
-            entry["active_persona"] = persona
-        if bot.autostart:
-            entry["autostart"] = True
-        if bot.permissions:
-            entry["permissions"] = bot.permissions
-        if persisted_session:
-            entry["session_id"] = persisted_session
-        if username:
-            entry["bot_username"] = username
-        return entry
-
-    def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
-        """Persist this bot's active_persona.
+    def _patch_config(self, fields: dict, config_path: Path | None = None) -> None:
+        """Persist config fields for this bot, routing to team or project config.
 
         Team bots live under ``config.teams[team].bots[role]``; solo bots under
         ``config.projects[name]``. ``patch_project`` on a team bot would create
         a stray projects entry and never touch the real team config, so the
         team path re-serialises the full ``bots`` dict via ``patch_team``.
-
-        ``config_path`` is primarily for tests; production uses this bot's active config.
         """
         cfg = config_path or self._effective_config_path()
         if self.team_name:
             teams = load_teams(cfg)
             team = teams.get(self.team_name)
             if team is None:
-                logger.warning(
-                    "Team %r not in config; persona change not persisted.", self.team_name
-                )
+                logger.warning("Team %r not in config; change %r not persisted.", self.team_name, fields)
                 return
             bots_dict: dict[str, dict] = {}
             for role, bot in team.bots.items():
-                active_persona = name if role == self.role else bot.active_persona
-                bots_dict[role] = self._serialize_team_bot_entry(
-                    bot,
-                    active_persona=active_persona,
-                )
+                entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
+                if bot.active_persona is not None:
+                    entry["active_persona"] = bot.active_persona
+                if bot.autostart:
+                    entry["autostart"] = True
+                if bot.permissions is not None:
+                    entry["permissions"] = bot.permissions
+                if bot.bot_username:
+                    entry["bot_username"] = bot.bot_username
+                if bot.session_id is not None:
+                    entry["session_id"] = bot.session_id
+                if bot.model is not None:
+                    entry["model"] = bot.model
+                if bot.effort is not None:
+                    entry["effort"] = bot.effort
+                if bot.show_thinking:
+                    entry["show_thinking"] = True
+
+                if role == self.role:
+                    for k, v in fields.items():
+                        if v is None:
+                            entry.pop(k, None)
+                        else:
+                            entry[k] = v
+                bots_dict[role] = entry
             patch_team(self.team_name, {"bots": bots_dict}, cfg)
         else:
-            patch_project(self.name, {"active_persona": name}, cfg)
+            patch_project(self.name, fields, cfg)
+
+    def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
+        """Persist this bot's active_persona."""
+        self._patch_config({"active_persona": name}, config_path)
 
     async def _on_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1358,7 +1351,7 @@ class ProjectBot(AuthMixin):
             if name in valid:
                 self.task_manager.claude.model = name
                 self.task_manager.claude.model_display = None
-                patch_project(self.name, {"model": name}, self._effective_config_path())
+                self._patch_config({"model": name})
             await self._transport.edit_text(
                 msg_ref,
                 f"Select model\nCurrent: {self._current_model()}",
@@ -1368,7 +1361,7 @@ class ProjectBot(AuthMixin):
             level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self.task_manager.claude.effort = level
-                patch_project(self.name, {"effort": level}, self._effective_config_path())
+                self._patch_config({"effort": level})
             await self._transport.edit_text(
                 msg_ref,
                 f"Effort: {self._current_effort()}",
@@ -1378,11 +1371,7 @@ class ProjectBot(AuthMixin):
             val = value[len("thinking_set_"):]
             if val in ("on", "off"):
                 self.show_thinking = val == "on"
-                patch_project(
-                    self.name,
-                    {"show_thinking": self.show_thinking},
-                    self._effective_config_path(),
-                )
+                self._patch_config({"show_thinking": self.show_thinking})
             await self._transport.edit_text(
                 msg_ref,
                 f"Live thinking: {self._current_thinking()}",
@@ -1394,11 +1383,7 @@ class ProjectBot(AuthMixin):
                 skip, pm = resolve_permissions(mode)
                 self.task_manager.claude.skip_permissions = skip
                 self.task_manager.claude.permission_mode = pm
-                patch_project(
-                    self.name,
-                    {"permissions": mode if mode != "default" else None},
-                    self._effective_config_path(),
-                )
+                self._patch_config({"permissions": mode if mode != "default" else None})
             await self._transport.edit_text(
                 msg_ref,
                 f"Permissions: {self._current_permission()}",

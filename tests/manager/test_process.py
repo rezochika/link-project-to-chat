@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -126,10 +127,12 @@ def test_start_uses_custom_config_path_and_default_model(tmp_path: Path):
         assert pm.start("proj") is True
 
     call_args = mock_popen.call_args[0][0]
-    assert call_args[:4] == [
-        "link-project-to-chat",
+    assert call_args[:6] == [
+        sys.executable,
+        "-m",
+        "link_project_to_chat.cli",
         "--config",
-        str(cfg_path.resolve()),
+        str(cfg_path),
         "start",
     ]
     assert "--project" in call_args and "proj" in call_args
@@ -152,10 +155,14 @@ def test_start_uses_process_group_kwargs(tmp_path: Path):
 
 
 def test_stop_uses_process_tree_termination(tmp_path: Path, monkeypatch):
+    import subprocess as _subp
     proc = MagicMock()
     proc.pid = 123
     proc.poll.return_value = None
     proc.stdout = []
+    # Keep the capture thread blocked in wait() so _capture_output doesn't
+    # prematurely mark the process as stopped before the test calls pm.stop().
+    proc.wait.side_effect = _subp.TimeoutExpired(cmd="x", timeout=0.1)
 
     with patch("link_project_to_chat.manager.process.subprocess.Popen", return_value=proc):
         pm = _pm(tmp_path, {"proj": {"path": str(tmp_path)}})
@@ -169,3 +176,36 @@ def test_stop_uses_process_tree_termination(tmp_path: Path, monkeypatch):
 
     assert pm.stop("proj") is True
     assert calls == [proc]
+
+
+def test_child_output_is_forwarded_to_logger(tmp_path: Path, caplog):
+    pm = _pm(
+        tmp_path,
+        {"echo": {"path": str(tmp_path)}},
+        command_builder=lambda n, c: [
+            sys.executable,
+            "-c",
+            "import sys,time; print('hello from child', flush=True); time.sleep(0.2)",
+        ],
+    )
+    with caplog.at_level(logging.INFO):
+        pm.start("echo")
+        time.sleep(0.4)
+    assert any("[echo] hello from child" in rec.getMessage() for rec in caplog.records)
+
+
+def test_child_exit_is_logged(tmp_path: Path, caplog):
+    pm = _pm(
+        tmp_path,
+        {"boom": {"path": str(tmp_path)}},
+        command_builder=lambda n, c: [
+            sys.executable,
+            "-c",
+            "import sys; print('about to fail', flush=True); sys.exit(7)",
+        ],
+    )
+    with caplog.at_level(logging.INFO):
+        pm.start("boom")
+        time.sleep(0.4)
+    assert any("boom exited with code 7" in rec.getMessage() for rec in caplog.records)
+    assert pm.status("boom") == "stopped"

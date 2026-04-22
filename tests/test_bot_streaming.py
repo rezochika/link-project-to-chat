@@ -4,8 +4,10 @@ import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.error import Forbidden
 
 from link_project_to_chat.livestream import LiveMessage
 from link_project_to_chat.stream import TextDelta, ThinkingDelta
@@ -202,6 +204,22 @@ async def test_finalize_without_live_text_falls_back_to_send_to_chat():
     await bot._finalize_claude_task(task)
 
     assert sent_chats == [(task.chat_id, "tool-only answer")]
+
+
+@pytest.mark.asyncio
+async def test_on_task_complete_still_finalizes_when_session_persist_fails(caplog):
+    bot = await _stub_bot()
+    task = _fake_task(task_id=13)
+    task.status = TaskStatus.DONE
+    bot.task_manager = SimpleNamespace(claude=SimpleNamespace(session_id="sess-123"))
+    bot._patch_config = MagicMock(side_effect=RuntimeError("disk full"))
+    bot._finalize_claude_task = AsyncMock()
+
+    with caplog.at_level("ERROR", logger="link_project_to_chat.bot"):
+        await bot._on_task_complete(task)
+
+    bot._finalize_claude_task.assert_awaited_once_with(task)
+    assert "Failed to persist session_id for task #13" in caplog.text
 
 
 @pytest.mark.asyncio

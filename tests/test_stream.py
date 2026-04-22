@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from link_project_to_chat.stream import Error, Result, TextDelta, ToolUse, parse_stream_line
+from link_project_to_chat.stream import Error, Result, TextDelta, ThinkingDelta, ToolUse, parse_stream_line
 
 
 def _line(obj: dict) -> str:
@@ -36,17 +36,6 @@ def test_result_error():
     assert events[0].message == "oops"
 
 
-def test_assistant_text_delta():
-    line = _line({
-        "type": "assistant",
-        "message": {"content": [{"type": "text", "text": "hello"}]},
-    })
-    events = parse_stream_line(line)
-    assert len(events) == 1
-    assert isinstance(events[0], TextDelta)
-    assert events[0].text == "hello"
-
-
 def test_assistant_tool_use():
     line = _line({
         "type": "assistant",
@@ -78,7 +67,117 @@ def test_assistant_empty_text_skipped():
     assert parse_stream_line(line) == []
 
 
-def test_assistant_mixed_content():
+def test_result_no_model_usage():
+    line = _line({"type": "result", "result": "ok"})
+    events = parse_stream_line(line)
+    assert isinstance(events[0], Result)
+    assert events[0].model is None
+    assert events[0].session_id is None
+
+
+# --- stream_event partial-message parsing (requires --include-partial-messages) ---
+
+
+def test_stream_event_text_delta_emits_textdelta():
+    line = _line({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Hello"},
+        },
+    })
+    events = parse_stream_line(line)
+    assert len(events) == 1
+    assert isinstance(events[0], TextDelta)
+    assert events[0].text == "Hello"
+
+
+def test_stream_event_thinking_delta_emits_thinkingdelta():
+    line = _line({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reasoning step"},
+        },
+    })
+    events = parse_stream_line(line)
+    assert len(events) == 1
+    assert isinstance(events[0], ThinkingDelta)
+    assert events[0].text == "reasoning step"
+
+
+def test_stream_event_empty_text_delta_skipped():
+    line = _line({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": ""},
+        },
+    })
+    assert parse_stream_line(line) == []
+
+
+def test_stream_event_empty_thinking_delta_skipped():
+    line = _line({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": ""},
+        },
+    })
+    assert parse_stream_line(line) == []
+
+
+def test_stream_event_other_delta_types_ignored():
+    """input_json_delta and similar non-text deltas produce nothing (tool input
+    still arrives as a complete tool_use in the final assistant event)."""
+    line = _line({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"},
+        },
+    })
+    assert parse_stream_line(line) == []
+
+
+def test_stream_event_non_delta_subevents_ignored():
+    """message_start/content_block_start/message_stop are noise for our parser."""
+    for sub in ("message_start", "content_block_start", "content_block_stop",
+                "message_delta", "message_stop"):
+        line = _line({"type": "stream_event", "event": {"type": sub}})
+        assert parse_stream_line(line) == [], f"expected no events for {sub}"
+
+
+# --- assistant-event contract under --include-partial-messages ---
+# With partial-message streaming on, text and thinking have already been emitted
+# as deltas via stream_event. The trailing assistant event must NOT re-emit them
+# (that would double every character). tool_use still comes from here because it
+# isn't reconstructable from input_json_delta without extra state.
+
+
+def test_assistant_text_does_not_re_emit():
+    line = _line({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "hello"}]},
+    })
+    assert parse_stream_line(line) == []
+
+
+def test_assistant_thinking_does_not_re_emit():
+    line = _line({
+        "type": "assistant",
+        "message": {"content": [{"type": "thinking", "thinking": "reasoning"}]},
+    })
+    assert parse_stream_line(line) == []
+
+
+def test_assistant_tool_use_still_emits_after_text():
     line = _line({
         "type": "assistant",
         "message": {"content": [
@@ -87,14 +186,7 @@ def test_assistant_mixed_content():
         ]},
     })
     events = parse_stream_line(line)
-    assert len(events) == 2
-    assert isinstance(events[0], TextDelta)
-    assert isinstance(events[1], ToolUse)
-
-
-def test_result_no_model_usage():
-    line = _line({"type": "result", "result": "ok"})
-    events = parse_stream_line(line)
-    assert isinstance(events[0], Result)
-    assert events[0].model is None
-    assert events[0].session_id is None
+    assert len(events) == 1
+    assert isinstance(events[0], ToolUse)
+    assert events[0].tool == "Read"
+    assert events[0].path == "/x"

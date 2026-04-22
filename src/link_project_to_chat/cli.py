@@ -689,3 +689,7 @@ def start_manager(ctx):
     )
     click.echo("Manager bot started.")
     bot.build().run_polling()
+
+
+if __name__ == "__main__":
+    main()

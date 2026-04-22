@@ -158,6 +158,10 @@ class ClaudeClient:
             self.effort,
             "--input-format",
             "stream-json",
+            # Emit `stream_event` records with `content_block_delta` as text and
+            # thinking are produced. Required for live streaming in bot.py —
+            # without it, text/thinking arrive in one chunk at the end of the turn.
+            "--include-partial-messages",
         ]
 
         if self.skip_permissions:

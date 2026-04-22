@@ -31,6 +31,22 @@ def test_load_project_configs_missing(tmp_path: Path):
     assert load_project_configs(tmp_path / "nope.json") == {}
 
 
+def test_load_project_configs_skips_phantom_entries(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "projects": {
+            "good": {"path": "/some/path", "telegram_bot_token": "BOT_TOKEN"},
+            "acme_manager": {"active_persona": "software_manager"},
+        },
+        "allowed_username": "someone",
+    }))
+    projects = load_project_configs(path)
+    assert projects == {"good": {"path": "/some/path", "telegram_bot_token": "BOT_TOKEN"}}
+    raw = json.loads(path.read_text())
+    assert raw["projects"] == {"good": {"path": "/some/path", "telegram_bot_token": "BOT_TOKEN"}}
+    assert raw["allowed_username"] == "someone"
+
+
 def test_save_project_configs_preserves_other_keys(tmp_path: Path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"allowed_username": "someone", "projects": {}}))
@@ -71,6 +87,15 @@ def test_set_project_autostart(tmp_path: Path):
     assert json.loads(path.read_text())["projects"]["myproj"]["autostart"] is True
     set_project_autostart("myproj", False, path)
     assert json.loads(path.read_text())["projects"]["myproj"]["autostart"] is False
+
+
+def test_set_project_autostart_unknown_project_is_noop(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"projects": {"myproj": {"path": "/p"}}}))
+    set_project_autostart("ghost", True, path)
+    raw = json.loads(path.read_text())
+    assert "ghost" not in raw["projects"]
+    assert "autostart" not in raw["projects"]["myproj"]
 
 
 def test_set_team_bot_autostart(tmp_path: Path):

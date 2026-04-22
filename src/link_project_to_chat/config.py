@@ -41,10 +41,13 @@ class TeamBotConfig:
     # None means "use the team default" — resolved at CLI startup to
     # "dangerously-skip-permissions" so team bots don't block on tool prompts.
     permissions: str | None = None
-    session_id: str | None = None
     # The bot's @username, captured at /create_team time (or backfilled via
     # getMe on first startup). Used so each team bot knows its peer's @handle.
     bot_username: str = ""
+    session_id: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    show_thinking: bool = False
 
 
 @dataclass
@@ -245,6 +248,40 @@ def _write_raw_trusted_users(
     raw.pop(singular_key, None)
 
 
+def _split_project_entries(projects: object) -> tuple[dict[str, dict], list[str]]:
+    """Partition raw project entries into valid configs and malformed leftovers."""
+    if not isinstance(projects, dict):
+        return {}, []
+
+    valid: dict[str, dict] = {}
+    malformed: list[str] = []
+    for name, proj in projects.items():
+        if isinstance(proj, dict) and "path" in proj:
+            valid[name] = proj
+        else:
+            malformed.append(name)
+    return valid, malformed
+
+
+def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
+    """Best-effort removal of known-bad project entries created by old bugs."""
+    if not names:
+        return
+
+    def _patch(raw: dict) -> None:
+        projects = raw.get("projects")
+        if not isinstance(projects, dict):
+            return
+        for name in names:
+            projects.pop(name, None)
+
+    try:
+        _patch_json(_patch, path)
+    except OSError:
+        # Reading config should still succeed even if cleanup cannot write.
+        pass
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     config = Config()
     if path.exists():
@@ -275,17 +312,21 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.tts_model = raw.get("tts_model", "tts-1")
         config.tts_voice = raw.get("tts_voice", "alloy")
         config.default_model = raw.get("default_model", "")
-        for name, proj in raw.get("projects", {}).items():
+        valid_projects, malformed_projects = _split_project_entries(raw.get("projects", {}))
+        for name in malformed_projects:
             # Tolerate phantom projects entries (no `path`) left over from a
             # pre-34b8dc5 bug where /persona on a team bot wrote to
             # projects[<team>_<role>] instead of the team config. Skipping
-            # lets the manager start; save_config filters them out next write.
-            if "path" not in proj:
-                print(
-                    f"warning: skipping malformed project '{name}' (no path) in config",
-                    file=sys.stderr,
-                )
-                continue
+            # lets the manager start; we also clean them up best-effort so the
+            # warning does not repeat on every subsequent load.
+            print(
+                f"warning: skipping malformed project '{name}' (no path) in config",
+                file=sys.stderr,
+            )
+        if malformed_projects:
+            _cleanup_malformed_projects(path, malformed_projects)
+
+        for name, proj in valid_projects.items():
             project_allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
             trust_scope_usernames = project_allowed_usernames or config.allowed_usernames
             config.projects[name] = ProjectConfig(
@@ -325,8 +366,11 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                         active_persona=b.get("active_persona"),
                         autostart=b.get("autostart", False),
                         permissions=b.get("permissions"),
-                        session_id=b.get("session_id"),
                         bot_username=b.get("bot_username", ""),
+                        session_id=b.get("session_id"),
+                        model=b.get("model"),
+                        effort=b.get("effort"),
+                        show_thinking=b.get("show_thinking", False),
                     )
                     for role, b in team.get("bots", {}).items()
                 },
@@ -467,8 +511,11 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
                 **({"active_persona": b.active_persona} if b.active_persona else {}),
                 **({"autostart": True} if b.autostart else {}),
                 **({"permissions": b.permissions} if b.permissions else {}),
-                **({"session_id": b.session_id} if b.session_id else {}),
                 **({"bot_username": b.bot_username} if b.bot_username else {}),
+                **({"session_id": b.session_id} if b.session_id else {}),
+                **({"model": b.model} if b.model else {}),
+                **({"effort": b.effort} if b.effort else {}),
+                **({"show_thinking": True} if b.show_thinking else {}),
             }
             for role, b in team.bots.items()
         }
@@ -521,11 +568,16 @@ def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
     if path.exists():
         try:
             raw = json.loads(path.read_text())
-            return {
+            sessions = {
                 name: proj["session_id"]
                 for name, proj in raw.get("projects", {}).items()
                 if proj.get("session_id")
             }
+            for t_name, t_data in raw.get("teams", {}).items():
+                for r_name, r_data in t_data.get("bots", {}).items():
+                    if r_data.get("session_id"):
+                        sessions[f"{t_name}_{r_name}"] = r_data["session_id"]
+            return sessions
         except (json.JSONDecodeError, OSError):
             pass
     return {}
@@ -600,8 +652,11 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                             active_persona=b.get("active_persona"),
                             autostart=b.get("autostart", False),
                             permissions=b.get("permissions"),
-                            session_id=b.get("session_id"),
                             bot_username=b.get("bot_username", ""),
+                            session_id=b.get("session_id"),
+                            model=b.get("model"),
+                            effort=b.get("effort"),
+                            show_thinking=b.get("show_thinking", False),
                         )
                         for role, b in team.get("bots", {}).items()
                     },
