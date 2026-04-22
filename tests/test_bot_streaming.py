@@ -74,6 +74,8 @@ async def _stub_bot(show_thinking: bool = False):
     bot._thinking_store = {}
     bot._voice_tasks = set()
     bot.show_thinking = show_thinking
+    # Non-team (single-project) bot: livestream enabled. Team bots set
+    # group_mode=True, which skips LiveMessage creation in _on_stream_event.
     bot.group_mode = False
     return bot
 
@@ -91,6 +93,42 @@ async def test_text_delta_starts_live_message():
     assert len(bot._app.bot.sent) == 1
     # The buffer contains both deltas.
     assert live._buffer == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_text_delta_in_group_mode_skips_live_message():
+    """Team bots (group_mode=True) must not livestream: streaming edits would
+    be picked up by team_relay mid-message and forwarded partial to the peer
+    bot. task.result assembled in task_manager is sent once at finalize.
+    """
+    bot = await _stub_bot()
+    bot.group_mode = True
+    task = _fake_task(task_id=50)
+
+    await bot._on_stream_event(task, TextDelta(text="hello "))
+    await bot._on_stream_event(task, TextDelta(text="world"))
+
+    # No LiveMessage was ever created and no placeholder was sent.
+    assert task.id not in bot._live_text
+    assert task.id not in bot._live_text_failed
+    assert len(bot._app.bot.sent) == 0
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_in_group_mode_uses_buffer_not_livestream():
+    """Even with show_thinking=True, team bots skip the thinking livestream
+    and fall through to `_thinking_buf` (which feeds the Thinking button).
+    """
+    bot = await _stub_bot(show_thinking=True)
+    bot.group_mode = True
+    task = _fake_task(task_id=51)
+
+    await bot._on_stream_event(task, ThinkingDelta(text="step A"))
+    await bot._on_stream_event(task, ThinkingDelta(text="step B"))
+
+    assert task.id not in bot._live_thinking
+    assert bot._thinking_buf[task.id] == "step A\n\nstep B"
+    assert len(bot._app.bot.sent) == 0
 
 
 @pytest.mark.asyncio
@@ -331,6 +369,8 @@ async def _stub_bot_with_bot(fake_bot, show_thinking: bool = False):
     bot._thinking_store = {}
     bot._voice_tasks = set()
     bot.show_thinking = show_thinking
+    # Non-team (single-project) bot: livestream enabled. Team bots set
+    # group_mode=True, which skips LiveMessage creation in _on_stream_event.
     bot.group_mode = False
     return bot
 

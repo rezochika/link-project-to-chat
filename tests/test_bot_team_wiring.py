@@ -485,6 +485,7 @@ def test_team_system_note_discourages_ack_echoing(tmp_path):
     )
     note = bot.task_manager.claude.team_system_note or ""
     lowered = note.lower()
+    # Mentions that acks shouldn't be echoed, or that silence is a valid reply.
     assert (
         "acknowledg" in lowered
         or "ack-only" in lowered
@@ -507,6 +508,7 @@ def test_team_system_note_no_longer_forces_every_reply_to_mention_peer(tmp_path)
         peer_bot_username="acme_dev_bot",
     )
     note = bot.task_manager.claude.team_system_note or ""
+    # The forbidden phrases from the old prompt must no longer appear.
     assert "Every single reply" not in note
     assert "Never send a reply without this @mention" not in note
 
