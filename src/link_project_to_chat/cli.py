@@ -386,6 +386,7 @@ def start(
             bot_cfg.telegram_bot_token,
             allowed_usernames=effective_usernames,
             trusted_users=effective_trusted_users,
+            session_id=session_id or bot_cfg.session_id,
             transcriber=transcriber,
             synthesizer=synthesizer,
             team_name=team,

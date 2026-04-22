@@ -876,6 +876,123 @@ async def test_after_ready_backfills_team_username_into_instance_config(tmp_path
     assert teams["acme"].bots["dev"].bot_username == "acme_dev_bot"
 
 
+@pytest.mark.asyncio
+async def test_on_task_complete_team_bot_persists_session_in_team_config(tmp_path):
+    from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, load_config, save_config
+    from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "acme": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=-100_111,
+                    bots={
+                        "manager": TeamBotConfig(telegram_bot_token="t1"),
+                        "dev": TeamBotConfig(telegram_bot_token="t2"),
+                    },
+                )
+            }
+        ),
+        cfg_path,
+    )
+
+    bot = ProjectBot(
+        name="acme_manager",
+        path=tmp_path,
+        token="t1",
+        team_name="acme",
+        role="manager",
+        group_chat_id=-100_111,
+        config_path=cfg_path,
+    )
+    bot._transport = FakeTransport()
+    bot.task_manager.claude.session_id = "sess-123"
+
+    async def fake_finalize(_task):
+        pass
+
+    bot._finalize_claude_task = fake_finalize
+
+    task = Task(
+        id=1,
+        chat_id=1,
+        message_id=1,
+        type=TaskType.CLAUDE,
+        input="hello",
+        name="hello",
+        status=TaskStatus.DONE,
+    )
+
+    await bot._on_task_complete(task)
+
+    cfg = load_config(cfg_path)
+    assert cfg.teams["acme"].bots["manager"].session_id == "sess-123"
+    assert "acme_manager" not in cfg.projects
+
+
+@pytest.mark.asyncio
+async def test_reset_confirm_clears_team_session_from_team_config(tmp_path):
+    import json
+
+    from link_project_to_chat.transport import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "acme": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -100_111,
+                        "bots": {
+                            "manager": {
+                                "telegram_bot_token": "t1",
+                                "session_id": "sess-123",
+                            },
+                            "dev": {
+                                "telegram_bot_token": "t2",
+                            },
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bot = ProjectBot(
+        name="acme_manager",
+        path=tmp_path,
+        token="t1",
+        team_name="acme",
+        role="manager",
+        group_chat_id=-100_111,
+        config_path=cfg_path,
+    )
+    bot._transport = FakeTransport()
+    bot._auth_identity = lambda _sender: True
+    bot.task_manager.claude.session_id = "sess-123"
+    bot.task_manager.cancel_all = lambda: 0
+
+    chat = ChatRef(transport_id="fake", native_id="-100111", kind=ChatKind.ROOM)
+    msg = MessageRef(transport_id="fake", native_id="7", chat=chat)
+    sender = Identity(
+        transport_id="fake",
+        native_id="42",
+        display_name="Rezo",
+        handle="rezo",
+        is_bot=False,
+    )
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="reset_confirm")
+
+    await bot._on_button(click)
+
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert "session_id" not in raw["teams"]["acme"]["bots"]["manager"]
+
+
 def test_team_mode_bot_build_uses_instance_config_path_for_relay_bootstrap(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch

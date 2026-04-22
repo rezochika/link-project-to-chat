@@ -19,7 +19,7 @@ from .config import (
     bind_project_trusted_user,
     clear_session,
     load_config,
-    load_sessions,
+    load_session,
     load_teams,
     patch_project,
     patch_team,
@@ -64,6 +64,7 @@ COMMANDS = [
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+_UNSET = object()
 
 
 def _parse_task_id(data: str) -> int:
@@ -461,6 +462,8 @@ class ProjectBot(AuthMixin):
                     self.name,
                     self.task_manager.claude.session_id,
                     self._effective_config_path(),
+                    team_name=self.team_name,
+                    role=self.role,
                 )
             await self._finalize_claude_task(task)
         else:
@@ -1106,23 +1109,40 @@ class ProjectBot(AuthMixin):
             return
         bots_dict: dict[str, dict] = {}
         for role, b in team.bots.items():
-            entry: dict = {"telegram_bot_token": b.telegram_bot_token}
-            if b.active_persona:
-                entry["active_persona"] = b.active_persona
-            if b.autostart:
-                entry["autostart"] = True
-            if b.permissions:
-                entry["permissions"] = b.permissions
-            if role == self.role:
-                entry["bot_username"] = self.bot_username
-            elif b.bot_username:
-                entry["bot_username"] = b.bot_username
-            bots_dict[role] = entry
+            bot_username = self.bot_username if role == self.role else b.bot_username
+            bots_dict[role] = self._serialize_team_bot_entry(
+                b,
+                bot_username=bot_username,
+            )
         patch_team(self.team_name, {"bots": bots_dict}, cfg)
         logger.info(
             "Backfilled bot_username=%s for team=%s role=%s in config",
             self.bot_username, self.team_name, self.role,
         )
+
+    @staticmethod
+    def _serialize_team_bot_entry(
+        bot,
+        *,
+        active_persona=_UNSET,
+        bot_username=_UNSET,
+        session_id=_UNSET,
+    ) -> dict:
+        entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
+        persona = bot.active_persona if active_persona is _UNSET else active_persona
+        username = bot.bot_username if bot_username is _UNSET else bot_username
+        persisted_session = bot.session_id if session_id is _UNSET else session_id
+        if persona:
+            entry["active_persona"] = persona
+        if bot.autostart:
+            entry["autostart"] = True
+        if bot.permissions:
+            entry["permissions"] = bot.permissions
+        if persisted_session:
+            entry["session_id"] = persisted_session
+        if username:
+            entry["bot_username"] = username
+        return entry
 
     def _persist_active_persona(self, name: str | None, config_path: Path | None = None) -> None:
         """Persist this bot's active_persona.
@@ -1145,22 +1165,11 @@ class ProjectBot(AuthMixin):
                 return
             bots_dict: dict[str, dict] = {}
             for role, bot in team.bots.items():
-                entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
-                if role == self.role:
-                    if name is not None:
-                        entry["active_persona"] = name
-                else:
-                    if bot.active_persona:
-                        entry["active_persona"] = bot.active_persona
-                # Preserve the other fields so patch_team's whole-bots-dict
-                # rewrite doesn't drop them.
-                if bot.autostart:
-                    entry["autostart"] = True
-                if bot.permissions:
-                    entry["permissions"] = bot.permissions
-                if bot.bot_username:
-                    entry["bot_username"] = bot.bot_username
-                bots_dict[role] = entry
+                active_persona = name if role == self.role else bot.active_persona
+                bots_dict[role] = self._serialize_team_bot_entry(
+                    bot,
+                    active_persona=active_persona,
+                )
             patch_team(self.team_name, {"bots": bots_dict}, cfg)
         else:
             patch_project(self.name, {"active_persona": name}, cfg)
@@ -1424,7 +1433,12 @@ class ProjectBot(AuthMixin):
             self._active_skill = None
             self._active_persona = None
             self.task_manager.claude.append_system_prompt = None
-            clear_session(self.name, self._effective_config_path())
+            clear_session(
+                self.name,
+                self._effective_config_path(),
+                team_name=self.team_name,
+                role=self.role,
+            )
             await self._transport.edit_text(msg_ref, "Session reset.")
         elif value == "reset_cancel":
             await self._transport.edit_text(msg_ref, "Reset cancelled.")
@@ -1768,11 +1782,13 @@ class ProjectBot(AuthMixin):
         except (OSError, ValueError):
             logger.warning("Invalid image path: %s", file_path)
             return
-        if not str(resolved).startswith(str(self.path.resolve())):
+        try:
+            resolved.relative_to(self.path.resolve())
+        except ValueError:
             logger.warning("Image path traversal blocked: %s", file_path)
             return
-        if not path.exists():
-            logger.warning("Image file not found: %s", path)
+        if not resolved.exists():
+            logger.warning("Image file not found: %s", resolved)
             return
         assert self._transport is not None
         chat = ChatRef(
@@ -1960,7 +1976,13 @@ def run_bot(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
     if session_id:
-        save_session(name, session_id, config_path or DEFAULT_CONFIG)
+        save_session(
+            name,
+            session_id,
+            config_path or DEFAULT_CONFIG,
+            team_name=team_name,
+            role=role,
+        )
     bot = ProjectBot(
         name, path, token,
         allowed_usernames=effective_usernames,
@@ -1981,9 +2003,12 @@ def run_bot(
         peer_bot_username=peer_bot_username,
         config_path=config_path,
     )
-    bot.task_manager.claude.session_id = session_id or load_sessions(
-        config_path or DEFAULT_CONFIG
-    ).get(name)
+    bot.task_manager.claude.session_id = session_id or load_session(
+        name,
+        config_path or DEFAULT_CONFIG,
+        team_name=team_name,
+        role=role,
+    )
     if model:
         bot.task_manager.claude.model = model
     if effort:

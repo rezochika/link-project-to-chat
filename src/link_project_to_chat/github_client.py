@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +35,20 @@ _GITHUB_CREDENTIAL_URL_RE = re.compile(r"https://[^/@\s]+@github\.com")
 
 def _gh_available() -> bool:
     """Check if gh CLI is installed and authenticated."""
-    return shutil.which("gh") is not None
+    gh_path = shutil.which("gh")
+    if gh_path is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [gh_path, "auth", "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 async def _run_gh(*args: str) -> tuple[int, str, str]:
@@ -77,7 +91,8 @@ class GitHubClient:
 
     def __init__(self, pat: str = ""):
         self._pat = pat
-        self._use_gh = _gh_available()
+        prefer_api = bool(pat) and httpx is not None
+        self._use_gh = _gh_available() and not prefer_api
         self._client = None
         if not self._use_gh:
             if httpx is None:

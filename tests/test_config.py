@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
+import link_project_to_chat.config as config_module
 from link_project_to_chat.config import (
     _atomic_write,
     Config,
@@ -175,6 +178,52 @@ def test_load_sessions_corrupt(tmp_path: Path):
     p = tmp_path / "sessions.json"
     p.write_text("not json")
     assert load_sessions(p) == {}
+
+
+def test_patch_json_serializes_overlapping_writes(tmp_path: Path, monkeypatch):
+    p = tmp_path / "cfg.json"
+
+    first_ready = threading.Event()
+    second_ready = threading.Event()
+    release_first = threading.Event()
+    order_lock = threading.Lock()
+    call_order = {"n": 0}
+    real_atomic_write = config_module._atomic_write
+
+    def blocking_atomic_write(path: Path, data: str) -> None:
+        with order_lock:
+            call_order["n"] += 1
+            idx = call_order["n"]
+        if idx == 1:
+            first_ready.set()
+            assert release_first.wait(timeout=2)
+        elif idx == 2:
+            second_ready.set()
+        real_atomic_write(path, data)
+
+    monkeypatch.setattr(config_module, "_atomic_write", blocking_atomic_write)
+
+    t1 = threading.Thread(target=save_session, args=("proj", "sess-123", p))
+    t1.start()
+    assert first_ready.wait(timeout=1)
+
+    t2 = threading.Thread(target=add_trusted_user_id, args=(42, p))
+    t2.start()
+
+    time.sleep(0.2)
+    assert not second_ready.is_set()
+
+    release_first.set()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert not t1.is_alive()
+    assert not t2.is_alive()
+    assert second_ready.is_set()
+
+    raw = json.loads(p.read_text())
+    assert raw["projects"]["proj"]["session_id"] == "sess-123"
+    assert raw["trusted_user_ids"] == [42]
 
 
 def test_trusted_user_id_roundtrip(tmp_path: Path):

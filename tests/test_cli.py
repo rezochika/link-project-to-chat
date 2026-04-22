@@ -364,6 +364,48 @@ def test_start_team_applies_default_model(tmp_path, monkeypatch):
     assert kwargs.get("model") == "opus[1m]"
 
 
+def test_start_team_passes_persisted_team_session_id(tmp_path, monkeypatch):
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "acme": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -1001,
+                        "bots": {
+                            "manager": {
+                                "telegram_bot_token": "t1",
+                                "session_id": "sess-123",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("session_id") == "sess-123"
+
+
 def test_start_team_explicit_model_overrides_default(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
     from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config

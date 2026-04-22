@@ -138,6 +138,36 @@ async def test_run_command_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_command_spawn_failure_marks_task_failed_and_completes(tmp_path, monkeypatch):
+    completed: list[Task] = []
+
+    async def _on_complete(task):
+        completed.append(task)
+
+    async def _on_start(_task):
+        pass
+
+    def fake_popen(*args, **kwargs):
+        raise OSError("spawn blew up")
+
+    monkeypatch.setattr(task_manager_module.subprocess, "Popen", fake_popen)
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        on_complete=_on_complete,
+        on_task_started=_on_start,
+    )
+    task = tm.run_command(chat_id=1, message_id=1, command="echo hello")
+
+    await asyncio.wait_for(task._asyncio_task, timeout=2)
+
+    assert task.status == TaskStatus.FAILED
+    assert task.exit_code is None
+    assert "spawn blew up" in (task.error or "")
+    assert completed == [task]
+
+
+@pytest.mark.asyncio
 async def test_run_command_cancel(tmp_path):
     async def _noop(task):
         pass
@@ -500,6 +530,41 @@ async def test_second_claude_task_waits_for_first_to_finish(tmp_path):
 
     assert second.status == TaskStatus.DONE
     assert tm._claude.inputs == ["first", "second"]
+
+
+class _SlowCloseClaude:
+    def __init__(self, close_delay: float):
+        self.close_delay = close_delay
+        self.session_id = None
+
+    def chat_stream(self, user_message, on_proc=None):
+        async def _gen():
+            yield Result(text="done", session_id="s1", model=None)
+
+        return _gen()
+
+    def close_interactive(self):
+        time.sleep(self.close_delay)
+
+
+@pytest.mark.asyncio
+async def test_claude_close_does_not_block_event_loop(tmp_path):
+    async def _noop(task):
+        pass
+
+    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm._claude = _SlowCloseClaude(close_delay=0.25)
+
+    started = time.monotonic()
+    ticker = asyncio.create_task(asyncio.sleep(0.05))
+    task = tm.submit_claude(chat_id=1, message_id=1, prompt="hello")
+
+    await asyncio.wait_for(ticker, timeout=1)
+    ticker_elapsed = time.monotonic() - started
+    await asyncio.wait_for(task._asyncio_task, timeout=2)
+
+    assert ticker_elapsed < 0.2
+    assert task.status == TaskStatus.DONE
 
 
 @pytest.mark.asyncio

@@ -326,6 +326,10 @@ class ClaudeClient:
             self._proc = None
             self._started_at = None
 
+    async def aclose_interactive(self) -> None:
+        """Async wrapper that avoids blocking the event loop while waiting."""
+        await asyncio.to_thread(self.close_interactive)
+
     # ------------------------------------------------------------------
     # Status / control
     # ------------------------------------------------------------------

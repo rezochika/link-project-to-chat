@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-try:
-    import fcntl
-except ImportError:  # Windows
-    class fcntl:  # type: ignore[no-redef]
-        LOCK_EX = 2
-
-        @staticmethod
-        def flock(fd, op):
-            pass  # no-op on Windows; locking is best-effort
-
 import json
 import os
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
@@ -44,6 +41,7 @@ class TeamBotConfig:
     # None means "use the team default" — resolved at CLI startup to
     # "dangerously-skip-permissions" so team bots don't block on tool prompts.
     permissions: str | None = None
+    session_id: str | None = None
     # The bot's @username, captured at /create_team time (or backfilled via
     # getMe on first startup). Used so each team bot knows its peer's @handle.
     bot_username: str = ""
@@ -75,6 +73,43 @@ class Config:
     default_model: str = ""          # global default model for all projects
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     teams: dict[str, TeamConfig] = field(default_factory=dict)
+
+
+def _lock_file(lock_handle) -> None:
+    if os.name == "nt":
+        lock_handle.seek(0, os.SEEK_END)
+        if lock_handle.tell() == 0:
+            lock_handle.write(b"0")
+            lock_handle.flush()
+        while True:
+            try:
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                time.sleep(0.05)
+    else:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX)
+
+
+def _unlock_file(lock_handle) -> None:
+    if os.name == "nt":
+        lock_handle.seek(0)
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock_handle, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _config_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(".lock")
+    with open(lock, "a+b") as lf:
+        _lock_file(lf)
+        try:
+            yield
+        finally:
+            _unlock_file(lf)
 
 
 def resolve_project_auth_scope(
@@ -290,6 +325,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                         active_persona=b.get("active_persona"),
                         autostart=b.get("autostart", False),
                         permissions=b.get("permissions"),
+                        session_id=b.get("session_id"),
                         bot_username=b.get("bot_username", ""),
                     )
                     for role, b in team.get("bots", {}).items()
@@ -302,9 +338,7 @@ def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         path.parent.chmod(0o700)
-    lock = path.with_suffix(".lock")
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    with _config_lock(path):
         _save_config_unlocked(config, path)
 
 
@@ -433,6 +467,7 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
                 **({"active_persona": b.active_persona} if b.active_persona else {}),
                 **({"autostart": True} if b.autostart else {}),
                 **({"permissions": b.permissions} if b.permissions else {}),
+                **({"session_id": b.session_id} if b.session_id else {}),
                 **({"bot_username": b.bot_username} if b.bot_username else {}),
             }
             for role, b in team.bots.items()
@@ -470,9 +505,7 @@ def _atomic_write(path: Path, data: str) -> None:
 def _patch_json(patch_fn, path: Path) -> None:
     """Read-modify-write config JSON with file locking."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.with_suffix(".lock")
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+    with _config_lock(path):
         raw: dict = {}
         if path.exists():
             try:
@@ -496,6 +529,31 @@ def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
         except (json.JSONDecodeError, OSError):
             pass
     return {}
+
+
+def load_session(
+    project_name: str,
+    path: Path = DEFAULT_CONFIG,
+    *,
+    team_name: str | None = None,
+    role: str | None = None,
+) -> str | None:
+    """Load one persisted Claude session for either a project or a team bot."""
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+            if team_name and role:
+                return (
+                    raw.get("teams", {})
+                    .get(team_name, {})
+                    .get("bots", {})
+                    .get(role, {})
+                    .get("session_id")
+                )
+            return raw.get("projects", {}).get(project_name, {}).get("session_id")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
 
 
 def patch_project(project_name: str, fields: dict, path: Path = DEFAULT_CONFIG) -> None:
@@ -542,6 +600,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                             active_persona=b.get("active_persona"),
                             autostart=b.get("autostart", False),
                             permissions=b.get("permissions"),
+                            session_id=b.get("session_id"),
                             bot_username=b.get("bot_username", ""),
                         )
                         for role, b in team.get("bots", {}).items()
@@ -554,14 +613,33 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
     return {}
 
 
-def save_session(project_name: str, session_id: str, path: Path = DEFAULT_CONFIG) -> None:
+def save_session(
+    project_name: str,
+    session_id: str,
+    path: Path = DEFAULT_CONFIG,
+    *,
+    team_name: str | None = None,
+    role: str | None = None,
+) -> None:
     def _patch(raw: dict) -> None:
+        if team_name and role:
+            raw.setdefault("teams", {}).setdefault(team_name, {}).setdefault("bots", {}).setdefault(role, {})["session_id"] = session_id
+            return
         raw.setdefault("projects", {}).setdefault(project_name, {})["session_id"] = session_id
     _patch_json(_patch, path)
 
 
-def clear_session(project_name: str, path: Path = DEFAULT_CONFIG) -> None:
+def clear_session(
+    project_name: str,
+    path: Path = DEFAULT_CONFIG,
+    *,
+    team_name: str | None = None,
+    role: str | None = None,
+) -> None:
     def _patch(raw: dict) -> None:
+        if team_name and role:
+            raw.setdefault("teams", {}).setdefault(team_name, {}).setdefault("bots", {}).setdefault(role, {}).pop("session_id", None)
+            return
         raw.setdefault("projects", {}).setdefault(project_name, {}).pop("session_id", None)
     _patch_json(_patch, path)
 

@@ -84,6 +84,13 @@ def gh_client(monkeypatch):
     return GitHubClient()
 
 
+def test_pat_uses_api_mode_even_when_gh_is_installed(monkeypatch):
+    monkeypatch.setattr("link_project_to_chat.github_client._gh_available", lambda: True)
+    client = GitHubClient(pat="ghp_test123")
+    assert client._use_gh is False
+    assert client._client is not None
+
+
 async def test_list_repos_gh_includes_org_repos_and_paginates(gh_client):
     body = json.dumps([
         {"name": "user-repo", "full_name": "me/user-repo", "html_url": "https://github.com/me/user-repo",

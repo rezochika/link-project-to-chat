@@ -178,6 +178,30 @@ class TaskManager:
         if self._claude_owner_task_id == task_id:
             self._claude_owner_task_id = None
 
+    async def _close_claude_interactive(self) -> None:
+        close_async = getattr(self._claude, "aclose_interactive", None)
+        if callable(close_async):
+            await close_async()
+            return
+        await asyncio.to_thread(self._claude.close_interactive)
+
+    def _cleanup_cancelled_claude_task(
+        self,
+        task: Task,
+        previous_status: TaskStatus,
+    ) -> None:
+        if task.type != TaskType.CLAUDE or self._claude_owner_task_id != task.id:
+            return
+        if previous_status not in (TaskStatus.WAITING_INPUT, TaskStatus.WAITING):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._claude.close_interactive()
+        else:
+            loop.create_task(self._close_claude_interactive())
+        self._release_claude_slot(task.id)
+
     def _command_popen_kwargs(self) -> dict[str, object]:
         return _command_popen_kwargs()
 
@@ -253,19 +277,19 @@ class TaskManager:
                     await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
-            self._claude.close_interactive()
+            await self._close_claude_interactive()
         except asyncio.CancelledError:
             if task._proc and task._proc.poll() is None:
-                _terminate_process_tree(task._proc)
+                await asyncio.to_thread(_terminate_process_tree, task._proc)
             task.status = TaskStatus.CANCELLED
             if claimed_slot:
-                self._claude.close_interactive()
+                await self._close_claude_interactive()
         except Exception as e:
             logger.exception("Claude task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
             if claimed_slot:
-                self._claude.close_interactive()
+                await self._close_claude_interactive()
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
@@ -323,15 +347,17 @@ class TaskManager:
                     await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
-            self._claude.close_interactive()
+            await self._close_claude_interactive()
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
-            self._claude.close_interactive()
+            if task._proc and task._proc.poll() is None:
+                await asyncio.to_thread(_terminate_process_tree, task._proc)
+            await self._close_claude_interactive()
         except Exception as e:
             logger.exception("Claude answer task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
-            self._claude.close_interactive()
+            await self._close_claude_interactive()
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
@@ -390,15 +416,23 @@ class TaskManager:
 
     async def _exec_command(self, task: Task) -> None:
         await self._safe_callback(self._on_task_started, task)
-        proc = subprocess.Popen(
-            task.input,
-            shell=True,
-            cwd=str(self.project_path),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            **self._command_popen_kwargs(),
-        )
+        try:
+            proc = subprocess.Popen(
+                task.input,
+                shell=True,
+                cwd=str(self.project_path),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                **self._command_popen_kwargs(),
+            )
+        except Exception as e:
+            logger.exception("task #%d failed to start: %s", task.id, task.input)
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            task.finished_at = time.monotonic()
+            await self._safe_callback(self._on_complete, task)
+            return
         setattr(proc, "_kill_process_tree", True)
         task._proc = proc
         logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
@@ -473,14 +507,20 @@ class TaskManager:
         task = self._tasks.get(task_id)
         if not task:
             return False
+        previous_status = task.status
         cancelled = task.cancel()
-        if cancelled and task.type == TaskType.CLAUDE and self._claude_owner_task_id == task.id:
-            self._claude.close_interactive()
-            self._release_claude_slot(task.id)
+        if cancelled:
+            self._cleanup_cancelled_claude_task(task, previous_status)
         return cancelled
 
     def cancel_all(self) -> int:
-        return sum(1 for t in list(self._tasks.values()) if t.cancel())
+        cancelled = 0
+        for task in list(self._tasks.values()):
+            previous_status = task.status
+            if task.cancel():
+                cancelled += 1
+                self._cleanup_cancelled_claude_task(task, previous_status)
+        return cancelled
 
     @property
     def running_count(self) -> int:

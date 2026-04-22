@@ -10,6 +10,7 @@ import pytest
 from link_project_to_chat.livestream import LiveMessage
 from link_project_to_chat.stream import TextDelta, ThinkingDelta
 from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
+from link_project_to_chat.transport.fake import FakeTransport
 
 
 @dataclass
@@ -461,3 +462,20 @@ async def test_ask_answer_annotation_preserves_question_html():
     assert "Which option?" in edit_text
     assert "Option A" in edit_text
     assert "<i>Selected:</i> Option A" in edit_text
+
+
+@pytest.mark.asyncio
+async def test_send_image_rejects_sibling_path_with_shared_prefix(tmp_path):
+    from link_project_to_chat.bot import ProjectBot
+
+    sibling_dir = tmp_path.parent / f"{tmp_path.name}-secret"
+    sibling_dir.mkdir()
+    leaked = sibling_dir / "leak.png"
+    leaked.write_bytes(b"not really a png")
+
+    bot = ProjectBot(name="proj", path=tmp_path, token="t")
+    bot._transport = FakeTransport()
+
+    await bot._send_image(chat_id=123, file_path=str(leaked))
+
+    assert bot._transport.sent_files == []
