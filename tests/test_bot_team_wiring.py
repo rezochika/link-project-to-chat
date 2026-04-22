@@ -447,6 +447,48 @@ def test_team_bot_with_peer_username_sets_team_system_note(tmp_path):
     assert "developer" in note  # peer role label
 
 
+def test_team_system_note_discourages_ack_echoing(tmp_path):
+    """The note must tell the bot not to echo acknowledgments — the ping-pong cause.
+
+    If this regresses, teams will loop on 'ok'/'agreed'/'standing by' forever.
+    """
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="acme_dev_bot",
+    )
+    note = bot.task_manager.claude.team_system_note or ""
+    lowered = note.lower()
+    # Mentions that acks shouldn't be echoed, or that silence is a valid reply.
+    assert (
+        "acknowledg" in lowered
+        or "ack-only" in lowered
+        or "silence" in lowered
+        or "don't reply" in lowered
+        or "do not reply" in lowered
+    ), f"system note does not discourage ack-echoing:\n{note}"
+
+
+def test_team_system_note_no_longer_forces_every_reply_to_mention_peer(tmp_path):
+    """The old 'EVERY reply must begin with @peer' rule is what created ping-pong loops.
+
+    It has been relaxed so the bot can reply to the user without pinging the peer.
+    """
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="acme_dev_bot",
+    )
+    note = bot.task_manager.claude.team_system_note or ""
+    # The forbidden phrases from the old prompt must no longer appear.
+    assert "Every single reply" not in note
+    assert "Never send a reply without this @mention" not in note
+
+
 def test_team_bot_without_peer_username_leaves_note_unset(tmp_path):
     """Missing peer @handle should leave team_system_note as None (no stale placeholder)."""
     from link_project_to_chat.bot import ProjectBot
