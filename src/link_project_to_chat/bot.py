@@ -39,7 +39,7 @@ from .config import (
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, ClaudeStreamError, is_usage_cap_error
 from .livestream import LiveMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
@@ -446,10 +446,12 @@ class ProjectBot(AuthMixin):
                 try:
                     probe = ClaudeClient(project_path=self.path)
                     result = await probe.chat("ping")
-                    if not result.startswith("Error:") and not is_usage_cap_error(result):
+                    if not is_usage_cap_error(result):
                         self._group_state.resume(chat_id)
                         await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
                         return
+                except ClaudeStreamError:
+                    pass  # stream error during probe — usage cap may still be active
                 except Exception:
                     logger.warning("cap probe failed", exc_info=True)
         task = asyncio.create_task(_probe())
@@ -636,8 +638,8 @@ class ProjectBot(AuthMixin):
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
-            await self._cancel_live_for(prev.id, "(superseded)")
             self.task_manager.cancel(prev.id)
+            await self._cancel_live_for(prev.id, "(superseded)")
             typing = self._typing_tasks.pop(prev.id, None)
             if typing:
                 typing.cancel()
@@ -1463,7 +1465,7 @@ class ProjectBot(AuthMixin):
         if self._rate_limited(update.effective_user.id):
             return await msg.reply_text("Rate limited. Try again shortly.")
 
-        uploads_dir = Path("/tmp/link-project-to-chat") / self.name / "uploads"
+        uploads_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "uploads"
         uploads_dir.mkdir(parents=True, exist_ok=True)
 
         if msg.photo:
