@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 try:
@@ -37,12 +38,46 @@ logger = logging.getLogger(__name__)
 
 
 _EDIT_DEBOUNCE_SECONDS = 6.0
-_MAX_CONSECUTIVE_BOT_RELAYS = 10
+_MAX_CONSECUTIVE_BOT_RELAYS = 5
 _FALLBACK_DELETE_SECONDS = 60.0
 
 # Shared with transport/telegram.py's _RELAY_PREFIX_RE — keep these in sync.
 # Telegram bot usernames are constrained to [A-Za-z][A-Za-z0-9_]*.
 _RELAY_HANDLE_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
+
+
+# Messages whose body (after stripping the leading @peer mention) matches one
+# of these patterns are pure acknowledgments and are never forwarded by the
+# relay. Echoing acks back and forth is the root shape of a ping-pong loop:
+# stopping them here prevents the loop from starting, regardless of whether
+# Claude decides to hand the work off or the halt cap eventually trips.
+_ACK_EMOJI_ONLY = re.compile(r"^\s*[\U0001F44D\U0001F44C\u2705\U0001F197\u2714\U0001F64F\U0001F64C]+\s*$")
+_ACK_WORDS = re.compile(
+    r"^(?:"
+    r"ok|okay|yes|no|sure|yep|nope|ack|acknowledged|noted|understood|"
+    r"agreed|agree|got\s?it|gotcha|roger|roger\s?that|will\s?do|"
+    r"standing\s?by|waiting|ready|confirmed|received|copy|copy\s?that|"
+    r"thanks|thank\s?you|np|no\s?problem|welcome|good|great|alright|done|fine"
+    r")[\s.!?\U0001F44D\u2705]*$",
+    re.IGNORECASE,
+)
+
+
+def _is_ack_only(body: str) -> bool:
+    """True when `body` is a pure acknowledgment with no actionable content.
+
+    Used by the relay to avoid forwarding ack-only bot messages: the classic
+    ping-pong shape is "@peer ok" → "@peer agreed" → "@peer 👍" where each bot
+    answers the peer's ack with another ack. Dropping these on the relay side
+    is a hard circuit-breaker: the peer never receives it, so nothing triggers
+    a response, so the loop never starts.
+    """
+    stripped = body.strip()
+    if not stripped:
+        return True
+    if _ACK_EMOJI_ONLY.match(stripped):
+        return True
+    return bool(_ACK_WORDS.match(stripped))
 
 
 def _body_without_mention(text: str, peer: str) -> str:
@@ -307,6 +342,15 @@ class TeamRelay:
         peer = find_peer_mention(text, sender_username, self._bot_usernames)
         if peer is not None:
             text = _normalize_mention_spacing(text, peer)
+        body = _body_without_mention(text, peer) if peer else text
+        if _is_ack_only(body):
+            logger.info(
+                "TeamRelay: dropping ack-only bot message from @%s (team=%s body=%r)",
+                sender_username, self._team_name, body[:60],
+            )
+            if msg_id is not None:
+                self._relayed_ids.add(msg_id)
+            return
         sent_id = await self._relay(sender_username, text)
         if msg_id is not None:
             self._relayed_ids.add(msg_id)

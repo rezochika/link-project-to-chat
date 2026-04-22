@@ -282,6 +282,86 @@ async def test_relay_deletes_forward_when_peer_bot_responds():
     assert 700 in list(ids)
 
 
+# --- ack-only suppression + default cap ---
+
+
+def test_is_ack_only_detects_pure_acks():
+    from link_project_to_chat.transport._telegram_relay import _is_ack_only
+
+    assert _is_ack_only("")
+    assert _is_ack_only("   ")
+    assert _is_ack_only("ok")
+    assert _is_ack_only("OK.")
+    assert _is_ack_only("Okay!")
+    assert _is_ack_only("agreed")
+    assert _is_ack_only("Agreed.")
+    assert _is_ack_only("👍")
+    assert _is_ack_only("👍👍")
+    assert _is_ack_only("understood")
+    assert _is_ack_only("Understood!")
+    assert _is_ack_only("standing by")
+    assert _is_ack_only("Standing by.")
+    assert _is_ack_only("got it")
+    assert _is_ack_only("noted")
+    assert _is_ack_only("Roger that.")
+    assert _is_ack_only("confirmed")
+
+
+def test_is_ack_only_lets_substance_through():
+    from link_project_to_chat.transport._telegram_relay import _is_ack_only
+
+    assert not _is_ack_only("Please implement src/models.py")
+    assert not _is_ack_only("Done — PR #123 opened")
+    assert not _is_ack_only("Yes, let's proceed with option B")
+    assert not _is_ack_only("OK, but can you clarify the scope first?")
+    assert not _is_ack_only("I see the bug — it's in foo.py line 42")
+
+
+@pytest.mark.asyncio
+async def test_relay_skips_ack_only_bot_messages():
+    """Ack-only messages must not be relayed — that's how ping-pong loops start."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+    for i, text in enumerate([
+        "@acme_dev_bot ok",
+        "@acme_dev_bot agreed.",
+        "@acme_dev_bot 👍",
+        "@acme_dev_bot standing by",
+        "@acme_dev_bot Understood!",
+    ]):
+        ev = await _mk_event(text, sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=1100 + i)
+        await relay._on_new_message(ev)
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@acme_dev_bot")]
+    assert forwards == []
+    assert relay._rounds == 0
+
+
+@pytest.mark.asyncio
+async def test_relay_still_forwards_substantive_messages():
+    """The ack filter must not swallow real handoffs."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+    ev = await _mk_event(
+        "@acme_dev_bot Please implement src/models.py per docs/spec.md §2",
+        sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=1200,
+    )
+    await relay._on_new_message(ev)
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@acme_dev_bot")]
+    assert len(forwards) == 1
+    assert relay._rounds == 1
+
+
+def test_default_max_consecutive_bot_relays_is_5():
+    """Prior default of 10 was too lenient — 5 catches ping-pongs earlier."""
+    from link_project_to_chat.transport._telegram_relay import _MAX_CONSECUTIVE_BOT_RELAYS
+
+    assert _MAX_CONSECUTIVE_BOT_RELAYS == 5
+
+
 @pytest.mark.asyncio
 async def test_relay_fallback_deletes_forward_after_timeout(monkeypatch):
     """If the peer never responds, a fallback timer deletes the relay forward."""
