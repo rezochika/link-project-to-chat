@@ -11,11 +11,14 @@ except ImportError:  # Windows
             pass  # no-op on Windows; locking is best-effort
 
 import json
+import logging
 import os
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
@@ -177,10 +180,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             # projects[<team>_<role>] instead of the team config. Skipping
             # lets the manager start; we also clean them up best-effort so the
             # warning does not repeat on every subsequent load.
-            print(
-                f"warning: skipping malformed project '{name}' (no path) in config",
-                file=sys.stderr,
-            )
+            logger.warning("skipping malformed project %r (no path) in config", name)
         if malformed_projects:
             _cleanup_malformed_projects(path, malformed_projects)
 

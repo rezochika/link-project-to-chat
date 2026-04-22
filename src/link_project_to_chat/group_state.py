@@ -6,8 +6,11 @@ restarts — that's intentional: a process restart is itself a reset.
 
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass, field
 from time import time
+
+_MAX_REGISTRY_ENTRIES = 500
 
 
 @dataclass
@@ -19,7 +22,7 @@ class GroupState:
 
 class GroupStateRegistry:
     def __init__(self, max_bot_rounds: int = 20) -> None:
-        self._states: dict[int, GroupState] = {}
+        self._states: collections.OrderedDict[int, GroupState] = collections.OrderedDict()
         self._max = max_bot_rounds
 
     @property
@@ -27,7 +30,13 @@ class GroupStateRegistry:
         return self._max
 
     def get(self, chat_id: int) -> GroupState:
-        return self._states.setdefault(chat_id, GroupState())
+        if chat_id not in self._states:
+            if len(self._states) >= _MAX_REGISTRY_ENTRIES:
+                self._states.popitem(last=False)  # evict LRU
+            self._states[chat_id] = GroupState()
+        else:
+            self._states.move_to_end(chat_id)
+        return self._states[chat_id]
 
     def note_user_message(self, chat_id: int) -> None:
         s = self.get(chat_id)

@@ -15,9 +15,12 @@ except Exception:  # pragma: no cover - test envs without full telegram install
 
 logger = logging.getLogger(__name__)
 
+# Edit cadence: Telegram allows ~1 edit/s per message; 1.2s gives headroom to
+# avoid 429s under normal load. _MAX_THROTTLE is the ceiling applied after a
+# RetryAfter response so a single flood-wait doesn't permanently slow the stream.
 _DEFAULT_THROTTLE = 1.2  # seconds between edits per message
-_DEFAULT_MAX_CHARS = 3800  # Telegram hard cap is 4096; leave room for prefix + ellipsis
-_MAX_THROTTLE = 5.0  # cap when backing off from 429
+_DEFAULT_MAX_CHARS = 3800  # Telegram hard cap is 4096; gap covers prefix + "…" suffix
+_MAX_THROTTLE = 5.0  # cap cadence after 429 RetryAfter to prevent permanently slow edits
 
 
 class LiveMessage:
@@ -156,9 +159,12 @@ class LiveMessage:
                 break
             head_size = max(1, head_size * 3 // 4)
         if rendered is None:
-            head_size = room  # HTML never fit; seal plain at full boundary.
+            # HTML never fit in 5 iterations; hard-truncate at boundary with ellipsis.
+            head_size = max(0, room - 1)
         head = self._buffer[:head_size]
         tail = self._buffer[head_size:]
+        # When HTML binary search was exhausted, add ellipsis to signal truncation.
+        plain_seal = self._prefix + head + ("…" if rendered is None else "")
 
         edited_html = False
         if rendered is not None:
@@ -181,7 +187,7 @@ class LiveMessage:
                 await self._bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=self.message_id,
-                    text=self._prefix + head,
+                    text=plain_seal,
                 )
             except Exception:
                 logger.warning(

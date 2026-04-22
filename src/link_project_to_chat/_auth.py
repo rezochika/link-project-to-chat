@@ -78,7 +78,7 @@ class AuthMixin:
         if trusted and user.id in trusted:
             return True
         # Allow any allowed username to get trusted (even if other IDs exist)
-        username = (user.username or "").lower()
+        username = (user.username or "").strip().lower()
         if username in allowed:
             self._trust_user(user.id)
             self._on_trust(user.id)

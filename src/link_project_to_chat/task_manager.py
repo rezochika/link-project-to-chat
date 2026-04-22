@@ -316,6 +316,7 @@ class TaskManager:
     # Compact
     # ------------------------------------------------------------------
 
+    # Sent to Claude during /compact to produce a context summary that seeds a fresh session.
     COMPACT_PROMPT = (
         "Summarize our entire conversation concisely. Include:\n"
         "- Key decisions and architectural choices\n"
