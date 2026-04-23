@@ -42,7 +42,7 @@ This spec teaches the config to carry a `backend` selector plus a per-provider `
 |---|---|---|
 | 1 | Should legacy flat fields be deleted on first write, or kept for one release? | **Keep for one release.** Config writer emits both new shape and legacy fields until a subsequent release. Reader prefers new shape. Prevents downgrade breakage. |
 | 2 | Where does the backend factory live? | `backends/factory.py`. Module-level registry dict. `ClaudeBackend` self-registers at import. |
-| 3 | How does the manager bot know which backend to launch a project with? | It doesn't need to know directly. The manager stores `backend` + `backend_state` in the per-project config; the project-bot subprocess reads its own config on startup. Manager-side changes are limited to preserving the new schema on save. |
+| 3 | How does the manager bot know which backend to launch a project with? | The project-bot subprocess reads its own config on startup, so launch doesn't require manager knowledge. **But** the manager *does* have user-facing commands that edit per-project model/permissions and a global `/model` (see §4.7). Those paths get concrete migration work — not just schema preservation. Decision: manager/config.py gets a lockdown test to preserve `backend_state` verbatim; manager/bot.py gets enumerated per-command changes. |
 | 4 | What happens when `/backend <name>` is called for an unregistered backend? | Return a clear error listing available backends. Do not create a `backend_state[<name>]` entry. |
 | 5 | What happens to the current interactive process when `/backend` switches? | `close_interactive()` is called on the old backend before the new one activates. (Matches original spec §8.2.) |
 | 6 | Should the default backend be configurable globally? | Yes — add `default_backend: str = "claude"` on top-level `Config`. New projects use this when `backend` is not set. |
@@ -102,10 +102,16 @@ class ProjectConfig:
 }
 ```
 
-`Config` top-level gains:
+`Config` top-level changes:
 ```python
+# New:
 default_backend: str = "claude"
+default_model_claude: str = ""   # was: default_model (renamed; see §4.2 and §4.7)
+# Legacy (kept for one release, mirrored on write):
+default_model: str = ""          # mirrored from default_model_claude at write time
 ```
+
+**Why `default_model` is renamed.** The existing top-level `default_model` is the per-project new-project default and is consumed by the manager's global `/model` command. Once `default_backend` exists, that field is semantically backend-specific — Claude's model names and Codex's model names do not share a namespace. Renaming per backend (Option A in §4.7) is the minimal change that keeps the semantics honest without introducing a dict-valued field that has no second entry yet. `default_model_codex` is added in spec #3, not here.
 
 ### 4.2 Migration: read-old / write-new
 
@@ -115,17 +121,21 @@ In [`config.py`](src/link_project_to_chat/config.py) `load_config`:
    - If `backend` is absent: set `backend = "claude"`.
    - If `backend_state` is absent or missing `"claude"`: build `backend_state["claude"]` from any legacy flat fields (`model`, `effort`, `permissions`, `session_id`, `show_thinking`). Skip `None` values.
    - Keep the legacy fields on the dataclass instance populated (so any code path that still reads them keeps working during the transition).
-3. If `default_backend` is absent: set to `"claude"`.
+3. Top-level:
+   - If `default_backend` is absent: set to `"claude"`.
+   - If `default_model_claude` is absent and legacy `default_model` is present: copy `default_model` → `default_model_claude`.
+   - Keep `default_model` populated on the dataclass (mirror; read fallback).
 
 In `save_config`:
-1. Write the new shape (`backend` + `backend_state`).
-2. Also emit legacy flat fields **mirrored from `backend_state["claude"]`** for downgrade safety.
+1. Write the new shape at project/team-bot level (`backend` + `backend_state`) and at top level (`default_backend`, `default_model_claude`).
+2. Also emit legacy flat fields — `model`/`effort`/`permissions`/`session_id`/`show_thinking` **mirrored from `backend_state["claude"]`** at project/team-bot level; `default_model` **mirrored from `default_model_claude`** at top level — for downgrade safety.
 3. Do not emit `backend_state["claude"]` entries that are `None`/default.
 
 **Migration tests** in `tests/test_config_migration.py`:
-- Legacy-only config → load → write → re-load round-trip preserves all fields in new shape.
+- Legacy-only config (flat project fields + legacy top-level `default_model`) → load → write → re-load round-trip preserves all fields in new shape.
 - New-shape config → load → write → re-load round-trip is idempotent.
-- Mixed config (has both legacy flat and `backend_state["claude"]`) → reader prefers `backend_state["claude"]`; legacy fields are ignored.
+- Mixed project config (has both legacy flat and `backend_state["claude"]`) → reader prefers `backend_state["claude"]`; legacy fields are ignored.
+- Mixed top-level (has both `default_model` and `default_model_claude`) → reader prefers `default_model_claude`.
 - Team bot entries go through the same path.
 
 ### 4.3 JSON helpers — direct mutators/readers must migrate too
@@ -235,6 +245,29 @@ Rationale for this order (contrary to the earlier draft): persist-first means a 
 
 **No tasks-in-flight.** If `task_manager` reports any live agent task, `/backend <other>` rejects with "Cancel running tasks before switching backend." (Matches spec #3 §4.4; introduced here so it's in place by the time Codex lands.)
 
+**Team-bot scope.** `/backend` is available on **both** project bots and team bots. A team bot is just a project bot launched with a team-role config. The handler lives in the shared command surface ([`bot.py`](src/link_project_to_chat/bot.py)) so both inherit it.
+
+Persistence differs by context:
+- **Project bot:** on successful switch, `patch_project(project_name, {"backend": new_name})` updates the project's top-level `backend` field.
+- **Team bot:** on successful switch, `patch_team_bot_backend(team_name, role, new_name)` — a new helper with the same shape as `patch_team_bot_backend_state` but targeting the team-bot's top-level `backend` field at `raw["teams"][team_name]["bots"][role]["backend"]`.
+
+The team-bot bot knows its own team+role from the config it was launched with. The handler distinguishes via `self.team_name` / `self.team_role` (existing fields on `ProjectBot` for team mode). If both are set, the team-bot persistence path is used; otherwise the project path.
+
+Add helper in `config.py`:
+```python
+def patch_team_bot_backend(
+    team_name: str,
+    role: str,
+    backend_name: str,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Set the active backend on a team bot. Analogous to patch_project
+    for project bots. Writes only the 'backend' key at the team-bot level;
+    does not touch 'backend_state'."""
+```
+
+Test coverage: `tests/test_backend_command.py` parametrizes `/backend` across project-bot mode and team-bot mode, confirming each persists to the correct config path.
+
 ### 4.6 Capability gating
 
 `/thinking`, `/permissions`, `/compact` currently proceed unconditionally. After this phase, each handler starts with:
@@ -272,11 +305,7 @@ Analogous for `/permissions` (→ `supports_permissions`) and `/compact` (→ `s
 1. **`_EDITABLE_FIELDS` update.** `model` and `permissions` entries in the list stay, but the handler at [line 746+](src/link_project_to_chat/manager/bot.py:746) routes writes through the new `patch_backend_state(project_name, project_config.backend, {"model": value})` helper from §4.3, not through `patch_project` with flat keys. The user-facing command surface is unchanged; the underlying write target changes.
 2. **`/add_project` wizard `_add_model` step.** Change the final config write to populate `backend_state[default_backend]["model"] = model_id` and `backend = default_backend`. Flat `model` is still mirrored (downgrade safety per §4.2) but the authoritative write is to `backend_state`.
 3. **Line 1934 project-model callback.** Same change: write to `backend_state[project["backend"]]["model"]`, mirror flat.
-4. **Global `/model` command and `default_model`.** `default_model` becomes semantically **backend-specific** once `default_backend` exists. Two options; pick one in this phase:
-   - **Option A (chosen):** Rename `default_model` → `default_model_claude` and introduce `default_model_codex` (empty until spec #3). The global `/model` selector shows the model list for `default_backend` only. Simple, no per-backend UI churn.
-   - Option B: Add a per-backend default-model mapping `default_models: dict[str, str]`. More flexible, but no use case yet.
-
-   This spec chooses Option A. Migration: `default_model` → `default_model_claude` in the reader (§4.2); legacy field mirrored on write.
+4. **Global `/model` command.** The schema rename `default_model` → `default_model_claude` is defined and migrated in §4.1 + §4.2 (Option A). In `manager/bot.py`, the manager's global `/model` button callback ([line 1959](src/link_project_to_chat/manager/bot.py:1959)) writes to `cfg.default_model_claude` instead of `cfg.default_model`; the selector at [lines 507–527](src/link_project_to_chat/manager/bot.py:507) shows the model list for `default_backend` (today always `"claude"`, so the list is unchanged user-visibly). `default_model_codex` is added in spec #3. Option B (`default_models: dict[str, str]`) was considered and rejected as premature — no second entry exists until spec #3, and a single-entry dict is just a rename with extra noise.
 
 No "audit" framing — these are concrete, enumerated changes with code-line citations.
 

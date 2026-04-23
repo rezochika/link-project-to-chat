@@ -152,7 +152,7 @@ All other capability flags (`supports_thinking`, `supports_permissions`, `suppor
 - `status` — already a property-like method; formalize as `@property`.
 - `name = "claude"` class attribute added.
 - `capabilities = BackendCapabilities(models=MODELS, supports_thinking=True, supports_permissions=True, supports_resume=True, supports_compact=True, supports_allowed_tools=True, supports_usage_cap_detection=True)` class attribute added.
-- `probe_health()` method added — spawns a detached `ClaudeClient`, sends `"ping"`, returns `HealthStatus(ok, usage_capped, error_message)` using the existing `is_usage_cap_error` check.
+- `probe_health()` method added — spawns a detached Claude subprocess (separate from the main interactive `_proc`, to avoid stdin contention), sends `"ping"`, returns `HealthStatus(ok, usage_capped, error_message)` using the existing `is_usage_cap_error` check.
 
 Claude-specific helpers that are not part of the Protocol (e.g., `EFFORT_LEVELS`, `MODELS`, `PERMISSION_MODES`, `is_usage_cap_error`, `ClaudeStreamError`, `ClaudeUsageCapError`, `_TELEGRAM_AWARENESS`, `_ASK_DISMISSED_HINT`) stay inside `backends/claude.py` and are re-exported from a module-level `__all__` for callers that still need them. `bot.py` currently imports some of these constants directly; those imports switch from `claude_client` to `backends.claude` but remain Claude-specific. **They are renamed/generalized in spec #2, not here.**
 
@@ -274,9 +274,9 @@ from .claude_client import ClaudeClient
 
 **Rationale for renaming in Phase 1 (not later):** after the transport refactor already decoupled UI, backend identity is the only remaining layer still pinned to "Claude". Leaving Claude-named identifiers across `TaskManager` and `bot.py` while the Protocol exists creates a misleading split where the *interface* is agent-neutral but the *implementation sites* claim it's a Claude. Phase 2 would then have to touch all these sites *again* for capability gating — doubling the diff. Better to rename once, now.
 
-`TaskManager.__init__` takes `backend: AgentBackend` (required, no default) and stores it as `self._backend`. Public construction is done via a helper in `backends/__init__.py`.
+`TaskManager.__init__` takes `backend: AgentBackend` (required, no default) and stores it as `self._backend`. Public construction goes through `backends.factory.create(...)` (introduced in §4.4.1).
 
-`bot.py` is the construction site: it creates a `ClaudeBackend` (using the existing config shape — flat `model`, `effort`, `permissions`, `session_id`, `show_thinking` fields — unchanged from today) and passes it to `TaskManager`. A thin helper `_make_backend_from_legacy_config(project)` in `backends/__init__.py` centralizes this so spec #2 has one place to expand when backend-aware config arrives.
+`bot.py` is the construction site: it calls `backends.factory.create("claude", Path(project_config.path), state)` with `state` built from the existing flat `ProjectConfig` fields (see §4.4.1 for the exact shape) and passes the result to `TaskManager`. When Phase 2 adds `backend_state`, the call signature is unchanged — only the `state` dict's source changes. No `backends/__init__.py` helper is needed.
 
 ### 4.6 `bot.py` — Claude-identifier scrub
 
@@ -310,14 +310,18 @@ def _claude(self) -> ClaudeBackend:
     return backend
 ```
 
-Sites that read/write tier-2 attrs route through `self._claude.effort`, `self._claude.permission_mode`, etc. The assertion documents the Phase-1-only assumption and will naturally surface if Phase 2's capability gating misses a site. In Phase 2, the `ClaudeBackend`-typed accessor goes away — replaced with per-capability methods on the Protocol (e.g., `AgentBackend.set_reasoning_effort(level: str)` for backends that declare `supports_reasoning_effort`).
+Sites that read/write tier-2 attrs route through `self._claude.effort`, `self._claude.permission_mode`, etc. The assertion documents the Phase-1-only assumption.
+
+**What Phase 2 does with tier-2.** Phase 2 begins capability-aware command routing: `/thinking`, `/permissions`, `/compact`, `/model`, and `/status` are gated by `AgentBackend.capabilities` flags introduced here. Tier-2 attribute *access* remains concrete-typed (via `self._claude`) in Phase 2 for the attributes those commands mutate — moving those attributes onto the Protocol is deferred until Phase 3 validates whether Codex has an equivalent concept. If Codex declares `supports_thinking=False` and `supports_permissions=False`, the tier-2 accesses are simply never reached for a Codex-active bot (the capability gate rejects the command first), so no Protocol-level setter is needed. If later backends *do* want to tune an equivalent, Phase 4 is the venue for promoting specific attrs.
+
+The tier-2 split's main job is therefore to keep the Protocol honest *and* to keep Phase 1 mechanical — the split is not a promise of a specific Phase-2 API.
 
 This split keeps the Protocol honest: it lists only attributes every backend must provide, with no Claude-specific pollution.
 
 **Category B — Direct imports from `claude_client`.** [bot.py:32](src/link_project_to_chat/bot.py:32) imports `EFFORT_LEVELS, MODELS, PERMISSION_MODES, ClaudeStreamError, is_usage_cap_error`. Action in Phase 1:
 - Move imports from `claude_client` → `backends.claude` (module path change only).
 - Keep them Claude-typed for now — these are legitimately Claude-specific values until the capability-aware generalization in spec #2.
-- Leaves the user-visible behavior unchanged while severing the dead-module dependency (`claude_client.py` is deleted in spec #2).
+- Leaves the user-visible behavior unchanged while severing the dead-module dependency. The `claude_client.py` shim is deleted in Phase 1 step 6 (see §7.1), not in Phase 2.
 
 **Category C — User-facing "Claude" strings.** Lines 43 ("Set Claude model"), 575 ("chat with Claude"), and similar. **Not touched in Phase 1.** These need to say the active backend's name ("Claude" or "Codex"), which requires spec #2's capability-aware plumbing. Changing them now either hardcodes "Claude" (wrong later) or introduces a branch that has no second arm yet. Left for Phase 2 §4.9 (help-text generalization).
 
@@ -363,7 +367,7 @@ class HealthStatus:
     error_message: str | None = None
 ```
 
-`ClaudeBackend.probe_health` does what `_schedule_cap_probe` does internally today: spawns a detached `ClaudeClient` (its own subprocess, separate from the main interactive turn, to avoid stdin contention), sends `"ping"`, runs the existing `is_usage_cap_error` check on the result, returns a `HealthStatus`. Error and usage-cap surfaces are **unchanged from today** — the probe is moved, not reshaped.
+`ClaudeBackend.probe_health` does what `_schedule_cap_probe` does internally today: spawns a detached Claude subprocess — its own `subprocess.Popen`, separate from the main interactive `self._proc`, to avoid stdin contention — sends `"ping"`, runs the existing `is_usage_cap_error` check on the result, returns a `HealthStatus`. Error and usage-cap surfaces are **unchanged from today** — the probe is moved, not reshaped.
 
 `bot.py` becomes:
 ```python
