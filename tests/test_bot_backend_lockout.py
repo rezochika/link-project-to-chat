@@ -1,23 +1,175 @@
-"""Lockout: bot.py must not construct ClaudeClient directly or reach through
-task_manager.claude — it must go through the backend Protocol for tier-1 access
-or the explicit self._claude tier-2 accessor for Claude-specific behavior."""
+"""Lockout: bot.py must route Claude-specific attribute access through the
+tier-2 ``self._claude`` accessor rather than reaching into the backend
+through ``self.task_manager.backend`` or any local alias of it.
+
+The enforcement is AST-based (not substring-based) because an alias-bypass
+pattern such as::
+
+    bd = self.task_manager.backend
+    bd.effort = "high"
+
+evades a simple ``.claude.`` substring check. The AST walker collects every
+local variable assigned from ``self.task_manager.backend`` (transitively)
+and flags any attribute access on those aliases — plus direct
+``self.task_manager.backend.X`` access — whose attribute name is in the
+tier-2 (Claude-specific) set.
+"""
+from __future__ import annotations
+
+import ast
 from pathlib import Path
 
-
-BOT_PY = Path(
-    "/home/botuser/.link-project-to-chat/repos/lptc/src/link_project_to_chat/bot.py"
+BOT_PY = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "link_project_to_chat"
+    / "bot.py"
 )
+
+# Attributes that live on ClaudeBackend but are NOT part of the AgentBackend
+# Protocol. Access to these must go through ProjectBot._claude.
+TIER2_ATTRS = frozenset({
+    "effort",
+    "permission_mode",
+    "skip_permissions",
+    "allowed_tools",
+    "disallowed_tools",
+    "append_system_prompt",
+    "team_system_note",
+    "model_display",
+    "show_thinking",
+})
+
+
+def _is_self_task_manager_backend(node: ast.AST) -> bool:
+    """True iff *node* is literally the expression ``self.task_manager.backend``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "backend"
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "task_manager"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self"
+    )
+
+
+def _collect_backend_aliases(tree: ast.AST) -> set[str]:
+    """Return every local name transitively assigned from ``self.task_manager.backend``."""
+    aliases: set[str] = set()
+    # Iterate to fixed point so chained aliases (a = self.task_manager.backend;
+    # b = a; c = b) are all captured regardless of source order.
+    while True:
+        before = set(aliases)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            source_is_alias = _is_self_task_manager_backend(node.value) or (
+                isinstance(node.value, ast.Name) and node.value.id in aliases
+            )
+            if not source_is_alias:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    aliases.add(target.id)
+        if aliases == before:
+            return aliases
+
+
+def _find_tier2_violations(source: str) -> list[str]:
+    """Return a list of ``"<access> at line <N>"`` strings for every tier-2 leak."""
+    tree = ast.parse(source)
+    aliases = _collect_backend_aliases(tree)
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr in TIER2_ATTRS):
+            continue
+        if _is_self_task_manager_backend(node.value):
+            violations.append(f"self.task_manager.backend.{node.attr} at line {node.lineno}")
+        elif isinstance(node.value, ast.Name) and node.value.id in aliases:
+            violations.append(f"{node.value.id}.{node.attr} at line {node.lineno}")
+    return violations
 
 
 def test_bot_does_not_construct_claude_client_directly():
+    """Direct construction of ClaudeClient/ClaudeBackend bypasses the factory
+    registry and defeats the capability-gating plan for Phase 2."""
     source = BOT_PY.read_text(encoding="utf-8")
     assert "ClaudeClient(" not in source
+    assert "ClaudeBackend(" not in source
 
 
-def test_bot_does_not_reach_through_task_manager_claude_property():
-    """`.claude.` in source would mean tier-2 access is leaking through the
-    task_manager property (e.g. self.task_manager.claude.effort) — blocked.
-    Note: `self._claude.X` passes this check because the `_` prefix means
-    `._claude.` is the substring, not `.claude.`."""
+def test_bot_does_not_leak_tier2_attrs_through_backend_or_alias():
+    """Tier-2 attributes (effort, permission_mode, ...) must be accessed via
+    self._claude, not through self.task_manager.backend or an alias of it.
+    Catches both the direct form and the alias-bypass pattern."""
     source = BOT_PY.read_text(encoding="utf-8")
-    assert ".claude." not in source
+    violations = _find_tier2_violations(source)
+    assert not violations, (
+        "Tier-2 Claude-specific attribute leaks detected in bot.py:\n  - "
+        + "\n  - ".join(violations)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Self-tests for the AST checker — prove it catches the bypass pattern.
+# ---------------------------------------------------------------------------
+
+
+def test_ast_checker_flags_direct_backend_tier2_access():
+    source = (
+        "class Bot:\n"
+        "    def f(self):\n"
+        "        self.task_manager.backend.effort = 'high'\n"
+    )
+    violations = _find_tier2_violations(source)
+    assert any("effort" in v for v in violations)
+
+
+def test_ast_checker_flags_single_hop_alias_bypass():
+    """``bd = self.task_manager.backend; bd.effort`` must be caught."""
+    source = (
+        "class Bot:\n"
+        "    def f(self):\n"
+        "        bd = self.task_manager.backend\n"
+        "        bd.effort = 'high'\n"
+    )
+    violations = _find_tier2_violations(source)
+    assert any("bd.effort" in v for v in violations)
+
+
+def test_ast_checker_flags_chained_alias_bypass():
+    """Transitive aliases (bd → c → ...) must still be caught."""
+    source = (
+        "class Bot:\n"
+        "    def f(self):\n"
+        "        bd = self.task_manager.backend\n"
+        "        c = bd\n"
+        "        c.permission_mode = 'dontAsk'\n"
+    )
+    violations = _find_tier2_violations(source)
+    assert any("permission_mode" in v for v in violations)
+
+
+def test_ast_checker_allows_self_claude_tier2_access():
+    """Tier-2 access through self._claude is the sanctioned path."""
+    source = (
+        "class Bot:\n"
+        "    def f(self):\n"
+        "        self._claude.effort = 'high'\n"
+        "        self._claude.permission_mode = 'dontAsk'\n"
+    )
+    violations = _find_tier2_violations(source)
+    assert violations == []
+
+
+def test_ast_checker_allows_tier1_backend_access():
+    """Protocol attributes (model, session_id, status) on the backend are fine."""
+    source = (
+        "class Bot:\n"
+        "    def f(self):\n"
+        "        _ = self.task_manager.backend.model\n"
+        "        _ = self.task_manager.backend.session_id\n"
+        "        _ = self.task_manager.backend.status\n"
+    )
+    violations = _find_tier2_violations(source)
+    assert violations == []
