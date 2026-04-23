@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import link_project_to_chat.task_manager as task_manager_module
-from link_project_to_chat.stream import (
+from link_project_to_chat.events import (
     AskQuestion,
     Question,
     QuestionOption,
@@ -19,6 +19,7 @@ from link_project_to_chat.stream import (
     TextDelta,
 )
 from link_project_to_chat.task_manager import Task, TaskManager, TaskStatus, TaskType
+from tests.backends.fakes import FakeBackend
 
 
 def _noop_manager(tmp_path) -> TaskManager:
@@ -27,6 +28,7 @@ def _noop_manager(tmp_path) -> TaskManager:
 
     return TaskManager(
         project_path=tmp_path,
+        backend=FakeBackend(tmp_path),
         on_complete=_noop,
         on_task_started=_noop,
     )
@@ -114,6 +116,7 @@ async def test_run_command_success(tmp_path):
 
     tm = TaskManager(
         project_path=tmp_path,
+        backend=FakeBackend(tmp_path),
         on_complete=_on_complete,
         on_task_started=_noop,
     )
@@ -130,7 +133,7 @@ async def test_run_command_failure(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     task = tm.run_command(chat_id=1, message_id=1, command="exit 1", name="fail")
     await asyncio.wait_for(task._asyncio_task, timeout=5)
     assert task.status == TaskStatus.FAILED
@@ -154,6 +157,7 @@ async def test_run_command_spawn_failure_marks_task_failed_and_completes(tmp_pat
 
     tm = TaskManager(
         project_path=tmp_path,
+        backend=FakeBackend(tmp_path),
         on_complete=_on_complete,
         on_task_started=_on_start,
     )
@@ -172,7 +176,7 @@ async def test_run_command_cancel(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     task = tm.run_command(chat_id=1, message_id=1, command=_long_running_command())
     await asyncio.sleep(0.1)
     assert task.cancel() is True
@@ -184,7 +188,7 @@ async def test_cancel_all(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     tm.run_command(chat_id=1, message_id=1, command=_long_running_command())
     tm.run_command(chat_id=1, message_id=2, command=_long_running_command())
     await asyncio.sleep(0.1)
@@ -302,7 +306,7 @@ async def test_exec_command_uses_process_group_spawn_kwargs(tmp_path, monkeypatc
 
     monkeypatch.setattr(task_manager_module.subprocess, "Popen", fake_popen)
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     task = tm.run_command(chat_id=1, message_id=1, command="echo hello")
     await asyncio.wait_for(task._asyncio_task, timeout=5)
 
@@ -323,7 +327,7 @@ async def test_list_tasks_ordering(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     t1 = tm.run_command(chat_id=1, message_id=1, command="echo 1")
     t2 = tm.run_command(chat_id=1, message_id=2, command="echo 2")
     tasks = tm.list_tasks()
@@ -371,11 +375,11 @@ def _make_tm_with_fake(tmp_path, turns, on_complete=None, on_waiting_input=None)
 
     tm = TaskManager(
         project_path=tmp_path,
+        backend=_FakeClaude(turns),
         on_complete=on_complete or _noop,
         on_task_started=_noop,
         on_waiting_input=on_waiting_input,
     )
-    tm._claude = _FakeClaude(turns)
     return tm
 
 
@@ -398,7 +402,7 @@ async def test_ask_question_transitions_to_waiting_input(tmp_path):
     ]]
     tm = _make_tm_with_fake(tmp_path, turns, on_waiting_input=_on_waiting)
 
-    task = tm.submit_claude(chat_id=1, message_id=1, prompt="hello")
+    task = tm.submit_agent(chat_id=1, message_id=1, prompt="hello")
     await asyncio.wait_for(task._asyncio_task, timeout=2)
 
     assert task.status == TaskStatus.WAITING_INPUT
@@ -406,7 +410,7 @@ async def test_ask_question_transitions_to_waiting_input(tmp_path):
     assert task.pending_questions[0].options[0].label == "Red"
     assert waiting_seen == [task]
     # Interactive subprocess must be kept alive across the pause
-    assert tm._claude.closed == 0
+    assert tm._backend.closed == 0
 
 
 @pytest.mark.asyncio
@@ -427,7 +431,7 @@ async def test_submit_answer_resumes_and_completes(tmp_path):
     ]
     tm = _make_tm_with_fake(tmp_path, turns, on_complete=_on_complete)
 
-    task = tm.submit_claude(chat_id=1, message_id=1, prompt="start")
+    task = tm.submit_agent(chat_id=1, message_id=1, prompt="start")
     await asyncio.wait_for(task._asyncio_task, timeout=2)
     assert task.status == TaskStatus.WAITING_INPUT
 
@@ -437,7 +441,7 @@ async def test_submit_answer_resumes_and_completes(tmp_path):
 
     assert task.status == TaskStatus.DONE
     assert task.result == "Thanks!"
-    assert tm._claude.inputs == ["start", "Yes"]
+    assert tm._backend.inputs == ["start", "Yes"]
     assert len(completed) == 1
 
 
@@ -451,7 +455,7 @@ async def test_waiting_input_task_lookup(tmp_path):
     turns = [[AskQuestion(questions=[question]), Result(text="", session_id=None, model=None)]]
     tm = _make_tm_with_fake(tmp_path, turns)
 
-    task = tm.submit_claude(chat_id=42, message_id=1, prompt="p")
+    task = tm.submit_agent(chat_id=42, message_id=1, prompt="p")
     await asyncio.wait_for(task._asyncio_task, timeout=2)
 
     assert tm.waiting_input_task(42) is task
@@ -461,7 +465,7 @@ async def test_waiting_input_task_lookup(tmp_path):
 @pytest.mark.asyncio
 async def test_submit_answer_rejects_non_waiting_task(tmp_path):
     tm = _make_tm_with_fake(tmp_path, [[Result(text="", session_id=None, model=None)]])
-    task = tm.submit_claude(chat_id=1, message_id=1, prompt="p")
+    task = tm.submit_agent(chat_id=1, message_id=1, prompt="p")
     await asyncio.wait_for(task._asyncio_task, timeout=2)
     assert task.status == TaskStatus.DONE
     # Task is done, cannot answer
@@ -475,7 +479,7 @@ async def test_find_by_message(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
     task = tm.run_command(chat_id=1, message_id=99, command=_long_running_command())
     await asyncio.sleep(0.05)
     found = tm.find_by_message(99)
@@ -512,24 +516,24 @@ async def test_second_claude_task_waits_for_first_to_finish(tmp_path):
         pass
 
     gate = asyncio.Event()
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
-    tm._claude = _BlockingClaude(gate)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
+    tm._backend = _BlockingClaude(gate)
 
-    first = tm.submit_claude(chat_id=1, message_id=1, prompt="first")
+    first = tm.submit_agent(chat_id=1, message_id=1, prompt="first")
     await asyncio.sleep(0.1)
-    second = tm.submit_claude(chat_id=1, message_id=2, prompt="second")
+    second = tm.submit_agent(chat_id=1, message_id=2, prompt="second")
     await asyncio.sleep(0.1)
 
     assert first.status == TaskStatus.RUNNING
     assert second.status == TaskStatus.WAITING
-    assert tm._claude.inputs == ["first"]
+    assert tm._backend.inputs == ["first"]
 
     gate.set()
     await asyncio.wait_for(first._asyncio_task, timeout=2)
     await asyncio.wait_for(second._asyncio_task, timeout=2)
 
     assert second.status == TaskStatus.DONE
-    assert tm._claude.inputs == ["first", "second"]
+    assert tm._backend.inputs == ["first", "second"]
 
 
 class _SlowCloseClaude:
@@ -552,12 +556,12 @@ async def test_claude_close_does_not_block_event_loop(tmp_path):
     async def _noop(task):
         pass
 
-    tm = TaskManager(project_path=tmp_path, on_complete=_noop, on_task_started=_noop)
-    tm._claude = _SlowCloseClaude(close_delay=0.25)
+    tm = TaskManager(project_path=tmp_path, backend=FakeBackend(tmp_path), on_complete=_noop, on_task_started=_noop)
+    tm._backend = _SlowCloseClaude(close_delay=0.25)
 
     started = time.monotonic()
     ticker = asyncio.create_task(asyncio.sleep(0.05))
-    task = tm.submit_claude(chat_id=1, message_id=1, prompt="hello")
+    task = tm.submit_agent(chat_id=1, message_id=1, prompt="hello")
 
     await asyncio.wait_for(ticker, timeout=1)
     ticker_elapsed = time.monotonic() - started
@@ -580,11 +584,11 @@ async def test_cancelling_waiting_input_task_releases_next_claude_task(tmp_path)
     ]
     tm = _make_tm_with_fake(tmp_path, turns)
 
-    first = tm.submit_claude(chat_id=1, message_id=1, prompt="start")
+    first = tm.submit_agent(chat_id=1, message_id=1, prompt="start")
     await asyncio.wait_for(first._asyncio_task, timeout=2)
     assert first.status == TaskStatus.WAITING_INPUT
 
-    second = tm.submit_claude(chat_id=1, message_id=2, prompt="next")
+    second = tm.submit_agent(chat_id=1, message_id=2, prompt="next")
     await asyncio.sleep(0.1)
     assert second.status == TaskStatus.WAITING
 
@@ -592,5 +596,5 @@ async def test_cancelling_waiting_input_task_releases_next_claude_task(tmp_path)
     await asyncio.wait_for(second._asyncio_task, timeout=2)
 
     assert second.status == TaskStatus.DONE
-    assert tm._claude.inputs == ["start", "next"]
-    assert tm._claude.closed == 2
+    assert tm._backend.inputs == ["start", "next"]
+    assert tm._backend.closed == 2

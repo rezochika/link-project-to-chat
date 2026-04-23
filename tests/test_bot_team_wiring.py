@@ -85,7 +85,7 @@ async def test_group_mode_rejects_wrong_chat_id(tmp_path):
     )
     bot.bot_username = "acme_manager"
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
 
     # Wrong group — should be silently ignored by the group chat_id guard.
     chat = _group_chat(-100_222)
@@ -94,7 +94,7 @@ async def test_group_mode_rejects_wrong_chat_id(tmp_path):
 
     # No replies sent, no Claude submission.
     assert bot._transport.sent_messages == []
-    bot.task_manager.submit_claude.assert_not_called()
+    bot.task_manager.submit_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -106,7 +106,7 @@ async def test_group_mode_allows_matching_chat_id_passes_routing(tmp_path):
     )
     bot.bot_username = "acme_manager"  # required by group_filters
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
 
     # Matching chat, but no mention → not addressed to the bot (early return
     # via is_directed_at_me=False, not the chat_id guard).
@@ -115,7 +115,7 @@ async def test_group_mode_allows_matching_chat_id_passes_routing(tmp_path):
     await bot._on_text_from_transport(incoming)
 
     assert bot._transport.sent_messages == []
-    bot.task_manager.submit_claude.assert_not_called()
+    bot.task_manager.submit_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -127,7 +127,7 @@ async def test_group_mode_no_chat_id_set_does_not_reject(tmp_path):
     )
     bot.bot_username = "acme_manager"
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
 
     # No chat_id bound — the guard does NOT fire. Capture would require a
     # trusted user, and "someone" isn't in the allowed list, so capture is
@@ -137,7 +137,7 @@ async def test_group_mode_no_chat_id_set_does_not_reject(tmp_path):
     await bot._on_text_from_transport(incoming)
 
     assert bot._transport.sent_messages == []
-    bot.task_manager.submit_claude.assert_not_called()
+    bot.task_manager.submit_agent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -245,7 +245,7 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
     bot.bot_username = "acme_manager"
     bot._auth = MagicMock(return_value=True)
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
 
     captured = []
     monkeypatch.setattr("link_project_to_chat.bot.patch_team", lambda *a, **k: captured.append(a))
@@ -260,7 +260,7 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
     # No capture should happen, nothing sent, no Claude submission.
     assert captured == []
     assert bot._transport.sent_messages == []
-    bot.task_manager.submit_claude.assert_not_called()
+    bot.task_manager.submit_agent.assert_not_called()
 
 
 # --- settings callbacks must work in group chats for team bots ---
@@ -464,7 +464,7 @@ def test_team_bot_with_peer_username_sets_team_system_note(tmp_path):
         team_name="acme", role="manager", group_chat_id=-100_111,
         peer_bot_username="acme_dev_claude_bot",
     )
-    note = bot.task_manager.claude.team_system_note
+    note = bot.task_manager.backend.team_system_note
     assert note is not None
     assert "acme_dev_claude_bot" in note
     assert "manager" in note  # self role
@@ -483,7 +483,7 @@ def test_team_system_note_discourages_ack_echoing(tmp_path):
         team_name="acme", role="manager", group_chat_id=-100_111,
         peer_bot_username="acme_dev_bot",
     )
-    note = bot.task_manager.claude.team_system_note or ""
+    note = bot.task_manager.backend.team_system_note or ""
     lowered = note.lower()
     # Mentions that acks shouldn't be echoed, or that silence is a valid reply.
     assert (
@@ -507,7 +507,7 @@ def test_team_system_note_no_longer_forces_every_reply_to_mention_peer(tmp_path)
         team_name="acme", role="manager", group_chat_id=-100_111,
         peer_bot_username="acme_dev_bot",
     )
-    note = bot.task_manager.claude.team_system_note or ""
+    note = bot.task_manager.backend.team_system_note or ""
     # The forbidden phrases from the old prompt must no longer appear.
     assert "Every single reply" not in note
     assert "Never send a reply without this @mention" not in note
@@ -522,7 +522,7 @@ def test_team_bot_without_peer_username_leaves_note_unset(tmp_path):
         team_name="acme", role="manager", group_chat_id=-100_111,
         peer_bot_username="",
     )
-    assert bot.task_manager.claude.team_system_note is None
+    assert bot.task_manager.backend.team_system_note is None
 
 
 def test_team_system_note_pins_self_handle_after_refresh(tmp_path):
@@ -539,7 +539,7 @@ def test_team_system_note_pins_self_handle_after_refresh(tmp_path):
         peer_bot_username="acme_mgr_bot",
     )
     # Before get_me(): note carries peer only.
-    note_init = bot.task_manager.claude.team_system_note
+    note_init = bot.task_manager.backend.team_system_note
     assert note_init is not None
     assert "@acme_mgr_bot" in note_init
     assert "@acme_dev_2_bot" not in note_init  # self handle not known yet
@@ -548,7 +548,7 @@ def test_team_system_note_pins_self_handle_after_refresh(tmp_path):
     bot.bot_username = "acme_dev_2_bot"
     bot._refresh_team_system_note()
 
-    note_post = bot.task_manager.claude.team_system_note
+    note_post = bot.task_manager.backend.team_system_note
     assert note_post is not None
     assert "@acme_dev_2_bot" in note_post  # self handle pinned
     assert "@acme_mgr_bot" in note_post    # peer handle still there
@@ -950,7 +950,7 @@ async def test_on_task_complete_team_bot_persists_session_in_team_config(tmp_pat
         config_path=cfg_path,
     )
     bot._transport = FakeTransport()
-    bot.task_manager.claude.session_id = "sess-123"
+    bot.task_manager.backend.session_id = "sess-123"
 
     async def fake_finalize(_task):
         pass
@@ -961,7 +961,7 @@ async def test_on_task_complete_team_bot_persists_session_in_team_config(tmp_pat
         id=1,
         chat_id=1,
         message_id=1,
-        type=TaskType.CLAUDE,
+        type=TaskType.AGENT,
         input="hello",
         name="hello",
         status=TaskStatus.DONE,
@@ -1015,7 +1015,7 @@ async def test_reset_confirm_clears_team_session_from_team_config(tmp_path):
     )
     bot._transport = FakeTransport()
     bot._auth_identity = lambda _sender: True
-    bot.task_manager.claude.session_id = "sess-123"
+    bot.task_manager.backend.session_id = "sess-123"
     bot.task_manager.cancel_all = lambda: 0
 
     chat = ChatRef(transport_id="fake", native_id="-100111", kind=ChatKind.ROOM)

@@ -19,7 +19,7 @@ def _mk_task(chat_id: int, error: str) -> Task:
     t.status = TaskStatus.FAILED
     t.error = error
     t.result = ""
-    t.type = TaskType.CLAUDE
+    t.type = TaskType.AGENT
     t._compact = False
     return t
 
