@@ -1076,3 +1076,25 @@ git commit -m "refactor: route project bot through backend factory and remove cl
 - [ ] `stream.py` is only a temporary shim; shared events live in `events.py`.
 - [ ] `skills.py` explicitly documents that skills are shared across backends.
 - [ ] `claude_client.py` is deleted at the end of the phase.
+
+## Phase 1 Smoke Test (blocking exit criterion)
+
+A green pytest run proves the Protocol wiring compiles and unit-level behavior is preserved; it does NOT prove that the refactored path still spawns a real `claude` subprocess and streams events end-to-end. Before Phase 1 is considered complete, the dev must execute and record the following manual smoke test:
+
+**Setup:** local checkout of `feat/transport-abstraction` on a machine with the `claude` CLI installed and authenticated.
+
+**Procedure:**
+1. Start a project bot: `link-project-to-chat start --project <name>`
+2. From an authorized Telegram account, send a trivial prompt to the bot (e.g. "say hello in one word")
+3. Observe that:
+   - The bot streams a live response (text deltas render mid-generation)
+   - The final message is finalized cleanly (no `RuntimeError`, no hung typing indicator)
+   - `/tasks` shows the task as `COMPLETED`
+4. Send `/run echo hi` and confirm the shell path still works (regression guard on `TaskType` rename)
+5. Send `/compact` and confirm the session-summary round-trip still works (regression guard on resume semantics)
+
+**Pass condition:** all three round-trips succeed; no tracebacks in bot logs; task statuses are correct.
+
+**Record:** paste the bot log excerpt or screenshots under `docs/backend-phase-1-smoke-evidence.md` as part of the final commit.
+
+_Rationale: Phase 1 moves the subprocess spawn path across module boundaries and renames 14+ call sites in `bot.py`. A unit-only test run can pass while the integration is subtly broken (wrong env, wrong working dir, stream parser regression). The smoke test is cheap and catches what tests can't._
