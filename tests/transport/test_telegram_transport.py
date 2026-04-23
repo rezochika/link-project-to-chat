@@ -505,7 +505,11 @@ async def test_dispatch_non_relay_text_unchanged():
 
 
 async def test_enable_team_relay_lifecycle():
-    """enable_team_relay stashes config; start() starts the relay; stop() stops it."""
+    """enable_team_relay stashes config; start() starts the relay; stop() stops it.
+
+    TeamRelay registers two handlers (NewMessage + MessageEdited) because
+    livestream edits carry @peer mentions that the original send lacks.
+    """
     t, bot = _make_transport_with_mock_bot()
     bot.delete_webhook = AsyncMock()
     bot.get_me = AsyncMock(return_value=SimpleNamespace(
@@ -524,10 +528,15 @@ async def test_enable_team_relay_lifecycle():
     )
 
     await t.start()
-    mock_client.add_event_handler.assert_called_once()
+    from telethon import events
+    assert mock_client.add_event_handler.call_count == 2
+    registered_event_types = {
+        type(call.args[1]) for call in mock_client.add_event_handler.call_args_list
+    }
+    assert registered_event_types == {events.NewMessage, events.MessageEdited}
 
     await t.stop()
-    mock_client.remove_event_handler.assert_called_once()
+    assert mock_client.remove_event_handler.call_count == 2
 
 
 async def test_build_without_enable_team_relay_starts_and_stops_cleanly():
