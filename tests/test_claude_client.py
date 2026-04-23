@@ -1,7 +1,7 @@
 """Tests for _sanitize_error() in claude_client."""
 from pathlib import Path
 
-from link_project_to_chat.claude_client import ClaudeClient, _sanitize_error
+from link_project_to_chat.backends.claude import ClaudeBackend as ClaudeClient, _sanitize_error
 
 
 def test_truncates_long_errors():
