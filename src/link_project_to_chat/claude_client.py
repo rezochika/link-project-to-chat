@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -13,6 +14,10 @@ from pathlib import Path
 from .stream import Error, Result, StreamEvent, parse_stream_line
 
 logger = logging.getLogger(__name__)
+
+
+class ClaudeStreamError(Exception):
+    """Raised by ClaudeClient.chat() when the stream returns an Error event."""
 
 
 _API_KEY_RE = re.compile(r"(sk-[a-zA-Z]+-)\S+")
@@ -237,7 +242,7 @@ class ClaudeClient:
             if isinstance(event, Result):
                 result_text = event.text
             elif isinstance(event, Error):
-                return f"Error: {event.message}"
+                raise ClaudeStreamError(event.message)
         return result_text or "[No response]"
 
     # ------------------------------------------------------------------
@@ -254,6 +259,12 @@ class ClaudeClient:
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        _SCRUB_PATTERNS = (
+            "*_TOKEN", "*_KEY", "*_SECRET",
+            "AWS_*", "OPENAI_*", "GITHUB_*", "DATABASE_*", "PASSWORD*",
+        )
+        for key in [k for k in env if any(fnmatch.fnmatch(k, p) for p in _SCRUB_PATTERNS)]:
+            del env[key]
 
         proc = subprocess.Popen(
             cmd,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -13,6 +14,8 @@ if os.name == "nt":
     import msvcrt
 else:
     import fcntl
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
@@ -319,10 +322,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             # projects[<team>_<role>] instead of the team config. Skipping
             # lets the manager start; we also clean them up best-effort so the
             # warning does not repeat on every subsequent load.
-            print(
-                f"warning: skipping malformed project '{name}' (no path) in config",
-                file=sys.stderr,
-            )
+            logger.warning("skipping malformed project %r (no path) in config", name)
         if malformed_projects:
             _cleanup_malformed_projects(path, malformed_projects)
 
@@ -376,6 +376,41 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 },
             )
     return config
+
+
+def _merge_project_entry(existing: dict, p: "ProjectConfig") -> dict:
+    """Return an updated copy of *existing* with fields from *p*, preserving unknown keys."""
+    proj = dict(existing)
+    proj["path"] = p.path
+    proj["telegram_bot_token"] = p.telegram_bot_token
+    proj["allowed_usernames"] = p.allowed_usernames
+    proj.pop("username", None)
+    proj["trusted_user_ids"] = p.trusted_user_ids
+    proj.pop("trusted_user_id", None)
+    if p.model:
+        proj["model"] = p.model
+    if p.effort:
+        proj["effort"] = p.effort
+    if p.permissions:
+        proj["permissions"] = p.permissions
+    else:
+        proj.pop("permissions", None)
+    proj.pop("permission_mode", None)
+    proj.pop("dangerously_skip_permissions", None)
+    if p.session_id:
+        proj["session_id"] = p.session_id
+    else:
+        proj.pop("session_id", None)
+    proj["autostart"] = p.autostart
+    if p.active_persona:
+        proj["active_persona"] = p.active_persona
+    else:
+        proj.pop("active_persona", None)
+    if p.show_thinking:
+        proj["show_thinking"] = True
+    else:
+        proj.pop("show_thinking", None)
+    return proj
 
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
@@ -456,6 +491,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw.pop("default_model", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
+    # Keep inline merge here rather than using the _merge_project_entry helper:
+    # feat's multi-user trust model needs _write_raw_trusted_users +
+    # _effective_trusted_users, which the helper (from main) does not yet know
+    # how to invoke.
     for name, p in config.projects.items():
         proj = existing_projects.get(name, {})
         proj["path"] = p.path

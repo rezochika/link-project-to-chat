@@ -24,6 +24,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from collections import deque
 from typing import Any
 
 try:
@@ -38,7 +40,13 @@ logger = logging.getLogger(__name__)
 
 
 _EDIT_DEBOUNCE_SECONDS = 6.0
-_MAX_CONSECUTIVE_BOT_RELAYS = 5
+# Halt the relay if `_MAX_CONSECUTIVE_BOT_RELAYS` forwards land within
+# `_ROUND_WINDOW_SECONDS`. The raw-count halt used previously treated a
+# long legitimate multi-round delegation the same as a fast ping-pong; a
+# time-windowed count distinguishes the two because real work has tool
+# calls between messages (10s+ minimum) while loops fire back-to-back.
+_MAX_CONSECUTIVE_BOT_RELAYS = 10
+_ROUND_WINDOW_SECONDS = 120.0
 _FALLBACK_DELETE_SECONDS = 60.0
 # Telegram splits bot messages longer than 4096 chars into separate parts,
 # each delivered as its own NewMessage event. Without coalescing, each part
@@ -190,10 +198,10 @@ class TeamRelay:
         # Pending debounced relay tasks, keyed by message_id. The livestream
         # emits many edits per reply; we only relay once the stream goes quiet.
         self._debounce_tasks: dict[int, asyncio.Task] = {}
-        # Loop guard: count consecutive bot-to-bot forwards since last user
-        # activity. Halts when `_max_rounds` is reached.
+        # Loop guard: timestamps of recent bot-to-bot forwards. Halts when
+        # `_max_rounds` of them land within `_ROUND_WINDOW_SECONDS`.
         self._max_rounds = max_consecutive_bot_relays
-        self._rounds = 0
+        self._round_times: deque[float] = deque()
         self._halted = False
         # Telegram message IDs the relay itself has sent (forwards + halt
         # notices). Needed because Telethon delivers our own sends back as
@@ -302,7 +310,7 @@ class TeamRelay:
             # so clear the loop guard. Only fresh messages count; edits may
             # just be the user cleaning up a prior message.
             if not is_edit:
-                self._rounds = 0
+                self._round_times.clear()
                 self._halted = False
             return
         sender_username = (getattr(sender, "username", "") or "").lower()
@@ -439,10 +447,23 @@ class TeamRelay:
             self._pending_delete_timers[sent_id] = asyncio.create_task(
                 self._fallback_delete(sent_id)
             )
-        self._rounds += 1
-        if self._rounds >= self._max_rounds and not self._halted:
+        self._record_round()
+        if len(self._round_times) >= self._max_rounds and not self._halted:
             self._halted = True
             await self._send_halt_notice()
+
+    def _record_round(self) -> None:
+        """Append now() and drop entries older than the rolling window."""
+        now = time.monotonic()
+        self._round_times.append(now)
+        cutoff = now - _ROUND_WINDOW_SECONDS
+        while self._round_times and self._round_times[0] < cutoff:
+            self._round_times.popleft()
+
+    @property
+    def _rounds(self) -> int:
+        """Current round count within the rolling window (read-only view)."""
+        return len(self._round_times)
 
     async def _relay(self, sender_username: str, text: str) -> int | None:
         try:
@@ -464,8 +485,9 @@ class TeamRelay:
 
     async def _send_halt_notice(self) -> None:
         notice = (
-            f"Bot-to-bot relay paused after {self._rounds} consecutive rounds "
-            f"in team '{self._team_name}'. Send any message to resume."
+            f"Bot-to-bot relay paused after {self._rounds} rounds within "
+            f"{int(_ROUND_WINDOW_SECONDS)}s in team '{self._team_name}'. "
+            f"Send any message to resume."
         )
         try:
             sent = await self._client.send_message(self._group_chat_id, notice)

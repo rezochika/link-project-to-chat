@@ -106,8 +106,11 @@ class BotFatherClient:
 
     async def authenticate(self, phone: str, code_callback, password_callback=None) -> None:
         client = await self._ensure_client()
+        if not self._session_path.exists():
+            self._session_path.touch(mode=0o600)
+        else:
+            self._session_path.chmod(0o600)
         await client.start(phone=phone, code_callback=code_callback, password=password_callback)
-        self._session_path.chmod(0o600)
 
     async def create_bot(self, display_name: str, username: str) -> str:
         client = await self._ensure_client()

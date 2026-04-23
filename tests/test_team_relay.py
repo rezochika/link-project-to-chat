@@ -420,11 +420,59 @@ async def test_relay_still_forwards_substantive_messages():
     assert relay._rounds == 1
 
 
-def test_default_max_consecutive_bot_relays_is_5():
-    """Prior default of 10 was too lenient — 5 catches ping-pongs earlier."""
-    from link_project_to_chat.transport._telegram_relay import _MAX_CONSECUTIVE_BOT_RELAYS
+def test_default_max_consecutive_bot_relays_is_10():
+    """Raised from 5 alongside the time-window guard — real delegations were
+    hitting the old cap mid-work. With the rolling window, 10 rounds within
+    120s still catches machine-gun loops but permits legitimate long-running
+    back-and-forth (each round spaced by tool calls of 10s+).
+    """
+    from link_project_to_chat.transport._telegram_relay import (
+        _MAX_CONSECUTIVE_BOT_RELAYS,
+        _ROUND_WINDOW_SECONDS,
+    )
 
-    assert _MAX_CONSECUTIVE_BOT_RELAYS == 5
+    assert _MAX_CONSECUTIVE_BOT_RELAYS == 10
+    assert _ROUND_WINDOW_SECONDS == 120.0
+
+
+@pytest.mark.asyncio
+async def test_relay_rounds_outside_window_are_pruned(monkeypatch):
+    """A round older than `_ROUND_WINDOW_SECONDS` must not count toward the
+    halt cap — real multi-round coordination spaces rounds by tool calls,
+    and we want it to flow through."""
+    import link_project_to_chat.transport._telegram_relay as tr
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    # Tiny window so the test can age rounds out quickly.
+    monkeypatch.setattr(tr, "_ROUND_WINDOW_SECONDS", 0.05)
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(
+        client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=3,
+    )
+
+    # 2 rounds inside the window — not yet halted.
+    for i in range(2):
+        sender = "acme_mgr_bot" if i % 2 == 0 else "acme_dev_bot"
+        peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
+        ev = await _mk_event(f"@{peer} x{i}", sender_username=sender, sender_is_bot=True, msg_id=1300 + i)
+        await _dispatch(relay, ev)
+    assert relay._halted is False
+    assert relay._rounds == 2
+
+    # Let the first two rounds age out.
+    await asyncio.sleep(0.08)
+
+    # 2 more rounds — prior two are now outside the window and must not count.
+    for i in range(2, 4):
+        sender = "acme_mgr_bot" if i % 2 == 0 else "acme_dev_bot"
+        peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
+        ev = await _mk_event(f"@{peer} x{i}", sender_username=sender, sender_is_bot=True, msg_id=1300 + i)
+        await _dispatch(relay, ev)
+    # Window now contains just the two fresh rounds — below the cap of 3.
+    assert relay._halted is False
+    assert relay._rounds == 2
 
 
 @pytest.mark.asyncio
@@ -721,13 +769,6 @@ async def test_relay_still_forwards_substantive_messages():
     forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@acme_dev_bot")]
     assert len(forwards) == 1
     assert relay._rounds == 1
-
-
-def test_default_max_consecutive_bot_relays_is_5():
-    """Prior default of 10 was too lenient — 5 catches ping-pongs earlier."""
-    from link_project_to_chat.transport._telegram_relay import _MAX_CONSECUTIVE_BOT_RELAYS
-
-    assert _MAX_CONSECUTIVE_BOT_RELAYS == 5
 
 
 @pytest.mark.asyncio

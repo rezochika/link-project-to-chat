@@ -4,8 +4,10 @@ import asyncio
 import collections
 import contextlib
 import enum
+import heapq
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -17,6 +19,18 @@ from .claude_client import ClaudeClient
 from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta
 
 logger = logging.getLogger(__name__)
+
+_MAX_CONCURRENT_RUNS = 3
+
+# Matches 40+ char alphanumeric strings (API keys/tokens) and common path prefixes.
+_SENSITIVE_RE = re.compile(
+    r"(?:[A-Za-z0-9+/]{40,})"
+    r"|(?:/(?:home|root|Users)/\S+)"
+)
+
+
+def _scrub_error_message(msg: str) -> str:
+    return _SENSITIVE_RE.sub("[REDACTED]", msg)
 
 
 def _command_popen_kwargs() -> dict[str, object]:
@@ -156,6 +170,7 @@ class TaskManager:
         self._on_waiting_input = on_waiting_input
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
+        self._active_run_pids: set[int] = set()
         self._claude = ClaudeClient(
             project_path,
             skip_permissions=skip_permissions,
@@ -322,7 +337,7 @@ class TaskManager:
             elif isinstance(event, Result):
                 task.result = event.text
             elif isinstance(event, Error):
-                raise RuntimeError(event.message)
+                raise RuntimeError(_scrub_error_message(event.message))
 
         if not task.result:
             task.result = "".join(collected_text) or "[No response]"
@@ -391,6 +406,7 @@ class TaskManager:
     # Compact
     # ------------------------------------------------------------------
 
+    # Sent to Claude during /compact to produce a context summary that seeds a fresh session.
     COMPACT_PROMPT = (
         "Summarize our entire conversation concisely. Include:\n"
         "- Key decisions and architectural choices\n"
@@ -415,6 +431,13 @@ class TaskManager:
     # ------------------------------------------------------------------
 
     async def _exec_command(self, task: Task) -> None:
+        if len(self._active_run_pids) >= _MAX_CONCURRENT_RUNS:
+            task.status = TaskStatus.FAILED
+            task.error = f"Too many concurrent /run commands (max {_MAX_CONCURRENT_RUNS}). Wait for one to finish."
+            task.finished_at = time.monotonic()
+            await self._safe_callback(self._on_complete, task)
+            return
+
         await self._safe_callback(self._on_task_started, task)
         try:
             proc = subprocess.Popen(
@@ -435,6 +458,7 @@ class TaskManager:
             return
         setattr(proc, "_kill_process_tree", True)
         task._proc = proc
+        self._active_run_pids.add(proc.pid)
         logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
 
         all_lines: list[str] = []
@@ -454,10 +478,12 @@ class TaskManager:
             task.status = TaskStatus.CANCELLED
             task.finished_at = time.monotonic()
             task._proc = None
+            self._active_run_pids.discard(proc.pid)
             return
 
         task.finished_at = time.monotonic()
         task._proc = None
+        self._active_run_pids.discard(proc.pid)
 
         if task.status == TaskStatus.CANCELLED:
             return
@@ -501,7 +527,7 @@ class TaskManager:
         tasks = list(self._tasks.values())
         if chat_id is not None:
             tasks = [t for t in tasks if t.chat_id == chat_id]
-        return sorted(tasks, key=lambda t: t.id, reverse=True)[:limit]
+        return heapq.nlargest(limit, tasks, key=lambda t: t.id)
 
     def cancel(self, task_id: int) -> bool:
         task = self._tasks.get(task_id)

@@ -29,7 +29,7 @@ from .config import (
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, is_usage_cap_error
+from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, ClaudeStreamError, is_usage_cap_error
 from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -173,6 +173,31 @@ class ProjectBot(AuthMixin):
         self._typing_tasks[task.id] = asyncio.create_task(
             self._keep_typing(self._transport, chat_ref)
         )
+        # Team bots skip per-delta livestreaming (_on_stream_event returns
+        # early), but we still need to emit *one* message early so the relay's
+        # event-driven auto-delete (_delete_pending_for_peer) can drop the
+        # forwarded trigger message before its 60-second fallback deletes it.
+        # Sending the placeholder now — while the forward still exists —
+        # means `reply_to` resolves; finalize() later *edits* this same
+        # message, so reply_to is never re-validated against a vanished
+        # target.
+        if self.group_mode and task.id not in self._live_text:
+            live = StreamingMessage(
+                transport=self._transport,
+                chat=chat_ref,
+                reply_to=self._message_ref_for_task_trigger(task),
+            )
+            try:
+                await live.start()
+            except Exception:
+                logger.exception(
+                    "StreamingMessage.start failed for team placeholder (task #%d); "
+                    "falling back to send-at-finalize",
+                    task.id,
+                )
+                self._live_text_failed.add(task.id)
+                return
+            self._live_text[task.id] = live
 
     def _chat_ref_for_task(self, task: Task) -> ChatRef:
         kind = ChatKind.ROOM if self.group_mode else ChatKind.DM
@@ -408,6 +433,8 @@ class ProjectBot(AuthMixin):
                         self._group_state.resume(chat)
                         await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
                         return
+                except ClaudeStreamError:
+                    pass  # stream error during probe — usage cap may still be active
                 except Exception:
                     logger.warning("cap probe failed", exc_info=True)
         task = asyncio.create_task(_probe())
@@ -729,8 +756,8 @@ class ProjectBot(AuthMixin):
             return
 
         for prev in self.task_manager.find_by_message(msg.message_id):
-            await self._cancel_live_for(prev.id, "(superseded)")
             self.task_manager.cancel(prev.id)
+            await self._cancel_live_for(prev.id, "(superseded)")
             typing = self._typing_tasks.pop(prev.id, None)
             if typing:
                 typing.cancel()
@@ -1782,9 +1809,7 @@ class ProjectBot(AuthMixin):
         except (OSError, ValueError):
             logger.warning("Invalid image path: %s", file_path)
             return
-        try:
-            resolved.relative_to(self.path.resolve())
-        except ValueError:
+        if not resolved.is_relative_to(self.path.resolve()):
             logger.warning("Image path traversal blocked: %s", file_path)
             return
         if not resolved.exists():
