@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
 
+class ConfigError(Exception):
+    """Raised when config.json contains structurally invalid data."""
+
+
 @dataclass
 class ProjectConfig:
     path: str
@@ -357,6 +361,11 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     config.projects[name].trusted_users.values()
                 )
         for name, team in raw.get("teams", {}).items():
+            for required in ("path", "group_chat_id"):
+                if required not in team:
+                    raise ConfigError(
+                        f"Team {name!r} in {path} is missing required field {required!r}"
+                    )
             config.teams[name] = TeamConfig(
                 path=team["path"],
                 group_chat_id=team["group_chat_id"],
