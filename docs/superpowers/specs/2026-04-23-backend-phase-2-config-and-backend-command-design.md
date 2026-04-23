@@ -21,12 +21,13 @@ This spec teaches the config to carry a `backend` selector plus a per-provider `
 **Goals**
 - Extend `ProjectConfig` and `TeamBotConfig` with `backend: str = "claude"` and `backend_state: dict[str, dict]`.
 - Implement read-old/write-new migration: legacy flat fields read from disk populate `backend_state["claude"]`; writes go to the new shape only.
+- **Migrate the direct JSON helpers** (`load_sessions`, `load_session`, `save_session`, `clear_session`, `patch_project`, `patch_team` — 22 call sites) so they read/write the new `backend_state[<provider>]` shape instead of flat keys. Without this, Claude turns would revert migration on every save. See §4.3.
 - Add a backend factory keyed by name; register `ClaudeBackend`.
 - Add `/backend` command (show + switch).
 - Gate `/thinking`, `/permissions`, `/compact`, `/model` responses on `AgentBackend.capabilities`.
 - Propagate the active backend through the manager bot's project-launch flow ([manager/bot.py](src/link_project_to_chat/manager/bot.py) + [manager/config.py](src/link_project_to_chat/manager/config.py)).
 - Audit group/team relay ([manager/team_relay.py](src/link_project_to_chat/manager/team_relay.py), [group_filters.py](src/link_project_to_chat/group_filters.py), [group_state.py](src/link_project_to_chat/group_state.py)) for Claude-named assumptions and fix any found.
-- Generalize user-facing help strings that currently say "Claude" where they should say "the agent" or the active backend's name.
+- Generalize user-facing help strings (category C from spec #1 §4.6) that currently say "Claude" where they should say "the agent" or the active backend's name.
 
 **Non-goals**
 - No Codex implementation.
@@ -127,7 +128,62 @@ In `save_config`:
 - Mixed config (has both legacy flat and `backend_state["claude"]`) → reader prefers `backend_state["claude"]`; legacy fields are ignored.
 - Team bot entries go through the same path.
 
-### 4.3 Backend factory
+### 4.3 JSON helpers — direct mutators/readers must migrate too
+
+`load_config`/`save_config` are not the only config I/O paths. [`config.py`](src/link_project_to_chat/config.py) exposes six direct JSON helpers that bypass the dataclass layer and read/write flat Claude-shaped keys under `raw["projects"][<name>]` and `raw["teams"][<name>]["bots"][<role>]`:
+
+| Helper | Line | What it does today | What it must do after Phase 2 |
+|---|---|---|---|
+| `load_sessions` | [config.py:605](src/link_project_to_chat/config.py:605) | Reads `proj["session_id"]` flat | Read from `proj["backend_state"][proj.get("backend","claude")]["session_id"]`, with flat-key fallback for unmigrated entries |
+| `load_session` | [config.py:625](src/link_project_to_chat/config.py:625) | Reads one project's flat `session_id` | Same new path + fallback |
+| `save_session` | [config.py:710](src/link_project_to_chat/config.py:710) | Writes `raw["projects"][name]["session_id"] = sid` | Write into `backend_state[<active>]["session_id"]`; also mirror to flat `session_id` for one release (downgrade safety, per §4.2) |
+| `clear_session` | [config.py:726](src/link_project_to_chat/config.py:726) | Deletes flat `session_id` | Delete from `backend_state[<active>]["session_id"]` **and** flat `session_id` (both the new and mirrored copies) |
+| `patch_project` | [config.py:650](src/link_project_to_chat/config.py:650) | Arbitrary field patch at project top-level | Unchanged at top-level for non-backend-state fields (`path`, `telegram_bot_token`, `autostart`, …); callers that previously patched `model`/`effort`/`permissions`/`show_thinking`/`session_id` migrate to a new `patch_backend_state(project_name, backend_name, fields)` helper |
+| `patch_team` | [config.py:662](src/link_project_to_chat/config.py:662) | Arbitrary field patch at team top-level | Same rule as `patch_project`; team-bot field patches go through a new `patch_team_bot_backend_state(team_name, role, backend_name, fields)` helper |
+
+**Call-site impact.** A grep in the current branch shows **22 call sites** across `config.py` (6), `bot.py` (14), and `manager/bot.py` (2). Each call site must be reviewed:
+- Reads of `session_id`: change to the migrated helper; no API change for the caller.
+- Writes of `session_id`: same.
+- Patches of `model`/`effort`/`permissions`/`show_thinking` via `patch_project`/`patch_team`: change the call to `patch_backend_state(name, <active>, fields)` or `patch_team_bot_backend_state(team, role, <active>, fields)`.
+
+**Why this is a load-bearing section:** without migrating these helpers, the Phase 2 release has two disagreeing code paths for the same data — the dataclass layer writes the new shape, but `save_session` called at end-of-turn [bot.py:497](src/link_project_to_chat/bot.py:497) overwrites it with the flat key, reverting the migration on every Claude turn.
+
+**New helpers.** Add to `config.py`:
+
+```python
+def patch_backend_state(
+    project_name: str,
+    backend_name: str,
+    fields: dict,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Update fields inside backend_state[<backend_name>] on a project.
+
+    Creates backend_state and the per-backend sub-dict if absent.
+    None values remove the key. Mirrors writes to legacy flat fields
+    (model/effort/permissions/session_id/show_thinking) for one release.
+    """
+
+def patch_team_bot_backend_state(
+    team_name: str,
+    role: str,
+    backend_name: str,
+    fields: dict,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Analogous for team bots."""
+```
+
+**Testing.** `tests/test_config_migration.py` adds cases for each helper:
+- `save_session` on a legacy-only entry → populates `backend_state["claude"]["session_id"]` + mirrored flat `session_id`.
+- `save_session` on a new-shape entry → writes only into `backend_state[<active>]`.
+- `clear_session` → both paths cleared.
+- `patch_backend_state` on a team bot with an existing unrelated `backend_state["codex"]` entry → leaves the `codex` entry untouched.
+- `load_session` with both flat and new-shape fields present → reads from new shape.
+
+**Call-site migration is part of this phase's commit sequence**, not deferred. See step 2b in §8.1.
+
+### 4.4 Backend factory
 
 New file `backends/factory.py`:
 
@@ -193,7 +249,7 @@ backend = create(
 )
 ```
 
-### 4.4 `/backend` command
+### 4.5 `/backend` command
 
 Three forms:
 
@@ -207,7 +263,7 @@ Handler lives in [`bot.py`](src/link_project_to_chat/bot.py) alongside other com
 
 `/backend <name>` persists the new selection to disk **before** activating the new backend, so a crash during activation doesn't leave the on-disk state ahead of the runtime state.
 
-### 4.5 Capability gating
+### 4.6 Capability gating
 
 `/thinking`, `/permissions`, `/compact` currently proceed unconditionally. After this phase, each handler starts with:
 ```python
@@ -221,7 +277,7 @@ Analogous for `/permissions` (→ `supports_permissions`) and `/compact` (→ `s
 
 `/status` is extended to report the active backend name alongside existing status fields.
 
-### 4.6 Manager-bot propagation
+### 4.7 Manager-bot propagation
 
 [`manager/config.py`](src/link_project_to_chat/manager/config.py) is the schema-aware writer used when the manager creates/edits project entries. Changes:
 
@@ -231,7 +287,7 @@ Analogous for `/permissions` (→ `supports_permissions`) and `/compact` (→ `s
 
 [`manager/bot.py`](src/link_project_to_chat/manager/bot.py) launches each project bot as a subprocess. No changes needed there — the subprocess reads its own config on startup via the updated loader. **Audit item:** grep `manager/bot.py` for any direct reads of `model`/`effort`/`permissions` on a `ProjectConfig` before subprocess launch; replace with `backend_state[cfg.backend].get(...)` if found.
 
-### 4.7 Group/team relay audit
+### 4.8 Group/team relay audit
 
 The original v1.0 spec flagged this as a vague risk ("Any direct assumptions in tests or manager utilities that reference Claude by name may cause hidden regressions"). This phase resolves it with an explicit audit:
 
@@ -247,7 +303,7 @@ The original v1.0 spec flagged this as a vague risk ("Any direct assumptions in 
 
 **Recorded in this phase:** the audit findings go into the spec commit message so spec #3 doesn't re-discover them. A placeholder section in `CLAUDE.md`'s "Manager & team support" subsection is updated.
 
-### 4.8 Help-text generalization
+### 4.9 Help-text generalization
 
 User-facing strings in `bot.py` that currently reference "Claude" by name are reviewed and changed to one of:
 - **Kept Claude-specific** if truly Claude-specific (e.g., usage-cap message).
@@ -293,7 +349,10 @@ Covered in §4.7 above.
 
 1. **Extend dataclasses.** Add `backend` + `backend_state` fields; add `default_backend` on `Config`. No reader/writer changes yet. Green tests.
 2. **Reader migration.** `load_config` populates `backend_state["claude"]` from legacy fields. Writer still emits legacy shape only. Green tests.
+   - **2a. JSON-helper readers.** Migrate `load_sessions`, `load_session` to the new shape with flat-key fallback. Green tests (including new `tests/test_config_migration.py` cases for the helpers).
 3. **Writer dual-emit.** `save_config` writes new shape + mirrored legacy fields. Migration round-trip tests added. Green tests.
+   - **3a. JSON-helper writers.** Migrate `save_session`, `clear_session` to write `backend_state[<active>]["session_id"]` with mirrored flat key. Add `patch_backend_state` / `patch_team_bot_backend_state`. Green tests.
+   - **3b. Call-site migration.** Update the 22 call sites across `bot.py`, `manager/bot.py`, `config.py` to use the migrated helpers (or the new `patch_backend_state` helper for model/effort/permissions/show_thinking). Green tests + manual smoke: run a Claude turn end-to-end, inspect the config on disk, confirm `backend_state["claude"]["session_id"]` is populated and the flat `session_id` mirror stays in sync.
 4. **Factory + registration.** `backends/factory.py` and `ClaudeBackend` self-registration. `bot.py` switches to factory-based construction. Green tests.
 5. **`/backend` command.** Handler + persistence + close_interactive-on-switch. Tests added. Green tests.
 6. **Capability gating.** `/thinking`, `/permissions`, `/compact`, `/model` routed through capabilities. Tests added. Green tests.
@@ -312,15 +371,18 @@ Covered in §4.7 above.
 - [ ] `ProjectConfig` / `TeamBotConfig` / `Config` have the new fields.
 - [ ] Loader populates `backend_state["claude"]` from legacy flat fields without data loss.
 - [ ] Writer emits both new and legacy shapes; round-trip is stable.
+- [ ] `load_session`, `load_sessions`, `save_session`, `clear_session` read/write `backend_state[<active>]["session_id"]` with flat-key mirror.
+- [ ] `patch_backend_state` and `patch_team_bot_backend_state` helpers exist and are tested.
+- [ ] All 22 call sites of the legacy JSON helpers are migrated — grep confirms no remaining writes to flat `model`/`effort`/`permissions`/`session_id`/`show_thinking` keys via `patch_project`/`patch_team` (mirror writes happen inside the helpers, not at call sites).
 - [ ] Factory registers `ClaudeBackend` at import; `create()` returns a usable instance.
-- [ ] `/backend`, `/backend claude`, `/backend <unknown>` all behave per §4.4.
+- [ ] `/backend`, `/backend claude`, `/backend <unknown>` all behave per §4.5.
 - [ ] `/thinking`, `/permissions`, `/compact` gated on capabilities.
 - [ ] `/status` includes active backend name.
 - [ ] `manager/config.py` round-trips `backend_state`.
 - [ ] Grep audit of team_relay + group_* files produces either zero Claude-named hits or a list of applied fixes.
 - [ ] `stream.py` shim and `claude_client.py` shim deleted.
 - [ ] All existing tests pass; new tests from §5.1 pass.
-- [ ] Manual smoke (three items in §5.3) passes.
+- [ ] Manual smoke (three items in §5.3) passes, plus: run a Claude turn, stop the bot, inspect on-disk config — `session_id` is persisted at `projects.<name>.backend_state.claude.session_id` and the flat `session_id` mirror matches.
 
 ## 10. Open questions
 
@@ -336,3 +398,5 @@ Covered in §4.7 above.
 | Capability gating silently blocks a command a user expected to work | Error message is specific: "Backend 'claude' does not support /thinking" — phrased so the mis-configuration is obvious |
 | Team-relay audit misses a Claude-named reference | The audit is mechanical grep; all hits are reviewed; add a grep-based regression test (similar to transport-lockout) that fails if Claude-named identifiers leak into non-backend modules |
 | Preamble generalization degrades Claude response quality | A/B the old and new preamble against a handful of real messages before merging; keep the old one as a fallback if regression observed |
+| JSON-helper migration breaks end-of-turn session persistence mid-flight (e.g., step 3a merged without step 3b call-site updates) | Steps 2a + 3a + 3b are contiguous and must land together. Commit review checklist requires all three before the branch advances. The helpers preserve flat-key reads throughout so partial rollout still loads old data correctly. |
+| 22 call sites across three files are tedious to migrate and easy to partially miss | Add a grep-based lockout test in step 3b that fails the build if `patch_project(..., {"session_id": …})` or `patch_team(..., {"session_id": …})` appears outside `config.py` itself. Catches regressions. |
