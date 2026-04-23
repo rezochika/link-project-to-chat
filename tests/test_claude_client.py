@@ -1,4 +1,4 @@
-"""Tests for _sanitize_error() in claude_client."""
+"""Tests for _sanitize_error() in backends.claude."""
 from pathlib import Path
 
 from link_project_to_chat.backends.claude import ClaudeBackend as ClaudeClient, _sanitize_error

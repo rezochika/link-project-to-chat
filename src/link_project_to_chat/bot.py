@@ -29,7 +29,14 @@ from .config import (
 )
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
-from .claude_client import EFFORT_LEVELS, MODELS, PERMISSION_MODES, ClaudeStreamError, is_usage_cap_error
+from .backends.claude import (
+    EFFORT_LEVELS,
+    MODELS,
+    PERMISSION_MODES,
+    ClaudeBackend,
+    ClaudeStreamError,
+    is_usage_cap_error,
+)
 from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -165,6 +172,16 @@ class ProjectBot(AuthMixin):
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
         self._probe_tasks: set[asyncio.Task] = set()
+
+    @property
+    def _claude(self) -> ClaudeBackend:
+        """Tier-2 accessor for Claude-specific behavior (effort, permissions,
+        append_system_prompt, team_system_note, model_display). Only valid
+        while the configured backend is ClaudeBackend; asserts so other
+        backends surface a clear error rather than silent attribute misses."""
+        backend = self.task_manager.backend
+        assert isinstance(backend, ClaudeBackend), "Tier-2 Claude-only access requires ClaudeBackend"
+        return backend
 
     def _effective_config_path(self) -> Path:
         return self._config_path or DEFAULT_CONFIG
@@ -427,25 +444,22 @@ class ProjectBot(AuthMixin):
                 await live_thinking.finalize(render=False)
 
     def _schedule_cap_probe(self, chat: ChatRef, interval_s: int = 1800) -> None:
-        """Probe Claude every `interval_s` seconds; on success, resume the group."""
+        """Probe the backend every `interval_s` seconds; on success, resume the group."""
         chat_id = int(chat.native_id)
         async def _probe() -> None:
-            from .claude_client import ClaudeClient
             while self._group_state.get(chat).halted:
                 await asyncio.sleep(interval_s)
                 if not self._group_state.get(chat).halted:
                     return  # user manually resumed
                 try:
-                    probe = ClaudeClient(project_path=self.path)
-                    result = await probe.chat("ping")
-                    if not result.startswith("Error:") and not is_usage_cap_error(result):
-                        self._group_state.resume(chat)
-                        await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
-                        return
-                except ClaudeStreamError:
-                    pass  # stream error during probe — usage cap may still be active
+                    status = await self.task_manager.backend.probe_health()
                 except Exception:
                     logger.warning("cap probe failed", exc_info=True)
+                    continue
+                if status.ok and not status.usage_capped:
+                    self._group_state.resume(chat)
+                    await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
+                    return
         task = asyncio.create_task(_probe())
         self._probe_tasks.add(task)
         task.add_done_callback(self._probe_tasks.discard)
@@ -862,7 +876,7 @@ class ProjectBot(AuthMixin):
         for model_id, label, desc in self.MODEL_OPTIONS:
             if model_id == raw:
                 return f"{label} — {desc}"
-        return self.task_manager.backend.model_display or raw
+        return self._claude.model_display or raw
 
     async def _on_model(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -881,7 +895,7 @@ class ProjectBot(AuthMixin):
         ])
 
     def _current_effort(self) -> str:
-        return self.task_manager.backend.effort
+        return self._claude.effort
 
     async def _on_effort(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -936,7 +950,7 @@ class ProjectBot(AuthMixin):
         ])
 
     def _current_permission(self) -> str:
-        claude = self.task_manager.backend
+        claude = self._claude
         if claude.skip_permissions:
             return "dangerously-skip-permissions"
         return claude.permission_mode or "default"
@@ -1026,7 +1040,7 @@ class ProjectBot(AuthMixin):
             if not skill:
                 await self._transport.send_text(ci.chat, f"Skill '{name}' not found.")
                 return
-            self.task_manager.backend.append_system_prompt = skill.content
+            self._claude.append_system_prompt = skill.content
             self._active_skill = name
             await self._transport.send_text(
                 ci.chat, f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate."
@@ -1057,7 +1071,7 @@ class ProjectBot(AuthMixin):
             return
         old = self._active_skill
         self._active_skill = None
-        self.task_manager.backend.append_system_prompt = None
+        self._claude.append_system_prompt = None
         await self._transport.send_text(ci.chat, f"Skill '{old}' deactivated.")
 
     async def _on_create_skill(self, ci) -> None:
@@ -1118,7 +1132,7 @@ class ProjectBot(AuthMixin):
         when the real handle is ``@..._dev_2_claude_bot``.
         """
         if not self.peer_bot_username:
-            self.task_manager.backend.team_system_note = None
+            self._claude.team_system_note = None
             return
         peer_role = "developer" if self.role == "manager" else "manager"
         self_line = (
@@ -1126,7 +1140,7 @@ class ProjectBot(AuthMixin):
             if self.bot_username
             else ""
         )
-        self.task_manager.backend.team_system_note = (
+        self._claude.team_system_note = (
             f"You are the '{self.role}' role bot in a dual-agent team group. "
             f"{self_line}"
             f"Your team peer (role: {peer_role}) in this group is @{self.peer_bot_username}. "
@@ -1401,7 +1415,7 @@ class ProjectBot(AuthMixin):
             valid = {m[0] for m in self.MODEL_OPTIONS}
             if name in valid:
                 self.task_manager.backend.model = name
-                self.task_manager.backend.model_display = None
+                self._claude.model_display = None
                 self._patch_config({"model": name})
             await self._transport.edit_text(
                 msg_ref,
@@ -1411,7 +1425,7 @@ class ProjectBot(AuthMixin):
         elif value.startswith("effort_set_"):
             level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
-                self.task_manager.backend.effort = level
+                self._claude.effort = level
                 self._patch_config({"effort": level})
             await self._transport.edit_text(
                 msg_ref,
@@ -1432,8 +1446,8 @@ class ProjectBot(AuthMixin):
             mode = value[len("permissions_set_"):]
             if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
                 skip, pm = resolve_permissions(mode)
-                self.task_manager.backend.skip_permissions = skip
-                self.task_manager.backend.permission_mode = pm
+                self._claude.skip_permissions = skip
+                self._claude.permission_mode = pm
                 self._patch_config({"permissions": mode if mode != "default" else None})
             await self._transport.edit_text(
                 msg_ref,
@@ -1468,7 +1482,7 @@ class ProjectBot(AuthMixin):
             self.task_manager.backend.session_id = None
             self._active_skill = None
             self._active_persona = None
-            self.task_manager.backend.append_system_prompt = None
+            self._claude.append_system_prompt = None
             clear_session(
                 self.name,
                 self._effective_config_path(),
@@ -1486,7 +1500,7 @@ class ProjectBot(AuthMixin):
             _delete_skill(name, self.path, scope=scope)
             if self._active_skill == name:
                 self._active_skill = None
-                self.task_manager.backend.append_system_prompt = None
+                self._claude.append_system_prompt = None
             await self._transport.edit_text(msg_ref, f"Skill '{name}' deleted.")
         elif value == "skill_delete_cancel":
             await self._transport.edit_text(msg_ref, "Cancelled.")
@@ -1503,7 +1517,7 @@ class ProjectBot(AuthMixin):
             if not skill:
                 await self._transport.edit_text(msg_ref, f"Skill '{name}' not found.")
                 return
-            self.task_manager.backend.append_system_prompt = skill.content
+            self._claude.append_system_prompt = skill.content
             self._active_skill = name
             await self._transport.edit_text(
                 msg_ref, f"🧠 Skill '{name}' activated.\nUse /stop_skill to deactivate."
@@ -1635,7 +1649,7 @@ class ProjectBot(AuthMixin):
         lines = [
             f"Project: {self.name}",
             f"Path: {self.path}",
-            f"Model: {self.task_manager.backend.model_display or self.task_manager.backend.model}",
+            f"Model: {self._claude.model_display or self.task_manager.backend.model}",
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st['session_id'] or 'none'}",
             f"Claude: {'RUNNING' if st['running'] else 'idle'}",

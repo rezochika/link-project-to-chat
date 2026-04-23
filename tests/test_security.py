@@ -157,7 +157,7 @@ async def test_send_image_blocks_sibling_dir_prefix_bypass(tmp_path):
 def test_claude_subprocess_env_scrubs_sensitive_vars(tmp_path):
     """AWS_*, GITHUB_TOKEN, OPENAI_API_KEY must not reach Claude subprocess."""
     from unittest.mock import patch as _patch
-    from link_project_to_chat.claude_client import ClaudeClient
+    from link_project_to_chat.backends.claude import ClaudeBackend as ClaudeClient
 
     sensitive = {
         "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",

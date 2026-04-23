@@ -1,3 +1,9 @@
+"""Skill and persona loading.
+
+Skills are backend-agnostic prompt text. The Claude-named fallback path
+(``~/.claude/skills``) is a convenience source only; the loaded markdown is
+shared across backends and not tied to Claude-specific runtime behavior.
+"""
 from __future__ import annotations
 
 import re

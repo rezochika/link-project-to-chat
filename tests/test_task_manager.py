@@ -342,11 +342,11 @@ async def test_list_tasks_ordering(tmp_path):
 
 
 class _FakeClaude:
-    """A stand-in for ClaudeClient that plays scripted event sequences.
+    """A stand-in for ClaudeBackend that plays scripted event sequences.
 
     Each call to ``chat_stream`` yields the next list of events from
     ``self.turns``. ``close_interactive`` / ``cancel`` / the attributes
-    used by ``_exec_claude`` are no-ops.
+    used by ``_exec_agent`` are no-ops.
     """
 
     def __init__(self, turns):

@@ -85,7 +85,7 @@ async def test_ordinary_error_falls_through_normally(tmp_path):
 
 
 def test_is_usage_cap_error_detects_marker():
-    from link_project_to_chat.claude_client import is_usage_cap_error
+    from link_project_to_chat.backends.claude import is_usage_cap_error
     assert is_usage_cap_error("USAGE_CAP: rate limit") is True
     assert is_usage_cap_error("Error: USAGE_CAP: rate limit") is False  # only prefix-matched
     assert is_usage_cap_error("you've reached your usage") is True  # via _detect_usage_cap

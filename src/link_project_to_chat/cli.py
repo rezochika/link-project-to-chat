@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from .claude_client import PERMISSION_MODES
+from .backends.claude import PERMISSION_MODES
 from .config import (
     DEFAULT_CONFIG,
     bind_project_trusted_user,
