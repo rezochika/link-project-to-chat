@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 
-from link_project_to_chat.stream import Error, Result, TextDelta, ThinkingDelta, ToolUse, parse_stream_line
+from link_project_to_chat.backends.claude_parser import parse_stream_line
+from link_project_to_chat.events import Error, Result, TextDelta, ThinkingDelta, ToolUse
 
 
 def _line(obj: dict) -> str:
