@@ -137,7 +137,12 @@ class AgentBackend(Protocol):
     def status(self) -> dict: ...
 ```
 
-**Shape rationale.** The method set is exactly what `TaskManager` and `ProjectBot` call on `ClaudeClient` today; the Protocol is extracted from real usage, not designed aspirationally. Attributes `model` and `session_id` remain on the backend instance (mutable) because `/model` and `/compact` currently mutate them and their Phase 2 equivalents will continue to. The `capabilities` field is declared now but unused in this phase — capability-based gating of commands lands in spec #2.
+**Shape rationale.** The method set is exactly what `TaskManager` and `ProjectBot` call generically on a backend today, minus Claude-specific attrs (see §4.6 tier-2 split). Attributes `model` and `session_id` remain on the backend instance (mutable) because `/model` and `/compact` currently mutate them and their Phase 2 equivalents will continue to.
+
+**Capabilities — what Phase 1 actually consumes.** The `BackendCapabilities` dataclass is introduced and populated by `ClaudeBackend` in Phase 1. Phase 1 consumers:
+- `supports_usage_cap_detection` is consumed indirectly — `probe_health()` is called unconditionally in Phase 1 because Claude is the only registered backend and declares `True`. Phase 2 adds the explicit gate (`if backend.capabilities.supports_usage_cap_detection: await probe_health()`) so Phase 3's Codex can declare `False` without calling a meaningless probe.
+
+All other capability flags (`supports_thinking`, `supports_permissions`, `supports_resume`, `supports_compact`, `supports_allowed_tools`) are **declared** in Phase 1 and **consumed** in Phase 2 (user-facing command gating).
 
 ### 4.3 `ClaudeBackend` — minimal surface change
 
@@ -162,7 +167,88 @@ Claude-specific helpers that are not part of the Protocol (e.g., `EFFORT_LEVELS`
   from .events import *  # noqa: F401,F403
   from .backends.claude_parser import parse_stream_line  # noqa: F401
   ```
-  This keeps any test or caller that still imports from `stream` working. **The shim is deleted in spec #2 after call sites are updated.**
+  This keeps any test or caller that still imports from `stream` working.
+
+**Phase-boundary state for the two shims.** Deterministic, not loose:
+
+| File | End of Phase 1 | End of Phase 2 |
+|---|---|---|
+| `stream.py` | Shim (re-exports from `events` + `backends.claude_parser`) | **Deleted.** All call sites updated to import from `events` or `backends.claude_parser` directly. |
+| `claude_client.py` | **Deleted.** | n/a |
+
+The `claude_client.py` shim exists only *within* Phase 1's commit sequence (step 4 creates it; step 6 removes it). It does not survive to Phase 2. `stream.py` is the only shim that spans phase boundaries.
+
+### 4.4.1 Backend factory — introduced in Phase 1 (moved forward)
+
+`backends/factory.py` is introduced in Phase 1 with a single registered backend (`"claude"`). Moving it forward avoids a throwaway `_make_backend_from_legacy_config` helper that would exist only between Phase 1 step 5 and Phase 2's factory introduction.
+
+```python
+# backends/factory.py
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+
+from .base import AgentBackend
+
+BackendFactory = Callable[[Path, dict], AgentBackend]
+
+_registry: dict[str, BackendFactory] = {}
+
+
+def register(name: str, factory: BackendFactory) -> None:
+    if name in _registry:
+        raise ValueError(f"Backend {name!r} already registered")
+    _registry[name] = factory
+
+
+def create(name: str, project_path: Path, state: dict) -> AgentBackend:
+    if name not in _registry:
+        raise KeyError(f"Unknown backend {name!r}; available: {sorted(_registry)}")
+    return _registry[name](project_path, state)
+
+
+def available() -> list[str]:
+    return sorted(_registry)
+```
+
+**Phase 1 state-dict shape.** The `state: dict` parameter is a plain dict. In Phase 1, the caller in `bot.py` builds it from the existing flat `ProjectConfig` fields:
+```python
+state = {
+    "model": project_config.model,
+    "effort": project_config.effort,
+    "permissions": project_config.permissions,
+    "session_id": project_config.session_id,
+    "show_thinking": project_config.show_thinking,
+}
+backend = create("claude", Path(project_config.path), state)
+```
+
+In Phase 2, the same call becomes `create(project_config.backend, Path(project_config.path), project_config.backend_state.get(project_config.backend, {}))`. The factory signature and registration do not change — only the input source. No throwaway helper needed.
+
+`ClaudeBackend` self-registers at module import:
+
+```python
+# backends/claude.py (end of file)
+from .factory import register
+
+
+def _make_claude(project_path: Path, state: dict) -> ClaudeBackend:
+    permissions = state.get("permissions")
+    backend = ClaudeBackend(
+        project_path=project_path,
+        model=state.get("model") or DEFAULT_MODEL,
+        skip_permissions=(permissions == "dangerously-skip-permissions"),
+        permission_mode=permissions if permissions != "dangerously-skip-permissions" else None,
+    )
+    backend.session_id = state.get("session_id")
+    backend.show_thinking = bool(state.get("show_thinking"))
+    backend.effort = state.get("effort") or "medium"
+    return backend
+
+
+register("claude", _make_claude)
+```
 
 ### 4.5 `TaskManager` — full rename to agent-neutral identifiers
 
@@ -196,14 +282,44 @@ from .claude_client import ClaudeClient
 
 Grep-audit of [bot.py](src/link_project_to_chat/bot.py) produces three categories. Phase 1 handles categories A and B; category C moves to Phase 2.
 
-**Category A — Direct attribute access via `task_manager.claude`.** ≥20 occurrences (lines 493, 497, 844, 852, 856, 875, 949, 1020, 1051, 1112, 1120, 1394, 1395, 1405, 1426, 1427, …). All rename to `task_manager.backend` in lockstep with the `TaskManager` rename. Every call is still legal against the Protocol because `session_id`, `model`, `effort`, `skip_permissions`, `permission_mode`, `model_display`, `append_system_prompt`, `team_system_note` are all preserved as instance attributes on `ClaudeBackend`.
+**Category A — Direct attribute access via `task_manager.claude`.** ≥20 occurrences (lines 493, 497, 844, 852, 856, 875, 949, 1020, 1051, 1112, 1120, 1394, 1395, 1405, 1426, 1427, …). All rename to `task_manager.backend` in lockstep with the `TaskManager` rename.
+
+**Two access tiers — deliberate split.** Of the attributes bot.py touches, only `session_id`, `model`, and `status` are on the `AgentBackend` Protocol. The rest — `effort`, `skip_permissions`, `permission_mode`, `model_display`, `append_system_prompt`, `team_system_note` — are **Claude-specific concepts** that this spec intentionally does **not** promote to the Protocol. Reason: hoisting them would force future backends (Codex) to express their reasoning/permission/model-display concepts in Claude's vocabulary — the lowest-common-denominator trap the original v1.0 spec's §2 non-goals called out.
+
+Instead, Phase 1 splits bot.py's reads/writes into two tiers:
+
+- **Tier 1 (Protocol-typed):** `task_manager.backend.{model, session_id, status, chat, chat_stream, probe_health, close_interactive, cancel}`. These are the contract. Any backend provides them.
+- **Tier 2 (concrete-typed):** `task_manager.backend.{effort, skip_permissions, permission_mode, model_display, append_system_prompt, team_system_note}`. These access Claude-specific attrs and are valid only while Claude is the active backend.
+
+To make tier 2 explicit in code, bot.py's Phase 1 implementation uses a tiny helper:
+
+```python
+# bot.py
+from .backends.claude import ClaudeBackend
+
+@property
+def _claude(self) -> ClaudeBackend:
+    """Claude-specific accessor. Phase 1: always valid (only Claude is registered).
+    Phase 2 replaces per-attribute uses with capability-aware command methods
+    (e.g., backend.set_effort(...) guarded on capabilities.supports_effort)."""
+    backend = self.task_manager.backend
+    assert isinstance(backend, ClaudeBackend), (
+        "Tier-2 access attempted on non-Claude backend; should be "
+        "capability-gated by Phase 2"
+    )
+    return backend
+```
+
+Sites that read/write tier-2 attrs route through `self._claude.effort`, `self._claude.permission_mode`, etc. The assertion documents the Phase-1-only assumption and will naturally surface if Phase 2's capability gating misses a site. In Phase 2, the `ClaudeBackend`-typed accessor goes away — replaced with per-capability methods on the Protocol (e.g., `AgentBackend.set_reasoning_effort(level: str)` for backends that declare `supports_reasoning_effort`).
+
+This split keeps the Protocol honest: it lists only attributes every backend must provide, with no Claude-specific pollution.
 
 **Category B — Direct imports from `claude_client`.** [bot.py:32](src/link_project_to_chat/bot.py:32) imports `EFFORT_LEVELS, MODELS, PERMISSION_MODES, ClaudeStreamError, is_usage_cap_error`. Action in Phase 1:
 - Move imports from `claude_client` → `backends.claude` (module path change only).
 - Keep them Claude-typed for now — these are legitimately Claude-specific values until the capability-aware generalization in spec #2.
 - Leaves the user-visible behavior unchanged while severing the dead-module dependency (`claude_client.py` is deleted in spec #2).
 
-**Category C — User-facing "Claude" strings.** Lines 43 ("Set Claude model"), 575 ("chat with Claude"), and similar. **Not touched in Phase 1.** These need to say the active backend's name ("Claude" or "Codex"), which requires spec #2's capability-aware plumbing. Changing them now either hardcodes "Claude" (wrong later) or introduces a branch that has no second arm yet. Left for Phase 2 §4.8.
+**Category C — User-facing "Claude" strings.** Lines 43 ("Set Claude model"), 575 ("chat with Claude"), and similar. **Not touched in Phase 1.** These need to say the active backend's name ("Claude" or "Codex"), which requires spec #2's capability-aware plumbing. Changing them now either hardcodes "Claude" (wrong later) or introduces a branch that has no second arm yet. Left for Phase 2 §4.9 (help-text generalization).
 
 ### 4.7 Backend health probe — move `_schedule_cap_probe` off `ClaudeClient`
 
@@ -322,12 +438,12 @@ Spec #3 revisits only if Codex-CLI-specific skill packaging turns out to exist.
 
 1. **Introduce events module.** Copy event dataclasses from `stream.py` into new `events.py`. `stream.py` re-exports from `events`. No behavior change, no call-site updates. Green tests.
 2. **Introduce backends package with parser.** Move `parse_stream_line` to `backends/claude_parser.py`. `stream.py` re-exports it. Green tests.
-3. **Introduce `AgentBackend` Protocol + `HealthStatus`.** New file `backends/base.py`. No callers yet. Green tests.
-4. **Move `ClaudeClient` → `ClaudeBackend`.** New file `backends/claude.py`. Implement `probe_health()` method (replaces what `_schedule_cap_probe` does inline today). Old `claude_client.py` becomes a one-line re-export shim: `from .backends.claude import ClaudeBackend as ClaudeClient`. Call sites unchanged. Green tests.
-5. **Inject backend into `TaskManager` + rename internals.** `TaskManager.__init__` takes `backend: AgentBackend`. All identifiers renamed per §4.5 table (`_claude` → `_backend`, `submit_claude` → `submit_agent`, `TaskType.CLAUDE` → `TaskType.AGENT`, etc.). `bot.py` updated to construct and pass. Existing test files updated to match new identifiers. Green tests + manual smoke.
-6. **`bot.py` Claude-identifier scrub (category A + B).** Rename all `self.task_manager.claude.X` → `self.task_manager.backend.X` (≥20 sites per §4.6). Redirect `claude_client` imports → `backends.claude`. `claude_client.py` shim removed. Green tests.
+3. **Introduce `AgentBackend` Protocol + `HealthStatus` + factory.** New file `backends/base.py` (Protocol, `BackendCapabilities`, `HealthStatus`) and `backends/factory.py` (register/create/available). No callers yet; empty registry. Green tests.
+4. **Move `ClaudeClient` → `ClaudeBackend`.** New file `backends/claude.py`. Implement `probe_health()` method (replaces what `_schedule_cap_probe` does inline today). Self-registers with factory as `"claude"`. Old `claude_client.py` becomes a one-line re-export shim: `from .backends.claude import ClaudeBackend as ClaudeClient`. Call sites unchanged. Green tests.
+5. **Inject backend into `TaskManager` + rename internals + switch bot.py to factory.** `TaskManager.__init__` takes `backend: AgentBackend`. All identifiers renamed per §4.5 table (`_claude` → `_backend`, `submit_claude` → `submit_agent`, `TaskType.CLAUDE` → `TaskType.AGENT`, etc.). `bot.py` calls `backends.factory.create("claude", path, state_from_legacy_fields)` instead of instantiating `ClaudeClient`. Existing test files updated to match new identifiers. Green tests + manual smoke.
+6. **`bot.py` Claude-identifier scrub (category A + B).** Rename all `self.task_manager.claude.X` → `self.task_manager.backend.X` (≥20 sites per §4.6). Route tier-2 (Claude-specific) accesses through the `_claude` property. Redirect `claude_client` imports → `backends.claude`. **`claude_client.py` deleted.** Green tests.
 7. **Route `_schedule_cap_probe` through `backend.probe_health()`.** Remove the lazy `from .claude_client import ClaudeClient` from `bot.py`. Green tests + manual smoke (halt group, wait for probe, verify resume).
-8. **Update tests.** Add `FakeBackend` with `probe_health` support, contract test, backend-lockout test, bot-backend-lockout test.
+8. **Update tests.** Add `FakeBackend` with `probe_health` support, factory test, contract test, backend-lockout test, bot-backend-lockout test.
 9. **Document decision.** Add skills audit note per §6. Update [CLAUDE.md](CLAUDE.md) "Key modules" section to mention `backends/`.
 
 ### 7.2 Rollback
@@ -340,10 +456,12 @@ Each commit is revertable independently. If any commit reveals a blocker, revert
 - [ ] `task_manager.py` has no identifier containing "claude" (attrs, methods, TaskType values) — verified by `grep -iw claude src/link_project_to_chat/task_manager.py` returning no hits.
 - [ ] `bot.py` has zero `ClaudeClient(` construction sites and zero `.claude.` attribute-chain references off `task_manager`.
 - [ ] `backends/base.py` defines `AgentBackend` Protocol, `BackendCapabilities` (with `supports_usage_cap_detection`), and `HealthStatus`.
+- [ ] `backends/factory.py` exists with `register`/`create`/`available`; `ClaudeBackend` self-registers at module import.
 - [ ] `backends/claude.py` implements `AgentBackend` with `name = "claude"`, declared capabilities, and working `probe_health()`.
+- [ ] `bot.py` uses `backends.factory.create(...)` for backend construction — no direct `ClaudeBackend(...)` call.
 - [ ] `_schedule_cap_probe` in `bot.py` routes through `task_manager.backend.probe_health()` — no lazy `ClaudeClient` import.
-- [ ] `events.py` and `backends/claude_parser.py` exist; `stream.py` is a shim or deleted.
-- [ ] `claude_client.py` is deleted (or is a one-line shim scheduled for deletion in spec #2).
+- [ ] `events.py` and `backends/claude_parser.py` exist; `stream.py` is a shim (one-line re-exports only). Deletion is owned by Phase 2.
+- [ ] `claude_client.py` is **deleted** at end of Phase 1 (step 6). No shim survives to Phase 2.
 - [ ] Contract test passes for `ClaudeBackend` and `FakeBackend` (including `probe_health` coverage).
 - [ ] Backend-lockout test and bot-backend-lockout test pass.
 - [ ] All existing tests pass (updated for the rename, assertions unchanged).

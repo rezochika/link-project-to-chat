@@ -20,7 +20,7 @@ This spec teaches the config to carry a `backend` selector plus a per-provider `
 
 **Goals**
 - Extend `ProjectConfig` and `TeamBotConfig` with `backend: str = "claude"` and `backend_state: dict[str, dict]`.
-- Implement read-old/write-new migration: legacy flat fields read from disk populate `backend_state["claude"]`; writes go to the new shape only.
+- Implement config migration: the new `backend_state` shape is authoritative in memory and on every write; legacy flat fields are *mirrored* on write for one release (downgrade safety) and read as a fallback when `backend_state` is absent. Mirror fields are computed from `backend_state["claude"]` at write time, never stored independently in memory. Details in §4.2.
 - **Migrate the direct JSON helpers** (`load_sessions`, `load_session`, `save_session`, `clear_session`, `patch_project`, `patch_team` — 22 call sites) so they read/write the new `backend_state[<provider>]` shape instead of flat keys. Without this, Claude turns would revert migration on every save. See §4.3.
 - Add a backend factory keyed by name; register `ClaudeBackend`.
 - Add `/backend` command (show + switch).
@@ -183,65 +183,24 @@ def patch_team_bot_backend_state(
 
 **Call-site migration is part of this phase's commit sequence**, not deferred. See step 2b in §8.1.
 
-### 4.4 Backend factory
+### 4.4 Backend factory — swap input source from legacy fields to `backend_state`
 
-New file `backends/factory.py`:
+The factory (`backends/factory.py`) and `ClaudeBackend` self-registration were **introduced in Phase 1** (see spec #1 §4.4.1). Phase 2 does not re-introduce them; it only changes the input source.
 
+**Phase 1 call in bot.py (from Phase 1 §4.4.1):**
 ```python
-from __future__ import annotations
-
-from collections.abc import Callable
-from pathlib import Path
-
-from .base import AgentBackend
-
-# Factory takes the project path + the provider-specific state dict
-# and returns a ready-to-use backend instance.
-BackendFactory = Callable[[Path, dict], AgentBackend]
-
-_registry: dict[str, BackendFactory] = {}
-
-
-def register(name: str, factory: BackendFactory) -> None:
-    if name in _registry:
-        raise ValueError(f"Backend {name!r} already registered")
-    _registry[name] = factory
-
-
-def create(name: str, project_path: Path, state: dict) -> AgentBackend:
-    if name not in _registry:
-        raise KeyError(f"Unknown backend {name!r}; available: {sorted(_registry)}")
-    return _registry[name](project_path, state)
-
-
-def available() -> list[str]:
-    return sorted(_registry)
+state = {
+    "model": project_config.model,
+    "effort": project_config.effort,
+    "permissions": project_config.permissions,
+    "session_id": project_config.session_id,
+    "show_thinking": project_config.show_thinking,
+}
+backend = create("claude", Path(project_config.path), state)
 ```
 
-`ClaudeBackend` self-registers at `backends/claude.py` import:
+**Phase 2 call in bot.py:**
 ```python
-from .factory import register
-
-
-def _make_claude(project_path, state):
-    backend = ClaudeBackend(
-        project_path=project_path,
-        model=state.get("model") or DEFAULT_MODEL,
-        skip_permissions=(state.get("permissions") == "dangerously-skip-permissions"),
-        permission_mode=state.get("permissions") if state.get("permissions") != "dangerously-skip-permissions" else None,
-    )
-    backend.session_id = state.get("session_id")
-    backend.show_thinking = bool(state.get("show_thinking"))
-    backend.effort = state.get("effort") or "medium"
-    return backend
-
-
-register("claude", _make_claude)
-```
-
-`bot.py`'s backend-construction helper (added in spec #1's step 5) now reads:
-```python
-from .backends.factory import create
 backend = create(
     project_config.backend,
     Path(project_config.path),
@@ -249,19 +208,32 @@ backend = create(
 )
 ```
 
+Factory signature and registration are unchanged. Only the input dict moves from flat legacy fields to `backend_state[<active>]`. The `ClaudeBackend` `_make_claude` factory function already reads from a state dict, so no factory-side change is needed.
+
 ### 4.5 `/backend` command
 
-Three forms:
+Four forms:
 
 | Form | Behavior |
 |---|---|
 | `/backend` | Reply with active backend name + available backends + one-line capability summary of the active one |
-| `/backend <name>` | Switch the active backend; persist to config; close_interactive() on old backend; hydrate new one from `backend_state[<name>]` (empty dict if absent) |
-| `/backend <unknown>` | Reply with error + available list |
+| `/backend <active>` | **No-op** when `<active>` equals the currently-active backend name. Reply: "`<Name>` is already active." No `close_interactive`, no rehydration, no session reset, no disk write. |
+| `/backend <other>` | Switch the active backend. See ordering below. |
+| `/backend <unknown>` | Reply with error + available list. |
 
 Handler lives in [`bot.py`](src/link_project_to_chat/bot.py) alongside other command handlers. Wires through the existing auth mixin (trusted-user check).
 
-`/backend <name>` persists the new selection to disk **before** activating the new backend, so a crash during activation doesn't leave the on-disk state ahead of the runtime state.
+**Switch ordering — activate first, persist on success.**
+
+1. Validate the new backend name is registered. On failure, reply "unknown backend" and return. No state changed.
+2. Build the new backend via `factory.create(new_name, self.path, backend_state.get(new_name, {}))`. If construction raises, reply with the error and return. Old backend remains active; disk unchanged.
+3. Call `close_interactive()` on the current backend. Swap `task_manager._backend` to the new instance.
+4. **On success**, persist the new selection: update `project_config.backend = new_name` and call `patch_project(name, {"backend": new_name})` (or the analogous team-bot helper).
+5. Reply "Switched to `<name>`."
+
+Rationale for this order (contrary to the earlier draft): persist-first means a crash between persist and activation leaves disk ahead of runtime — on next start, the bot loads a backend that was never successfully activated. Activate-first keeps disk as the follower. If a crash happens mid-swap (between step 3 and step 4), the on-disk selection still points at the previous backend; the process will be restarted by the manager and come up on the old backend, which the user can retry from.
+
+**No tasks-in-flight.** If `task_manager` reports any live agent task, `/backend <other>` rejects with "Cancel running tasks before switching backend." (Matches spec #3 §4.4; introduced here so it's in place by the time Codex lands.)
 
 ### 4.6 Capability gating
 
@@ -279,13 +251,34 @@ Analogous for `/permissions` (→ `supports_permissions`) and `/compact` (→ `s
 
 ### 4.7 Manager-bot propagation
 
-[`manager/config.py`](src/link_project_to_chat/manager/config.py) is the schema-aware writer used when the manager creates/edits project entries. Changes:
+**Current state of `manager/config.py`.** Verified at [manager/config.py](src/link_project_to_chat/manager/config.py): it is a **raw-dict passthrough**, not a schema-aware serializer. `load_project_configs` returns `dict[str, dict]` filtered only by "has a `path` key". `save_project_configs` does `raw.update({"projects": projects})` — it replaces the entire projects dict wholesale. There is no migration, no field validation, no typed dataclass round-trip.
 
-- Preserve `backend` and `backend_state` on round-trip. Do not flatten.
-- New project creation defaults `backend = config.default_backend` and `backend_state = {}`.
-- When the manager edits per-project fields (e.g., model, permissions) via its command surface, write to `backend_state[<active>]` instead of flat fields.
+**Changes needed in `manager/config.py`:**
 
-[`manager/bot.py`](src/link_project_to_chat/manager/bot.py) launches each project bot as a subprocess. No changes needed there — the subprocess reads its own config on startup via the updated loader. **Audit item:** grep `manager/bot.py` for any direct reads of `model`/`effort`/`permissions` on a `ProjectConfig` before subprocess launch; replace with `backend_state[cfg.backend].get(...)` if found.
+- Preserve `backend` and `backend_state` keys verbatim on any round-trip through `load_project_configs`/`save_project_configs`. Because the module already treats projects as opaque dicts, this "just works" for any new keys — **but** add an explicit round-trip test to lock the behavior in, because nothing in the current code distinguishes "known" from "unknown" project fields. Without a test, a future refactor that starts validating fields could silently drop `backend_state`.
+- `_filter_valid_projects` currently filters on "is a dict with a `path` key". Leave this unchanged — it correctly handles entries that have `backend_state` too.
+- Add helper `set_project_backend(project_name, backend_name, path)` that writes `project["backend"] = backend_name` via `_patch_json`, analogous to the existing `set_project_autostart`.
+
+**Current state of `manager/bot.py` — real changes, not just an audit.** The reviewer's original concern was correct: manager/bot.py does more than just launch subprocesses. Verified sites:
+
+- [manager/bot.py:34–35](src/link_project_to_chat/manager/bot.py:34) registers `/add_project` and `/edit_project` commands.
+- [manager/bot.py:49](src/link_project_to_chat/manager/bot.py:49) defines `_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions")` — `/edit_project <proj> model <value>` and `/edit_project <proj> permissions <value>` write flat keys directly, bypassing `backend_state`.
+- [manager/bot.py:629](src/link_project_to_chat/manager/bot.py:629) `_add_model` is a step in the `/add_project` wizard that stores the user's model choice.
+- [manager/bot.py:1934](src/link_project_to_chat/manager/bot.py:1934) writes `projects[name]["model"] = model_id` on the global model-selection button callback.
+- [manager/bot.py:507–527, 1952–1965](src/link_project_to_chat/manager/bot.py:507) implement a global `/model` command on the manager that reads/writes `Config.default_model`.
+
+**Concrete changes in Phase 2:**
+
+1. **`_EDITABLE_FIELDS` update.** `model` and `permissions` entries in the list stay, but the handler at [line 746+](src/link_project_to_chat/manager/bot.py:746) routes writes through the new `patch_backend_state(project_name, project_config.backend, {"model": value})` helper from §4.3, not through `patch_project` with flat keys. The user-facing command surface is unchanged; the underlying write target changes.
+2. **`/add_project` wizard `_add_model` step.** Change the final config write to populate `backend_state[default_backend]["model"] = model_id` and `backend = default_backend`. Flat `model` is still mirrored (downgrade safety per §4.2) but the authoritative write is to `backend_state`.
+3. **Line 1934 project-model callback.** Same change: write to `backend_state[project["backend"]]["model"]`, mirror flat.
+4. **Global `/model` command and `default_model`.** `default_model` becomes semantically **backend-specific** once `default_backend` exists. Two options; pick one in this phase:
+   - **Option A (chosen):** Rename `default_model` → `default_model_claude` and introduce `default_model_codex` (empty until spec #3). The global `/model` selector shows the model list for `default_backend` only. Simple, no per-backend UI churn.
+   - Option B: Add a per-backend default-model mapping `default_models: dict[str, str]`. More flexible, but no use case yet.
+
+   This spec chooses Option A. Migration: `default_model` → `default_model_claude` in the reader (§4.2); legacy field mirrored on write.
+
+No "audit" framing — these are concrete, enumerated changes with code-line citations.
 
 ### 4.8 Group/team relay audit
 
@@ -310,17 +303,18 @@ User-facing strings in `bot.py` that currently reference "Claude" by name are re
 - **Generalized** to "the agent" if the concept applies to any backend.
 - **Parameterized** via `task_manager.backend.name` if the user benefits from seeing which backend is active.
 
-The `_TELEGRAM_AWARENESS` preamble ([claude_client.py:94–115](src/link_project_to_chat/claude_client.py:94)) hardcodes a command list. This phase moves it to a template that the backend fills in using its declared capabilities, so Codex (in spec #3) can omit commands it doesn't support without forking the preamble.
+The `_TELEGRAM_AWARENESS` preamble (now at `backends/claude.py` after Phase 1 step 4; was formerly `claude_client.py:94–115`) hardcodes a command list. This phase moves it to a template that the backend fills in using its declared capabilities, so Codex (in spec #3) can omit commands it doesn't support without forking the preamble.
 
 ## 5. Testing strategy
 
 ### 5.1 New tests
 
-- `tests/test_config_migration.py` — four cases from §4.2.
-- `tests/backends/test_factory.py` — register/create/available; unknown backend raises.
-- `tests/test_backend_command.py` — `/backend`, `/backend claude`, `/backend bogus`; switching closes old interactive process; persistence happens before activation.
+- `tests/test_config_migration.py` — four cases from §4.2 plus the JSON-helper cases from §4.3 (six helpers, legacy-only / new-shape / mixed entries).
+- Extend `tests/backends/test_factory.py` (created in Phase 1) — round-trip through `create()` using `backend_state` input.
+- `tests/test_backend_command.py` — `/backend`, `/backend claude` (no-op case), `/backend <switch>` (activate-first ordering; crash-during-activate leaves disk unchanged), `/backend bogus`, switch-with-live-task rejection.
 - `tests/test_capability_gating.py` — `/thinking`, `/permissions`, `/compact` gated correctly. Uses a `FakeBackend` with capabilities tuned per test.
-- Extend `tests/test_manager_config.py` (create if absent) — manager writes preserve `backend_state`.
+- Extend `tests/test_manager_config.py` (create if absent) — `manager/config.py` round-trips `backend` and `backend_state` verbatim (locks in the raw-dict passthrough behavior per §4.7).
+- New `tests/test_manager_bot_backend.py` — `/add_project` wizard writes to `backend_state[default_backend]`; `/edit_project <proj> model <value>` writes to `backend_state[<proj's backend>].model`; global `/model` shows models for `default_backend`.
 
 ### 5.2 Regression
 
@@ -337,11 +331,11 @@ The `_TELEGRAM_AWARENESS` preamble ([claude_client.py:94–115](src/link_project
 
 ## 6. Folded gap: manager-bot backend propagation
 
-Covered in §4.6 above.
+Covered in §4.7 above.
 
 ## 7. Folded gap: group/team relay Claude-name audit
 
-Covered in §4.7 above.
+Covered in §4.8 above.
 
 ## 8. Migration & rollout
 
@@ -353,13 +347,15 @@ Covered in §4.7 above.
 3. **Writer dual-emit.** `save_config` writes new shape + mirrored legacy fields. Migration round-trip tests added. Green tests.
    - **3a. JSON-helper writers.** Migrate `save_session`, `clear_session` to write `backend_state[<active>]["session_id"]` with mirrored flat key. Add `patch_backend_state` / `patch_team_bot_backend_state`. Green tests.
    - **3b. Call-site migration.** Update the 22 call sites across `bot.py`, `manager/bot.py`, `config.py` to use the migrated helpers (or the new `patch_backend_state` helper for model/effort/permissions/show_thinking). Green tests + manual smoke: run a Claude turn end-to-end, inspect the config on disk, confirm `backend_state["claude"]["session_id"]` is populated and the flat `session_id` mirror stays in sync.
-4. **Factory + registration.** `backends/factory.py` and `ClaudeBackend` self-registration. `bot.py` switches to factory-based construction. Green tests.
-5. **`/backend` command.** Handler + persistence + close_interactive-on-switch. Tests added. Green tests.
-6. **Capability gating.** `/thinking`, `/permissions`, `/compact`, `/model` routed through capabilities. Tests added. Green tests.
-7. **Manager propagation.** `manager/config.py` preserves new schema; audit `manager/bot.py`. Green tests.
-8. **Relay audit + fixes.** Grep pass on team_relay/group_*/tests; apply fixes. Green tests + manual smoke with a team bot.
-9. **Help-text + preamble generalization.** Parameterize `_TELEGRAM_AWARENESS` by capabilities. Smoke-test Claude response quality. Green tests.
-10. **Drop `stream.py` shim and `claude_client.py` shim.** (Deferred from spec #1.) Update any stragglers. Green tests.
+4. **Factory input source swap.** Change `bot.py`'s `create(...)` call from flat-fields input to `backend_state[<active>]` input. Factory and `ClaudeBackend` registration are unchanged (inherited from Phase 1 step 3). Green tests.
+5. **`/backend` command.** Handler with four forms (including same-backend no-op and activate-first ordering per §4.5). Reject switch with live tasks. Tests added. Green tests.
+6. **Capability gating.** `/thinking`, `/permissions`, `/compact`, `/model` routed through capabilities. Cap-probe gate added (calls `probe_health()` only when `supports_usage_cap_detection`). Tests added. Green tests.
+7. **Manager `config.py` round-trip.** Add test that locks in preservation of `backend` and `backend_state`. Add `set_project_backend` helper. Green tests.
+8. **Manager `bot.py` per-project command migration.** `/edit_project model`, `/edit_project permissions`, `/add_project` wizard, line-1934 project-model callback all write via `patch_backend_state`. Green tests.
+9. **Manager global `/model` + `default_model` split.** Rename `default_model` → `default_model_claude`; global `/model` selector consults `default_backend`'s model list. Migration reader mirrors old key. Green tests.
+10. **Relay audit + fixes.** Grep pass on team_relay/group_*/tests; apply fixes. Green tests + manual smoke with a team bot.
+11. **Help-text + preamble generalization.** Parameterize `_TELEGRAM_AWARENESS` (now at `backends/claude.py`) by capabilities. Smoke-test Claude response quality. Green tests.
+12. **Drop `stream.py` shim.** Update any stragglers that still import from `stream`. Green tests. (Note: `claude_client.py` is already deleted by Phase 1 step 6, not here.)
 
 ### 8.2 Downgrade safety
 
@@ -380,7 +376,10 @@ Covered in §4.7 above.
 - [ ] `/status` includes active backend name.
 - [ ] `manager/config.py` round-trips `backend_state`.
 - [ ] Grep audit of team_relay + group_* files produces either zero Claude-named hits or a list of applied fixes.
-- [ ] `stream.py` shim and `claude_client.py` shim deleted.
+- [ ] `stream.py` shim deleted (Phase 2 step 12). `claude_client.py` was already deleted by Phase 1 step 6 — Phase 2 confirms no imports of it remain.
+- [ ] `manager/config.py` preserves `backend`/`backend_state` on round-trip (locked in by test).
+- [ ] `manager/bot.py` per-project commands (`/edit_project`, `/add_project`, project-model callback at line 1934) write via `patch_backend_state`, not flat keys.
+- [ ] Global `/model` in manager consults `default_backend`'s model list. `default_model` renamed to `default_model_claude` with legacy-key mirror.
 - [ ] All existing tests pass; new tests from §5.1 pass.
 - [ ] Manual smoke (three items in §5.3) passes, plus: run a Claude turn, stop the bot, inspect on-disk config — `session_id` is persisted at `projects.<name>.backend_state.claude.session_id` and the flat `session_id` mirror matches.
 
