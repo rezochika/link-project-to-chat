@@ -98,6 +98,53 @@ async def test_on_message_handler_fires_on_telegram_update():
     assert received[0].chat.native_id == "12345"
 
 
+async def test_incoming_file_tempdir_is_cleaned_after_handlers_return():
+    t, _bot = _make_transport_with_mock_bot()
+    seen_exists: list[bool] = []
+    seen_paths = []
+
+    async def handler(msg):
+        file = msg.files[0]
+        seen_exists.append(file.path.exists())
+        seen_paths.append(file.path)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    document = SimpleNamespace(
+        file_name="report.txt",
+        mime_type="text/plain",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100,
+        chat=tg_chat,
+        from_user=tg_user,
+        text=None,
+        caption=None,
+        photo=None,
+        document=document,
+        voice=None,
+        audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=SimpleNamespace(user_data={}))
+
+    assert seen_exists == [True]
+    assert seen_paths
+    assert not seen_paths[0].exists()
+
+
 async def test_on_command_handler_fires_for_telegram_command():
     t, _bot = _make_transport_with_mock_bot()
     captured: list = []
@@ -183,9 +230,11 @@ async def test_incoming_message_populates_files_from_document(tmp_path):
     """Document attachments get downloaded and exposed as IncomingFile."""
     t, _bot = _make_transport_with_mock_bot()
     captured: list = []
+    captured_bytes: list[bytes] = []
 
     async def handler(msg):
         captured.append(msg)
+        captured_bytes.append(msg.files[0].path.read_bytes())
 
     t.on_message(handler)
 
@@ -232,7 +281,8 @@ async def test_incoming_message_populates_files_from_document(tmp_path):
     f = captured[0].files[0]
     assert f.original_name == "notes.txt"
     assert f.mime_type == "text/plain"
-    assert f.path.read_bytes() == downloaded_bytes
+    assert captured_bytes == [downloaded_bytes]
+    assert not f.path.exists()
     # Caption becomes the message text when no text is set.
     assert captured[0].text == "see this file"
 
@@ -338,9 +388,11 @@ async def test_incoming_message_populates_files_from_voice(tmp_path):
     """Voice attachments get downloaded and exposed as IncomingFile with audio mime."""
     t, _bot = _make_transport_with_mock_bot()
     captured: list = []
+    captured_bytes: list[bytes] = []
 
     async def handler(msg):
         captured.append(msg)
+        captured_bytes.append(msg.files[0].path.read_bytes())
 
     t.on_message(handler)
 
@@ -383,7 +435,8 @@ async def test_incoming_message_populates_files_from_voice(tmp_path):
     assert len(captured[0].files) == 1
     f = captured[0].files[0]
     assert f.mime_type == "audio/ogg"
-    assert f.path.read_bytes() == downloaded_bytes
+    assert captured_bytes == [downloaded_bytes]
+    assert not f.path.exists()
 
 
 async def test_default_error_handler_logs_on_exception(caplog):
@@ -549,6 +602,52 @@ async def test_enable_team_relay_lifecycle():
     assert removed_callbacks == ["_on_new_message", "_on_message_edited"]
 
 
+async def test_post_hooks_run_ready_callbacks_and_team_relay_for_run_polling():
+    """Application.run_polling() uses post hooks rather than TelegramTransport.start()."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+    bot.set_my_commands = AsyncMock()
+    t._menu = [("help", "Help")]
+
+    ready: list[str | None] = []
+
+    async def on_ready(identity):
+        ready.append(identity.handle)
+
+    t.on_ready(on_ready)
+
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.is_user_authorized = AsyncMock(return_value=True)
+    mock_client.disconnect = AsyncMock()
+    mock_client.add_event_handler = MagicMock(return_value=object())
+    mock_client.remove_event_handler = MagicMock()
+    t.enable_team_relay(
+        telethon_client=mock_client,
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100123,
+        team_name="acme",
+    )
+
+    await t.post_init(t.app)
+
+    assert ready == ["bot_a"]
+    bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=True)
+    bot.get_me.assert_awaited_once()
+    bot.set_my_commands.assert_awaited_once_with([("help", "Help")])
+    mock_client.connect.assert_awaited_once()
+    mock_client.is_user_authorized.assert_awaited_once()
+    assert mock_client.add_event_handler.call_count == 2
+
+    await t.post_stop(t.app)
+
+    assert mock_client.remove_event_handler.call_count == 2
+    mock_client.disconnect.assert_awaited_once()
+
+
 async def test_build_without_enable_team_relay_starts_and_stops_cleanly():
     """TelegramTransport without a team relay starts/stops without touching relay code."""
     t, bot = _make_transport_with_mock_bot()
@@ -568,3 +667,172 @@ async def test_app_property_returns_underlying_application():
     app = t.app
     assert app is t._app  # exposes the same instance
     assert hasattr(app, "add_handler")  # quacks like an Application
+
+
+async def test_enable_team_relay_from_session_constructs_client(monkeypatch):
+    """TelegramTransport.enable_team_relay_from_session owns the telethon import
+    so bot.py never has to know the optional library exists."""
+    from types import SimpleNamespace
+    constructed: list = []
+
+    class FakeTelegramClient:
+        def __init__(self, session, api_id, api_hash):
+            constructed.append((session, api_id, api_hash))
+
+    fake_telethon = SimpleNamespace(TelegramClient=FakeTelegramClient)
+    monkeypatch.setitem(__import__("sys").modules, "telethon", fake_telethon)
+
+    t, _bot = _make_transport_with_mock_bot()
+    t.enable_team_relay_from_session(
+        session_path="/tmp/x.session",
+        api_id=12345,
+        api_hash="secret",
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100,
+        team_name="acme",
+    )
+
+    assert constructed == [("/tmp/x.session", 12345, "secret")]
+    assert t._team_relay is not None
+
+
+async def test_tempdir_cleanup_runs_even_when_handler_raises(tmp_path):
+    """A handler exception must not leak the downloaded-attachment tempdir."""
+    t, _bot = _make_transport_with_mock_bot()
+    seen: list = []
+
+    async def handler(msg):
+        seen.append(msg.files[0].path)
+        raise RuntimeError("handler blew up")
+
+    t.on_message(handler)
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file = SimpleNamespace(download_to_drive=download_to_drive)
+    document = SimpleNamespace(
+        file_name="report.txt",
+        mime_type="text/plain",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100,
+        chat=tg_chat,
+        from_user=tg_user,
+        text=None,
+        caption=None,
+        photo=None,
+        document=document,
+        voice=None,
+        audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    with pytest.raises(RuntimeError, match="handler blew up"):
+        await t._dispatch_message(update, ctx=SimpleNamespace(user_data={}))
+
+    assert seen, "handler did not observe the file"
+    assert not seen[0].exists(), "tempdir was leaked after handler raised"
+
+
+async def test_post_init_unauthorized_relay_session_logs_and_continues(caplog):
+    """Expired Telethon session must not kill the whole bot — log warning + skip relay."""
+    import logging
+
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.is_user_authorized = AsyncMock(return_value=False)
+    mock_client.disconnect = AsyncMock()
+    mock_client.add_event_handler = MagicMock(return_value=object())
+    mock_client.remove_event_handler = MagicMock()
+    t.enable_team_relay(
+        telethon_client=mock_client,
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100123,
+        team_name="acme",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="link_project_to_chat.transport.telegram"):
+        await t.post_init(t.app)
+
+    # The relay disconnected cleanly (no handlers registered, no leaks).
+    mock_client.connect.assert_awaited_once()
+    mock_client.disconnect.assert_awaited_once()
+    mock_client.add_event_handler.assert_not_called()
+    assert t._team_relay is None, "relay should be dropped after unauthorized"
+    assert any("Team relay disabled" in r.message for r in caplog.records)
+
+    # post_stop should be a no-op (no second disconnect attempt).
+    await t.post_stop(t.app)
+    mock_client.disconnect.assert_awaited_once()  # still exactly once
+
+
+async def test_post_init_is_idempotent_when_invoked_twice():
+    """Both TelegramTransport.start() and PTB.run_polling() can call post_init;
+    a double invocation must not re-run get_me / on_ready callbacks."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+
+    ready_calls: list = []
+
+    async def on_ready(identity):
+        ready_calls.append(identity.handle)
+
+    t.on_ready(on_ready)
+
+    await t.post_init(t.app)
+    await t.post_init(t.app)
+
+    # Second call is a no-op.
+    bot.delete_webhook.assert_awaited_once()
+    bot.get_me.assert_awaited_once()
+    assert len(ready_calls) == 1
+
+
+async def test_post_init_unwinds_partially_started_relay_on_failure():
+    """If the relay's second handler registration fails, the first must be removed
+    and the Telethon connection closed — no leaked handlers or open sessions."""
+    t, bot = _make_transport_with_mock_bot()
+    bot.delete_webhook = AsyncMock()
+    bot.get_me = AsyncMock(return_value=SimpleNamespace(
+        id=1, full_name="Bot", username="bot_a",
+    ))
+
+    mock_client = MagicMock()
+    mock_client.connect = AsyncMock()
+    mock_client.is_user_authorized = AsyncMock(return_value=True)
+    mock_client.disconnect = AsyncMock()
+    mock_client.remove_event_handler = MagicMock()
+    # First add_event_handler succeeds; second raises — partially-initialized relay.
+    mock_client.add_event_handler = MagicMock(
+        side_effect=[object(), RuntimeError("handler registration failed")]
+    )
+    t.enable_team_relay(
+        telethon_client=mock_client,
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100123,
+        team_name="acme",
+    )
+
+    with pytest.raises(RuntimeError, match="handler registration failed"):
+        await t.post_init(t.app)
+
+    # The first handler must have been removed; the Telethon client disconnected.
+    mock_client.remove_event_handler.assert_called_once()
+    mock_client.disconnect.assert_awaited_once()
+    # The guard is reset so a retry is possible.
+    assert t._post_init_ran is False

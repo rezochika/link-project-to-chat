@@ -62,7 +62,7 @@ def _audio_incoming(tmp_path, text: str = "") -> IncomingMessage:
             mime_type="audio/ogg", size_bytes=100,
         )],
         reply_to=None,
-        native=SimpleNamespace(message_id=1, reply_to_message=None),
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
     )
 
 
@@ -83,7 +83,7 @@ def _file_incoming(tmp_path, text: str = "") -> IncomingMessage:
             mime_type="text/plain", size_bytes=11,
         )],
         reply_to=None,
-        native=SimpleNamespace(message_id=7, reply_to_message=None),
+        message=MessageRef(transport_id="fake", native_id="7", chat=chat),
     )
 
 
@@ -172,7 +172,6 @@ async def test_voice_with_reply_prefixes_prompt(tmp_path):
     """When incoming has a reply_to with text, the prompt is prefixed with '[Replying to: ...]'."""
     bot = _make_project_bot_stub()
     incoming = _audio_incoming(tmp_path)
-    # Construct a reply-to MessageRef and attach reply_to_message.text on native.
     chat = incoming.chat
     reply_ref = MessageRef(transport_id="fake", native_id="42", chat=chat)
     incoming_with_reply = IncomingMessage(
@@ -181,10 +180,7 @@ async def test_voice_with_reply_prefixes_prompt(tmp_path):
         text=incoming.text,
         files=incoming.files,
         reply_to=reply_ref,
-        native=SimpleNamespace(
-            message_id=1,
-            reply_to_message=SimpleNamespace(text="earlier message"),
-        ),
+        reply_to_text="earlier message",
     )
     await bot._on_voice_from_transport(incoming_with_reply)
     kwargs = bot.task_manager.submit_agent.call_args.kwargs

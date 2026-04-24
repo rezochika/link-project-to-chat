@@ -2190,10 +2190,7 @@ class ManagerBot(AuthMixin):
         }
         for name, handler in ported_commands.items():
             self._transport.on_command(name, handler)
-            app.add_handler(CommandHandler(
-                name,
-                lambda u, c, _n=name: self._transport._dispatch_command(_n, u, c),
-            ))
+            app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))
 
         # Legacy commands — still use Update/ctx internals; bridged to PTB
         # directly until their respective tasks port them.
@@ -2291,12 +2288,6 @@ class ManagerBot(AuthMixin):
         # transport. PTB is bridged so wizard-internal CallbackQueryHandlers (which
         # ConversationHandler routes by state) keep ownership of their clicks; this
         # last-position handler picks up everything else.
-        # TODO(spec #1): Underscore-method access needed because the manager
-        # can't use attach_telegram_routing (conflicts with ConversationHandler
-        # CallbackQueryHandlers). Consider elevating _dispatch_{command,button}
-        # to public API in the Conversation-primitive spec.
         self._transport.on_button(self._on_button_from_transport)
-        app.add_handler(CallbackQueryHandler(
-            lambda u, c: self._transport._dispatch_button(u, c)
-        ))
+        app.add_handler(CallbackQueryHandler(self._transport.bridge_button()))
         return app

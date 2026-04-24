@@ -137,6 +137,10 @@ class FakeTransport:
     async def send_typing(self, chat: ChatRef) -> None:
         self.typing_signals.append(chat)
 
+    def render_markdown(self, md: str) -> str:
+        """Return the input unchanged — FakeTransport has no rendering semantics."""
+        return md
+
     # ── Inbound registration ──────────────────────────────────────────────
     def on_message(self, handler: MessageHandler) -> None:
         self._message_handlers.append(handler)
@@ -159,7 +163,12 @@ class FakeTransport:
         *,
         files: list[IncomingFile] | None = None,
         reply_to: MessageRef | None = None,
+        reply_to_text: str | None = None,
+        reply_to_sender: Identity | None = None,
     ) -> None:
+        msg_ref = MessageRef(
+            transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat,
+        )
         msg = IncomingMessage(
             chat=chat,
             sender=sender,
@@ -167,6 +176,9 @@ class FakeTransport:
             files=files or [],
             reply_to=reply_to,
             native=None,
+            message=msg_ref,
+            reply_to_text=reply_to_text,
+            reply_to_sender=reply_to_sender,
         )
         for h in self._message_handlers:
             await h(msg)

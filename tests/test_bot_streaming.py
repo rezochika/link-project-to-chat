@@ -7,12 +7,12 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from telegram.error import Forbidden
 
-from link_project_to_chat.livestream import LiveMessage
 from link_project_to_chat.stream import TextDelta, ThinkingDelta
 from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
+from link_project_to_chat.transport import ChatKind, ChatRef, MessageRef
 from link_project_to_chat.transport.fake import FakeTransport
+from link_project_to_chat.transport.streaming import StreamingMessage
 
 
 @dataclass
@@ -268,11 +268,12 @@ async def test_finalize_with_empty_buffer_falls_back_to_task_result():
     task.status = TaskStatus.DONE
     task.result = "fallback answer"
 
-    # Create an empty-buffer LiveMessage (no TextDelta ever fired).
-    from link_project_to_chat.livestream import LiveMessage
-    lm = LiveMessage(bot=bot._app.bot, chat_id=task.chat_id, reply_to_message_id=task.message_id)
-    await lm.start()
-    bot._live_text[task.id] = lm
+    # Create an empty-buffer StreamingMessage (no TextDelta ever fired).
+    chat_ref = ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=ChatKind.DM)
+    reply_ref = MessageRef(transport_id="telegram", native_id=str(task.message_id), chat=chat_ref)
+    sm = StreamingMessage(bot._transport, chat_ref, reply_to=reply_ref)
+    await sm.start()
+    bot._live_text[task.id] = sm
 
     await bot._finalize_claude_task(task)
     # With empty buffer, the fallback kicks in and the final edit contains task.result.
@@ -290,10 +291,11 @@ async def test_finalize_empty_buffer_and_empty_result_replaces_placeholder():
     task.status = TaskStatus.DONE
     task.result = ""  # Claude turn ended with only tool_use blocks
 
-    from link_project_to_chat.livestream import LiveMessage
-    lm = LiveMessage(bot=bot._app.bot, chat_id=task.chat_id, reply_to_message_id=task.message_id)
-    await lm.start()
-    bot._live_text[task.id] = lm
+    chat_ref = ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=ChatKind.DM)
+    reply_ref = MessageRef(transport_id="telegram", native_id=str(task.message_id), chat=chat_ref)
+    sm = StreamingMessage(bot._transport, chat_ref, reply_to=reply_ref)
+    await sm.start()
+    bot._live_text[task.id] = sm
 
     await bot._finalize_claude_task(task)
     # Placeholder must be replaced with the "no text response" notice (not left as "…").

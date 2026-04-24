@@ -6,6 +6,7 @@ Telegram-specific lives behind it.
 """
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,7 +20,10 @@ from .base import (
     Identity,
     MessageHandler,
     MessageRef,
+    TransportRetryAfter,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ._telegram_relay import TeamRelay
@@ -27,6 +31,17 @@ if TYPE_CHECKING:
 TRANSPORT_ID = "telegram"
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def _as_retry_after(exc: BaseException) -> TransportRetryAfter | None:
+    """Map a PTB exception carrying `retry_after` into a portable TransportRetryAfter.
+
+    Non-retry errors return None so callers can re-raise or swallow as appropriate.
+    """
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is None:
+        return None
+    return TransportRetryAfter(float(retry_after))
 
 # Matches the prefix the Telethon relay prepends to forwarded bot-to-bot messages.
 # Format: "[auto-relay from <handle>]\n\n" — note there is no '@' on the handle.
@@ -94,6 +109,7 @@ class TelegramTransport:
         self._on_ready_callbacks: list = []
         self._menu: Any = None
         self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
+        self._post_init_ran: bool = False
 
     @classmethod
     def build(
@@ -137,6 +153,31 @@ class TelegramTransport:
             team_name=team_name,
             group_chat_id=group_chat_id,
             bot_usernames=team_bot_usernames,
+        )
+
+    def enable_team_relay_from_session(
+        self,
+        *,
+        session_path: str,
+        api_id: int,
+        api_hash: str,
+        team_bot_usernames: set[str],
+        group_chat_id: int,
+        team_name: str,
+    ) -> None:
+        """Construct a Telethon client from session credentials and enable the relay.
+
+        Keeps the telethon import inside this module so bot.py stays platform-free
+        (only TelegramTransport knows the underlying library). Missing optional
+        deps raise ImportError so the caller can degrade gracefully.
+        """
+        from telethon import TelegramClient  # telethon is an optional extra
+        client = TelegramClient(session_path, api_id, api_hash)
+        self.enable_team_relay(
+            telethon_client=client,
+            team_bot_usernames=team_bot_usernames,
+            group_chat_id=group_chat_id,
+            team_name=team_name,
         )
 
     def attach_telegram_routing(
@@ -208,55 +249,110 @@ class TelegramTransport:
         """
         return self._app
 
+    def bridge_command(self, name: str):
+        """Return a PTB CommandHandler callback that forwards to `on_command`.
+
+        The manager bot still registers PTB handlers directly (its
+        ConversationHandler wizards can't live inside attach_telegram_routing)
+        but should never reach into _dispatch_command. Use this helper instead.
+        """
+        async def _bridge(update: Any, ctx: Any) -> None:
+            await self._dispatch_command(name, update, ctx)
+        return _bridge
+
+    def bridge_button(self):
+        """Return a PTB CallbackQueryHandler callback that forwards to `on_button`.
+
+        See `bridge_command` for why the manager needs this.
+        """
+        async def _bridge(update: Any, ctx: Any) -> None:
+            await self._dispatch_button(update, ctx)
+        return _bridge
+
     # ── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
         await self._app.initialize()
-
-        # Platform post-init: drain pending updates + discover own identity +
-        # register /commands menu. Runs between initialize() and start() so the
-        # Application is configured before polling begins.
-        try:
-            await self._app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass  # non-fatal
-        try:
-            me = await self._app.bot.get_me()
-            from .base import Identity
-            self_identity = Identity(
-                transport_id=TRANSPORT_ID,
-                native_id=str(me.id),
-                display_name=me.full_name or me.username or "bot",
-                handle=(me.username or "").lower() or None,
-                is_bot=True,
-            )
-        except Exception:
-            from .base import Identity
-            self_identity = Identity(
-                transport_id=TRANSPORT_ID, native_id="0",
-                display_name="bot", handle=None, is_bot=True,
-            )
-        if self._menu:
-            try:
-                await self._app.bot.set_my_commands(self._menu)
-            except Exception:
-                pass
-
-        # Fire caller-registered callbacks with the bot's identity.
-        for cb in self._on_ready_callbacks:
-            await cb(self_identity)
-
-        if self._team_relay is not None:
-            await self._team_relay.start()
-
+        await self.post_init(self._app)
         await self._app.start()
         await self._app.updater.start_polling()
+
+    async def post_init(self, _app: Any = None) -> None:
+        # Platform post-init: drain pending updates + discover own identity +
+        # register /commands menu. Runs between initialize() and start() so the
+        # Application is configured before polling begins. Idempotent — PTB may
+        # invoke us both from TelegramTransport.start() (tests/scaffolding) and
+        # from Application.run_polling(); the guard lets both paths coexist.
+        if self._post_init_ran:
+            return
+        self._post_init_ran = True
+
+        from ._telegram_relay import RelayUnauthorizedError
+
+        try:
+            try:
+                await self._app.bot.delete_webhook(drop_pending_updates=True)
+            except Exception:
+                pass  # non-fatal
+            try:
+                me = await self._app.bot.get_me()
+                from .base import Identity
+                self_identity = Identity(
+                    transport_id=TRANSPORT_ID,
+                    native_id=str(me.id),
+                    display_name=me.full_name or me.username or "bot",
+                    handle=(me.username or "").lower() or None,
+                    is_bot=True,
+                )
+            except Exception:
+                from .base import Identity
+                self_identity = Identity(
+                    transport_id=TRANSPORT_ID, native_id="0",
+                    display_name="bot", handle=None, is_bot=True,
+                )
+            if self._menu:
+                try:
+                    await self._app.bot.set_my_commands(self._menu)
+                except Exception:
+                    pass
+
+            # Fire caller-registered callbacks with the bot's identity.
+            for cb in self._on_ready_callbacks:
+                await cb(self_identity)
+
+            if self._team_relay is not None:
+                try:
+                    await self._team_relay.start()
+                except RelayUnauthorizedError as e:
+                    # Missing Telethon auth disables bot-to-bot relay but the rest
+                    # of the bot still works; re-linking re-enables it at next start.
+                    logger.warning("Team relay disabled: %s", e)
+                    self._team_relay = None
+        except Exception:
+            # Undo anything we started so we don't leak Telethon handlers or
+            # half-wired menu state — post_stop only runs after a successful start.
+            if self._team_relay is not None:
+                try:
+                    await self._team_relay.stop()
+                except Exception:
+                    logger.exception("post_stop fallback after post_init failure")
+            self._post_init_ran = False
+            raise
 
     def on_ready(self, callback) -> None:
         self._on_ready_callbacks.append(callback)
 
-    async def stop(self) -> None:
+    async def post_stop(self, _app: Any = None) -> None:
         if self._team_relay is not None:
-            await self._team_relay.stop()
+            try:
+                await self._team_relay.stop()
+            except Exception:
+                logger.exception("post_stop team_relay.stop failed")
+        # Reset the guard so a rebuilt transport can re-init if the caller
+        # drives the start/stop sequence manually (tests + CLI scaffolding).
+        self._post_init_ran = False
+
+    async def stop(self) -> None:
+        await self.post_stop(self._app)
         await self._app.updater.stop()
         await self._app.stop()
         await self._app.shutdown()
@@ -285,10 +381,9 @@ class TelegramTransport:
         try:
             native_msg = await self._app.bot.send_message(**kwargs)
         except Exception as e:
-            retry_after = getattr(e, "retry_after", None)
-            if retry_after is not None:
-                from .base import TransportRetryAfter
-                raise TransportRetryAfter(float(retry_after)) from e
+            remapped = _as_retry_after(e)
+            if remapped is not None:
+                raise remapped from e
             raise
         return message_ref_from_telegram(native_msg)
 
@@ -313,10 +408,9 @@ class TelegramTransport:
         try:
             await self._app.bot.edit_message_text(**kwargs)
         except Exception as e:
-            retry_after = getattr(e, "retry_after", None)
-            if retry_after is not None:
-                from .base import TransportRetryAfter
-                raise TransportRetryAfter(float(retry_after)) from e
+            remapped = _as_retry_after(e)
+            if remapped is not None:
+                raise remapped from e
             raise
 
     async def send_file(
@@ -329,16 +423,22 @@ class TelegramTransport:
     ) -> MessageRef:
         suffix = path.suffix.lower()
         chat_id = int(chat.native_id)
-        if suffix in _IMAGE_SUFFIXES:
-            with path.open("rb") as fh:
-                native = await self._app.bot.send_photo(
-                    chat_id=chat_id, photo=fh, caption=caption,
-                )
-        else:
-            with path.open("rb") as fh:
-                native = await self._app.bot.send_document(
-                    chat_id=chat_id, document=fh, caption=caption, filename=display_name,
-                )
+        try:
+            if suffix in _IMAGE_SUFFIXES:
+                with path.open("rb") as fh:
+                    native = await self._app.bot.send_photo(
+                        chat_id=chat_id, photo=fh, caption=caption,
+                    )
+            else:
+                with path.open("rb") as fh:
+                    native = await self._app.bot.send_document(
+                        chat_id=chat_id, document=fh, caption=caption, filename=display_name,
+                    )
+        except Exception as e:
+            remapped = _as_retry_after(e)
+            if remapped is not None:
+                raise remapped from e
+            raise
         return message_ref_from_telegram(native)
 
     async def send_voice(
@@ -353,26 +453,39 @@ class TelegramTransport:
         }
         if reply_to is not None:
             kwargs["reply_to_message_id"] = int(reply_to.native_id)
-        with path.open("rb") as fh:
-            native = await self._app.bot.send_voice(voice=fh, **kwargs)
+        try:
+            with path.open("rb") as fh:
+                native = await self._app.bot.send_voice(voice=fh, **kwargs)
+        except Exception as e:
+            remapped = _as_retry_after(e)
+            if remapped is not None:
+                raise remapped from e
+            raise
         return message_ref_from_telegram(native)
+
+    def render_markdown(self, md: str) -> str:
+        """Render markdown into Telegram's HTML subset (see formatting.md_to_telegram)."""
+        from ..formatting import md_to_telegram
+        return md_to_telegram(md)
 
     async def send_typing(self, chat: ChatRef) -> None:
         try:
             await self._app.bot.send_chat_action(
                 chat_id=int(chat.native_id), action="typing",
             )
-        except Exception:
-            # Typing indicators are best-effort; never fatal.
-            pass
+        except Exception as e:
+            remapped = _as_retry_after(e)
+            if remapped is not None:
+                # Rate-limit hint matters — surface it so the caller can back off.
+                raise remapped from e
+            # Other errors: typing indicators are best-effort; never fatal.
 
     # ── Inbound dispatch ──────────────────────────────────────────────────
     async def _dispatch_message(self, update: Any, ctx: Any) -> None:
         """Convert a telegram Update into IncomingMessage and invoke handlers.
 
-        Downloads photo/document attachments to a per-handler temp directory.
-        The tempdir is stashed on the native message so it lives until handler
-        completion; GC then cleans it up.
+        Downloads photo/document attachments to per-handler temp directories,
+        then removes them after all handlers return.
         """
         import tempfile
 
@@ -384,11 +497,13 @@ class TelegramTransport:
         from .base import IncomingFile, IncomingMessage
 
         files: list[IncomingFile] = []
+        tmpdirs: list[tempfile.TemporaryDirectory] = []
 
         photo = getattr(msg, "photo", None)
         if photo:
             largest = photo[-1]
             tmpdir = tempfile.TemporaryDirectory()
+            tmpdirs.append(tmpdir)
             path = Path(tmpdir.name) / "photo.jpg"
             tg_file = await largest.get_file()
             await tg_file.download_to_drive(path)
@@ -398,11 +513,11 @@ class TelegramTransport:
                 mime_type="image/jpeg",
                 size_bytes=getattr(largest, "file_size", 0) or 0,
             ))
-            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 
         doc = getattr(msg, "document", None)
         if doc is not None:
             tmpdir = tempfile.TemporaryDirectory()
+            tmpdirs.append(tmpdir)
             name = getattr(doc, "file_name", None) or "document"
             path = Path(tmpdir.name) / name
             tg_file = await doc.get_file()
@@ -413,11 +528,11 @@ class TelegramTransport:
                 mime_type=getattr(doc, "mime_type", None),
                 size_bytes=getattr(doc, "file_size", 0) or 0,
             ))
-            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 
         voice = getattr(msg, "voice", None)
         if voice is not None:
             tmpdir = tempfile.TemporaryDirectory()
+            tmpdirs.append(tmpdir)
             path = Path(tmpdir.name) / "voice.ogg"
             tg_file = await voice.get_file()
             await tg_file.download_to_drive(path)
@@ -427,11 +542,11 @@ class TelegramTransport:
                 mime_type="audio/ogg",
                 size_bytes=getattr(voice, "file_size", 0) or 0,
             ))
-            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 
         audio = getattr(msg, "audio", None)
         if audio is not None:
             tmpdir = tempfile.TemporaryDirectory()
+            tmpdirs.append(tmpdir)
             name = getattr(audio, "file_name", None) or "audio"
             path = Path(tmpdir.name) / name
             tg_file = await audio.get_file()
@@ -442,7 +557,6 @@ class TelegramTransport:
                 mime_type=getattr(audio, "mime_type", None) or "audio/mpeg",
                 size_bytes=getattr(audio, "file_size", 0) or 0,
             ))
-            msg._transport_tmpdirs = getattr(msg, "_transport_tmpdirs", []) + [tmpdir]
 
         text = msg.text or getattr(msg, "caption", None) or ""
         is_relayed = False
@@ -453,21 +567,37 @@ class TelegramTransport:
             is_relayed = True
             text = text[relay_match.end():]
 
+        reply_native = msg.reply_to_message if msg.reply_to_message is not None else None
+        reply_to_text = (
+            reply_native.text or getattr(reply_native, "caption", None) or None
+            if reply_native is not None else None
+        )
+        reply_to_sender = (
+            identity_from_telegram_user(reply_native.from_user)
+            if reply_native is not None and getattr(reply_native, "from_user", None) is not None
+            else None
+        )
         incoming = IncomingMessage(
             chat=chat_ref_from_telegram(msg.chat),
             sender=identity_from_telegram_user(user),
             text=text,
             files=files,
             reply_to=(
-                message_ref_from_telegram(msg.reply_to_message)
-                if msg.reply_to_message is not None
-                else None
+                message_ref_from_telegram(reply_native)
+                if reply_native is not None else None
             ),
             native=msg,
             is_relayed_bot_to_bot=is_relayed,
+            message=message_ref_from_telegram(msg),
+            reply_to_text=reply_to_text,
+            reply_to_sender=reply_to_sender,
         )
-        for h in self._message_handlers:
-            await h(incoming)
+        try:
+            for h in self._message_handlers:
+                await h(incoming)
+        finally:
+            for tmpdir in tmpdirs:
+                tmpdir.cleanup()
 
     async def _dispatch_button(self, update: Any, ctx: Any) -> None:
         """Convert a telegram CallbackQuery into ButtonClick and invoke handlers.

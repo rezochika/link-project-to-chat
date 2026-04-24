@@ -1,10 +1,8 @@
 """Pure functions for deciding whether a group-chat message is directed at this bot.
 
 No transport-specific dependencies — takes an IncomingMessage and returns bools.
-
-One exception: `is_reply_to_bot` uses the `msg.native` escape hatch to read
-reply_to_message.from_user.username, because MessageRef doesn't carry sender
-info. Documented scope limit for spec #0a.
+`is_reply_to_bot` reads `msg.reply_to_sender` (populated by every transport
+that has threading semantics); no `msg.native` lookup required.
 """
 
 from __future__ import annotations
@@ -54,19 +52,11 @@ def mentions_bot(msg: IncomingMessage, bot_username: str) -> bool:
 def is_reply_to_bot(msg: IncomingMessage, bot_username: str) -> bool:
     """True when the message is a reply to an earlier message from this bot.
 
-    Uses the `native` escape hatch — MessageRef doesn't carry sender info.
-    Future work (not #0a): MessageRef.sender: Identity | None.
+    Uses the portable `reply_to_sender` field — no transport-native lookup.
     """
-    reply = msg.reply_to
-    if reply is None or msg.native is None:
+    if msg.reply_to_sender is None:
         return False
-    native_reply = getattr(msg.native, "reply_to_message", None)
-    if native_reply is None:
-        return False
-    from_user = getattr(native_reply, "from_user", None)
-    if from_user is None:
-        return False
-    sender = (getattr(from_user, "username", "") or "").lower()
+    sender = (msg.reply_to_sender.handle or "").lower()
     return sender == bot_username.lower()
 
 

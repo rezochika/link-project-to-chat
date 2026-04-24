@@ -90,6 +90,13 @@ class IncomingMessage:
     reply_to: MessageRef | None
     native: Any = None
     is_relayed_bot_to_bot: bool = False
+    # Optional platform-neutral fields populated by transports that have them.
+    # `message` identifies *this* incoming message so handlers can link tasks
+    # back to it without reaching into `native`. `reply_to_text`/`reply_to_sender`
+    # let group-routing and "[Replying to: ...]" prefixing stay transport-free.
+    message: MessageRef | None = None
+    reply_to_text: str | None = None
+    reply_to_sender: Identity | None = None
 
 
 @dataclass(frozen=True)
@@ -195,5 +202,16 @@ class Transport(Protocol):
         """Register a callback fired after the Transport completes platform-specific
         startup (e.g., identity discovery, menu registration). Called once per process
         with the bot's own Identity as argument.
+        """
+        ...
+
+    def render_markdown(self, md: str) -> str:
+        """Render markdown into the platform's native rich-text dialect.
+
+        Synchronous — this must never do I/O. The returned string is what the
+        Transport will accept when `send_text(html=True)` is called; the
+        `StreamingMessage` helper uses it to pretty-print the sealed head on
+        overflow. Transports that can't render rich text MAY return the input
+        unchanged.
         """
         ...

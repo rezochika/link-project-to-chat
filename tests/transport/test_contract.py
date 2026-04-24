@@ -195,3 +195,45 @@ async def test_send_voice_returns_usable_message_ref(transport, tmp_path):
     ref = await transport.send_voice(chat, p)
     assert isinstance(ref, MessageRef)
     assert ref.chat == chat
+
+
+async def test_send_file_returns_usable_message_ref(transport, tmp_path):
+    """send_file must accept a Path and return a MessageRef whose chat matches."""
+    chat = _chat(transport.TRANSPORT_ID)
+    p = tmp_path / "notes.txt"
+    p.write_text("hi")
+    ref = await transport.send_file(chat, p, caption="see this")
+    assert isinstance(ref, MessageRef)
+    assert ref.chat == chat
+
+
+async def test_send_text_html_renders_without_error(transport):
+    """html=True is a portable hint; transports that can't render it must degrade,
+    never raise."""
+    chat = _chat(transport.TRANSPORT_ID)
+    ref = await transport.send_text(chat, "<b>hi</b>", html=True)
+    assert isinstance(ref, MessageRef)
+    await transport.edit_text(ref, "<b>updated</b>", html=True)
+
+
+async def test_send_text_reply_to_attaches(transport):
+    """reply_to must be accepted even if a transport has no thread semantics."""
+    chat = _chat(transport.TRANSPORT_ID)
+    parent = await transport.send_text(chat, "parent")
+    child = await transport.send_text(chat, "child", reply_to=parent)
+    assert isinstance(child, MessageRef)
+
+
+async def test_send_text_with_button_styles_does_not_raise(transport):
+    """Every ButtonStyle must be accepted; Transports that can't render a style
+    are allowed to downgrade silently (Telegram ignores; Web/Discord may honor)."""
+    from link_project_to_chat.transport import Button, Buttons, ButtonStyle
+
+    chat = _chat(transport.TRANSPORT_ID)
+    buttons = Buttons(rows=[[
+        Button(label="Go", value="go", style=ButtonStyle.PRIMARY),
+        Button(label="Stop", value="stop", style=ButtonStyle.DANGER),
+        Button(label="Meh", value="meh", style=ButtonStyle.DEFAULT),
+    ]])
+    ref = await transport.send_text(chat, "pick", buttons=buttons)
+    assert isinstance(ref, MessageRef)

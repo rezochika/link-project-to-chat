@@ -30,22 +30,25 @@ def _group_incoming(
     is_relayed: bool = False,
     reply_to_bot_username: str | None = None,
 ) -> IncomingMessage:
-    from types import SimpleNamespace
-    native = None
     reply_to = None
+    reply_to_sender = None
     if reply_to_bot_username:
-        reply_from_user = SimpleNamespace(username=reply_to_bot_username)
-        reply_native = SimpleNamespace(from_user=reply_from_user)
-        native = SimpleNamespace(reply_to_message=reply_native, message_id=1)
         reply_to = MessageRef(transport_id="fake", native_id="0", chat=chat)
+        reply_to_sender = Identity(
+            transport_id="fake", native_id="0",
+            display_name=reply_to_bot_username,
+            handle=reply_to_bot_username, is_bot=True,
+        )
     return IncomingMessage(
         chat=chat,
         sender=_sender_identity(uid=sender_uid, handle=sender_handle, is_bot=sender_is_bot),
         text=text,
         files=[],
         reply_to=reply_to,
-        native=native,
+        native=None,
         is_relayed_bot_to_bot=is_relayed,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        reply_to_sender=reply_to_sender,
     )
 
 
@@ -698,9 +701,12 @@ def _stub_config_with_api_creds():
 
 def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, monkeypatch):
     """When LP2C_TELETHON_SESSION is set and the bot is team-mode,
-    build() constructs a TelegramClient and calls enable_team_relay.
+    build() delegates to TelegramTransport.enable_team_relay_from_session.
+
+    Telethon client construction lives inside TelegramTransport (see
+    test_enable_team_relay_from_session_builds_client in test_telegram_transport);
+    here we just assert the bot hands the session credentials over.
     """
-    from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
@@ -710,7 +716,6 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     bot = _make_team_bot_for_relay_test(tmp_path)
 
     mock_transport = MagicMock()
-    fake_telethon = SimpleNamespace(TelegramClient=MagicMock())
     with patch(
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
@@ -720,18 +725,14 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     ), patch(
         "link_project_to_chat.bot.load_config",
         return_value=_stub_config_with_api_creds(),
-    ), patch.dict("sys.modules", {"telethon": fake_telethon}):
+    ):
         bot.build()
 
-    fake_telethon.TelegramClient.assert_called_once()
-    # First positional arg: session path; then api_id, api_hash — mirrors manager.
-    args, _kwargs = fake_telethon.TelegramClient.call_args
-    assert args[0] == str(session_path)
-    assert args[1] == 12345
-    assert args[2] == "fakehash"
-
-    mock_transport.enable_team_relay.assert_called_once()
-    call_kwargs = mock_transport.enable_team_relay.call_args.kwargs
+    mock_transport.enable_team_relay_from_session.assert_called_once()
+    call_kwargs = mock_transport.enable_team_relay_from_session.call_args.kwargs
+    assert call_kwargs["session_path"] == str(session_path)
+    assert call_kwargs["api_id"] == 12345
+    assert call_kwargs["api_hash"] == "fakehash"
     assert call_kwargs["group_chat_id"] == -100123
     assert call_kwargs["team_name"] == "acme"
     usernames = call_kwargs["team_bot_usernames"]
@@ -739,9 +740,80 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     assert "acme_dev_bot" in usernames
 
 
-def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
-    """Without LP2C_TELETHON_SESSION, build() does NOT call enable_team_relay."""
+def test_project_bot_build_installs_transport_lifecycle_hooks_for_run_polling(tmp_path):
+    """run_polling() only invokes Application post hooks, so build() must bridge
+    them to TelegramTransport's lifecycle.
+    """
     from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    app = SimpleNamespace(post_init=None, post_stop=None)
+    mock_transport = MagicMock()
+    mock_transport.app = app
+
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ):
+        returned_app = bot.build()
+
+    assert returned_app is app
+    assert app.post_init is mock_transport.post_init
+    assert app.post_stop is mock_transport.post_stop
+    mock_transport.on_ready.assert_called_once_with(bot._after_ready)
+
+
+@pytest.mark.asyncio
+async def test_telegram_text_dispatch_preserves_context_and_submits_agent(tmp_path):
+    """Normal Telegram text should survive the transport dispatch path into TaskManager."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    app = MagicMock()
+    app.bot = MagicMock()
+    transport = TelegramTransport(app)
+    bot = ProjectBot(
+        name="solo",
+        path=tmp_path,
+        token="t",
+        allowed_usernames=["alice"],
+    )
+    bot._transport = transport
+    bot.task_manager.submit_agent = MagicMock()
+    transport.on_message(bot._on_text_from_transport)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100,
+        chat=tg_chat,
+        from_user=tg_user,
+        text="hello from telegram",
+        photo=None,
+        document=None,
+        voice=None,
+        audio=None,
+        caption=None,
+        reply_to_message=None,
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+    ctx = SimpleNamespace(user_data={})
+
+    await transport._dispatch_message(update, ctx)
+
+    bot.task_manager.submit_agent.assert_called_once_with(
+        chat_id=12345,
+        message_id=100,
+        prompt="hello from telegram",
+    )
+
+
+def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
+    """Without LP2C_TELETHON_SESSION, build() does NOT call enable_team_relay_from_session."""
     from unittest.mock import MagicMock, patch
 
     monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
@@ -749,7 +821,6 @@ def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
     bot = _make_team_bot_for_relay_test(tmp_path)
 
     mock_transport = MagicMock()
-    fake_telethon = SimpleNamespace(TelegramClient=MagicMock())
     with patch(
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
@@ -759,16 +830,14 @@ def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
     ), patch(
         "link_project_to_chat.bot.load_config",
         return_value=_stub_config_with_api_creds(),
-    ), patch.dict("sys.modules", {"telethon": fake_telethon}):
+    ):
         bot.build()
 
-    fake_telethon.TelegramClient.assert_not_called()
-    mock_transport.enable_team_relay.assert_not_called()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
 
 
 def test_no_relay_when_solo_mode(tmp_path, monkeypatch):
-    """A solo-mode bot (no team_name) does NOT call enable_team_relay even if env set."""
-    from types import SimpleNamespace
+    """A solo-mode bot (no team_name) does NOT call enable_team_relay_from_session even if env set."""
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
@@ -778,7 +847,6 @@ def test_no_relay_when_solo_mode(tmp_path, monkeypatch):
     bot = _make_solo_bot_for_relay_test(tmp_path)
 
     mock_transport = MagicMock()
-    fake_telethon = SimpleNamespace(TelegramClient=MagicMock())
     with patch(
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
@@ -788,17 +856,15 @@ def test_no_relay_when_solo_mode(tmp_path, monkeypatch):
     ), patch(
         "link_project_to_chat.bot.load_config",
         return_value=_stub_config_with_api_creds(),
-    ), patch.dict("sys.modules", {"telethon": fake_telethon}):
+    ):
         bot.build()
 
-    fake_telethon.TelegramClient.assert_not_called()
-    mock_transport.enable_team_relay.assert_not_called()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
 
 
 def test_no_relay_when_team_missing_from_config(tmp_path, monkeypatch):
     """Defensive: if team_name is set but load_teams() doesn't have an entry,
-    enable_team_relay is NOT called (logged as warning instead of silent no-op)."""
-    from types import SimpleNamespace
+    enable_team_relay_from_session is NOT called (logged as warning instead of silent no-op)."""
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
@@ -817,7 +883,6 @@ def test_no_relay_when_team_missing_from_config(tmp_path, monkeypatch):
     )
 
     mock_transport = MagicMock()
-    fake_telethon = SimpleNamespace(TelegramClient=MagicMock())
     with patch(
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
@@ -827,12 +892,10 @@ def test_no_relay_when_team_missing_from_config(tmp_path, monkeypatch):
     ), patch(
         "link_project_to_chat.bot.load_config",
         return_value=_stub_config_with_api_creds(),
-    ), patch.dict("sys.modules", {"telethon": fake_telethon}):
+    ):
         bot.build()
 
-    # No relay enabled, no client constructed (we skip both when usernames empty).
-    mock_transport.enable_team_relay.assert_not_called()
-    fake_telethon.TelegramClient.assert_not_called()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
 
 
 def test_persist_active_persona_team_bot_uses_instance_config_path_by_default(tmp_path):
@@ -1036,7 +1099,6 @@ async def test_reset_confirm_clears_team_session_from_team_config(tmp_path):
 
 
 def test_team_mode_bot_build_uses_instance_config_path_for_relay_bootstrap(tmp_path, monkeypatch):
-    from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
@@ -1056,7 +1118,6 @@ def test_team_mode_bot_build_uses_instance_config_path_for_relay_bootstrap(tmp_p
     )
 
     mock_transport = MagicMock()
-    fake_telethon = SimpleNamespace(TelegramClient=MagicMock())
     with patch(
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
@@ -1066,7 +1127,7 @@ def test_team_mode_bot_build_uses_instance_config_path_for_relay_bootstrap(tmp_p
     ) as mock_load_teams, patch(
         "link_project_to_chat.bot.load_config",
         return_value=_stub_config_with_api_creds(),
-    ) as mock_load_config, patch.dict("sys.modules", {"telethon": fake_telethon}):
+    ) as mock_load_config:
         bot.build()
 
     mock_load_config.assert_called_once_with(cfg_path)

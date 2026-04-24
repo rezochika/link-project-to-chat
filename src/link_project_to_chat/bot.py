@@ -133,6 +133,13 @@ class ProjectBot(AuthMixin):
         self._init_auth()
         self._active_skill: str | None = None
         self._active_persona = active_persona
+        # Pending skill/persona capture — set by /create_skill + scope-button click,
+        # consumed by the next plain-text message. Initialized here so _on_text
+        # can read them unconditionally without a getattr dance.
+        self._pending_skill_name: str | None = None
+        self._pending_skill_scope: str | None = None
+        self._pending_persona_name: str | None = None
+        self._pending_persona_scope: str | None = None
         self.show_thinking = show_thinking
         self._transcriber = transcriber
         self._synthesizer = synthesizer
@@ -590,25 +597,17 @@ class ProjectBot(AuthMixin):
                 reply_markup=self._question_buttons(task.id, q_idx, question),
             )
 
-    async def _on_start(self, update, ctx) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(
-            f"Project: {self.name}\nPath: {self.path}\n\n"
-            f"Send a message to chat with Claude.\n{_CMD_HELP}"
-        )
-
-    async def _legacy_command(self, legacy_handler, ci) -> None:
-        """Bridge from CommandInvocation to a legacy handler that takes (Update, ctx).
-
-        Temporary shim: lets commands be registered via transport.on_command while
-        their implementation still uses telegram-native types. Ported away piecemeal
-        as each command's internals are rewritten to use the Transport directly.
-        """
-        if ci.native is None:
+    async def _on_start(self, ci) -> None:
+        assert self._transport is not None
+        if not self._auth_identity(ci.sender):
+            await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
-        update, ctx = ci.native
-        await legacy_handler(update, ctx)
+        await self._transport.send_text(
+            ci.chat,
+            f"Project: {self.name}\nPath: {self.path}\n\n"
+            f"Send a message to chat with Claude.\n{_CMD_HELP}",
+            reply_to=ci.message,
+        )
 
     async def _on_text_from_transport(self, incoming) -> None:
         """Unified entry point for inbound messages from the Transport.
@@ -641,18 +640,9 @@ class ProjectBot(AuthMixin):
                 if incoming.is_relayed_bot_to_bot or incoming.sender.is_bot:
                     await self._submit_group_message_to_claude(incoming)
                     return
-                # Human message in group — fall through to legacy _on_text shim
-                # for the full auth/rate-limit/pending-skill/pending-persona flow.
-            native = incoming.native
-            if native is None:
-                return
-            from types import SimpleNamespace
-            fake_update = SimpleNamespace(
-                effective_message=native,
-                effective_user=native.from_user,
-                effective_chat=native.chat,
-            )
-            await self._on_text(fake_update, None)
+                # Human message in group — fall through to full auth/rate-limit/
+                # pending-skill/pending-persona flow below.
+            await self._on_text(incoming)
             return
 
         # 4. Nothing actionable — unsupported.
@@ -730,84 +720,111 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
-        message_id_int = (
-            int(getattr(incoming.native, "message_id", 0))
-            if incoming.native is not None else 0
-        )
+        message_id_int = int(incoming.message.native_id) if incoming.message else 0
         self.task_manager.submit_agent(
             chat_id=int(incoming.chat.native_id),
             message_id=message_id_int,
             prompt=prompt,
         )
 
-    async def _on_text(self, update, ctx) -> None:
-        msg = update.effective_message
-        if not msg:
-            return
-        if not self._auth(update.effective_user):
-            return await msg.reply_text("Unauthorized.")
-        if self._rate_limited(update.effective_user.id):
-            return await msg.reply_text("Rate limited. Try again shortly.")
+    async def _on_text(self, incoming) -> None:
+        """Handle a plain-text message: auth, rate-limit, pending skill/persona
+        capture, waiting-input routing, supersede, then Claude submission.
 
-        pending_skill = ctx.user_data.pop("pending_skill_name", None) if ctx.user_data else None
-        pending_scope = ctx.user_data.pop("pending_skill_scope", None) if ctx.user_data else None
+        All routing keys are read from `IncomingMessage` directly — no
+        telegram/ctx knowledge required.
+        """
+        assert self._transport is not None
+        if not incoming.text.strip():
+            return
+        if not self._auth_identity(incoming.sender):
+            await self._transport.send_text(
+                incoming.chat, "Unauthorized.", reply_to=incoming.message,
+            )
+            return
+        if self._rate_limited(int(incoming.sender.native_id)):
+            await self._transport.send_text(
+                incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
+            )
+            return
+
+        # Pending skill capture (set by /create_skill + scope-button click).
+        pending_skill = self._pending_skill_name
+        pending_scope = self._pending_skill_scope
         if pending_skill and pending_scope:
             from .skills import save_skill
-            save_skill(pending_skill, msg.text, self.path, scope=pending_scope)
+            save_skill(pending_skill, incoming.text, self.path, scope=pending_scope)
+            self._pending_skill_name = None
+            self._pending_skill_scope = None
             icon = "🌐" if pending_scope == "global" else "📁"
-            return await msg.reply_text(f"{icon} Skill '{pending_skill}' created ({pending_scope}). Use /use {pending_skill} to activate.")
-        if pending_skill:
-            ctx.user_data["pending_skill_name"] = pending_skill
+            await self._transport.send_text(
+                incoming.chat,
+                f"{icon} Skill '{pending_skill}' created ({pending_scope}). "
+                f"Use /use {pending_skill} to activate.",
+                reply_to=incoming.message,
+            )
             return
 
-        pending_persona = ctx.user_data.pop("pending_persona_name", None) if ctx.user_data else None
-        pending_persona_scope = ctx.user_data.pop("pending_persona_scope", None) if ctx.user_data else None
+        # Pending persona capture (same shape as pending skill).
+        pending_persona = self._pending_persona_name
+        pending_persona_scope = self._pending_persona_scope
         if pending_persona and pending_persona_scope:
             from .skills import save_persona
-            save_persona(pending_persona, msg.text, self.path, scope=pending_persona_scope)
+            save_persona(pending_persona, incoming.text, self.path, scope=pending_persona_scope)
+            self._pending_persona_name = None
+            self._pending_persona_scope = None
             icon = "🌐" if pending_persona_scope == "global" else "📁"
-            return await msg.reply_text(f"{icon} Persona '{pending_persona}' created ({pending_persona_scope}). Use /persona {pending_persona} to activate.")
-        if pending_persona:
-            ctx.user_data["pending_persona_name"] = pending_persona
+            await self._transport.send_text(
+                incoming.chat,
+                f"{icon} Persona '{pending_persona}' created ({pending_persona_scope}). "
+                f"Use /persona {pending_persona} to activate.",
+                reply_to=incoming.message,
+            )
             return
 
-        # If Claude is currently waiting on a question in this chat, route
-        # this message as the answer instead of starting a new turn.
-        waiting = self.task_manager.waiting_input_task(update.effective_chat.id)
+        chat_id_int = int(incoming.chat.native_id)
+        message_id_int = int(incoming.message.native_id) if incoming.message else 0
+
+        # Active Claude turn waiting on a question? Route as the answer.
+        waiting = self.task_manager.waiting_input_task(chat_id_int)
         if waiting:
-            self.task_manager.submit_answer(waiting.id, msg.text)
+            self.task_manager.submit_answer(waiting.id, incoming.text)
             return
 
-        for prev in self.task_manager.find_by_message(msg.message_id):
+        # Supersede any in-flight task tied to this message (edit-message case).
+        for prev in self.task_manager.find_by_message(message_id_int):
             self.task_manager.cancel(prev.id)
             await self._cancel_live_for(prev.id, "(superseded)")
             typing = self._typing_tasks.pop(prev.id, None)
             if typing:
                 typing.cancel()
 
-        prompt = msg.text
-        if msg.reply_to_message and msg.reply_to_message.text:
-            prompt = f"[Replying to: {msg.reply_to_message.text}]\n\n{prompt}"
+        prompt = incoming.text
+        if incoming.reply_to_text:
+            prompt = f"[Replying to: {incoming.reply_to_text}]\n\n{prompt}"
         if self._active_persona:
             from .skills import load_persona, format_persona_prompt
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
         self.task_manager.submit_agent(
-            chat_id=update.effective_chat.id,
-            message_id=msg.message_id,
+            chat_id=chat_id_int,
+            message_id=message_id_int,
             prompt=prompt,
         )
 
-    async def _on_run(self, update, ctx) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        if not ctx.args:
-            return await update.effective_message.reply_text("Usage: /run <command>")
-        command = " ".join(ctx.args)
+    async def _on_run(self, ci) -> None:
+        assert self._transport is not None
+        if not self._auth_identity(ci.sender):
+            await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
+        if not ci.args:
+            await self._transport.send_text(ci.chat, "Usage: /run <command>", reply_to=ci.message)
+            return
+        command = " ".join(ci.args)
         self.task_manager.run_command(
-            chat_id=update.effective_chat.id,
-            message_id=update.effective_message.message_id,
+            chat_id=int(ci.chat.native_id),
+            message_id=int(ci.message.native_id),
             command=command,
         )
 
@@ -977,27 +994,12 @@ class ProjectBot(AuthMixin):
             message_id=int(ci.message.native_id),
         )
 
-    async def _on_version(self, update, ctx) -> None:
-        if not update.effective_message:
-            return
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        from . import __version__
-        await update.effective_message.reply_text(f"link-project-to-chat v{__version__}")
-
     async def _on_version_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
         from . import __version__
         assert self._transport is not None
         await self._transport.send_text(ci.chat, f"link-project-to-chat v{__version__}")
-
-    async def _on_help(self, update, ctx) -> None:
-        if not update.effective_message:
-            return
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(_CMD_HELP)
 
     async def _on_help_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1276,29 +1278,37 @@ class ProjectBot(AuthMixin):
         self._persist_active_persona(None)
         await self._transport.send_text(ci.chat, f"Persona '{old}' deactivated.")
 
-    async def _on_halt(self, update, ctx) -> None:
+    async def _on_halt(self, ci) -> None:
+        assert self._transport is not None
         if not self.group_mode:
-            return await update.effective_message.reply_text("/halt is only available in group mode.")
-        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            await self._transport.send_text(
+                ci.chat, "/halt is only available in group mode.", reply_to=ci.message,
+            )
+            return
+        if self.group_chat_id is not None and int(ci.chat.native_id) != self.group_chat_id:
             return  # silently ignore — wrong group
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        from .transport.telegram import chat_ref_from_telegram
-        # TODO(spec #1): port to CommandInvocation once Conversation primitive ships.
-        self._group_state.halt(chat_ref_from_telegram(update.effective_chat))
-        await update.effective_message.reply_text("Halted. Use /resume to continue.")
+        if not self._auth_identity(ci.sender):
+            await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
+        self._group_state.halt(ci.chat)
+        await self._transport.send_text(
+            ci.chat, "Halted. Use /resume to continue.", reply_to=ci.message,
+        )
 
-    async def _on_resume(self, update, ctx) -> None:
+    async def _on_resume(self, ci) -> None:
+        assert self._transport is not None
         if not self.group_mode:
-            return await update.effective_message.reply_text("/resume is only available in group mode.")
-        if self.group_chat_id is not None and update.effective_chat.id != self.group_chat_id:
+            await self._transport.send_text(
+                ci.chat, "/resume is only available in group mode.", reply_to=ci.message,
+            )
+            return
+        if self.group_chat_id is not None and int(ci.chat.native_id) != self.group_chat_id:
             return  # silently ignore — wrong group
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        from .transport.telegram import chat_ref_from_telegram
-        # TODO(spec #1): port to CommandInvocation once Conversation primitive ships.
-        self._group_state.resume(chat_ref_from_telegram(update.effective_chat))
-        await update.effective_message.reply_text("Resumed.")
+        if not self._auth_identity(ci.sender):
+            await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
+        self._group_state.resume(ci.chat)
+        await self._transport.send_text(ci.chat, "Resumed.", reply_to=ci.message)
 
     async def _on_create_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1345,16 +1355,21 @@ class ProjectBot(AuthMixin):
             ci.chat, f"Delete {icon} {persona.source} persona '{name}'?", buttons=buttons,
         )
 
-    async def _on_voice_status(self, update, ctx) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
+    async def _on_voice_status(self, ci) -> None:
+        assert self._transport is not None
+        if not self._auth_identity(ci.sender):
+            await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
         if self._transcriber:
             backend = type(self._transcriber).__name__
-            await update.effective_message.reply_text(f"Voice: enabled ({backend})")
+            await self._transport.send_text(
+                ci.chat, f"Voice: enabled ({backend})", reply_to=ci.message,
+            )
         else:
-            await update.effective_message.reply_text(
-                "Voice: disabled\n"
-                "Configure with: link-project-to-chat setup"
+            await self._transport.send_text(
+                ci.chat,
+                "Voice: disabled\nConfigure with: link-project-to-chat setup",
+                reply_to=ci.message,
             )
 
     LANGUAGES = [
@@ -1660,11 +1675,6 @@ class ProjectBot(AuthMixin):
         ]
         return "\n".join(lines)
 
-    async def _on_status(self, update, ctx) -> None:
-        if not self._auth(update.effective_user):
-            return await update.effective_message.reply_text("Unauthorized.")
-        await update.effective_message.reply_text(self._compose_status())
-
     async def _on_status_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
@@ -1728,7 +1738,7 @@ class ProjectBot(AuthMixin):
 
         self.task_manager.submit_agent(
             chat_id=int(incoming.chat.native_id),
-            message_id=int(incoming.native.message_id) if incoming.native is not None else 0,
+            message_id=int(incoming.message.native_id) if incoming.message else 0,
             prompt=prompt,
         )
 
@@ -1782,12 +1792,8 @@ class ProjectBot(AuthMixin):
                 return
 
             prompt = text
-            if incoming.reply_to is not None and incoming.native is not None:
-                reply_text = getattr(
-                    getattr(incoming.native, "reply_to_message", None), "text", None,
-                )
-                if reply_text:
-                    prompt = f"[Replying to: {reply_text}]\n\n{prompt}"
+            if incoming.reply_to_text:
+                prompt = f"[Replying to: {incoming.reply_to_text}]\n\n{prompt}"
 
             if self._active_persona:
                 from .skills import load_persona, format_persona_prompt
@@ -1795,10 +1801,7 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
-            message_id_int = (
-                int(getattr(incoming.native, "message_id", 0))
-                if incoming.native is not None else 0
-            )
+            message_id_int = int(incoming.message.native_id) if incoming.message else 0
             task = self.task_manager.submit_agent(
                 chat_id=chat_id_int,
                 message_id=message_id_int,
@@ -1903,10 +1906,12 @@ class ProjectBot(AuthMixin):
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
         self._app = self._transport.app
+        self._app.post_init = self._transport.post_init
+        self._app.post_stop = self._transport.post_stop
         self._transport.on_ready(self._after_ready)
         app = self._app
 
-        # Fully-ported commands — handler consumes CommandInvocation directly.
+        # All commands consume CommandInvocation directly — no legacy shim.
         ported_commands = (
             ("help", self._on_help_t),
             ("version", self._on_version_t),
@@ -1927,9 +1932,6 @@ class ProjectBot(AuthMixin):
             ("create_persona", self._on_create_persona),
             ("delete_persona", self._on_delete_persona),
             ("lang", self._on_lang),
-        )
-        # Legacy commands — still use Update/ctx internals; bridged via _legacy_command shim.
-        legacy_commands = (
             ("start", self._on_start),
             ("run", self._on_run),
             ("voice", self._on_voice_status),
@@ -1940,16 +1942,11 @@ class ProjectBot(AuthMixin):
         self._transport.on_button(self._on_button)
         for _name, _handler in ported_commands:
             self._transport.on_command(_name, _handler)
-        for _name, _legacy in legacy_commands:
-            self._transport.on_command(
-                _name, lambda ci, _h=_legacy: self._legacy_command(_h, ci)
-            )
 
         # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
-        all_command_names = [n for n, _ in ported_commands] + [n for n, _ in legacy_commands]
         self._transport.attach_telegram_routing(
             group_mode=self.group_mode,
-            command_names=all_command_names,
+            command_names=[n for n, _ in ported_commands],
         )
 
         # Team-mode bot: if the manager passed a Telethon session path, wire the
@@ -1959,9 +1956,6 @@ class ProjectBot(AuthMixin):
         if self.team_name and self.group_chat_id:
             session_env = os.environ.get("LP2C_TELETHON_SESSION")
             if session_env:
-                # Lazy import — telethon is an optional dep; solo-mode installs
-                # don't need it and must still be able to import bot.py.
-                from telethon import TelegramClient
                 cfg_path = self._effective_config_path()
                 config = load_config(cfg_path)
                 teams = load_teams(cfg_path)
@@ -1976,13 +1970,10 @@ class ProjectBot(AuthMixin):
                         self.team_name,
                     )
                 else:
-                    client = TelegramClient(
-                        session_env,
-                        config.telegram_api_id,
-                        config.telegram_api_hash,
-                    )
-                    self._transport.enable_team_relay(
-                        telethon_client=client,
+                    self._transport.enable_team_relay_from_session(
+                        session_path=session_env,
+                        api_id=config.telegram_api_id,
+                        api_hash=config.telegram_api_hash,
                         team_bot_usernames=team_bot_usernames,
                         group_chat_id=self.group_chat_id,
                         team_name=self.team_name,

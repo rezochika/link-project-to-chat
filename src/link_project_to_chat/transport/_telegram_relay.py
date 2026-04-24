@@ -22,6 +22,7 @@ forwards whose peer never responded (bot crashed, error, end of task).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import time
@@ -37,6 +38,15 @@ except ImportError:
     MessageEntityMentionName = None  # type: ignore[assignment, misc]
 
 logger = logging.getLogger(__name__)
+
+
+class RelayUnauthorizedError(RuntimeError):
+    """Telethon session lacks user-level auth.
+
+    TelegramTransport.post_init catches this and continues without a relay so
+    an expired session doesn't kill the whole bot — bot-to-bot delegation is
+    disabled until the user re-runs setup, but everything else keeps working.
+    """
 
 
 _EDIT_DEBOUNCE_SECONDS = 6.0
@@ -59,6 +69,12 @@ _COALESCE_WINDOW_SECONDS = 3.0
 # Shared with transport/telegram.py's _RELAY_PREFIX_RE — keep these in sync.
 # Telegram bot usernames are constrained to [A-Za-z][A-Za-z0-9_]*.
 _RELAY_HANDLE_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 # Messages whose body (after stripping the leading @peer mention) matches one
@@ -192,6 +208,7 @@ class TeamRelay:
         self._bot_usernames = {u.lower().lstrip("@") for u in bot_usernames if u}
         self._handler = None
         self._edit_handler = None
+        self._connected = False
         # Message IDs we have already relayed, so edits to the same message do
         # not trigger a second relay.
         self._relayed_ids: set[int] = set()
@@ -234,6 +251,19 @@ class TeamRelay:
         """
         if self._handler is not None:
             return  # already running
+        connect = getattr(self._client, "connect", None)
+        if callable(connect):
+            await _maybe_await(connect())
+            self._connected = True
+        is_authorized = getattr(self._client, "is_user_authorized", None)
+        if callable(is_authorized):
+            authorized = await _maybe_await(is_authorized())
+            if not authorized:
+                await self._disconnect_safely()
+                raise RelayUnauthorizedError(
+                    f"Telethon session for team '{self._team_name}' is not authorized; "
+                    "run setup to re-link before the relay can forward messages."
+                )
         self._handler = self._client.add_event_handler(
             self._on_new_message,
             events.NewMessage(),
@@ -271,6 +301,22 @@ class TeamRelay:
             except Exception:
                 logger.warning("Removing TeamRelay edit handler failed", exc_info=True)
             self._edit_handler = None
+        await self._disconnect_safely()
+
+    async def _disconnect_safely(self) -> None:
+        if not self._connected:
+            return
+        self._connected = False
+        disconnect = getattr(self._client, "disconnect", None)
+        if not callable(disconnect):
+            return
+        try:
+            await _maybe_await(disconnect())
+        except Exception:
+            logger.warning(
+                "TeamRelay Telethon disconnect failed (team=%s)",
+                self._team_name, exc_info=True,
+            )
 
     async def _on_new_message(self, event: Any) -> None:
         """Route one new group message: relay if bot-to-bot, otherwise skip."""

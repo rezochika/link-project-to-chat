@@ -6,8 +6,26 @@ from unittest.mock import MagicMock, AsyncMock
 
 from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.group_state import GroupStateRegistry
-from link_project_to_chat.transport import ChatKind, ChatRef, Identity, IncomingMessage, MessageRef
+from link_project_to_chat.transport import (
+    ChatKind, ChatRef, CommandInvocation, Identity, IncomingMessage, MessageRef,
+)
 from link_project_to_chat.transport.fake import FakeTransport
+
+
+def _halt_ci(chat: ChatRef, *, sender_uid: int = 12345, handle: str = "rezo") -> CommandInvocation:
+    """Build a CommandInvocation for /halt + /resume tests."""
+    sender = Identity(
+        transport_id=chat.transport_id, native_id=str(sender_uid),
+        display_name=handle, handle=handle, is_bot=False,
+    )
+    return CommandInvocation(
+        chat=chat,
+        sender=sender,
+        name="halt",
+        args=[],
+        raw_text="/halt",
+        message=MessageRef(transport_id=chat.transport_id, native_id="1", chat=chat),
+    )
 
 
 def _team_bot_with_fake_transport(bot: ProjectBot) -> ProjectBot:
@@ -47,22 +65,25 @@ def _group_incoming(
     is_relayed: bool = False,
     reply_to_bot_username: str | None = None,
 ) -> IncomingMessage:
-    from types import SimpleNamespace
-    native = None
     reply_to = None
+    reply_to_sender = None
     if reply_to_bot_username:
-        reply_from_user = SimpleNamespace(username=reply_to_bot_username)
-        reply_native = SimpleNamespace(from_user=reply_from_user)
-        native = SimpleNamespace(reply_to_message=reply_native, message_id=1)
         reply_to = MessageRef(transport_id="fake", native_id="0", chat=chat)
+        reply_to_sender = Identity(
+            transport_id="fake", native_id="0",
+            display_name=reply_to_bot_username,
+            handle=reply_to_bot_username, is_bot=True,
+        )
     return IncomingMessage(
         chat=chat,
         sender=_sender_identity(uid=sender_uid, handle=sender_handle, is_bot=sender_is_bot),
         text=text,
         files=[],
         reply_to=reply_to,
-        native=native,
+        native=None,
         is_relayed_bot_to_bot=is_relayed,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        reply_to_sender=reply_to_sender,
     )
 
 
@@ -179,103 +200,93 @@ async def test_on_text_human_message_resumes_halted_group(tmp_path):
 @pytest.mark.asyncio
 async def test_halt_command_sets_halted_in_registry(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_chat = MagicMock(id=-100_111)
-    update.effective_user = MagicMock(id=12345)
-    update.effective_message.reply_text = AsyncMock()
-    # Stub auth to allow this user
-    bot._auth = MagicMock(return_value=True)
-    await bot._on_halt(update, MagicMock())
-    # /halt builds its ChatRef via chat_ref_from_telegram → transport_id="telegram"
-    assert bot._group_state.get(_telegram_group_chat(-100_111)).halted is True
-    update.effective_message.reply_text.assert_called_once()
-    assert "Halted" in update.effective_message.reply_text.call_args[0][0]
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+
+    chat = _group_chat(-100_111)
+    await bot._on_halt(_halt_ci(chat))
+
+    assert bot._group_state.get(chat).halted is True
+    assert len(bot._transport.sent_messages) == 1
+    assert "Halted" in bot._transport.sent_messages[0].text
 
 
 @pytest.mark.asyncio
 async def test_resume_command_clears_halt(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)
-    halt_chat = _telegram_group_chat(-100_111)
-    bot._group_state.halt(halt_chat)
-    bot._group_state.get(halt_chat).bot_to_bot_rounds = 5
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_chat = MagicMock(id=-100_111)
-    update.effective_user = MagicMock(id=12345)
-    update.effective_message.reply_text = AsyncMock()
-    bot._auth = MagicMock(return_value=True)
-    await bot._on_resume(update, MagicMock())
-    s = bot._group_state.get(halt_chat)
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+
+    chat = _group_chat(-100_111)
+    bot._group_state.halt(chat)
+    bot._group_state.get(chat).bot_to_bot_rounds = 5
+
+    await bot._on_resume(_halt_ci(chat))
+
+    s = bot._group_state.get(chat)
     assert s.halted is False
     assert s.bot_to_bot_rounds == 0
-    update.effective_message.reply_text.assert_called_once()
-    assert "Resumed" in update.effective_message.reply_text.call_args[0][0]
+    assert len(bot._transport.sent_messages) == 1
+    assert "Resumed" in bot._transport.sent_messages[0].text
 
 
 @pytest.mark.asyncio
 async def test_halt_in_solo_mode_rejects(tmp_path):
     """Solo (non-team) bots should reject /halt with a helpful message."""
-    from link_project_to_chat.bot import ProjectBot
     bot = ProjectBot(name="solo", path=tmp_path, token="t")  # no team_name → group_mode=False
-    bot._auth = MagicMock(return_value=True)
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    await bot._on_halt(update, MagicMock())
-    update.effective_message.reply_text.assert_called_once()
-    assert "group mode" in update.effective_message.reply_text.call_args[0][0]
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+    chat = _group_chat(-100_111)
+
+    await bot._on_halt(_halt_ci(chat))
+
+    assert len(bot._transport.sent_messages) == 1
+    assert "group mode" in bot._transport.sent_messages[0].text
 
 
 @pytest.mark.asyncio
 async def test_resume_in_solo_mode_rejects(tmp_path):
     """Solo (non-team) bots should reject /resume with a helpful message."""
-    from link_project_to_chat.bot import ProjectBot
     bot = ProjectBot(name="solo", path=tmp_path, token="t")
-    bot._auth = MagicMock(return_value=True)
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_user = MagicMock(id=12345)
-    await bot._on_resume(update, MagicMock())
-    update.effective_message.reply_text.assert_called_once()
-    assert "group mode" in update.effective_message.reply_text.call_args[0][0]
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+    chat = _group_chat(-100_111)
+
+    await bot._on_resume(_halt_ci(chat))
+
+    assert len(bot._transport.sent_messages) == 1
+    assert "group mode" in bot._transport.sent_messages[0].text
 
 
 @pytest.mark.asyncio
 async def test_halt_from_wrong_group_silently_ignored(tmp_path):
     """A /halt sent from a chat_id != self.group_chat_id should be silently ignored."""
     bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
-    bot._auth = MagicMock(return_value=True)
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock(id=-100_222)  # wrong group
-    update.effective_user = MagicMock(id=12345)
-    await bot._on_halt(update, MagicMock())
-    # Should NOT have set halt on either group; should NOT have replied
-    assert bot._group_state.get(_telegram_group_chat(-100_111)).halted is False
-    assert bot._group_state.get(_telegram_group_chat(-100_222)).halted is False
-    update.effective_message.reply_text.assert_not_called()
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+
+    wrong_chat = _group_chat(-100_222)
+    await bot._on_halt(_halt_ci(wrong_chat))
+
+    assert bot._group_state.get(_group_chat(-100_111)).halted is False
+    assert bot._group_state.get(wrong_chat).halted is False
+    assert bot._transport.sent_messages == []
 
 
 @pytest.mark.asyncio
 async def test_resume_from_wrong_group_silently_ignored(tmp_path):
     """A /resume sent from wrong chat_id should be silently ignored."""
     bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
-    bot._auth = MagicMock(return_value=True)
-    correct_chat = _telegram_group_chat(-100_111)
-    bot._group_state.halt(correct_chat)  # halt the correct group first
-    update = MagicMock()
-    update.effective_message = MagicMock()
-    update.effective_message.reply_text = AsyncMock()
-    update.effective_chat = MagicMock(id=-100_222)
-    update.effective_user = MagicMock(id=12345)
-    await bot._on_resume(update, MagicMock())
-    # The correct group's halt should still be set; no reply
+    _team_bot_with_fake_transport(bot)
+    bot._auth_identity = lambda _s: True
+    correct_chat = _group_chat(-100_111)
+    bot._group_state.halt(correct_chat)
+
+    wrong_chat = _group_chat(-100_222)
+    await bot._on_resume(_halt_ci(wrong_chat))
+
     assert bot._group_state.get(correct_chat).halted is True
-    update.effective_message.reply_text.assert_not_called()
+    assert bot._transport.sent_messages == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

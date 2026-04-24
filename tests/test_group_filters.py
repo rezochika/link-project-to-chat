@@ -39,21 +39,23 @@ def _msg(
     sender_is_bot: bool = False,
     reply_to_bot_username: str | None = None,
 ) -> IncomingMessage:
-    native = None
     reply_to: MessageRef | None = None
+    reply_to_sender: Identity | None = None
     if reply_to_bot_username:
-        # Construct a minimal native object carrying reply_to_message.from_user.username.
-        reply_from_user = SimpleNamespace(username=reply_to_bot_username)
-        reply_native = SimpleNamespace(from_user=reply_from_user)
-        native = SimpleNamespace(reply_to_message=reply_native)
         reply_to = MessageRef(transport_id="telegram", native_id="0", chat=_chat())
+        reply_to_sender = Identity(
+            transport_id="telegram", native_id="0",
+            display_name=reply_to_bot_username,
+            handle=reply_to_bot_username, is_bot=True,
+        )
     return IncomingMessage(
         chat=_chat(),
         sender=_sender(handle=sender_handle, is_bot=sender_is_bot),
         text=text,
         files=[],
         reply_to=reply_to,
-        native=native,
+        native=None,
+        reply_to_sender=reply_to_sender,
     )
 
 

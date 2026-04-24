@@ -3,10 +3,8 @@
 Owns one editable message and throttles updates. The bot calls `append(delta)`
 as Claude's deltas arrive; this class handles rate-limiting, HTML rendering on
 finalize, overflow rotation into new messages, and back-off when the transport
-signals RetryAfter.
-
-Replaces the telegram-specific `LiveMessage` in `link_project_to_chat.livestream`
-for callers that can live with HTML through the Transport interface.
+signals RetryAfter. Rich rendering goes through `transport.render_markdown` so
+this module stays platform-free.
 """
 from __future__ import annotations
 
@@ -14,7 +12,6 @@ import asyncio
 import logging
 import time
 
-from ..formatting import md_to_telegram
 from .base import ChatRef, MessageRef, Transport, TransportRetryAfter
 
 logger = logging.getLogger(__name__)
@@ -149,7 +146,7 @@ class StreamingMessage:
         head_size = room
         rendered: str | None = None
         for _ in range(5):
-            candidate = self._prefix + md_to_telegram(self._buffer[:head_size])
+            candidate = self._prefix + self._transport.render_markdown(self._buffer[:head_size])
             if len(candidate) <= self._max_chars:
                 rendered = candidate
                 break
@@ -221,7 +218,7 @@ class StreamingMessage:
         use_html = render
         rendered = text
         if render:
-            rendered = self._prefix + md_to_telegram(self._buffer)
+            rendered = self._prefix + self._transport.render_markdown(self._buffer)
 
         if rendered != self._last_rendered:
             try:
