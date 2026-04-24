@@ -52,7 +52,10 @@ def test_load_config_truncated_json_raises(tmp_path: Path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="UNIX permissions only")
-@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permission checks")
+@pytest.mark.skipif(
+    hasattr(os, "getuid") and os.getuid() == 0,
+    reason="root bypasses permission checks",
+)
 def test_load_config_unreadable_file_raises(tmp_path: Path):
     """load_config raises when the file exists but is not readable."""
     p = tmp_path / "secret.json"
