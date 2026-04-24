@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,9 +14,23 @@ from link_project_to_chat.transcriber import (
 )
 
 
-def test_create_transcriber_api():
+def _install_fake_openai(monkeypatch, client: MagicMock):
+    openai_ctor = MagicMock(return_value=client)
+    monkeypatch.setattr(
+        "link_project_to_chat.transcriber.openai",
+        SimpleNamespace(OpenAI=openai_ctor),
+    )
+    return openai_ctor
+
+
+def test_create_transcriber_api(monkeypatch):
+    mock_client = MagicMock()
+    openai_ctor = _install_fake_openai(monkeypatch, mock_client)
+
     t = create_transcriber("whisper-api", openai_api_key="sk-test")
+
     assert isinstance(t, WhisperAPITranscriber)
+    openai_ctor.assert_called_once_with(api_key="sk-test")
 
 
 def test_create_transcriber_cli():
@@ -71,7 +86,7 @@ async def test_convert_ogg_to_wav_ffmpeg_failure(tmp_path):
             await convert_ogg_to_wav(ogg, tmp_path / "out.wav")
 
 
-async def test_whisper_api_transcribe(tmp_path):
+async def test_whisper_api_transcribe(tmp_path, monkeypatch):
     """WhisperAPI transcriber with a real temp file and mocked openai client."""
     ogg = tmp_path / "voice.ogg"
     ogg.write_bytes(b"fake ogg audio data")
@@ -82,8 +97,8 @@ async def test_whisper_api_transcribe(tmp_path):
     mock_client = MagicMock()
     mock_client.audio.transcriptions.create = MagicMock(return_value=mock_transcription)
 
+    _install_fake_openai(monkeypatch, mock_client)
     transcriber = WhisperAPITranscriber(api_key="sk-test", model="whisper-1")
-    transcriber._client = mock_client
 
     result = await transcriber.transcribe(ogg)
     assert result == "Hello, this is a test"
@@ -93,7 +108,7 @@ async def test_whisper_api_transcribe(tmp_path):
     assert "file" in call_kwargs
 
 
-async def test_whisper_api_transcribe_with_language(tmp_path):
+async def test_whisper_api_transcribe_with_language(tmp_path, monkeypatch):
     """Language parameter is forwarded to the OpenAI API."""
     ogg = tmp_path / "voice.ogg"
     ogg.write_bytes(b"fake")
@@ -104,8 +119,8 @@ async def test_whisper_api_transcribe_with_language(tmp_path):
     mock_client = MagicMock()
     mock_client.audio.transcriptions.create = MagicMock(return_value=mock_transcription)
 
+    _install_fake_openai(monkeypatch, mock_client)
     transcriber = WhisperAPITranscriber(api_key="sk-test", model="whisper-1", language="ka")
-    transcriber._client = mock_client
 
     result = await transcriber.transcribe(ogg)
     assert result == "გამარჯობა"
@@ -113,7 +128,7 @@ async def test_whisper_api_transcribe_with_language(tmp_path):
     assert call_kwargs["language"] == "ka"
 
 
-async def test_whisper_api_transcribe_closes_file_on_error(tmp_path):
+async def test_whisper_api_transcribe_closes_file_on_error(tmp_path, monkeypatch):
     """File handle is closed even when the API call throws.
 
     Captures the file-object passed into the mocked client and asserts
@@ -133,8 +148,8 @@ async def test_whisper_api_transcribe_closes_file_on_error(tmp_path):
     mock_client = MagicMock()
     mock_client.audio.transcriptions.create = MagicMock(side_effect=capturing_create)
 
+    _install_fake_openai(monkeypatch, mock_client)
     transcriber = WhisperAPITranscriber(api_key="sk-test", model="whisper-1")
-    transcriber._client = mock_client
 
     with pytest.raises(RuntimeError, match="API down"):
         await transcriber.transcribe(ogg)
