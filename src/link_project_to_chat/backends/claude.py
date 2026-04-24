@@ -11,13 +11,16 @@ import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
-from .stream import Error, Result, StreamEvent, parse_stream_line
+from ..events import Error, Result, StreamEvent
+from .base import BackendCapabilities, HealthStatus
+from .claude_parser import parse_stream_line
+from .factory import register
 
 logger = logging.getLogger(__name__)
 
 
 class ClaudeStreamError(Exception):
-    """Raised by ClaudeClient.chat() when the stream returns an Error event."""
+    """Raised by ClaudeBackend.chat() when the stream returns an Error event."""
 
 
 _API_KEY_RE = re.compile(r"(sk-[a-zA-Z]+-)\S+")
@@ -115,7 +118,18 @@ only channel to you. Confirm before editing those files, and note that running \
 `rebuild.sh` restarts the service (brief gap before the next message gets through)."""
 
 
-class ClaudeClient:
+class ClaudeBackend:
+    name = "claude"
+    capabilities = BackendCapabilities(
+        models=MODELS,
+        supports_thinking=True,
+        supports_permissions=True,
+        supports_resume=True,
+        supports_compact=True,
+        supports_allowed_tools=True,
+        supports_usage_cap_detection=True,
+    )
+
     def __init__(
         self,
         project_path: Path,
@@ -140,6 +154,7 @@ class ClaudeClient:
         # append_system_prompt.
         self.team_system_note: str | None = None
         self.session_id: str | None = None
+        self.show_thinking: bool = False
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
@@ -244,6 +259,27 @@ class ClaudeClient:
             elif isinstance(event, Error):
                 raise ClaudeStreamError(event.message)
         return result_text or "[No response]"
+
+    async def probe_health(self) -> HealthStatus:
+        """Send a trivial prompt to verify the backend is reachable.
+
+        Returns HealthStatus(ok=True) when chat returns a normal response;
+        HealthStatus(ok=False, usage_capped=True) when a usage-cap signal is
+        detected (either via stream Error or direct result string);
+        HealthStatus(ok=False) for other stream errors.
+        """
+        try:
+            result = await self.chat("ping")
+        except ClaudeStreamError as exc:
+            message = str(exc)
+            return HealthStatus(
+                ok=False,
+                usage_capped=is_usage_cap_error(message),
+                error_message=message,
+            )
+        if is_usage_cap_error(result):
+            return HealthStatus(ok=False, usage_capped=True, error_message=result)
+        return HealthStatus(ok=True, usage_capped=False, error_message=None)
 
     # ------------------------------------------------------------------
     # Interactive process management
@@ -371,3 +407,22 @@ class ClaudeClient:
             self._proc.kill()
             return True
         return False
+
+
+def _make_claude(project_path: Path, state: dict) -> ClaudeBackend:
+    permissions = state.get("permissions")
+    backend = ClaudeBackend(
+        project_path=project_path,
+        model=state.get("model") or DEFAULT_MODEL,
+        skip_permissions=(permissions == "dangerously-skip-permissions"),
+        permission_mode=permissions if permissions != "dangerously-skip-permissions" else None,
+        allowed_tools=state.get("allowed_tools"),
+        disallowed_tools=state.get("disallowed_tools"),
+    )
+    backend.session_id = state.get("session_id")
+    backend.show_thinking = bool(state.get("show_thinking"))
+    backend.effort = state.get("effort") or "medium"
+    return backend
+
+
+register("claude", _make_claude)

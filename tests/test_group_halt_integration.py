@@ -107,7 +107,7 @@ async def test_on_text_emits_cap_message_when_round_limit_tripped(tmp_path):
     auto-pause message exactly once."""
     bot = _mk_bot(tmp_path, max_rounds=2)
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
     chat = _group_chat(-100_111)
 
     # Two bot-to-bot messages — the second trips the cap.
@@ -134,7 +134,7 @@ async def test_on_text_silently_drops_bot_messages_after_cap(tmp_path):
     """Once halted, additional bot-to-bot messages must not produce any reply."""
     bot = _mk_bot(tmp_path, max_rounds=2)
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
     chat = _group_chat(-100_111)
 
     # Trip the cap.
@@ -296,7 +296,7 @@ async def test_relayed_bot_to_bot_increments_round_counter(tmp_path):
     increment the round counter (previously reset it, per the v1 tradeoff)."""
     bot = _mk_bot(tmp_path, max_rounds=20)
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
     chat = _group_chat(int(bot.group_chat_id))
 
     for _ in range(20):
@@ -320,7 +320,7 @@ async def test_native_bot_sender_increments_round_counter(tmp_path):
     """For non-Telegram transports: a sender with is_bot=True also increments."""
     bot = _mk_bot(tmp_path, max_rounds=20)
     _team_bot_with_fake_transport(bot)
-    bot.task_manager.submit_claude = MagicMock()
+    bot.task_manager.submit_agent = MagicMock()
     chat = _group_chat(int(bot.group_chat_id))
 
     for _ in range(20):

@@ -7,10 +7,13 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import link_project_to_chat.config as config_module
 from link_project_to_chat.config import (
     _atomic_write,
     Config,
+    ConfigError,
     ProjectConfig,
     TeamBotConfig,
     TeamConfig,
@@ -805,6 +808,53 @@ def test_load_config_self_heals_phantom_project_without_path(tmp_path: Path):
     raw = json.loads(p.read_text())
     assert raw["projects"] == {"good": {"path": "/x", "telegram_bot_token": "T"}}
     assert raw["future_key"] == "kept"
+
+
+def test_load_config_team_missing_path_raises_config_error(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "teams": {
+            "acme": {
+                "group_chat_id": -1,
+                "bots": {"manager": {"active_persona": "developer"}},
+            }
+        },
+    }))
+    with pytest.raises(ConfigError) as exc:
+        load_config(p)
+    msg = str(exc.value)
+    assert "acme" in msg
+    assert "path" in msg
+
+
+def test_load_config_team_missing_group_chat_id_raises_config_error(tmp_path: Path):
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "teams": {
+            "beta": {
+                "path": "/some/path",
+                "bots": {"manager": {"active_persona": "developer"}},
+            }
+        },
+    }))
+    with pytest.raises(ConfigError) as exc:
+        load_config(p)
+    msg = str(exc.value)
+    assert "beta" in msg
+    assert "group_chat_id" in msg
+
+
+def test_load_config_team_missing_everything_names_first_missing_field(tmp_path: Path):
+    """A stub team entry (only bots) must raise ConfigError naming the team."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "teams": {
+            "acme": {"bots": {"manager": {"active_persona": "developer"}}},
+        },
+    }))
+    with pytest.raises(ConfigError) as exc:
+        load_config(p)
+    assert "acme" in str(exc.value)
 
 
 def test_save_config_drops_phantom_project_on_next_write(tmp_path: Path):

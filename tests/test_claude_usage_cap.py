@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from link_project_to_chat.claude_client import (
+from link_project_to_chat.backends.claude import (
     ClaudeUsageCapError,
     _detect_usage_cap,
 )

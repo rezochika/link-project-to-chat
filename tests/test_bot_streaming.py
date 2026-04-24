@@ -49,7 +49,7 @@ def _fake_task(task_id: int = 1) -> Task:
     t.chat_id = 99
     t.message_id = 7
     t.status = TaskStatus.RUNNING
-    t.type = TaskType.CLAUDE
+    t.type = TaskType.AGENT
     t.result = ""
     t.error = None
     t.pending_questions = []
@@ -326,7 +326,7 @@ async def test_on_task_complete_still_finalizes_when_session_persist_fails(caplo
     bot = await _stub_bot()
     task = _fake_task(task_id=13)
     task.status = TaskStatus.DONE
-    bot.task_manager = SimpleNamespace(claude=SimpleNamespace(session_id="sess-123"))
+    bot.task_manager = SimpleNamespace(backend=SimpleNamespace(session_id="sess-123"))
     bot._patch_config = MagicMock(side_effect=RuntimeError("disk full"))
     bot._finalize_claude_task = AsyncMock()
 

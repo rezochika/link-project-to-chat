@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .claude_client import ClaudeClient
-from .stream import AskQuestion, Error, Question, Result, StreamEvent, TextDelta
+from .backends.base import AgentBackend
+from .events import AskQuestion, Error, Question, Result, StreamEvent, TextDelta
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
 
 
 class TaskType(enum.Enum):
-    CLAUDE = "claude"
+    AGENT = "agent"
     COMMAND = "command"
 
 
@@ -154,16 +154,14 @@ class TaskManager:
     def __init__(
         self,
         project_path: Path,
+        backend: AgentBackend,
         on_complete: OnTaskEvent,
         on_task_started: OnTaskEvent,
         on_stream_event: Callable[[Task, StreamEvent], Awaitable[None]] | None = None,
         on_waiting_input: OnTaskEvent | None = None,
-        skip_permissions: bool = False,
-        permission_mode: str | None = None,
-        allowed_tools: list[str] | None = None,
-        disallowed_tools: list[str] | None = None,
     ):
         self.project_path = project_path
+        self._backend = backend
         self._on_complete = on_complete
         self._on_task_started = on_task_started
         self._on_stream_event = on_stream_event
@@ -171,66 +169,59 @@ class TaskManager:
         self._next_id = 1
         self._tasks: dict[int, Task] = {}
         self._active_run_pids: set[int] = set()
-        self._claude = ClaudeClient(
-            project_path,
-            skip_permissions=skip_permissions,
-            permission_mode=permission_mode,
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-        )
-        self._claude_owner_task_id: int | None = None
+        self._backend_owner_task_id: int | None = None
 
     @property
-    def claude(self) -> ClaudeClient:
-        return self._claude
+    def backend(self) -> AgentBackend:
+        return self._backend
 
-    async def _acquire_claude_slot(self, task_id: int) -> None:
-        while self._claude_owner_task_id not in (None, task_id):
+    async def _acquire_backend_slot(self, task_id: int) -> None:
+        while self._backend_owner_task_id not in (None, task_id):
             await asyncio.sleep(0.05)
-        self._claude_owner_task_id = task_id
+        self._backend_owner_task_id = task_id
 
-    def _release_claude_slot(self, task_id: int) -> None:
-        if self._claude_owner_task_id == task_id:
-            self._claude_owner_task_id = None
+    def _release_backend_slot(self, task_id: int) -> None:
+        if self._backend_owner_task_id == task_id:
+            self._backend_owner_task_id = None
 
-    async def _close_claude_interactive(self) -> None:
-        close_async = getattr(self._claude, "aclose_interactive", None)
+    async def _close_backend_interactive(self) -> None:
+        close_async = getattr(self._backend, "aclose_interactive", None)
         if callable(close_async):
             await close_async()
             return
-        await asyncio.to_thread(self._claude.close_interactive)
+        await asyncio.to_thread(self._backend.close_interactive)
 
-    def _cleanup_cancelled_claude_task(
+    def _cleanup_cancelled_agent_task(
         self,
         task: Task,
         previous_status: TaskStatus,
     ) -> None:
-        if task.type != TaskType.CLAUDE or self._claude_owner_task_id != task.id:
+        if task.type != TaskType.AGENT or self._backend_owner_task_id != task.id:
             return
         if previous_status not in (TaskStatus.WAITING_INPUT, TaskStatus.WAITING):
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            self._claude.close_interactive()
+            self._backend.close_interactive()
         else:
-            loop.create_task(self._close_claude_interactive())
-        self._release_claude_slot(task.id)
+            loop.create_task(self._close_backend_interactive())
+        self._release_backend_slot(task.id)
 
     def _command_popen_kwargs(self) -> dict[str, object]:
         return _command_popen_kwargs()
 
     def _submit(self, task: Task) -> Task:
         self._tasks[task.id] = task
-        task._asyncio_task = asyncio.create_task(self._exec_claude(task))
+        task._asyncio_task = asyncio.create_task(self._exec_agent(task))
         return task
 
-    def submit_claude(self, chat_id: int, message_id: int, prompt: str) -> Task:
+    def submit_agent(self, chat_id: int, message_id: int, prompt: str) -> Task:
         task = Task(
             id=self._next_id,
             chat_id=chat_id,
             message_id=message_id,
-            type=TaskType.CLAUDE,
+            type=TaskType.AGENT,
             input=prompt,
             name=prompt[:40],
         )
@@ -242,7 +233,7 @@ class TaskManager:
             id=self._next_id,
             chat_id=chat_id,
             message_id=message_id,
-            type=TaskType.CLAUDE,
+            type=TaskType.AGENT,
             input="/compact",
             name="compact",
             _compact=True,
@@ -269,13 +260,13 @@ class TaskManager:
         return task
 
     # ------------------------------------------------------------------
-    # Claude task execution
+    # Agent task execution
     # ------------------------------------------------------------------
 
-    async def _exec_claude(self, task: Task) -> None:
+    async def _exec_agent(self, task: Task) -> None:
         claimed_slot = False
         try:
-            await self._acquire_claude_slot(task.id)
+            await self._acquire_backend_slot(task.id)
             claimed_slot = True
             task.status = TaskStatus.RUNNING
             task.started_at = time.monotonic()
@@ -283,7 +274,7 @@ class TaskManager:
             if task._compact:
                 task.result = await self._do_compact()
             else:
-                await self._run_claude_turn(task)
+                await self._run_agent_turn(task)
 
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT
@@ -292,34 +283,34 @@ class TaskManager:
                     await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
-            await self._close_claude_interactive()
+            await self._close_backend_interactive()
         except asyncio.CancelledError:
             if task._proc and task._proc.poll() is None:
                 await asyncio.to_thread(_terminate_process_tree, task._proc)
             task.status = TaskStatus.CANCELLED
             if claimed_slot:
-                await self._close_claude_interactive()
+                await self._close_backend_interactive()
         except Exception as e:
-            logger.exception("Claude task #%d failed", task.id)
+            logger.exception("Agent task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
             if claimed_slot:
-                await self._close_claude_interactive()
+                await self._close_backend_interactive()
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
             if claimed_slot and task.status != TaskStatus.WAITING_INPUT:
-                self._release_claude_slot(task.id)
+                self._release_backend_slot(task.id)
 
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
 
-    async def _run_claude_turn(self, task: Task) -> None:
-        """Run one turn of Claude conversation, collecting events."""
+    async def _run_agent_turn(self, task: Task) -> None:
+        """Run one turn of agent conversation, collecting events."""
         collected_text: list[str] = []
         task.pending_questions = []
 
-        async for event in self._claude.chat_stream(
+        async for event in self._backend.chat_stream(
             task.input,
             on_proc=lambda p: setattr(task, "_proc", p),
         ):
@@ -348,13 +339,13 @@ class TaskManager:
         if not task or task.status != TaskStatus.WAITING_INPUT:
             return
 
-        if self._claude_owner_task_id != task.id:
-            await self._acquire_claude_slot(task.id)
+        if self._backend_owner_task_id != task.id:
+            await self._acquire_backend_slot(task.id)
         task.status = TaskStatus.RUNNING
-        task.input = answer  # set input for _run_claude_turn
+        task.input = answer  # set input for _run_agent_turn
 
         try:
-            await self._run_claude_turn(task)
+            await self._run_agent_turn(task)
 
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT
@@ -362,22 +353,22 @@ class TaskManager:
                     await self._safe_callback(self._on_waiting_input, task)
                 return
             task.status = TaskStatus.DONE
-            await self._close_claude_interactive()
+            await self._close_backend_interactive()
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
             if task._proc and task._proc.poll() is None:
                 await asyncio.to_thread(_terminate_process_tree, task._proc)
-            await self._close_claude_interactive()
+            await self._close_backend_interactive()
         except Exception as e:
-            logger.exception("Claude answer task #%d failed", task.id)
+            logger.exception("Agent answer task #%d failed", task.id)
             task.status = TaskStatus.FAILED
             task.error = str(e)
-            await self._close_claude_interactive()
+            await self._close_backend_interactive()
         finally:
             if task.status != TaskStatus.WAITING_INPUT:
                 task.finished_at = time.monotonic()
             if task.status != TaskStatus.WAITING_INPUT:
-                self._release_claude_slot(task.id)
+                self._release_backend_slot(task.id)
 
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
@@ -406,7 +397,7 @@ class TaskManager:
     # Compact
     # ------------------------------------------------------------------
 
-    # Sent to Claude during /compact to produce a context summary that seeds a fresh session.
+    # Sent to the agent during /compact to produce a context summary that seeds a fresh session.
     COMPACT_PROMPT = (
         "Summarize our entire conversation concisely. Include:\n"
         "- Key decisions and architectural choices\n"
@@ -417,11 +408,11 @@ class TaskManager:
     )
 
     async def _do_compact(self) -> str:
-        if not self._claude.session_id:
+        if not self._backend.session_id:
             return "No active session to compact."
-        summary = await self._claude.chat(self.COMPACT_PROMPT)
-        self._claude.session_id = None
-        await self._claude.chat(
+        summary = await self._backend.chat(self.COMPACT_PROMPT)
+        self._backend.session_id = None
+        await self._backend.chat(
             f"Continue from this context summary of our previous session:\n\n{summary}"
         )
         return summary
@@ -536,7 +527,7 @@ class TaskManager:
         previous_status = task.status
         cancelled = task.cancel()
         if cancelled:
-            self._cleanup_cancelled_claude_task(task, previous_status)
+            self._cleanup_cancelled_agent_task(task, previous_status)
         return cancelled
 
     def cancel_all(self) -> int:
@@ -545,7 +536,7 @@ class TaskManager:
             previous_status = task.status
             if task.cancel():
                 cancelled += 1
-                self._cleanup_cancelled_claude_task(task, previous_status)
+                self._cleanup_cancelled_agent_task(task, previous_status)
         return cancelled
 
     @property

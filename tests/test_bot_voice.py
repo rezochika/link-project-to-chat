@@ -34,13 +34,13 @@ def _make_project_bot_stub(with_synthesizer: bool = False):
     bot._transcriber = AsyncMock()
     bot._transcriber.transcribe = AsyncMock(return_value="transcribed text")
     bot._synthesizer = object() if with_synthesizer else None
-    # task_manager stub — submit_claude is sync in the real TaskManager,
+    # task_manager stub — submit_agent is sync in the real TaskManager,
     # so we use MagicMock here (AsyncMock would return a coroutine that
     # breaks ``task.id`` access in the synthesizer path).
     bot.task_manager = SimpleNamespace(
         waiting_input_task=lambda chat_id: None,
         submit_answer=MagicMock(),
-        submit_claude=MagicMock(return_value=SimpleNamespace(id=99)),
+        submit_agent=MagicMock(return_value=SimpleNamespace(id=99)),
     )
     return bot
 
@@ -105,8 +105,8 @@ async def test_voice_message_submits_to_claude(tmp_path):
     bot = _make_project_bot_stub()
     incoming = _audio_incoming(tmp_path)
     await bot._on_voice_from_transport(incoming)
-    bot.task_manager.submit_claude.assert_called_once()
-    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    bot.task_manager.submit_agent.assert_called_once()
+    kwargs = bot.task_manager.submit_agent.call_args.kwargs
     assert kwargs["prompt"] == "transcribed text"
 
 
@@ -131,7 +131,7 @@ async def test_voice_unauthorized_sender_ignored(tmp_path):
     await bot._on_voice_from_transport(incoming)
     # No status message sent; no task submitted.
     assert bot._transport.sent_messages == []
-    bot.task_manager.submit_claude.assert_not_called()
+    bot.task_manager.submit_agent.assert_not_called()
     bot._transcriber.transcribe.assert_not_called()
 
 
@@ -187,7 +187,7 @@ async def test_voice_with_reply_prefixes_prompt(tmp_path):
         ),
     )
     await bot._on_voice_from_transport(incoming_with_reply)
-    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    kwargs = bot.task_manager.submit_agent.call_args.kwargs
     assert kwargs["prompt"].startswith("[Replying to: earlier message]")
 
 
@@ -207,7 +207,7 @@ async def test_voice_with_active_persona_formats_prompt(tmp_path, monkeypatch):
 
     incoming = _audio_incoming(tmp_path)
     await bot._on_voice_from_transport(incoming)
-    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    kwargs = bot.task_manager.submit_agent.call_args.kwargs
     assert "[persona=You are a reviewer.]" in kwargs["prompt"]
     assert "transcribed text" in kwargs["prompt"]
 
@@ -220,7 +220,7 @@ async def test_unified_dispatch_routes_audio_to_voice_handler(tmp_path):
     await bot._on_text_from_transport(incoming)
     # Voice flow fires: status message sent, transcript edited, task submitted.
     assert any("Transcribing" in m.text for m in bot._transport.sent_messages)
-    bot.task_manager.submit_claude.assert_called_once()
+    bot.task_manager.submit_agent.assert_called_once()
 
 
 async def test_unified_dispatch_unsupported_fallback():
@@ -271,7 +271,7 @@ async def test_file_upload_uses_platform_temp_root(tmp_path, monkeypatch):
     expected = temp_root / "link-project-to-chat" / "proj" / "uploads" / "report.txt"
     assert expected.read_text(encoding="utf-8") == "report body"
 
-    kwargs = bot.task_manager.submit_claude.call_args.kwargs
+    kwargs = bot.task_manager.submit_agent.call_args.kwargs
     assert kwargs["chat_id"] == 12345
     assert kwargs["message_id"] == 7
     assert str(expected) in kwargs["prompt"]
