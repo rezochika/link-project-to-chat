@@ -201,10 +201,9 @@ class ProjectBot(AuthMixin):
         # Only show typing indicator for Claude tasks, not /run commands
         if task.type == TaskType.COMMAND:
             return
-        chat_ref = self._chat_ref_for_task(task)
         assert self._transport is not None
         self._typing_tasks[task.id] = asyncio.create_task(
-            self._keep_typing(self._transport, chat_ref)
+            self._keep_typing(self._transport, task.chat)
         )
         # Team bots skip per-delta livestreaming (_on_stream_event returns
         # early), but we still need to emit *one* message early so the relay's
@@ -217,8 +216,8 @@ class ProjectBot(AuthMixin):
         if self.group_mode and task.id not in self._live_text:
             live = StreamingMessage(
                 transport=self._transport,
-                chat=chat_ref,
-                reply_to=self._message_ref_for_task_trigger(task),
+                chat=task.chat,
+                reply_to=task.message,
             )
             try:
                 await live.start()
@@ -231,17 +230,6 @@ class ProjectBot(AuthMixin):
                 self._live_text_failed.add(task.id)
                 return
             self._live_text[task.id] = live
-
-    def _chat_ref_for_task(self, task: Task) -> ChatRef:
-        kind = ChatKind.ROOM if self.group_mode else ChatKind.DM
-        return ChatRef(transport_id=self._transport.TRANSPORT_ID, native_id=str(task.chat_id), kind=kind)
-
-    def _message_ref_for_task_trigger(self, task: Task) -> MessageRef:
-        return MessageRef(
-            transport_id=self._transport.TRANSPORT_ID,
-            native_id=str(task.message_id),
-            chat=self._chat_ref_for_task(task),
-        )
 
     async def _on_stream_event(self, task: Task, event: StreamEvent) -> None:
         if isinstance(event, TextDelta):
@@ -257,8 +245,8 @@ class ProjectBot(AuthMixin):
                 assert self._transport is not None
                 live = StreamingMessage(
                     self._transport,
-                    self._chat_ref_for_task(task),
-                    reply_to=self._message_ref_for_task_trigger(task),
+                    task.chat,
+                    reply_to=task.message,
                 )
                 try:
                     await live.start()
@@ -283,8 +271,8 @@ class ProjectBot(AuthMixin):
                     assert self._transport is not None
                     live = StreamingMessage(
                         self._transport,
-                        self._chat_ref_for_task(task),
-                        reply_to=self._message_ref_for_task_trigger(task),
+                        task.chat,
+                        reply_to=task.message,
                         prefix="💭 ",
                     )
                     try:
@@ -311,59 +299,49 @@ class ProjectBot(AuthMixin):
             self._thinking_buf[task.id] = buf + sep + event.text
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
-                await self._send_image(
-                    task.chat_id, event.path, reply_to=task.message_id
-                )
+                await self._send_image(task.chat, event.path, reply_to=task.message)
 
     async def _send_html(
         self,
-        chat_id: int,
+        chat: ChatRef,
         html: str,
-        reply_to: int | None = None,
+        reply_to: MessageRef | None = None,
         reply_markup: Buttons | None = None,
-    ) -> int | None:
-        """Send HTML message(s), attaching buttons to the last chunk. Returns last message ID."""
+    ) -> MessageRef | None:
+        """Send HTML message(s), attaching buttons to the last chunk. Returns the last sent ref."""
         assert self._transport is not None
-        chat = ChatRef(
-            transport_id=self._transport.TRANSPORT_ID,
-            native_id=str(chat_id),
-            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
-        )
-        reply_ref: MessageRef | None = None
-        if reply_to is not None:
-            reply_ref = MessageRef(
-                transport_id=self._transport.TRANSPORT_ID, native_id=str(reply_to), chat=chat,
-            )
         chunks = split_html(html)
-        last_id: int | None = None
+        last_ref: MessageRef | None = None
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
             btns = reply_markup if is_last else None
             try:
-                sent = await self._transport.send_text(
-                    chat, chunk, html=True, reply_to=reply_ref, buttons=btns,
+                last_ref = await self._transport.send_text(
+                    chat, chunk, html=True, reply_to=reply_to, buttons=btns,
                 )
-                last_id = int(sent.native_id)
             except Exception:
                 logger.warning("HTML send failed, falling back to plain", exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    sent = await self._transport.send_text(
+                    last_ref = await self._transport.send_text(
                         chat,
                         plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to=reply_ref,
+                        reply_to=reply_to,
                         buttons=btns,
                     )
-                    last_id = int(sent.native_id)
-        return last_id
+        return last_ref
 
-    async def _send_to_chat(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+    async def _send_to_chat(
+        self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
+    ) -> None:
         html = md_to_telegram(text or "[No output]").replace("\x00", "")
-        await self._send_html(chat_id, html, reply_to)
+        await self._send_html(chat, html, reply_to)
 
-    async def _send_raw(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+    async def _send_raw(
+        self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
+    ) -> None:
         escaped = (text or "[No output]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        await self._send_html(chat_id, f"<pre>{escaped}</pre>", reply_to)
+        await self._send_html(chat, f"<pre>{escaped}</pre>", reply_to)
 
     async def _cancel_live_for(self, task_id: int, note: str = "(cancelled)") -> None:
         """Seal any live text/thinking messages for this task with a cancellation marker."""
@@ -398,7 +376,7 @@ class ProjectBot(AuthMixin):
                 await live_text.cancel("(compacted)")
             if live_thinking is not None:
                 await live_thinking.cancel("(compacted)")
-            await self._send_to_chat(task.chat_id, text, reply_to=task.message_id)
+            await self._send_to_chat(task.chat, text, reply_to=task.message)
             return
 
         if task.status == TaskStatus.DONE:
@@ -421,13 +399,13 @@ class ProjectBot(AuthMixin):
                     fallback = task.result if not has_buffer else None
                     await live_text.finalize(fallback, render=True)
             else:
-                await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+                await self._send_to_chat(task.chat, task.result, reply_to=task.message)
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
             elif thinking:
                 self._thinking_store[task.id] = thinking
             if is_voice and self._synthesizer and task.result:
-                await self._send_voice_response(task.chat_id, task.result, reply_to=task.message_id)
+                await self._send_voice_response(task.chat, task.result, reply_to=task.message)
         else:
             error_text = f"Error: {task.error}"
             if is_usage_cap_error(task.error) and self.group_mode:
@@ -435,24 +413,23 @@ class ProjectBot(AuthMixin):
                     await live_text.finalize(error_text, render=False)
                 if live_thinking is not None:
                     await live_thinking.finalize(render=False)
-                self._group_state.halt(self._chat_ref_for_task(task))
+                self._group_state.halt(task.chat)
                 await self._send_to_chat(
-                    task.chat_id,
+                    task.chat,
                     "Hit Max usage cap. Pausing until reset. Will retry every 30 min.",
-                    reply_to=task.message_id,
+                    reply_to=task.message,
                 )
-                self._schedule_cap_probe(self._chat_ref_for_task(task))
+                self._schedule_cap_probe(task.chat)
                 return
             if live_text is not None:
                 await live_text.finalize(error_text, render=False)
             else:
-                await self._send_to_chat(task.chat_id, error_text, reply_to=task.message_id)
+                await self._send_to_chat(task.chat, error_text, reply_to=task.message)
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
 
     def _schedule_cap_probe(self, chat: ChatRef, interval_s: int = 1800) -> None:
         """Probe the backend every `interval_s` seconds; on success, resume the group."""
-        chat_id = int(chat.native_id)
         async def _probe() -> None:
             while self._group_state.get(chat).halted:
                 await asyncio.sleep(interval_s)
@@ -465,14 +442,14 @@ class ProjectBot(AuthMixin):
                     continue
                 if status.ok and not status.usage_capped:
                     self._group_state.resume(chat)
-                    await self._send_to_chat(chat_id, "Usage cap cleared. Resumed.")
+                    await self._send_to_chat(chat, "Usage cap cleared. Resumed.")
                     return
         task = asyncio.create_task(_probe())
         self._probe_tasks.add(task)
         task.add_done_callback(self._probe_tasks.discard)
 
     async def _send_voice_response(
-        self, chat_id: int, text: str, reply_to: int | None = None
+        self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
     ) -> None:
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
         voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -482,20 +459,9 @@ class ProjectBot(AuthMixin):
         out_path = voice_dir / f"tts_{uuid.uuid4().hex}.opus"
 
         assert self._transport is not None
-        chat = ChatRef(
-            transport_id=self._transport.TRANSPORT_ID,
-            native_id=str(chat_id),
-            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
-        )
-        reply_ref: MessageRef | None = None
-        if reply_to is not None:
-            reply_ref = MessageRef(
-                transport_id=self._transport.TRANSPORT_ID, native_id=str(reply_to), chat=chat,
-            )
-
         try:
             await self._synthesizer.synthesize(plain, out_path)
-            await self._transport.send_voice(chat, out_path, reply_to=reply_ref)
+            await self._transport.send_voice(chat, out_path, reply_to=reply_to)
         except Exception:
             logger.warning("TTS failed", exc_info=True)
         finally:
@@ -510,9 +476,9 @@ class ProjectBot(AuthMixin):
         if len(output) > 3000:
             output = output[:3000] + "\n... (truncated, use /log)"
         if task.status == TaskStatus.DONE:
-            await self._send_raw(task.chat_id, f"{output}\n[exit 0]")
+            await self._send_raw(task.chat, f"{output}\n[exit 0]")
         else:
-            await self._send_raw(task.chat_id, f"[exit {task.exit_code}]\n\n{output}")
+            await self._send_raw(task.chat, f"[exit {task.exit_code}]\n\n{output}")
 
     async def _on_task_complete(self, task: Task) -> None:
         typing = self._typing_tasks.pop(task.id, None)
@@ -583,7 +549,7 @@ class ProjectBot(AuthMixin):
         if live_text is not None:
             await live_text.finalize(task.result or None, render=True)
         elif task.result and task.result.strip():
-            await self._send_to_chat(task.chat_id, task.result, reply_to=task.message_id)
+            await self._send_to_chat(task.chat, task.result, reply_to=task.message)
         live_thinking = self._live_thinking.pop(task.id, None)
         self._live_thinking_failed.discard(task.id)
         if live_thinking is not None:
@@ -591,9 +557,9 @@ class ProjectBot(AuthMixin):
 
         for q_idx, question in enumerate(task.pending_questions):
             await self._send_html(
-                task.chat_id,
+                task.chat,
                 self._render_question_html(question),
-                reply_to=task.message_id,
+                reply_to=task.message,
                 reply_markup=self._question_buttons(task.id, q_idx, question),
             )
 
@@ -720,10 +686,12 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
-        message_id_int = int(incoming.message.native_id) if incoming.message else 0
+        message_ref = incoming.message or MessageRef(
+            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
+        )
         self.task_manager.submit_agent(
-            chat_id=int(incoming.chat.native_id),
-            message_id=message_id_int,
+            chat=incoming.chat,
+            message=message_ref,
             prompt=prompt,
         )
 
@@ -782,17 +750,18 @@ class ProjectBot(AuthMixin):
             )
             return
 
-        chat_id_int = int(incoming.chat.native_id)
-        message_id_int = int(incoming.message.native_id) if incoming.message else 0
+        message_ref = incoming.message or MessageRef(
+            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
+        )
 
         # Active Claude turn waiting on a question? Route as the answer.
-        waiting = self.task_manager.waiting_input_task(chat_id_int)
+        waiting = self.task_manager.waiting_input_task(incoming.chat)
         if waiting:
             self.task_manager.submit_answer(waiting.id, incoming.text)
             return
 
         # Supersede any in-flight task tied to this message (edit-message case).
-        for prev in self.task_manager.find_by_message(message_id_int):
+        for prev in self.task_manager.find_by_message(message_ref):
             self.task_manager.cancel(prev.id)
             await self._cancel_live_for(prev.id, "(superseded)")
             typing = self._typing_tasks.pop(prev.id, None)
@@ -808,8 +777,8 @@ class ProjectBot(AuthMixin):
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
         self.task_manager.submit_agent(
-            chat_id=chat_id_int,
-            message_id=message_id_int,
+            chat=incoming.chat,
+            message=message_ref,
             prompt=prompt,
         )
 
@@ -823,8 +792,8 @@ class ProjectBot(AuthMixin):
             return
         command = " ".join(ci.args)
         self.task_manager.run_command(
-            chat_id=int(ci.chat.native_id),
-            message_id=int(ci.message.native_id),
+            chat=ci.chat,
+            message=ci.message,
             command=command,
         )
 
@@ -836,8 +805,8 @@ class ProjectBot(AuthMixin):
         TaskStatus.CANCELLED: "x",
     }
 
-    def _tasks_buttons(self, chat_id: int) -> Buttons | None:
-        all_tasks = self.task_manager.list_tasks(chat_id=chat_id, limit=100)
+    def _tasks_buttons(self, chat: ChatRef) -> Buttons | None:
+        all_tasks = self.task_manager.list_tasks(chat=chat, limit=100)
         active = [t for t in all_tasks if t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)]
         finished = [t for t in all_tasks if t.status not in (TaskStatus.WAITING, TaskStatus.RUNNING)][:5]
         tasks = active + finished
@@ -851,9 +820,9 @@ class ProjectBot(AuthMixin):
             rows.append([Button(label=f"{icon} #{t.id}{elapsed} {label}", value=f"task_info_{t.id}")])
         return Buttons(rows=rows)
 
-    async def _render_tasks(self, chat_id: int, msg_ref: MessageRef) -> None:
+    async def _render_tasks(self, chat: ChatRef, msg_ref: MessageRef) -> None:
         """Render the tasks list into an existing message (edit)."""
-        buttons = self._tasks_buttons(chat_id)
+        buttons = self._tasks_buttons(chat)
         assert self._transport is not None
         await self._transport.edit_text(
             msg_ref,
@@ -864,7 +833,7 @@ class ProjectBot(AuthMixin):
     async def _on_tasks(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
-        buttons = self._tasks_buttons(int(ci.chat.native_id))
+        buttons = self._tasks_buttons(ci.chat)
         assert self._transport is not None
         await self._transport.send_text(
             ci.chat,
@@ -990,8 +959,8 @@ class ProjectBot(AuthMixin):
             await self._transport.send_text(ci.chat, "No active session.")
             return
         self.task_manager.submit_compact(
-            chat_id=int(ci.chat.native_id),
-            message_id=int(ci.message.native_id),
+            chat=ci.chat,
+            message=ci.message,
         )
 
     async def _on_version_t(self, ci) -> None:
@@ -1616,7 +1585,7 @@ class ProjectBot(AuthMixin):
             rows.append([Button(label="« Back", value="tasks_back")])
             await self._transport.edit_text(msg_ref, text, buttons=Buttons(rows=rows))
         elif value == "tasks_back":
-            await self._render_tasks(int(chat.native_id), msg_ref)
+            await self._render_tasks(chat, msg_ref)
         elif value.startswith("task_cancel_"):
             task_id = _parse_task_id(value)
             await self._cancel_live_for(task_id)
@@ -1653,7 +1622,7 @@ class ProjectBot(AuthMixin):
             thinking = self._thinking_store.get(task_id)
             if not thinking:
                 return
-            await self._send_to_chat(int(chat.native_id), f"💭 {thinking}")
+            await self._send_to_chat(chat, f"💭 {thinking}")
 
     def _compose_status(self) -> str:
         uptime = time.monotonic() - self._started_at
@@ -1731,14 +1700,17 @@ class ProjectBot(AuthMixin):
         if caption:
             prompt += f"\n\n{caption}"
 
-        waiting = self.task_manager.waiting_input_task(int(incoming.chat.native_id))
+        waiting = self.task_manager.waiting_input_task(incoming.chat)
         if waiting:
             self.task_manager.submit_answer(waiting.id, prompt)
             return
 
+        message_ref = incoming.message or MessageRef(
+            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
+        )
         self.task_manager.submit_agent(
-            chat_id=int(incoming.chat.native_id),
-            message_id=int(incoming.message.native_id) if incoming.message else 0,
+            chat=incoming.chat,
+            message=message_ref,
             prompt=prompt,
         )
 
@@ -1785,8 +1757,7 @@ class ProjectBot(AuthMixin):
             display = text if len(text) <= 200 else text[:200] + "..."
             await self._transport.edit_text(status_ref, f'🎤 "{display}"')
 
-            chat_id_int = int(incoming.chat.native_id)
-            waiting = self.task_manager.waiting_input_task(chat_id_int)
+            waiting = self.task_manager.waiting_input_task(incoming.chat)
             if waiting:
                 self.task_manager.submit_answer(waiting.id, text)
                 return
@@ -1801,10 +1772,12 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
-            message_id_int = int(incoming.message.native_id) if incoming.message else 0
+            message_ref = incoming.message or MessageRef(
+                transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
+            )
             task = self.task_manager.submit_agent(
-                chat_id=chat_id_int,
-                message_id=message_id_int,
+                chat=incoming.chat,
+                message=message_ref,
                 prompt=prompt,
             )
             if self._synthesizer:
@@ -1825,7 +1798,7 @@ class ProjectBot(AuthMixin):
         return PurePosixPath(path).suffix.lower() in self.IMAGE_EXTENSIONS
 
     async def _send_image(
-        self, chat_id: int, file_path: str, reply_to: int | None = None
+        self, chat: ChatRef, file_path: str, reply_to: MessageRef | None = None,
     ) -> None:
         path = (
             self.path / file_path if not file_path.startswith("/") else Path(file_path)
@@ -1842,11 +1815,6 @@ class ProjectBot(AuthMixin):
             logger.warning("Image file not found: %s", resolved)
             return
         assert self._transport is not None
-        chat = ChatRef(
-            transport_id=self._transport.TRANSPORT_ID,
-            native_id=str(chat_id),
-            kind=ChatKind.ROOM if self.group_mode else ChatKind.DM,
-        )
         try:
             # Oversized (>10MB) or SVG — Transport.send_file picks document-mode
             # for non-image suffixes automatically; SVG has .svg suffix not in

@@ -268,8 +268,8 @@ async def test_file_upload_uses_platform_temp_root(tmp_path, monkeypatch):
     assert expected.read_text(encoding="utf-8") == "report body"
 
     kwargs = bot.task_manager.submit_agent.call_args.kwargs
-    assert kwargs["chat_id"] == 12345
-    assert kwargs["message_id"] == 7
+    assert kwargs["chat"].native_id == "12345"
+    assert kwargs["message"].native_id == "7"
     assert str(expected) in kwargs["prompt"]
     assert kwargs["prompt"].endswith("please review")
 

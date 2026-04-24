@@ -805,9 +805,11 @@ async def test_telegram_text_dispatch_preserves_context_and_submits_agent(tmp_pa
 
     await transport._dispatch_message(update, ctx)
 
+    from link_project_to_chat.transport import ChatKind, ChatRef, MessageRef
+    expected_chat = ChatRef(transport_id="telegram", native_id="12345", kind=ChatKind.DM)
     bot.task_manager.submit_agent.assert_called_once_with(
-        chat_id=12345,
-        message_id=100,
+        chat=expected_chat,
+        message=MessageRef(transport_id="telegram", native_id="100", chat=expected_chat),
         prompt="hello from telegram",
     )
 
@@ -1020,10 +1022,11 @@ async def test_on_task_complete_team_bot_persists_session_in_team_config(tmp_pat
 
     bot._finalize_claude_task = fake_finalize
 
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
     task = Task(
         id=1,
-        chat_id=1,
-        message_id=1,
+        chat=chat,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
         type=TaskType.AGENT,
         input="hello",
         name="hello",

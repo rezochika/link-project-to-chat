@@ -17,6 +17,7 @@ from typing import Awaitable, Callable
 
 from .backends.base import AgentBackend
 from .events import AskQuestion, Error, Question, Result, StreamEvent, TextDelta
+from .transport import ChatRef, MessageRef
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,8 @@ class TaskStatus(enum.Enum):
 @dataclass
 class Task:
     id: int
-    chat_id: int
-    message_id: int
+    chat: ChatRef
+    message: MessageRef
     type: TaskType
     input: str
     name: str
@@ -216,11 +217,11 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_agent(task))
         return task
 
-    def submit_agent(self, chat_id: int, message_id: int, prompt: str) -> Task:
+    def submit_agent(self, chat: ChatRef, message: MessageRef, prompt: str) -> Task:
         task = Task(
             id=self._next_id,
-            chat_id=chat_id,
-            message_id=message_id,
+            chat=chat,
+            message=message,
             type=TaskType.AGENT,
             input=prompt,
             name=prompt[:40],
@@ -228,11 +229,11 @@ class TaskManager:
         self._next_id += 1
         return self._submit(task)
 
-    def submit_compact(self, chat_id: int, message_id: int) -> Task:
+    def submit_compact(self, chat: ChatRef, message: MessageRef) -> Task:
         task = Task(
             id=self._next_id,
-            chat_id=chat_id,
-            message_id=message_id,
+            chat=chat,
+            message=message,
             type=TaskType.AGENT,
             input="/compact",
             name="compact",
@@ -242,12 +243,12 @@ class TaskManager:
         return self._submit(task)
 
     def run_command(
-        self, chat_id: int, message_id: int, command: str, name: str | None = None
+        self, chat: ChatRef, message: MessageRef, command: str, name: str | None = None
     ) -> Task:
         task = Task(
             id=self._next_id,
-            chat_id=chat_id,
-            message_id=message_id,
+            chat=chat,
+            message=message,
             type=TaskType.COMMAND,
             input=command,
             name=name or command or f"task-{self._next_id}",
@@ -386,10 +387,10 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self.answer_question(task_id, answer))
         return True
 
-    def waiting_input_task(self, chat_id: int) -> Task | None:
+    def waiting_input_task(self, chat: ChatRef) -> Task | None:
         """Return the WAITING_INPUT task for a chat, if any."""
         for t in self._tasks.values():
-            if t.chat_id == chat_id and t.status == TaskStatus.WAITING_INPUT:
+            if t.chat == chat and t.status == TaskStatus.WAITING_INPUT:
                 return t
         return None
 
@@ -506,18 +507,18 @@ class TaskManager:
     def get(self, task_id: int) -> Task | None:
         return self._tasks.get(task_id)
 
-    def find_by_message(self, message_id: int) -> list[Task]:
+    def find_by_message(self, message: MessageRef) -> list[Task]:
         return [
             t
             for t in self._tasks.values()
-            if t.message_id == message_id
+            if t.message == message
             and t.status in (TaskStatus.WAITING, TaskStatus.RUNNING)
         ]
 
-    def list_tasks(self, chat_id: int | None = None, limit: int = 20) -> list[Task]:
+    def list_tasks(self, chat: ChatRef | None = None, limit: int = 20) -> list[Task]:
         tasks = list(self._tasks.values())
-        if chat_id is not None:
-            tasks = [t for t in tasks if t.chat_id == chat_id]
+        if chat is not None:
+            tasks = [t for t in tasks if t.chat == chat]
         return heapq.nlargest(limit, tasks, key=lambda t: t.id)
 
     def cancel(self, task_id: int) -> bool:

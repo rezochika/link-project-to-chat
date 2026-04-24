@@ -46,8 +46,9 @@ class FakeBot:
 def _fake_task(task_id: int = 1) -> Task:
     t = Task.__new__(Task)
     t.id = task_id
-    t.chat_id = 99
-    t.message_id = 7
+    chat = ChatRef(transport_id="telegram", native_id="99", kind=ChatKind.DM)
+    t.chat = chat
+    t.message = MessageRef(transport_id="telegram", native_id="7", chat=chat)
     t.status = TaskStatus.RUNNING
     t.type = TaskType.AGENT
     t.result = ""
@@ -132,7 +133,7 @@ async def test_team_bot_sends_placeholder_at_task_start():
 
     assert task.id in bot._live_text
     assert len(bot._app.bot.sent) == 1
-    assert bot._app.bot.sent[0]["reply_to"] == task.message_id
+    assert bot._app.bot.sent[0]["reply_to"] == int(task.message.native_id)
 
 
 @pytest.mark.asyncio
@@ -269,9 +270,7 @@ async def test_finalize_with_empty_buffer_falls_back_to_task_result():
     task.result = "fallback answer"
 
     # Create an empty-buffer StreamingMessage (no TextDelta ever fired).
-    chat_ref = ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=ChatKind.DM)
-    reply_ref = MessageRef(transport_id="telegram", native_id=str(task.message_id), chat=chat_ref)
-    sm = StreamingMessage(bot._transport, chat_ref, reply_to=reply_ref)
+    sm = StreamingMessage(bot._transport, task.chat, reply_to=task.message)
     await sm.start()
     bot._live_text[task.id] = sm
 
@@ -291,9 +290,7 @@ async def test_finalize_empty_buffer_and_empty_result_replaces_placeholder():
     task.status = TaskStatus.DONE
     task.result = ""  # Claude turn ended with only tool_use blocks
 
-    chat_ref = ChatRef(transport_id="telegram", native_id=str(task.chat_id), kind=ChatKind.DM)
-    reply_ref = MessageRef(transport_id="telegram", native_id=str(task.message_id), chat=chat_ref)
-    sm = StreamingMessage(bot._transport, chat_ref, reply_to=reply_ref)
+    sm = StreamingMessage(bot._transport, task.chat, reply_to=task.message)
     await sm.start()
     bot._live_text[task.id] = sm
 
@@ -320,7 +317,7 @@ async def test_finalize_without_live_text_falls_back_to_send_to_chat():
 
     await bot._finalize_claude_task(task)
 
-    assert sent_chats == [(task.chat_id, "tool-only answer")]
+    assert sent_chats == [(task.chat, "tool-only answer")]
 
 
 @pytest.mark.asyncio
@@ -517,7 +514,7 @@ async def test_text_start_failure_does_not_crash_and_finalize_falls_back():
     await bot._finalize_claude_task(task)
 
     # Fallback path sent task.result via _send_to_chat.
-    assert fallback_sends == [(task.chat_id, "the final answer")]
+    assert fallback_sends == [(task.chat, "the final answer")]
     # Failed flag cleaned up for subsequent tasks.
     assert task.id not in bot._live_text_failed
 
@@ -613,6 +610,7 @@ async def test_send_image_rejects_sibling_path_with_shared_prefix(tmp_path):
     bot = ProjectBot(name="proj", path=tmp_path, token="t")
     bot._transport = FakeTransport()
 
-    await bot._send_image(chat_id=123, file_path=str(leaked))
+    chat = ChatRef(transport_id="telegram", native_id="123", kind=ChatKind.DM)
+    await bot._send_image(chat=chat, file_path=str(leaked))
 
     assert bot._transport.sent_files == []

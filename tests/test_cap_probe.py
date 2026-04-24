@@ -7,26 +7,26 @@ import pytest
 
 from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
-from link_project_to_chat.transport import ChatKind, ChatRef
+from link_project_to_chat.transport import ChatKind, ChatRef, MessageRef
+
+
+def _chat_ref(chat_id: int) -> ChatRef:
+    """Build a Telegram-shaped ChatRef for group-mode tests."""
+    return ChatRef(transport_id="telegram", native_id=str(chat_id), kind=ChatKind.ROOM)
 
 
 def _mk_task(chat_id: int, error: str) -> Task:
     """Build a finalized Task in error state with the given error message."""
     t = MagicMock(spec=Task)
     t.id = 1
-    t.chat_id = chat_id
-    t.message_id = 100
+    t.chat = _chat_ref(chat_id)
+    t.message = MessageRef(transport_id="telegram", native_id="100", chat=t.chat)
     t.status = TaskStatus.FAILED
     t.error = error
     t.result = ""
     t.type = TaskType.AGENT
     t._compact = False
     return t
-
-
-def _chat_ref(chat_id: int) -> ChatRef:
-    """Build a Telegram ChatRef matching what _chat_ref_for_task produces in group mode."""
-    return ChatRef(transport_id="telegram", native_id=str(chat_id), kind=ChatKind.ROOM)
 
 
 @pytest.mark.asyncio
