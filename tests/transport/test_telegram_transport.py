@@ -524,10 +524,20 @@ async def test_enable_team_relay_lifecycle():
     )
 
     await t.start()
-    mock_client.add_event_handler.assert_called_once()
+    assert mock_client.add_event_handler.call_count == 2
+    registered_callbacks = [
+        call.args[0].__name__
+        for call in mock_client.add_event_handler.call_args_list
+    ]
+    assert registered_callbacks == ["_on_new_message", "_on_message_edited"]
 
     await t.stop()
-    mock_client.remove_event_handler.assert_called_once()
+    assert mock_client.remove_event_handler.call_count == 2
+    removed_callbacks = [
+        call.args[0].__name__
+        for call in mock_client.remove_event_handler.call_args_list
+    ]
+    assert removed_callbacks == ["_on_new_message", "_on_message_edited"]
 
 
 async def test_build_without_enable_team_relay_starts_and_stops_cleanly():
