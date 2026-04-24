@@ -634,16 +634,17 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
         if not phone:
             phone = click.prompt("Phone number (with country code, e.g. +995511166693)")
 
+        if not session_path.exists():
+            session_path.touch(mode=0o600)
+        else:
+            session_path.chmod(0o600)
+
         from telethon.sync import TelegramClient
         client = TelegramClient(
             str(session_path), api_id, api_hash,
             device_model="Desktop", system_version="macOS", app_version="1.0",
         )
         try:
-            if not session_path.exists():
-                session_path.touch(mode=0o600)
-            else:
-                session_path.chmod(0o600)
             client.start(phone=phone)
             session_path.chmod(0o600)
             click.echo("Telethon authenticated successfully!")

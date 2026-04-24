@@ -46,6 +46,12 @@ def test_setup_authenticates_telethon_with_secure_session_before_start(tmp_path,
             app_version: str,
         ) -> None:
             self.session_path = Path(session_path)
+            mode = (
+                self.session_path.stat().st_mode & 0o777
+                if self.session_path.exists()
+                else None
+            )
+            events.append(("init", self.session_path.exists(), mode))
             self.api_id = api_id
             self.api_hash = api_hash
             self.device_model = device_model
@@ -76,10 +82,14 @@ def test_setup_authenticates_telethon_with_secure_session_before_start(tmp_path,
     )
 
     assert result.exit_code == 0, result.output
-    assert events[0][0] == "start"
+    assert events[0][0] == "init"
     assert events[0][1] is True
     if sys.platform != "win32":
         assert events[0][2] == 0o600
+    assert events[1][0] == "start"
+    assert events[1][1] is True
+    if sys.platform != "win32":
+        assert events[1][2] == 0o600
     assert events[-1] == ("disconnect",)
     assert "Telethon authenticated successfully!" in result.output
 
