@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,63 @@ def cfg(tmp_path: Path):
         "projects": {"existing": {"path": str(tmp_path), "telegram_bot_token": "TOK"}},
     }))
     return p, tmp_path
+
+
+def test_setup_authenticates_telethon_with_secure_session_before_start(tmp_path, monkeypatch):
+    from link_project_to_chat.config import Config, save_config
+
+    cfg_path = tmp_path / "config.json"
+    save_config(Config(telegram_api_id=12345, telegram_api_hash="hash"), cfg_path)
+    events: list[tuple[str, bool, int | None] | tuple[str]] = []
+
+    class FakeTelegramClient:
+        def __init__(
+            self,
+            session_path: str,
+            api_id: int,
+            api_hash: str,
+            *,
+            device_model: str,
+            system_version: str,
+            app_version: str,
+        ) -> None:
+            self.session_path = Path(session_path)
+            self.api_id = api_id
+            self.api_hash = api_hash
+            self.device_model = device_model
+            self.system_version = system_version
+            self.app_version = app_version
+
+        def start(self, phone: str) -> None:
+            mode = (
+                self.session_path.stat().st_mode & 0o777
+                if self.session_path.exists()
+                else None
+            )
+            events.append(("start", self.session_path.exists(), mode))
+
+        def disconnect(self) -> None:
+            events.append(("disconnect",))
+
+    fake_telethon = types.ModuleType("telethon")
+    fake_sync = types.ModuleType("telethon.sync")
+    fake_sync.TelegramClient = FakeTelegramClient
+    fake_telethon.sync = fake_sync
+    monkeypatch.setitem(sys.modules, "telethon", fake_telethon)
+    monkeypatch.setitem(sys.modules, "telethon.sync", fake_sync)
+
+    result = CliRunner().invoke(
+        main,
+        ["--config", str(cfg_path), "setup", "--phone", "+995511166693"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert events[0][0] == "start"
+    assert events[0][1] is True
+    if sys.platform != "win32":
+        assert events[0][2] == 0o600
+    assert events[-1] == ("disconnect",)
+    assert "Telethon authenticated successfully!" in result.output
 
 
 # --- projects add ---

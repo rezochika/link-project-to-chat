@@ -640,6 +640,10 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
             device_model="Desktop", system_version="macOS", app_version="1.0",
         )
         try:
+            if not session_path.exists():
+                session_path.touch(mode=0o600)
+            else:
+                session_path.chmod(0o600)
             client.start(phone=phone)
             session_path.chmod(0o600)
             click.echo("Telethon authenticated successfully!")
