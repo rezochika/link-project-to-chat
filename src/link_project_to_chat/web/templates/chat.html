@@ -15,12 +15,14 @@
 
   <form class="composer"
         hx-post="/chat/{{ chat_id }}/message"
-        hx-on::after-request="this.text.value=''"
+        hx-encoding="multipart/form-data"
+        hx-on::after-request="this.text.value=''; this.file.value=''"
         hx-swap="none">
     <input type="text" name="username" id="username-field"
            placeholder="username" autocomplete="username"
            value="" required>
-    <input type="text" name="text" placeholder="Message…" autocomplete="off" autofocus required>
+    <input type="text" name="text" placeholder="Message…" autocomplete="off" autofocus>
+    <input type="file" name="file" accept="audio/*,application/pdf,text/*,image/*">
     <button type="submit">Send</button>
   </form>
   <script>

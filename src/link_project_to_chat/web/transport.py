@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -304,19 +305,34 @@ class WebTransport:
                     native_id=str(db_id),
                     chat=chat,
                 )
+                incoming_files: list[IncomingFile] = []
+                for f in payload.get("files", []):
+                    incoming_files.append(IncomingFile(
+                        path=Path(f["path"]),
+                        original_name=f.get("original_name", "upload"),
+                        mime_type=f.get("mime_type", "application/octet-stream"),
+                        size_bytes=f.get("size_bytes", 0),
+                    ))
                 # Web only handles text+files via the message form; no
                 # platform-delivered media types we can't decode.
                 msg = IncomingMessage(
                     chat=chat,
                     sender=sender,
                     text=text,
-                    files=[],
+                    files=incoming_files,
                     reply_to=None,
                     message=msg_ref,
                     has_unsupported_media=False,
                 )
-                for h in self._message_handlers:
-                    await h(msg)
+                try:
+                    for h in self._message_handlers:
+                        await h(msg)
+                finally:
+                    # Best-effort cleanup of upload tempdirs after handlers return.
+                    for f in incoming_files:
+                        parent = f.path.parent
+                        if parent and parent.exists():
+                            shutil.rmtree(parent, ignore_errors=True)
 
     # -- Test injection helpers -------------------------------------------
     async def inject_message(

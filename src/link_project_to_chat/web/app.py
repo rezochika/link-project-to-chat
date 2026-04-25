@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -51,14 +52,29 @@ def create_app(
     @app.post("/chat/{chat_id}/message")
     async def post_message(
         chat_id: str,
-        text: str = Form(...),
+        text: str = Form(""),
         username: str | None = Form(None),
+        file: UploadFile | None = File(None),
     ):
+        files: list[dict] = []
+        if file is not None and file.filename:
+            tmpdir = tempfile.mkdtemp(prefix="lp2c-web-")
+            # Sanitize filename: strip path separators
+            safe_name = file.filename.replace("/", "_").replace("\\", "_") or "upload"
+            dest = Path(tmpdir) / safe_name
+            dest.write_bytes(await file.read())
+            files.append({
+                "path": str(dest),
+                "original_name": safe_name,
+                "mime_type": file.content_type or "application/octet-stream",
+                "size_bytes": dest.stat().st_size,
+            })
         payload = {
             "text": text,
             "sender_native_id": "browser_user",
             "sender_display_name": username or "You",
             "sender_handle": username,
+            "files": files,
         }
         await inbound_queue.put({
             "event_type": "inbound_message",
