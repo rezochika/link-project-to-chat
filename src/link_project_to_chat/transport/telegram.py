@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from .base import (
@@ -50,6 +50,23 @@ def _as_retry_after(exc: BaseException) -> TransportRetryAfter | None:
 # prefix is written.
 from ._telegram_relay import _RELAY_HANDLE_PATTERN
 _RELAY_PREFIX_RE = re.compile(rf"^\[auto-relay from {_RELAY_HANDLE_PATTERN}\]\n\n")
+
+
+def _safe_basename(raw: str | None, fallback: str) -> str:
+    """Reduce an attacker-controlled filename to a safe basename for tempdir use.
+
+    Strips path separators, parent-dir traversals, and leading dots. Falls back
+    to `fallback` if the result is empty or starts with '.'. The returned name
+    is suitable for direct concatenation under a tempfile.TemporaryDirectory.
+    """
+    name = (raw or "").strip()
+    if not name:
+        return fallback
+    candidate = PurePath(name.replace("\\", "/")).name
+    # Reject empty, '.', '..', and dotfile-like names that could shadow OS paths.
+    if not candidate or candidate in (".", "..") or candidate.startswith("."):
+        return fallback
+    return candidate
 
 
 def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
@@ -518,13 +535,14 @@ class TelegramTransport:
         if doc is not None:
             tmpdir = tempfile.TemporaryDirectory()
             tmpdirs.append(tmpdir)
-            name = getattr(doc, "file_name", None) or "document"
-            path = Path(tmpdir.name) / name
+            raw_name = getattr(doc, "file_name", None)
+            safe_name = _safe_basename(raw_name, "document")
+            path = Path(tmpdir.name) / safe_name
             tg_file = await doc.get_file()
             await tg_file.download_to_drive(path)
             files.append(IncomingFile(
                 path=path,
-                original_name=name,
+                original_name=safe_name,
                 mime_type=getattr(doc, "mime_type", None),
                 size_bytes=getattr(doc, "file_size", 0) or 0,
             ))
@@ -547,13 +565,14 @@ class TelegramTransport:
         if audio is not None:
             tmpdir = tempfile.TemporaryDirectory()
             tmpdirs.append(tmpdir)
-            name = getattr(audio, "file_name", None) or "audio"
-            path = Path(tmpdir.name) / name
+            raw_name = getattr(audio, "file_name", None)
+            safe_name = _safe_basename(raw_name, "audio")
+            path = Path(tmpdir.name) / safe_name
             tg_file = await audio.get_file()
             await tg_file.download_to_drive(path)
             files.append(IncomingFile(
                 path=path,
-                original_name=name,
+                original_name=safe_name,
                 mime_type=getattr(audio, "mime_type", None) or "audio/mpeg",
                 size_bytes=getattr(audio, "file_size", 0) or 0,
             ))

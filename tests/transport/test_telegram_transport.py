@@ -836,3 +836,80 @@ async def test_post_init_unwinds_partially_started_relay_on_failure():
     mock_client.disconnect.assert_awaited_once()
     # The guard is reset so a retry is possible.
     assert t._post_init_ran is False
+
+
+async def test_document_filename_with_path_separators_is_sanitized_to_basename():
+    """A malicious document filename like '../../etc/passwd' must not escape the temp dir."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured_path: list = []
+
+    async def handler(msg):
+        captured_path.append(msg.files[0].path)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    document = SimpleNamespace(
+        file_name="../../etc/passwd",
+        mime_type="text/plain",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=document, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    # Path must live under tempfile's tempdir; basename must NOT contain separators.
+    import tempfile as _tf
+    assert captured_path[0].name == "passwd", f"basename leaked separators: {captured_path[0].name}"
+    assert str(captured_path[0]).startswith(_tf.gettempdir()) or "tmp" in str(captured_path[0]).lower()
+
+
+async def test_audio_filename_with_absolute_path_is_sanitized():
+    """An audio filename like '/etc/passwd' must reduce to the basename inside tempdir."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured_path: list = []
+
+    async def handler(msg):
+        captured_path.append(msg.files[0].path)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    audio = SimpleNamespace(
+        file_name="/etc/passwd",
+        mime_type="audio/mpeg",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=None, voice=None, audio=audio,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert captured_path[0].name == "passwd"
