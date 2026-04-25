@@ -24,6 +24,7 @@ from .config import (
     patch_backend_state,
     patch_project,
     patch_team,
+    patch_team_bot_backend,
     patch_team_bot_backend_state,
     resolve_permissions,
     resolve_project_auth_scope,
@@ -49,13 +50,14 @@ logger = logging.getLogger(__name__)
 COMMANDS = [
     ("run", "Run a background command"),
     ("tasks", "List all tasks"),
-    ("model", "Set Claude model (haiku/sonnet/opus)"),
+    ("backend", "Show or switch backend"),
+    ("model", "Set backend model"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
     ("thinking", "Toggle live thinking display (on/off)"),
     ("permissions", "Set permission mode"),
-    ("compact", "Compress session context"),
+    ("compact", "Compact backend session"),
     ("status", "Bot status"),
-    ("reset", "Clear Claude session"),
+    ("reset", "Clear backend session"),
     ("version", "Show version"),
     ("help", "Show available commands"),
     ("skills", "List skills or activate one"),
@@ -194,9 +196,9 @@ class ProjectBot(AuthMixin):
     @property
     def _claude(self) -> ClaudeBackend:
         """Tier-2 accessor for Claude-specific behavior (effort, permissions,
-        append_system_prompt, team_system_note, model_display). Only valid
-        while the configured backend is ClaudeBackend; asserts so other
-        backends surface a clear error rather than silent attribute misses."""
+        append_system_prompt, team_system_note). Only valid while the
+        configured backend is ClaudeBackend; asserts so other backends
+        surface a clear error rather than silent attribute misses."""
         backend = self.task_manager.backend
         assert isinstance(backend, ClaudeBackend), "Tier-2 Claude-only access requires ClaudeBackend"
         return backend
@@ -448,6 +450,8 @@ class ProjectBot(AuthMixin):
 
     def _schedule_cap_probe(self, chat: ChatRef, interval_s: int = 1800) -> None:
         """Probe the backend every `interval_s` seconds; on success, resume the group."""
+        if not self.task_manager.backend.capabilities.supports_usage_cap_detection:
+            return
         async def _probe() -> None:
             while self._group_state.get(chat).halted:
                 await asyncio.sleep(interval_s)
@@ -586,10 +590,11 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
+        backend_name = self.task_manager.backend.name
         await self._transport.send_text(
             ci.chat,
             f"Project: {self.name}\nPath: {self.path}\n\n"
-            f"Send a message to chat with Claude.\n{_CMD_HELP}",
+            f"Send a message to chat with {backend_name}.\n{_CMD_HELP}",
             reply_to=ci.message,
         )
 
@@ -884,16 +889,20 @@ class ProjectBot(AuthMixin):
         return Buttons(rows=rows)
 
     def _current_model(self) -> str:
-        raw = self.task_manager.backend.model
+        backend = self.task_manager.backend
+        raw = backend.model
         for model_id, label, desc in self.MODEL_OPTIONS:
             if model_id == raw:
                 return f"{label} — {desc}"
-        return self._claude.model_display or raw
+        return backend.model_display or raw
 
     async def _on_model(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self.task_manager.backend.capabilities.models:
+            await self._transport.send_text(ci.chat, "This backend doesn't support /model.")
+            return
         await self._transport.send_text(
             ci.chat,
             f"Select model\nCurrent: {self._current_model()}",
@@ -932,6 +941,9 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self.task_manager.backend.capabilities.supports_thinking:
+            await self._transport.send_text(ci.chat, "This backend doesn't support /thinking.")
+            return
         args = ci.args or []
         if args:
             arg = args[0].lower()
@@ -971,6 +983,9 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self.task_manager.backend.capabilities.supports_permissions:
+            await self._transport.send_text(ci.chat, "This backend doesn't support /permissions.")
+            return
         await self._transport.send_text(
             ci.chat,
             f"Current: {self._current_permission()}",
@@ -981,6 +996,9 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self.task_manager.backend.capabilities.supports_compact:
+            await self._transport.send_text(ci.chat, "This backend doesn't support /compact.")
+            return
         if not self.task_manager.backend.session_id:
             await self._transport.send_text(ci.chat, "No active session.")
             return
@@ -988,6 +1006,70 @@ class ProjectBot(AuthMixin):
             chat=ci.chat,
             message=ci.message,
         )
+
+    async def _on_backend(self, ci) -> None:
+        """Show or switch the active backend.
+
+        - No args: print active + available backends.
+        - `<active>`: no-op, no disk write.
+        - `<unknown>`: error listing available backends.
+        - `<other>` while a live agent task runs: rejected.
+        - `<other>` otherwise: build new backend, swap, persist (project or
+          team-bot path) — activate first, persist on success per spec §4.5.
+        """
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+
+        from .backends.factory import available, create
+
+        current_name = self.task_manager.backend.name
+        available_backends = available()
+
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat,
+                f"Active backend: {current_name}\n"
+                f"Available: {', '.join(available_backends)}",
+            )
+            return
+
+        requested = ci.args[0].lower()
+        if requested == current_name:
+            await self._transport.send_text(
+                ci.chat, f"{requested} is already active."
+            )
+            return
+        if requested not in available_backends:
+            await self._transport.send_text(
+                ci.chat,
+                f"Unknown backend '{requested}'. "
+                f"Available: {', '.join(available_backends)}",
+            )
+            return
+        if self.task_manager.has_live_agent_tasks():
+            await self._transport.send_text(
+                ci.chat, "Cancel running tasks before switching backend."
+            )
+            return
+
+        # Activate first (build + swap), persist on success.
+        new_backend = create(requested, self.path, self._backend_state_for(requested))
+        self.task_manager.backend.close_interactive()
+        self.task_manager._backend = new_backend
+        self._backend_name = requested
+        # _backend_state_for returns a fresh dict regardless of whether
+        # `requested` was previously persisted, so seeding with `{}` is
+        # equivalent and avoids a wasted dict copy on the no-key path.
+        self._backend_state.setdefault(requested, {})
+
+        cfg = self._effective_config_path()
+        if self.team_name and self.role:
+            patch_team_bot_backend(self.team_name, self.role, requested, cfg)
+        else:
+            patch_project(self.name, {"backend": requested}, cfg)
+
+        await self._transport.send_text(ci.chat, f"Switched to {requested}.")
 
     async def _on_version_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1012,7 +1094,7 @@ class ProjectBot(AuthMixin):
         ]])
         await self._transport.send_text(
             ci.chat,
-            "Are you sure? This will clear the Claude session.",
+            f"Are you sure? This will clear the {self.task_manager.backend.name} session.",
             buttons=buttons,
         )
 
@@ -1450,7 +1532,7 @@ class ProjectBot(AuthMixin):
             valid = {m[0] for m in self.MODEL_OPTIONS}
             if name in valid:
                 self.task_manager.backend.model = name
-                self._claude.model_display = None
+                self.task_manager.backend.model_display = None
                 self._patch_backend_config({"model": name})
             await self._transport.edit_text(
                 msg_ref,
@@ -1680,14 +1762,19 @@ class ProjectBot(AuthMixin):
         h, rem = divmod(int(uptime), 3600)
         m, s = divmod(rem, 60)
 
-        st = self.task_manager.backend.status
+        backend = self.task_manager.backend
+        st = backend.status
+        # `model_display` is a first-class AgentBackend Protocol attribute;
+        # backends without a pretty label return `None` and we fall back to `model`.
+        model_label = backend.model_display or backend.model
         lines = [
             f"Project: {self.name}",
             f"Path: {self.path}",
-            f"Model: {self._claude.model_display or self.task_manager.backend.model}",
+            f"Backend: {backend.name}",
+            f"Model: {model_label or 'default'}",
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st['session_id'] or 'none'}",
-            f"Claude: {'RUNNING' if st['running'] else 'idle'}",
+            f"Agent: {'RUNNING' if st['running'] else 'idle'}",
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
             f"Skill: {self._active_skill or 'none'}",
@@ -1948,6 +2035,7 @@ class ProjectBot(AuthMixin):
             ("version", self._on_version_t),
             ("status", self._on_status_t),
             ("tasks", self._on_tasks),
+            ("backend", self._on_backend),
             ("model", self._on_model),
             ("effort", self._on_effort),
             ("thinking", self._on_thinking),

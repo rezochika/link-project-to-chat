@@ -32,6 +32,9 @@ class AgentBackend(Protocol):
     capabilities: BackendCapabilities
     project_path: Path
     model: str | None
+    # `None` means the backend has no friendlier label than `model` — callers
+    # should fall back to `model` in that case.
+    model_display: str | None
     session_id: str | None
 
     async def chat_stream(

@@ -547,3 +547,12 @@ class TaskManager:
     @property
     def waiting_count(self) -> int:
         return sum(1 for t in self._tasks.values() if t.status == TaskStatus.WAITING)
+
+    def has_live_agent_tasks(self) -> bool:
+        """True iff any AGENT task is in a non-terminal state. Used by the
+        `/backend` switch to refuse mid-flight backend swaps."""
+        live = {TaskStatus.WAITING, TaskStatus.RUNNING, TaskStatus.WAITING_INPUT}
+        return any(
+            t.type == TaskType.AGENT and t.status in live
+            for t in self._tasks.values()
+        )
