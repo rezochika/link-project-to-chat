@@ -39,7 +39,7 @@ from .backends.claude import (
 )
 from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
-from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
+from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
