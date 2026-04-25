@@ -52,26 +52,78 @@ def _terminate_process_tree(proc: subprocess.Popen) -> None:
         proc.wait(timeout=5)
 
 
-def _build_project_bot_env(team_name: str | None, config_dir: Path) -> dict[str, str]:
+def _export_telethon_session_string(session_path: Path) -> str | None:
+    """Export a SQLite Telethon session as a ``StringSession`` string.
+
+    Returns ``None`` if the file is missing, ``telethon`` is not installed, or
+    the session has no auth key (i.e. ``/setup`` was never completed). The
+    open is read-only with respect to the auth row — Telethon's SQLite schema
+    init may CREATE TABLE IF NOT EXISTS, but the session table itself is not
+    rewritten, so this is safe to run alongside the manager's own
+    ``_telethon_client``.
+
+    Used to seed subprocess relays via ``LP2C_TELETHON_SESSION_STRING`` so
+    each subprocess constructs an in-memory ``StringSession`` instead of
+    opening the shared SQLite file (which serialises through a single write
+    lock at ``connect()`` time and crashes concurrent starts — spec D′).
+    """
+    if not session_path.exists():
+        return None
+    try:
+        from telethon.sessions import SQLiteSession, StringSession
+    except ImportError:
+        return None
+    try:
+        sql = SQLiteSession(str(session_path))
+        try:
+            if sql.auth_key is None:
+                return None
+            # StringSession.save returns "" when the underlying session has no
+            # auth data — normalize to None so callers can ``or``-chain it.
+            return StringSession.save(sql) or None
+        finally:
+            sql.close()
+    except Exception:
+        logger.warning(
+            "Failed to export Telethon session %s as StringSession",
+            session_path,
+            exc_info=True,
+        )
+        return None
+
+
+def _build_project_bot_env(
+    team_name: str | None,
+    config_dir: Path,
+    *,
+    session_string: str | None = None,
+) -> dict[str, str]:
     """Build the env dict for a project-bot subprocess.
 
     Returns a fresh copy of ``os.environ`` so callers can mutate it without
-    leaking state into the parent process. When the bot is team-mode AND the
-    manager's Telethon session file exists, exposes its absolute path via
-    ``LP2C_TELETHON_SESSION`` so the project bot can construct its own
-    Telethon client and call ``enable_team_relay`` (spec #0c).
+    leaking state into the parent process.
 
-    A solo-mode bot (``team_name is None``) never receives the env var — it
-    has no relay to attach. A team-mode bot whose ``telethon.session`` file
-    is absent (i.e. ``/setup`` hasn't run yet) also doesn't receive the var,
-    so the project bot can detect "no session" by env-var absence rather than
-    by stat'ing a missing path.
+    For team-mode bots, exposes one of two env vars so the project bot can
+    construct its own Telethon client and call ``enable_team_relay`` (spec
+    #0c). When ``session_string`` is provided (the spec-D′ path), it is
+    surfaced as ``LP2C_TELETHON_SESSION_STRING`` and the file-path fallback
+    is suppressed — subprocesses then build an in-memory ``StringSession``
+    instead of opening the shared SQLite session file, which eliminates the
+    ``database is locked`` race when several team bots autostart at once.
+    Otherwise, falls back to ``LP2C_TELETHON_SESSION`` pointing at the
+    shared on-disk session file when it exists.
+
+    A solo-mode bot (``team_name is None``) never receives either var — it
+    has no relay to attach.
     """
     env = os.environ.copy()
     if team_name is not None:
-        session_path = (config_dir / "telethon.session").resolve()
-        if session_path.exists():
-            env["LP2C_TELETHON_SESSION"] = str(session_path)
+        if session_string:
+            env["LP2C_TELETHON_SESSION_STRING"] = session_string
+        else:
+            session_path = (config_dir / "telethon.session").resolve()
+            if session_path.exists():
+                env["LP2C_TELETHON_SESSION"] = str(session_path)
     return env
 
 
@@ -86,6 +138,12 @@ class ProcessManager:
         self._processes: dict[str, subprocess.Popen] = {}
         self._logs: dict[str, collections.deque] = {}
         self._log_threads: dict[str, threading.Thread] = {}
+        # Cached spec-D′ StringSession export. ``None`` means "not yet computed";
+        # a falsy str means "tried, no usable session" (caller falls back to
+        # path-mode env var). Computed lazily on first ``start_team`` so the
+        # SQLite file is opened at most once per manager lifetime.
+        self._cached_session_string: str | None = None
+        self._session_string_cached: bool = False
 
     def _base_cli_command(self) -> list[str]:
         cmd = [sys.executable, "-m", "link_project_to_chat.cli"]
@@ -178,6 +236,19 @@ class ProcessManager:
         cmd.extend(["start", "--team", team_name, "--role", role])
         return cmd
 
+    def _telethon_session_string(self) -> str | None:
+        """Lazy-export the manager's Telethon session as a StringSession.
+
+        Cached for the manager's lifetime — the on-disk SQLite file is opened
+        once, even when ``start_autostart`` spawns several team bots in a row.
+        """
+        if not self._session_string_cached:
+            self._cached_session_string = _export_telethon_session_string(
+                self._config_dir() / "telethon.session"
+            )
+            self._session_string_cached = True
+        return self._cached_session_string
+
     def start_team(self, team_name: str, role: str) -> bool:
         config = load_config(self._project_config_path) if self._project_config_path else load_config()
         if team_name not in config.teams:
@@ -190,7 +261,11 @@ class ProcessManager:
         if key in self._processes and self._processes[key].poll() is None:
             return False
         cmd = self._team_command_builder(team_name, role)
-        env = _build_project_bot_env(team_name=team_name, config_dir=self._config_dir())
+        env = _build_project_bot_env(
+            team_name=team_name,
+            config_dir=self._config_dir(),
+            session_string=self._telethon_session_string(),
+        )
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,

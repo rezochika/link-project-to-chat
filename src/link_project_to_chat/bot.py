@@ -2114,13 +2114,20 @@ class ProjectBot(AuthMixin):
                 command_names=[n for n, _ in ported_commands],
             )
 
-            # Team-mode bot: if the manager passed a Telethon session path, wire the
+            # Team-mode bot: if the manager passed a Telethon session, wire the
             # bot-to-bot relay. Spec #0c: project bot owns its relay; the manager
-            # exposes the session-file absolute path via LP2C_TELETHON_SESSION when
-            # spawning team-mode subprocesses (see manager/process.py).
+            # exposes credentials via env vars when spawning team-mode subprocesses
+            # (see manager/process.py). Two env vars are recognised:
+            #   LP2C_TELETHON_SESSION_STRING — preferred (spec D′): an in-memory
+            #     StringSession seeded by the manager, no SQLite file lock.
+            #   LP2C_TELETHON_SESSION — fallback: absolute path to the on-disk
+            #     telethon.session file. Only used when the StringSession export
+            #     was unavailable (e.g. unauthorized session, or telethon import
+            #     failed in the manager).
             if self.team_name and self.group_chat_id:
-                session_env = os.environ.get("LP2C_TELETHON_SESSION")
-                if session_env:
+                session_string_env = os.environ.get("LP2C_TELETHON_SESSION_STRING")
+                session_path_env = os.environ.get("LP2C_TELETHON_SESSION")
+                if session_string_env or session_path_env:
                     cfg_path = self._effective_config_path()
                     config = load_config(cfg_path)
                     teams = load_teams(cfg_path)
@@ -2134,9 +2141,18 @@ class ProjectBot(AuthMixin):
                             "skipping enable_team_relay (bot will operate without relay).",
                             self.team_name,
                         )
+                    elif session_string_env:
+                        self._transport.enable_team_relay_from_session_string(
+                            session_string=session_string_env,
+                            api_id=config.telegram_api_id,
+                            api_hash=config.telegram_api_hash,
+                            team_bot_usernames=team_bot_usernames,
+                            group_chat_id=self.group_chat_id,
+                            team_name=self.team_name,
+                        )
                     else:
                         self._transport.enable_team_relay_from_session(
-                            session_path=session_env,
+                            session_path=session_path_env,
                             api_id=config.telegram_api_id,
                             api_hash=config.telegram_api_hash,
                             team_bot_usernames=team_bot_usernames,
