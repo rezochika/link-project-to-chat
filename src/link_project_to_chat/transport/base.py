@@ -88,13 +88,12 @@ class IncomingMessage:
     text: str
     files: list[IncomingFile]
     reply_to: MessageRef | None
+    message: MessageRef  # Required: every transport-emitted message has a back-ref.
     native: Any = None
     is_relayed_bot_to_bot: bool = False
     # Optional platform-neutral fields populated by transports that have them.
-    # `message` identifies *this* incoming message so handlers can link tasks
-    # back to it without reaching into `native`. `reply_to_text`/`reply_to_sender`
-    # let group-routing and "[Replying to: ...]" prefixing stay transport-free.
-    message: MessageRef | None = None
+    # `reply_to_text`/`reply_to_sender` let group-routing and
+    # "[Replying to: ...]" prefixing stay transport-free.
     reply_to_text: str | None = None
     reply_to_sender: Identity | None = None
     has_unsupported_media: bool = False  # True if the platform delivered a

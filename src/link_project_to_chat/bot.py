@@ -696,12 +696,9 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
         self.task_manager.submit_agent(
             chat=incoming.chat,
-            message=message_ref,
+            message=incoming.message,
             prompt=prompt,
         )
 
@@ -770,9 +767,7 @@ class ProjectBot(AuthMixin):
             )
             return
 
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
+        message_ref = incoming.message
 
         # Active Claude turn waiting on a question? Route as the answer.
         waiting = self.task_manager.waiting_input_task(incoming.chat)
@@ -1725,12 +1720,9 @@ class ProjectBot(AuthMixin):
             self.task_manager.submit_answer(waiting.id, prompt)
             return
 
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
         self.task_manager.submit_agent(
             chat=incoming.chat,
-            message=message_ref,
+            message=incoming.message,
             prompt=prompt,
         )
 
@@ -1792,12 +1784,9 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
-            message_ref = incoming.message or MessageRef(
-                transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-            )
             task = self.task_manager.submit_agent(
                 chat=incoming.chat,
-                message=message_ref,
+                message=incoming.message,
                 prompt=prompt,
             )
             if self._synthesizer:

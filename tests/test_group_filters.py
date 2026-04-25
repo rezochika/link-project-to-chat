@@ -48,12 +48,14 @@ def _msg(
             display_name=reply_to_bot_username,
             handle=reply_to_bot_username, is_bot=True,
         )
+    chat = _chat()
     return IncomingMessage(
-        chat=_chat(),
+        chat=chat,
         sender=_sender(handle=sender_handle, is_bot=sender_is_bot),
         text=text,
         files=[],
         reply_to=reply_to,
+        message=MessageRef(transport_id="telegram", native_id="1", chat=chat),
         native=None,
         reply_to_sender=reply_to_sender,
     )

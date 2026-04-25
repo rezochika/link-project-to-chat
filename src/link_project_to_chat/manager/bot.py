@@ -389,14 +389,26 @@ class ManagerBot(AuthMixin):
         at the boundary.
         """
         from ..transport import IncomingMessage
-        from ..transport.telegram import chat_ref_from_telegram, identity_from_telegram_user
+        from ..transport.telegram import (
+            chat_ref_from_telegram,
+            identity_from_telegram_user,
+            message_ref_from_telegram,
+        )
         msg = update.effective_message
+        chat = chat_ref_from_telegram(update.effective_chat)
+        if msg is not None:
+            message_ref = message_ref_from_telegram(msg)
+        else:
+            message_ref = MessageRef(
+                transport_id=chat.transport_id, native_id="0", chat=chat,
+            )
         return IncomingMessage(
-            chat=chat_ref_from_telegram(update.effective_chat),
+            chat=chat,
             sender=identity_from_telegram_user(update.effective_user),
             text=(msg.text if msg else "") or "",
             files=[],
             reply_to=None,
+            message=message_ref,
             native=msg,
         )
 

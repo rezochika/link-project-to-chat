@@ -180,6 +180,7 @@ async def test_voice_with_reply_prefixes_prompt(tmp_path):
         text=incoming.text,
         files=incoming.files,
         reply_to=reply_ref,
+        message=incoming.message,
         reply_to_text="earlier message",
     )
     await bot._on_voice_from_transport(incoming_with_reply)
@@ -228,7 +229,8 @@ async def test_unified_dispatch_unsupported_fallback():
         handle="alice", is_bot=False,
     )
     incoming = IncomingMessage(
-        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+        chat=chat, sender=sender, text="", files=[], reply_to=None,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat), native=None,
     )
     await bot._on_text_from_transport(incoming)
     assert any(
@@ -247,7 +249,8 @@ async def test_unified_dispatch_unsupported_unauthorized_ignored():
         handle="alice", is_bot=False,
     )
     incoming = IncomingMessage(
-        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+        chat=chat, sender=sender, text="", files=[], reply_to=None,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat), native=None,
     )
     await bot._on_text_from_transport(incoming)
     assert bot._transport.sent_messages == []
@@ -266,7 +269,8 @@ async def test_unsupported_media_caption_routes_to_specific_rejection():
     )
     incoming = IncomingMessage(
         chat=chat, sender=sender, text="check this out", files=[],
-        reply_to=None, native=None, has_unsupported_media=True,
+        reply_to=None, message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        native=None, has_unsupported_media=True,
     )
     await bot._on_text_from_transport(incoming)
     assert any(
@@ -289,7 +293,8 @@ async def test_unsupported_media_no_caption_routes_to_specific_rejection():
     )
     incoming = IncomingMessage(
         chat=chat, sender=sender, text="", files=[],
-        reply_to=None, native=None, has_unsupported_media=True,
+        reply_to=None, message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        native=None, has_unsupported_media=True,
     )
     await bot._on_text_from_transport(incoming)
     assert any(
