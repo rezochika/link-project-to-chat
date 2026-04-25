@@ -43,7 +43,7 @@ class ProjectConfig:
     path: str
     telegram_bot_token: str
     allowed_usernames: list[str] = field(default_factory=list)  # per-project override
-    trusted_users: dict[str, int] = field(default_factory=dict)
+    trusted_users: dict[str, int | str] = field(default_factory=dict)
     trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     model: str | None = None
     effort: str | None = None
@@ -83,7 +83,7 @@ class TeamConfig:
 @dataclass
 class Config:
     allowed_usernames: list[str] = field(default_factory=list)
-    trusted_users: dict[str, int] = field(default_factory=dict)
+    trusted_users: dict[str, int | str] = field(default_factory=dict)
     trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     github_pat: str = ""
     telegram_api_id: int = 0
@@ -142,7 +142,7 @@ def resolve_project_auth_scope(
     project: ProjectConfig,
     config: Config,
     username_override: str | None = None,
-) -> tuple[list[str], dict[str, int]]:
+) -> tuple[list[str], dict[str, int | str]]:
     """Return the effective usernames and trusted-user bindings for a project bot.
 
     Project-specific allowlists must not inherit unrelated global trusted IDs:
@@ -214,24 +214,39 @@ def _migrate_user_ids(raw: dict, list_key: str, singular_key: str) -> list[int]:
     return []
 
 
+def _coerce_user_id(user_id: object) -> int | str:
+    """Coerce a persisted user_id, preserving non-numeric (Web/Discord) ids.
+
+    Telegram ids are integers, but cross-platform ids (Discord snowflakes,
+    arbitrary Web user ids) are opaque strings. We try int() for legacy
+    compatibility and fall back to the raw value so ids round-trip through
+    save→load without ValueError. AuthMixin tolerates mixed-type values
+    (per PR #6 0ad608e).
+    """
+    try:
+        return int(user_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return user_id  # type: ignore[return-value]
+
+
 def _effective_trusted_users(
     allowed_usernames: list[str],
     *,
-    trusted_users: dict[str, int] | None = None,
+    trusted_users: dict[str, int | str] | None = None,
     trusted_user_ids: list[int] | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     normalized_allowed = [_normalize_username(username) for username in allowed_usernames]
     allowed_set = set(normalized_allowed)
     if trusted_users:
-        effective: dict[str, int] = {}
+        effective: dict[str, int | str] = {}
         for username, user_id in trusted_users.items():
             normalized = _normalize_username(username)
             if normalized in allowed_set:
-                effective[normalized] = int(user_id)
+                effective[normalized] = _coerce_user_id(user_id)
         if effective:
             return effective
     return {
-        username: int(user_id)
+        username: _coerce_user_id(user_id)
         for username, user_id in zip(normalized_allowed, trusted_user_ids or [])
     }
 
@@ -242,7 +257,7 @@ def _migrate_trusted_users(
     map_key: str,
     list_key: str,
     singular_key: str,
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     trusted_users = raw.get(map_key)
     if isinstance(trusted_users, dict):
         return _effective_trusted_users(
@@ -257,7 +272,7 @@ def _migrate_trusted_users(
 
 def _write_raw_trusted_users(
     raw: dict,
-    trusted_users: dict[str, int],
+    trusted_users: dict[str, int | str],
     *,
     map_key: str,
     list_key: str,
@@ -834,8 +849,12 @@ def add_project_trusted_user_id(project_name: str, user_id: int, path: Path = DE
     _patch_json(_patch, path)
 
 
-def bind_trusted_user(username: str, user_id: int, path: Path = DEFAULT_CONFIG) -> None:
-    """Bind a trusted user ID to a specific allowed username."""
+def bind_trusted_user(username: str, user_id: int | str, path: Path = DEFAULT_CONFIG) -> None:
+    """Bind a trusted user ID to a specific allowed username.
+
+    user_id may be int (Telegram) or str (Web/Discord opaque id); the
+    raw value is persisted as-is when non-numeric.
+    """
     normalized = _normalize_username(username)
 
     def _patch(raw: dict) -> None:
@@ -847,7 +866,7 @@ def bind_trusted_user(username: str, user_id: int, path: Path = DEFAULT_CONFIG) 
             "trusted_user_ids",
             "trusted_user_id",
         )
-        trusted_users[normalized] = int(user_id)
+        trusted_users[normalized] = _coerce_user_id(user_id)
         _write_raw_trusted_users(
             raw,
             trusted_users,
@@ -862,10 +881,14 @@ def bind_trusted_user(username: str, user_id: int, path: Path = DEFAULT_CONFIG) 
 def bind_project_trusted_user(
     project_name: str,
     username: str,
-    user_id: int,
+    user_id: int | str,
     path: Path = DEFAULT_CONFIG,
 ) -> None:
-    """Bind a trusted user ID to a specific allowed username for one project."""
+    """Bind a trusted user ID to a specific allowed username for one project.
+
+    user_id may be int (Telegram) or str (Web/Discord opaque id); the
+    raw value is persisted as-is when non-numeric.
+    """
     normalized = _normalize_username(username)
 
     def _patch(raw: dict) -> None:
@@ -883,7 +906,7 @@ def bind_project_trusted_user(
             "trusted_user_ids",
             "trusted_user_id",
         )
-        trusted_users[normalized] = int(user_id)
+        trusted_users[normalized] = _coerce_user_id(user_id)
         _write_raw_trusted_users(
             proj,
             trusted_users,
