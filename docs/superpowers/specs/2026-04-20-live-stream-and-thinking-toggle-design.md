@@ -1,7 +1,7 @@
 # Live Streaming and Optional Thinking Display — Design
 
 **Date:** 2026-04-20
-**Status:** Approved design, pending implementation plan
+**Status:** Shipped. See [docs/TODO.md §3](../../TODO.md#3-earlier-feature-tracks-shipped) for current status.
 
 ## Context
 

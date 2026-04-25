@@ -28,27 +28,29 @@ No Makefile, tox, or linter configured. Build system is hatchling. Entry point: 
 ## Architecture
 
 ### Core flow
-`cli.py` → `ProjectBot` (bot.py) → `TelegramTransport` (transport/telegram.py) → user messages → `TaskManager` → `ClaudeClient` → streaming response → `StreamingMessage` (transport/streaming.py)
+`cli.py` → `ProjectBot` (bot.py) → `Transport` (telegram or web) → user messages → `TaskManager` → `AgentBackend` (backends/) → streaming response → `StreamingMessage` (transport/streaming.py)
 
 ### Key modules
 - **bot.py** — Main ProjectBot handler. Zero direct Telegram imports (enforced by `tests/test_transport_lockout.py`). All platform calls go through Transport.
-- **transport/** — `Transport` Protocol (base.py), `TelegramTransport` (telegram.py), `FakeTransport` (fake.py) for tests, `StreamingMessage` (streaming.py) for rate-limited edits.
-- **claude_client.py** — Wraps `claude` CLI as subprocess, reads streaming events from stderr.
+- **transport/** — `Transport` Protocol (base.py), `TelegramTransport` (telegram.py), `FakeTransport` (fake.py) for tests, `StreamingMessage` (streaming.py) for rate-limited edits. Telegram-specific helpers (`_telegram_relay.py`, `_telegram_group.py`) live alongside but are private.
+- **web/** — `WebTransport` (transport.py), FastAPI app + SSE (app.py), SQLite store (store.py). First non-Telegram transport, shipped under spec #1.
+- **backends/** — `AgentBackend` Protocol (base.py), `ClaudeBackend` (claude.py), parser (claude_parser.py), `factory.py`. The bot constructs a backend via the factory; backend extraction landed under backend phase 1.
 - **stream.py** — Event types: TextDelta, ThinkingDelta, ToolUse, AskQuestion, Result, Error.
 - **task_manager.py** — Tracks concurrent Claude tasks and shell commands with lifecycle callbacks.
-- **manager/** — ManagerBot controls multiple project bots as subprocesses. ProcessManager handles lifecycle.
+- **manager/** — `ManagerBot` (ported to `TelegramTransport` under spec #0c, with a 7-name allowlist for `Update`/`ConversationHandler` family enforced by `tests/test_manager_lockout.py`). `ProcessManager` handles project-bot subprocess lifecycle. Wizard state lives in `conversation.py` above the transport layer.
 - **_auth.py** — AuthMixin: username-based auth, user ID locking, brute-force protection, rate limiting.
 - **skills.py** — Skill/persona loading with priority: project > global > Claude Code user > bundled.
-- **config.py** — Dataclass-based config with backward-compat migrations. Files written with `0o600`.
+- **config.py** — Dataclass-based config with backward-compat migrations. Files written with `0o600`. Includes transport-agnostic `BotPeerRef` and `RoomBinding` types for team routing.
 - **formatting.py** — Markdown-to-Telegram HTML conversion, message chunking at ~4096 chars.
 
 ### Transport abstraction
-The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only communicates through transport primitives (`ChatRef`, `MessageRef`, `Identity`, `IncomingMessage`). New transports must implement the Protocol and pass the parametrized contract test in `tests/transport/test_contract.py`.
+The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only communicates through transport primitives (`ChatRef`, `MessageRef`, `Identity`, `IncomingMessage`, `PromptSpec`). New transports must implement the Protocol and pass the parametrized contract test in `tests/transport/test_contract.py` (currently runs against `[fake, telegram, web]`).
 
 ### Manager & team support
-- `manager/bot.py` — Multi-project orchestration bot (still Telegram-specific, pending port)
-- `manager/team_relay.py` — Syncs messages between group chat and project bot DMs
-- `group_filters.py` / `group_state.py` — Group chat filtering and persistent state
+- `manager/bot.py` — Multi-project orchestration bot, runs through `TelegramTransport` (spec #0c). Residual `telegram` imports are limited to `Update` + `ConversationHandler` family.
+- `transport/_telegram_relay.py` — Telegram team relay; lifecycle owned by `TelegramTransport.enable_team_relay`.
+- `transport/_telegram_group.py` — Telethon TL helpers used by the manager for supergroup creation/deletion.
+- `group_filters.py` / `group_state.py` — Group chat filtering and persistent state. `group_state` is keyed by `ChatRef`; `group_filters` consumes `IncomingMessage.mentions` (structured mentions, not regex parsing).
 
 ## Coding Conventions
 
@@ -69,4 +71,9 @@ The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only commun
 
 ## Current Development
 
-Active branch `feat/transport-abstraction` is porting remaining Telegram-specific code to the Transport Protocol. Completed: core bot (spec #0), voice (spec #0b). Pending: group/team (spec #0a), manager (spec #0c).
+Active branch `feat/transport-abstraction` carries the transport-abstraction track plus the first non-Telegram transport.
+
+- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`) and 2 (backend-aware config + `/backend` command) also shipped.
+- Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4), backend phases 3 (Codex adapter) and 4 (capability expansion).
+
+[docs/TODO.md](docs/TODO.md) is the live status source — update there first; this section is a pointer.

@@ -1,6 +1,6 @@
 # Transport Abstraction — Design Spec
 
-**Status:** Designed (2026-04-20). Not yet implemented.
+**Status:** Shipped as v0.13.0. See [docs/TODO.md §1.1](../../TODO.md#11-shipped-specs) for current status and follow-ups.
 **Date:** 2026-04-20
 **Part of:** Tier 1 additive-transports track (Web UI / Discord / Slack). This spec is #0 of 4 — the prerequisite refactor that the three new-transport specs depend on.
 

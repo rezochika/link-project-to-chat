@@ -1,6 +1,6 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Generated 2026-04-25 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD._
+_Last refreshed 2026-04-26 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
 
@@ -45,6 +45,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | #1 Web UI | [spec](superpowers/specs/2026-04-21-transport-web-ui-design.md) | [plan](superpowers/plans/2026-04-21-web-transport.md) · [review-fix plan](superpowers/plans/2026-04-25-transport-spec1-review-fixes.md) | ✅ | Shipped 2026-04-25 (commits `6c12b39`..`d24ef52`); review-fix landed same day (commits `77abcff`..`7b73b8d`) closing P1.1/P1.2/P1.3/P1.4/P2. First non-Telegram transport. FastAPI + HTMX + SSE + SQLite. Closed A1, partially closed A2 (schema only). |
 | #2 Discord | [spec](superpowers/specs/2026-04-21-transport-discord-design.md) | [plan](superpowers/plans/2026-04-21-discord-transport.md) | 📋 | Uses discord.py 2.x, depends on #1 primitives. |
 | #3 Slack | [spec](superpowers/specs/2026-04-21-transport-slack-design.md) | [plan](superpowers/plans/2026-04-21-slack-transport.md) | 📋 | slack_bolt + Socket Mode; final cross-platform validation. |
+| #4 Google Chat | [spec](superpowers/specs/2026-04-25-transport-google-chat-design.md) | — | 📋 | HTTP Chat app events + Google Chat REST API; Cards v2/dialogs map to `Buttons`/`PromptSpec`; depends on public HTTPS endpoint or future Pub/Sub delivery. |
 
 ---
 
@@ -55,11 +56,13 @@ Multi-backend support (Claude → Codex / others). Phase 1 has shipped; phases 2
 | Phase | Spec | Plan | Status |
 |---|---|---|---|
 | Phase 1 — Claude extraction | [spec](superpowers/specs/2026-04-23-backend-phase-1-claude-extraction-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-1-claude-extraction.md) | ✅ |
-| Phase 2 — Config & `/backend` command | [spec](superpowers/specs/2026-04-23-backend-phase-2-config-and-backend-command-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-2-config-and-backend-command.md) | 📋 |
+| Phase 2 — Config & `/backend` command | [spec](superpowers/specs/2026-04-23-backend-phase-2-config-and-backend-command-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-2-config-and-backend-command.md) | ✅ |
 | Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | 📋 |
 | Phase 4 — Capability expansion readiness | [spec](superpowers/specs/2026-04-23-backend-phase-4-capability-expansion-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-4-capability-expansion-readiness.md) | 📋 |
 
 Phase 1 evidence: `src/link_project_to_chat/backends/` (5 files: `base.py` `AgentBackend` Protocol, `claude.py` `ClaudeBackend`, `claude_parser.py`, `factory.py`, `__init__.py`). `claude_client.py` was removed; `ProjectBot` constructs a Claude backend via the factory. Commits: `0ab1c56` (Protocol+factory), `ee53d19` (move Claude client), `f1acefd` (inject into TaskManager), `f20d8d1` (route through factory + remove shim).
+
+Phase 2 evidence: `ProjectConfig.backend` + `backend_state` dataclass fields (`config.py:55-56`), `Config.default_backend` (`config.py:104`), legacy-flat-field migration helpers (`_legacy_backend_state`, `_mirror_legacy_claude_fields`, `_effective_backend_state` at `config.py:194-241`), `/backend` command registered in `bot.py:53`, `ProjectBot.__init__(backend_name, backend_state)` (`bot.py:111`), capability-gated `/thinking`/`/permissions`/`/compact` responses, and manager-side propagation. Commits: `4828120` (config migration + dual-write), `7917b44` (helper migration + persistence call sites), `f73b43e` (`/backend` switching + capability gating), `283c5ed` (manager+CLI propagation), `cb91bb4` (parameterize Telegram-awareness preamble), `552df09` (post-phase-2 cleanup).
 
 PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
 
@@ -189,14 +192,14 @@ Open questions:
 |---|---|
 | ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
 | 🟡 Partial / intermittent | A2 (schema landed, call-sites pending) · 2 intermittent flaky tests (F1, F2 in §4.4) |
-| 📋 Designed, not started | 5 specs (Discord #2, Slack #3, Backend phases 2–4), sandbox |
+| 📋 Designed, not started | 6 specs (Discord #2, Slack #3, Google Chat #4, Backend phases 2–4), sandbox |
 | ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 1 deferred follow-up (A3) · WebTransport.stop() listener-release |
 
 ---
 
 ## Source Documents
 
-**Specs:** [docs/superpowers/specs/](superpowers/specs/) (16 design docs)
+**Specs:** [docs/superpowers/specs/](superpowers/specs/) (17 design docs)
 **Plans:** [docs/superpowers/plans/](superpowers/plans/) (23 implementation plans)
 **Audit:** [issues-2026-04-22.md](issues-2026-04-22.md) · [2026-04-22-remediation-plan.md](2026-04-22-remediation-plan.md) · [review-2026-04-22-batch1.md](review-2026-04-22-batch1.md)
 **Follow-ups:** [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)

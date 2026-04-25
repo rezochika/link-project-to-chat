@@ -1,18 +1,19 @@
 # link-project-to-chat
 
-Chat with Claude about a project via Telegram. Links a local directory to a Telegram bot — send messages, get responses with full project context.
+Chat with Claude about a project via Telegram or a local web UI. Links a local directory to a chat surface — send messages, get responses with full project context.
 
 ## Security warning
 
-This tool exposes Claude Code and a `/run` command for shell execution via Telegram. It is effectively a **remote shell** on your machine. Only use it with bot tokens you control and never share them.
+This tool exposes Claude Code and a `/run` command for shell execution. It is effectively a **remote shell** on your machine. On Telegram, only use it with bot tokens you control and never share them. With the web UI, bind to `127.0.0.1` and don't expose the port to the public internet without your own auth in front.
 
-Access is restricted to configured Telegram usernames. On first contact, the bot locks each user's numeric Telegram ID — subsequent requests are validated by ID, not username, so a username change cannot bypass access. Multiple users are supported.
+On Telegram, access is restricted to configured usernames. On first contact, the bot locks each user's numeric Telegram ID — subsequent requests are validated by ID, not username, so a username change cannot bypass access. Multiple users are supported.
 
 ## Requirements
 
 - Python 3.11+
 - [Claude Code](https://claude.ai/code) installed and authenticated (`claude` on PATH)
-- A Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather) on Telegram
+- For Telegram: a Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather) on Telegram
+- For local Web UI: nothing extra beyond the `[web]` install extra
 
 ## Install
 
@@ -20,10 +21,19 @@ Access is restricted to configured Telegram usernames. On first contact, the bot
 pipx install link-project-to-chat
 ```
 
-With automated project creation support (GitHub + BotFather):
+Optional extras:
+
+| Extra | Pulls in | Use it for |
+|---|---|---|
+| `[create]` | `httpx`, `telethon` | `/create_project`, `/create_team`, BotFather automation |
+| `[voice]` | `openai` | OpenAI Whisper API voice transcription |
+| `[web]` | `fastapi[standard]`, `jinja2`, `aiosqlite` | Local browser UI transport |
+| `[all]` | all of the above | Everything |
+
+Example:
 
 ```bash
-pipx install "link-project-to-chat[create]"
+pipx install "link-project-to-chat[all]"
 ```
 
 ## Quick start
@@ -44,6 +54,18 @@ link-project-to-chat projects add --name myproject --path /path/to/project --tok
 # Start the bot
 link-project-to-chat start
 ```
+
+## Web UI (alternative to Telegram)
+
+Run the same project bot in your browser instead of Telegram. No bot token required.
+
+```bash
+pipx install "link-project-to-chat[web]"
+link-project-to-chat start --project myproject --transport web --port 8080
+# then open http://localhost:8080
+```
+
+The web UI is local-only — bind to `127.0.0.1` and never expose it to the public internet without your own auth in front, since the same `/run` shell-execution surface is exposed.
 
 ## Example session
 
@@ -193,6 +215,8 @@ link-project-to-chat start-manager
 | `/stop_all` | Stop all projects |
 | `/add_project` | Add a project interactively |
 | `/create_project` | Create a project (GitHub repo + auto bot creation) |
+| `/create_team` | Create a multi-bot team in a group chat (interactive wizard) |
+| `/delete_team` | Delete a team and clean up its bots |
 | `/setup` | Configure GitHub PAT and Telegram API credentials |
 | `/users` | List authorized users |
 | `/add_user <username>` | Add an authorized user |
@@ -243,6 +267,7 @@ link-project-to-chat projects edit <name> <field> <value>
 link-project-to-chat start [--project NAME] [--path PATH --token TOKEN] [--username USER] [--model MODEL]
                             [--permission-mode MODE] [--dangerously-skip-permissions]
                             [--allowed-tools TOOLS] [--disallowed-tools TOOLS]
+                            [--transport telegram|web] [--port PORT]
 link-project-to-chat start-manager
 ```
 
@@ -272,11 +297,21 @@ EOF
 sudo systemctl enable --now link-project-to-chat
 ```
 
-## Planned features
+## Roadmap
 
-- **Discord support** — same interface over Discord instead of Telegram
-- ~~**Voice commands**~~ — ✓ done
-- **Other coding agents** — pluggable backend for agents beyond Claude Code
+**Shipped:**
+- Telegram transport
+- Local Web UI transport (FastAPI + SSE + SQLite)
+- Voice messages (Whisper API or local whisper.cpp)
+- Multi-project manager bot, team chats, group/team relay
+- Skills and personas
+- Pluggable agent backend with `/backend` command and capability-gated commands (Claude is the only registered backend today; phases 1+2 of multi-backend)
+
+**Planned (designed, not yet implemented):**
+- Discord transport
+- Slack transport
+- Google Chat transport
+- Codex backend (phase 3); capability-expansion polish (phase 4)
 
 Contributions welcome.
 

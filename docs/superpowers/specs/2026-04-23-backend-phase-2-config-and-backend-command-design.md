@@ -1,6 +1,6 @@
 # Backend Abstraction Phase 2 — Backend-Aware Config + `/backend` Command
 
-**Status:** Designed (2026-04-23). Not yet implemented.
+**Status:** Shipped (commits `4828120`, `7917b44`, `f73b43e`, `283c5ed`, `cb91bb4`, `552df09`). See [docs/TODO.md §2](../../TODO.md#2-backend-abstraction-track) for current status and follow-ups.
 **Date:** 2026-04-23
 **Part of:** Backend-abstraction track, spec #2 of 4.
 **Depends on:** Spec #1 (Claude extracted behind `AgentBackend`).

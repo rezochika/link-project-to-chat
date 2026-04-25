@@ -1,6 +1,6 @@
 # Transport — Voice Port — Design Spec
 
-**Status:** Designed (2026-04-20). Not yet implemented.
+**Status:** Shipped as v0.14.0. See [docs/TODO.md §1.1](../../TODO.md#11-shipped-specs) for current status and follow-ups.
 **Date:** 2026-04-20
 **Depends on:** [2026-04-20-transport-abstraction-design.md](2026-04-20-transport-abstraction-design.md) (spec #0)
 **Part of:** The transport-abstraction follow-up track. This is spec #0b — voice inbound + outbound TTS port.

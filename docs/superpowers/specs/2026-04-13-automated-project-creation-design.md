@@ -1,7 +1,7 @@
 # Automated Project Creation with GitHub & Bot Generation
 
 **Date:** 2026-04-13
-**Status:** Draft
+**Status:** Shipped. See [docs/TODO.md §3](../../TODO.md#3-earlier-feature-tracks-shipped) for current status.
 
 ## Overview
 

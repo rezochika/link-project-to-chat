@@ -1,6 +1,6 @@
 # Backend Abstraction Phase 1 — Claude Extraction Behind `AgentBackend`
 
-**Status:** Designed (2026-04-23). Not yet implemented.
+**Status:** Shipped (commits `0ab1c56`, `ee53d19`, `f1acefd`, `f20d8d1`). See [docs/TODO.md §2](../../TODO.md#2-backend-abstraction-track) for current status and follow-ups.
 **Date:** 2026-04-23
 **Part of:** Backend-abstraction track, spec #1 of 4. Stacks on the `feat/transport-abstraction` branch. Refines the external v1.0 draft (`Codex_CLI_Architecture_Spec_Link_Project_to_Chat.docx`, 2026-04-23) into actionable phases.
 **Depends on:** `feat/transport-abstraction` landing (bot.py is already decoupled from Telegram there; this spec decouples it from Claude).

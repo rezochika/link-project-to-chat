@@ -1,6 +1,6 @@
 # Transport - Web UI + Conversation Primitive - Design Spec
 
-**Status:** Designed (2026-04-21). Not yet implemented.
+**Status:** Shipped 2026-04-25 (commits `6c12b39`..`d24ef52`); review-fix landed same day (commits `77abcff`..`7b73b8d`). See [docs/TODO.md §1.3](../../TODO.md#13-new-transport-platforms-designed-not-implemented) for current status and follow-ups.
 **Date:** 2026-04-21
 **Depends on:** [2026-04-20-transport-abstraction-design.md](2026-04-20-transport-abstraction-design.md) (spec #0), [2026-04-20-transport-voice-port-design.md](2026-04-20-transport-voice-port-design.md) (spec #0b), [2026-04-21-transport-group-team-port-design.md](2026-04-21-transport-group-team-port-design.md) (spec #0a), [2026-04-21-transport-manager-port-design.md](2026-04-21-transport-manager-port-design.md) (spec #0c)
 **Part of:** First additive non-Telegram transport. This is spec #1 of 3 in the Web UI / Discord / Slack track and introduces the shared Conversation/Wizard primitive the later specs depend on.
