@@ -5,7 +5,7 @@ See docs/superpowers/specs/2026-04-20-transport-abstraction-design.md section 4.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
@@ -100,6 +100,9 @@ class IncomingMessage:
     # video/sticker/location/contact/video-note that the transport can't decode.
     # Bot SHOULD reject with a "media type not supported" reply rather than
     # treating any caption as a normal prompt.
+    mentions: list[Identity] = field(default_factory=list)
+    # Identities @-mentioned in this message. Lets the bot route group
+    # messages without parsing platform-specific entity offsets.
 
 
 @dataclass(frozen=True)

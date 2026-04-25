@@ -177,6 +177,7 @@ class FakeTransport:
         reply_to: MessageRef | None = None,
         reply_to_text: str | None = None,
         reply_to_sender: Identity | None = None,
+        mentions: list[Identity] | None = None,
     ) -> None:
         msg_ref = MessageRef(
             transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat,
@@ -193,6 +194,7 @@ class FakeTransport:
             message=msg_ref,
             reply_to_text=reply_to_text,
             reply_to_sender=reply_to_sender,
+            mentions=mentions or [],
         )
         for h in self._message_handlers:
             await h(msg)
