@@ -112,7 +112,7 @@ relevant: """
 _TELEGRAM_AWARENESS_SUFFIX = """
 
 CHANNEL FRAGILITY: `src/link_project_to_chat/bot.py`, \
-`src/link_project_to_chat/claude_client.py`, and the `link-project-to-chat` systemd \
+`src/link_project_to_chat/backends/claude.py`, and the `link-project-to-chat` systemd \
 unit are load-bearing for THIS conversation — a breaking change drops the user's \
 only channel to you. Confirm before editing those files, and note that running \
 `rebuild.sh` restarts the service (brief gap before the next message gets through)."""

@@ -168,7 +168,8 @@ class ProjectBot(AuthMixin):
         persisted_state.setdefault("show_thinking", show_thinking)
         _backend = _create_backend(backend_name, self.path, persisted_state)
         self._backend_name = backend_name
-        self._backend_state = backend_state or {backend_name: persisted_state}
+        self._backend_state = dict(backend_state or {})
+        self._backend_state[backend_name] = persisted_state
         self.task_manager = TaskManager(
             project_path=self.path,
             backend=_backend,
