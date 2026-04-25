@@ -10,6 +10,7 @@ from .config import (
     DEFAULT_CONFIG,
     bind_project_trusted_user,
     load_config,
+    patch_backend_state,
     resolve_project_auth_scope,
     resolve_permissions,
     save_config,
@@ -118,12 +119,22 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
     entry: dict = {"path": str(Path(project_path).resolve()), "telegram_bot_token": token}
     if username:
         entry["username"] = username.lower().lstrip("@")
+    # Phase 2: write the new shape (backend + backend_state). load_config()
+    # mirrors legacy flat fields back from backend_state on read, and
+    # save_config() keeps the legacy mirror in sync, so older code paths
+    # still see the values they expect.
+    entry["backend"] = "claude"
+    claude_state: dict[str, object] = {}
     if model:
-        entry["model"] = model
+        claude_state["model"] = model
+        entry["model"] = model  # legacy mirror for downgrade safety
     if skip_permissions:
+        claude_state["permissions"] = "dangerously-skip-permissions"
         entry["permissions"] = "dangerously-skip-permissions"
     elif permission_mode:
+        claude_state["permissions"] = permission_mode
         entry["permissions"] = permission_mode
+    entry["backend_state"] = {"claude": claude_state} if claude_state else {}
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")
 
@@ -188,16 +199,28 @@ def projects_edit(ctx, name: str, field: str, value: str):
         projects[name]["telegram_bot_token"] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' token.")
-    elif field in ("username", "model"):
+    elif field == "username":
         projects[name][field] = value
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' {field} to {value}.")
+    elif field == "model":
+        # Phase 2: write the new shape into backend_state[<active_backend>]
+        # and mirror the legacy flat key for downgrade safety.
+        backend_name = projects[name].get("backend") or "claude"
+        patch_backend_state(name, backend_name, {"model": value}, cfg_path)
+        click.echo(f"Updated '{name}' model to {value}.")
     elif field in ("permissions", "permission_mode", "dangerously_skip_permissions"):
-        projects[name]["permissions"] = _normalize_permissions_edit(field, value)
-        projects[name].pop("permission_mode", None)
-        projects[name].pop("dangerously_skip_permissions", None)
-        save_project_configs(projects, cfg_path)
-        click.echo(f"Updated '{name}' permissions to {projects[name]['permissions']}.")
+        normalized = _normalize_permissions_edit(field, value)
+        projects = load_project_configs(cfg_path)
+        backend_name = projects[name].get("backend") or "claude"
+        patch_backend_state(name, backend_name, {"permissions": normalized}, cfg_path)
+        # Drop legacy alias keys so the source of truth is the canonical key.
+        projects = load_project_configs(cfg_path)
+        if "permission_mode" in projects[name] or "dangerously_skip_permissions" in projects[name]:
+            projects[name].pop("permission_mode", None)
+            projects[name].pop("dangerously_skip_permissions", None)
+            save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' permissions to {normalized}.")
     else:
         raise SystemExit(f"Unknown field. Use: {', '.join(_EDITABLE)}")
 
@@ -399,26 +422,29 @@ def start(
             if other_role != role and other_bot.bot_username:
                 peer_username = other_bot.bot_username
                 break
+        bot_state = bot_cfg.backend_state.get(bot_cfg.backend, {})
         run_bot(
             f"{team}_{role}",
             Path(t.path),
             bot_cfg.telegram_bot_token,
             allowed_usernames=effective_usernames,
             trusted_users=effective_trusted_users,
-            session_id=session_id or bot_cfg.session_id,
+            session_id=session_id or bot_state.get("session_id") or bot_cfg.session_id,
             transcriber=transcriber,
             synthesizer=synthesizer,
             team_name=team,
             group_chat_id=t.group_chat_id,
             role=role,
             active_persona=bot_cfg.active_persona,
-            model=model or config.default_model or None,
+            model=model or bot_state.get("model") or config.default_model or None,
             skip_permissions=team_skip,
             permission_mode=team_pm,
             peer_bot_username=peer_username,
             config_path=cfg_path,
             transport_kind=transport_kind,
             web_port=web_port,
+            backend_name=bot_cfg.backend,
+            backend_state=bot_cfg.backend_state,
         )
         return
 
@@ -437,14 +463,15 @@ def start(
             username_override=username,
         )
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
+        project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
             project,
             Path(proj.path),
             proj.telegram_bot_token,
             allowed_usernames=effective_usernames,
             session_id=session_id,
-            model=model or proj.model,
-            effort=proj.effort,
+            model=model or project_state.get("model") or proj.model,
+            effort=project_state.get("effort") or proj.effort,
             skip_permissions=skip_permissions or proj_skip,
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed,
@@ -458,11 +485,13 @@ def start(
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
-            show_thinking=proj.show_thinking,
+            show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
             trusted_users=effective_trusted_users,
             config_path=cfg_path,
             transport_kind=transport_kind,
             web_port=web_port,
+            backend_name=proj.backend,
+            backend_state=proj.backend_state,
         )
     else:
         run_bots(

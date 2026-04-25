@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import DEFAULT_CONFIG, bind_trusted_user, unbind_trusted_user
+from ..config import DEFAULT_CONFIG, bind_trusted_user, patch_backend_state, unbind_trusted_user
 from .._auth import AuthMixin
 from ..transport import Button, Buttons, ChatRef, MessageRef
 
@@ -1498,6 +1498,11 @@ class ManagerBot(AuthMixin):
             await add_bot(client, group_id, dev_username)
 
             # --- COMMIT config (point of no return) ---
+            # Team bots run unattended — skip tool-permission prompts. Mirror
+            # the legacy ``permissions`` flat key for downgrade safety; the new
+            # shape lives under ``backend_state["claude"]``.
+            def _unattended_state() -> dict:
+                return {"claude": {"permissions": "dangerously-skip-permissions"}}
             patch_team(
                 prefix,
                 {
@@ -1507,17 +1512,20 @@ class ManagerBot(AuthMixin):
                         "manager": {
                             "telegram_bot_token": mgr_token,
                             "active_persona": mgr_persona,
-                            # Team bots run unattended — skip tool-permission prompts.
                             "permissions": "dangerously-skip-permissions",
                             # Store each bot's @handle so the peer role can address it
                             # directly instead of using a persona-placeholder like "@developer".
                             "bot_username": mgr_username,
+                            "backend": "claude",
+                            "backend_state": _unattended_state(),
                         },
                         "dev": {
                             "telegram_bot_token": dev_token,
                             "active_persona": dev_persona,
                             "permissions": "dangerously-skip-permissions",
                             "bot_username": dev_username,
+                            "backend": "claude",
+                            "backend_state": _unattended_state(),
                         },
                     },
                 },
@@ -1962,8 +1970,13 @@ class ManagerBot(AuthMixin):
             if model_id and name:
                 projects = self._load_projects()
                 if name in projects:
-                    projects[name]["model"] = model_id
-                    self._save_projects(projects)
+                    backend_name = projects[name].get("backend") or "claude"
+                    patch_backend_state(
+                        name,
+                        backend_name,
+                        {"model": model_id},
+                        self._project_config_path or DEFAULT_CONFIG,
+                    )
                 current = model_id
                 rows = []
                 for mid, label in MODEL_OPTIONS:

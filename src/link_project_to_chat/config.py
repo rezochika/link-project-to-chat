@@ -752,20 +752,57 @@ def _patch_json(patch_fn, path: Path) -> None:
         _atomic_write(path, json.dumps(raw, indent=2) + "\n")
 
 
+def _active_backend_name(entry: dict) -> str:
+    """Return the active backend for a config entry, defaulting to ``claude``."""
+    return entry.get("backend") or "claude"
+
+
+def _session_from_entry(entry: dict) -> str | None:
+    """Read session_id from an entry, preferring backend_state over legacy flat key."""
+    backend_name = _active_backend_name(entry)
+    backend_state = entry.get("backend_state") or {}
+    state = backend_state.get(backend_name) or {}
+    return state.get("session_id") or entry.get("session_id")
+
+
+def _ensure_backend_state_seeded(entry: dict) -> dict:
+    """Fold legacy Claude flat fields into backend_state on-the-fly during a patch.
+
+    Patching helpers operate directly on raw JSON, so a legacy-only entry
+    (no ``backend_state`` yet) would lose its sibling flat values when the
+    helper writes a single key under ``backend_state[claude]`` and then
+    re-mirrors. Seeding the in-progress raw entry from legacy fields keeps
+    the round-trip lossless. Returns the (possibly mutated) backend_state.
+    """
+    backend_state = entry.setdefault("backend_state", {})
+    if "claude" not in backend_state:
+        legacy = _legacy_backend_state(
+            entry.get("model"),
+            entry.get("effort"),
+            entry.get("permissions"),
+            entry.get("session_id"),
+            entry.get("show_thinking", False),
+        )
+        if legacy.get("claude"):
+            backend_state["claude"] = legacy["claude"]
+    return backend_state
+
+
 def load_sessions(path: Path = DEFAULT_CONFIG) -> dict[str, str]:
     """Load all session IDs from config.json per-project entries."""
     if path.exists():
         try:
             raw = json.loads(path.read_text())
-            sessions = {
-                name: proj["session_id"]
-                for name, proj in raw.get("projects", {}).items()
-                if proj.get("session_id")
-            }
+            sessions: dict[str, str] = {}
+            for name, proj in raw.get("projects", {}).items():
+                sid = _session_from_entry(proj)
+                if sid:
+                    sessions[name] = sid
             for t_name, t_data in raw.get("teams", {}).items():
                 for r_name, r_data in t_data.get("bots", {}).items():
-                    if r_data.get("session_id"):
-                        sessions[f"{t_name}_{r_name}"] = r_data["session_id"]
+                    sid = _session_from_entry(r_data)
+                    if sid:
+                        sessions[f"{t_name}_{r_name}"] = sid
             return sessions
         except (json.JSONDecodeError, OSError):
             pass
@@ -779,19 +816,24 @@ def load_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> str | None:
-    """Load one persisted Claude session for either a project or a team bot."""
+    """Load one persisted session for either a project or a team bot.
+
+    Prefers the new ``backend_state[<active_backend>]["session_id"]`` shape and
+    falls back to the legacy flat ``session_id`` for old configs.
+    """
     if path.exists():
         try:
             raw = json.loads(path.read_text())
             if team_name and role:
-                return (
+                entry = (
                     raw.get("teams", {})
                     .get(team_name, {})
                     .get("bots", {})
                     .get(role, {})
-                    .get("session_id")
                 )
-            return raw.get("projects", {}).get(project_name, {}).get("session_id")
+                return _session_from_entry(entry)
+            entry = raw.get("projects", {}).get(project_name, {})
+            return _session_from_entry(entry)
         except (json.JSONDecodeError, OSError):
             pass
     return None
@@ -855,11 +897,24 @@ def save_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> None:
+    """Persist session_id into backend_state[<active_backend>] and mirror legacy when claude."""
     def _patch(raw: dict) -> None:
         if team_name and role:
-            raw.setdefault("teams", {}).setdefault(team_name, {}).setdefault("bots", {}).setdefault(role, {})["session_id"] = session_id
-            return
-        raw.setdefault("projects", {}).setdefault(project_name, {})["session_id"] = session_id
+            entry = (
+                raw.setdefault("teams", {})
+                .setdefault(team_name, {})
+                .setdefault("bots", {})
+                .setdefault(role, {})
+            )
+        else:
+            entry = raw.setdefault("projects", {}).setdefault(project_name, {})
+        backend_name = _active_backend_name(entry)
+        backend_state = _ensure_backend_state_seeded(entry)
+        state = backend_state.setdefault(backend_name, {})
+        state["session_id"] = session_id
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(entry, backend_state)
+
     _patch_json(_patch, path)
 
 
@@ -870,11 +925,107 @@ def clear_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> None:
+    """Drop session_id from backend_state[<active_backend>] and the legacy mirror."""
     def _patch(raw: dict) -> None:
         if team_name and role:
-            raw.setdefault("teams", {}).setdefault(team_name, {}).setdefault("bots", {}).setdefault(role, {}).pop("session_id", None)
-            return
-        raw.setdefault("projects", {}).setdefault(project_name, {}).pop("session_id", None)
+            entry = (
+                raw.setdefault("teams", {})
+                .setdefault(team_name, {})
+                .setdefault("bots", {})
+                .setdefault(role, {})
+            )
+        else:
+            entry = raw.setdefault("projects", {}).setdefault(project_name, {})
+        backend_name = _active_backend_name(entry)
+        backend_state = _ensure_backend_state_seeded(entry)
+        state = backend_state.setdefault(backend_name, {})
+        state.pop("session_id", None)
+        entry.pop("session_id", None)
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(entry, backend_state)
+
+    _patch_json(_patch, path)
+
+
+def patch_backend_state(
+    project_name: str,
+    backend_name: str,
+    fields: dict,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Update backend_state[<backend_name>] for a project entry.
+
+    None values remove the key. When ``backend_name == "claude"`` the legacy
+    flat fields on the project entry are re-mirrored from backend_state for
+    downgrade safety. If the on-disk entry only has legacy flat fields, they
+    are folded into ``backend_state["claude"]`` first so unrelated fields are
+    not lost during the partial update.
+    """
+    def _patch(raw: dict) -> None:
+        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
+        backend_state = _ensure_backend_state_seeded(proj)
+        state = backend_state.setdefault(backend_name, {})
+        for key, value in fields.items():
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(proj, backend_state)
+
+    _patch_json(_patch, path)
+
+
+def patch_team_bot_backend_state(
+    team_name: str,
+    role: str,
+    backend_name: str,
+    fields: dict,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Update backend_state[<backend_name>] for a team-bot entry.
+
+    None values remove the key. When ``backend_name == "claude"`` the legacy
+    flat fields on the team-bot entry are re-mirrored from backend_state for
+    downgrade safety. Legacy flat fields are folded into ``backend_state["claude"]``
+    first when the on-disk entry only has the legacy shape.
+    """
+    def _patch(raw: dict) -> None:
+        bot = (
+            raw.setdefault("teams", {})
+            .setdefault(team_name, {})
+            .setdefault("bots", {})
+            .setdefault(role, {})
+        )
+        backend_state = _ensure_backend_state_seeded(bot)
+        state = backend_state.setdefault(backend_name, {})
+        for key, value in fields.items():
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(bot, backend_state)
+
+    _patch_json(_patch, path)
+
+
+def patch_team_bot_backend(
+    team_name: str,
+    role: str,
+    backend_name: str,
+    path: Path = DEFAULT_CONFIG,
+) -> None:
+    """Set the active backend on a team-bot entry without touching state."""
+    def _patch(raw: dict) -> None:
+        bot = (
+            raw.setdefault("teams", {})
+            .setdefault(team_name, {})
+            .setdefault("bots", {})
+            .setdefault(role, {})
+        )
+        bot["backend"] = backend_name
+
     _patch_json(_patch, path)
 
 

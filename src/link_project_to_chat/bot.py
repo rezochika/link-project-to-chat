@@ -21,8 +21,10 @@ from .config import (
     load_config,
     load_session,
     load_teams,
+    patch_backend_state,
     patch_project,
     patch_team,
+    patch_team_bot_backend_state,
     resolve_permissions,
     resolve_project_auth_scope,
     save_session,
@@ -104,6 +106,8 @@ class ProjectBot(AuthMixin):
         config_path: Path | None = None,
         transport_kind: str = "telegram",
         web_port: int = 8080,
+        backend_name: str = "claude",
+        backend_state: dict[str, dict] | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -149,17 +153,20 @@ class ProjectBot(AuthMixin):
         self._synthesizer = synthesizer
         self._voice_tasks: set[int] = set()
         from .backends.factory import create as _create_backend
-        backend_state = {
-            "permissions": (
-                "dangerously-skip-permissions"
-                if skip_permissions
-                else permission_mode
-            ),
-            "allowed_tools": allowed_tools or [],
-            "disallowed_tools": disallowed_tools or [],
-            "show_thinking": show_thinking,
-        }
-        _backend = _create_backend("claude", self.path, backend_state)
+        # Phase 2: legacy flat constructor args still take effect, layered onto
+        # any backend_state[<backend_name>] supplied by the caller. Persisted
+        # backend_state wins for keys it sets; legacy args fill the rest.
+        persisted_state = dict((backend_state or {}).get(backend_name, {}))
+        persisted_state.setdefault(
+            "permissions",
+            "dangerously-skip-permissions" if skip_permissions else permission_mode,
+        )
+        persisted_state.setdefault("allowed_tools", allowed_tools or [])
+        persisted_state.setdefault("disallowed_tools", disallowed_tools or [])
+        persisted_state.setdefault("show_thinking", show_thinking)
+        _backend = _create_backend(backend_name, self.path, persisted_state)
+        self._backend_name = backend_name
+        self._backend_state = backend_state or {backend_name: persisted_state}
         self.task_manager = TaskManager(
             project_path=self.path,
             backend=_backend,
@@ -930,7 +937,7 @@ class ProjectBot(AuthMixin):
             arg = args[0].lower()
             if arg in ("on", "off"):
                 self.show_thinking = arg == "on"
-                self._patch_config({"show_thinking": self.show_thinking})
+                self._patch_backend_config({"show_thinking": self.show_thinking})
                 await self._transport.send_text(
                     ci.chat, f"Live thinking: {self._current_thinking()}"
                 )
@@ -1172,6 +1179,27 @@ class ProjectBot(AuthMixin):
             self.bot_username, self.team_name, self.role,
         )
 
+    def _patch_backend_config(self, fields: dict) -> None:
+        """Persist backend-state fields for this bot's active backend.
+
+        Routes to ``patch_team_bot_backend_state`` for team bots or
+        ``patch_backend_state`` for solo bots. Backend-state writes are
+        scoped per-backend, so switching backends doesn't clobber a sibling
+        backend's saved state.
+        """
+        cfg = self._effective_config_path()
+        backend_name = self.task_manager.backend.name
+        if self.team_name and self.role:
+            patch_team_bot_backend_state(
+                self.team_name, self.role, backend_name, fields, cfg,
+            )
+        else:
+            patch_backend_state(self.name, backend_name, fields, cfg)
+
+    def _backend_state_for(self, backend_name: str) -> dict:
+        """Return a copy of the persisted backend_state[<backend_name>] for this bot."""
+        return dict(self._backend_state.get(backend_name, {}))
+
     def _patch_config(self, fields: dict, config_path: Path | None = None) -> None:
         """Persist config fields for this bot, routing to team or project config.
 
@@ -1189,7 +1217,11 @@ class ProjectBot(AuthMixin):
                 return
             bots_dict: dict[str, dict] = {}
             for role, bot in team.bots.items():
-                entry: dict = {"telegram_bot_token": bot.telegram_bot_token}
+                entry: dict = {
+                    "telegram_bot_token": bot.telegram_bot_token,
+                    "backend": bot.backend,
+                    "backend_state": dict(bot.backend_state),
+                }
                 if bot.active_persona is not None:
                     entry["active_persona"] = bot.active_persona
                 if bot.autostart:
@@ -1419,7 +1451,7 @@ class ProjectBot(AuthMixin):
             if name in valid:
                 self.task_manager.backend.model = name
                 self._claude.model_display = None
-                self._patch_config({"model": name})
+                self._patch_backend_config({"model": name})
             await self._transport.edit_text(
                 msg_ref,
                 f"Select model\nCurrent: {self._current_model()}",
@@ -1429,7 +1461,7 @@ class ProjectBot(AuthMixin):
             level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self._claude.effort = level
-                self._patch_config({"effort": level})
+                self._patch_backend_config({"effort": level})
             await self._transport.edit_text(
                 msg_ref,
                 f"Effort: {self._current_effort()}",
@@ -1439,7 +1471,7 @@ class ProjectBot(AuthMixin):
             val = value[len("thinking_set_"):]
             if val in ("on", "off"):
                 self.show_thinking = val == "on"
-                self._patch_config({"show_thinking": self.show_thinking})
+                self._patch_backend_config({"show_thinking": self.show_thinking})
             await self._transport.edit_text(
                 msg_ref,
                 f"Live thinking: {self._current_thinking()}",
@@ -1451,7 +1483,7 @@ class ProjectBot(AuthMixin):
                 skip, pm = resolve_permissions(mode)
                 self._claude.skip_permissions = skip
                 self._claude.permission_mode = pm
-                self._patch_config({"permissions": mode if mode != "default" else None})
+                self._patch_backend_config({"permissions": mode if mode != "default" else None})
             await self._transport.edit_text(
                 msg_ref,
                 f"Permissions: {self._current_permission()}",
@@ -2016,6 +2048,8 @@ def run_bot(
     config_path: Path | None = None,
     transport_kind: str = "telegram",
     web_port: int = 8080,
+    backend_name: str = "claude",
+    backend_state: dict[str, dict] | None = None,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -2051,6 +2085,8 @@ def run_bot(
         config_path=config_path,
         transport_kind=transport_kind,
         web_port=web_port,
+        backend_name=backend_name,
+        backend_state=backend_state,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -2094,12 +2130,13 @@ def run_bots(
             _path = config_path
             on_trust = lambda uid, username: bind_project_trusted_user(_name, username, uid, _path)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
+        project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
             name,
             Path(proj.path),
             proj.telegram_bot_token,
-            model=model or proj.model,
-            effort=proj.effort,
+            model=model or project_state.get("model") or proj.model,
+            effort=project_state.get("effort") or proj.effort,
             skip_permissions=skip_permissions or proj_skip,
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed_tools,
@@ -2110,10 +2147,12 @@ def run_bots(
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
-            show_thinking=proj.show_thinking,
+            show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
             config_path=config_path,
             transport_kind=transport_kind,
             web_port=web_port,
+            backend_name=proj.backend,
+            backend_state=proj.backend_state,
         )
     else:
         names = ", ".join(config.projects.keys())
