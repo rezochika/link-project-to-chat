@@ -300,6 +300,12 @@ class WebTransport:
                     text=text,
                     html=False,
                 )
+                # Notify SSE AFTER save so the partial fetch sees this message.
+                # (post_message no longer notifies; the dispatch loop owns the
+                # save->notify ordering.) Notifying before handler dispatch
+                # ensures the user's just-posted message is rendered before
+                # the bot's reply starts streaming.
+                await _notify_sse(self._sse_queues, chat_id)
                 msg_ref = MessageRef(
                     transport_id=self.TRANSPORT_ID,
                     native_id=str(db_id),

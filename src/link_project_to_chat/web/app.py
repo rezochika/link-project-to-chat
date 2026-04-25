@@ -81,7 +81,6 @@ def create_app(
             "chat_id": chat_id,
             "payload": payload,
         })
-        await _notify_sse(sse_queues, chat_id)
         return HTMLResponse("", status_code=204)
 
     @app.get("/chat/{chat_id}/sse")
