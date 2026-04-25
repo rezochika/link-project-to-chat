@@ -30,8 +30,11 @@
 | `tests/backends/test_capability_declaration.py` | **NEW**: conservative Codex capability lock |
 | `tests/backends/test_contract.py` | Extend backend contract coverage to include Codex |
 | `tests/backends/test_codex_live.py` | **NEW**: real-CLI integration tests, skipped by default |
+| `tests/test_backend_command.py` | Extend `/backend` command coverage for active-Codex bot commands |
+| `src/link_project_to_chat/bot.py` | Gracefully reject Claude-only commands/features when Codex is active |
 | `pyproject.toml` | Add `codex_live` pytest marker |
 | `CLAUDE.md` | Update architecture notes to mention backend abstraction and opt-in Codex |
+| `docs/TODO.md` | Move Backend Phase 3 status from designed to shipped/in progress after implementation |
 
 ---
 
@@ -87,8 +90,10 @@ codex --help
 codex exec --help
 codex exec resume --help
 codex login --help
+codex login status
 codex exec --json --sandbox read-only "Reply with exactly OK and do not run any commands."
 codex exec resume --json 019db9de-2ad5-7110-8d11-d96e6617cc0f "Reply with exactly AGAIN and do not run any commands."
+codex exec resume --json --model gpt-5.4 019db9de-2ad5-7110-8d11-d96e6617cc0f "Reply with exactly MODEL and do not run any commands."
 ```
 
 ## Observed behavior
@@ -105,6 +110,8 @@ codex exec resume --json 019db9de-2ad5-7110-8d11-d96e6617cc0f "Reply with exactl
 - No thinking delta stream was observed.
 - No tool-use event stream was observed.
 - Model selection exists as `--model`, but the CLI help does not enumerate a fixed supported model list.
+- `codex login status` exits `0` only when the CLI is authenticated.
+- `codex exec resume --json --model <model> <thread_id> <prompt>` was validated before the adapter includes `--model` on resumed turns.
 
 ## Initial capability conclusions
 
@@ -289,6 +296,9 @@ class AgentBackend(Protocol):
     capabilities: BackendCapabilities
     project_path: Path
     model: str | None
+    # `None` means the backend has no friendlier label than `model` — callers
+    # should fall back to `model` in that case.
+    model_display: str | None
     session_id: str | None
 
     async def chat_stream(
@@ -618,6 +628,29 @@ async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_successful_stderr_warning_does_not_fail_turn(tmp_path, monkeypatch):
+    backend = CodexBackend(tmp_path, {})
+    warning = (FIXTURES / "codex_stderr_warning.txt").read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        backend,
+        "_popen",
+        lambda cmd: _FakeProc(
+            _lines("codex_exec_ok.jsonl"),
+            stderr_text=warning,
+            returncode=0,
+        ),
+    )
+
+    events = [event async for event in backend.chat_stream("hello")]
+
+    assert events[-1] == Result(
+        text="OK",
+        session_id="019db9de-2ad5-7110-8d11-d96e6617cc0f",
+        model=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_probe_health_returns_ok(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})
 
@@ -662,7 +695,7 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 from ..events import Error, Result, StreamEvent, TextDelta
-from ..task_manager import _terminate_process_tree
+from ..task_manager import _command_popen_kwargs, _terminate_process_tree
 from .base import BaseBackend, BackendCapabilities, HealthStatus
 from .codex_parser import parse_codex_line
 from .factory import register
@@ -700,6 +733,7 @@ class CodexBackend(BaseBackend):
     def __init__(self, project_path: Path, state: dict):
         self.project_path = project_path
         self.model = state.get("model")
+        self.model_display: str | None = None
         self.session_id = state.get("session_id")
         self._proc: subprocess.Popen[bytes] | None = None
         self._started_at: float | None = None
@@ -722,14 +756,19 @@ class CodexBackend(BaseBackend):
         return cmd
 
     def _popen(self, cmd: list[str]) -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
+        popen_kwargs = _command_popen_kwargs()
+        proc = subprocess.Popen(
             cmd,
             cwd=str(self.project_path),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self._prepare_env(),
+            **popen_kwargs,
         )
+        if popen_kwargs.get("start_new_session"):
+            setattr(proc, "_kill_process_tree", True)
+        return proc
 
     async def chat_stream(
         self,
@@ -747,6 +786,7 @@ class CodexBackend(BaseBackend):
 
         collected_text: list[str] = []
         thread_id = self.session_id
+        result: Result | None = None
 
         try:
             while True:
@@ -766,17 +806,20 @@ class CodexBackend(BaseBackend):
                 if parsed.turn_completed:
                     self.session_id = thread_id or self.session_id
                     self._last_usage = parsed.usage
-                    yield Result(
+                    result = Result(
                         text="".join(collected_text) or "[No response]",
                         session_id=self.session_id,
                         model=None,
                     )
-                    return
+                    break
 
             stderr = (await asyncio.to_thread(proc.stderr.read)).decode("utf-8", errors="replace").strip()
             await asyncio.to_thread(proc.wait)
             if proc.returncode != 0:
                 raise CodexStreamError(stderr or f"codex exit code {proc.returncode}")
+            if result is not None:
+                yield result
+                return
         finally:
             if self._proc is proc:
                 self._proc = None
@@ -888,7 +931,124 @@ git commit -m "feat: add conservative codex backend"
 
 ---
 
-### Task 5: Lock Capabilities, Cross-Backend Env Policy, And Live Coverage
+### Task 5: Make Active-Codex Bot Commands Graceful
+
+**Why this task exists.** Phase 2 already capability-gates `/thinking`, `/permissions`, `/compact`, and `/model`, but several bot paths still call `self._claude` directly. With Codex active, those paths assert because `self.task_manager.backend` is no longer `ClaudeBackend`. This task makes unsupported Claude-specific UX explicit and test-covered before the final backend coverage pass.
+
+**Files:**
+- Modify: `src/link_project_to_chat/bot.py`
+- Modify: `tests/test_backend_command.py`
+
+- [ ] **Step 1: Add active-Codex command regression tests**
+
+Append these tests to `tests/test_backend_command.py`. They register the real `codex` backend, switch to it, then verify high-risk commands fail gracefully instead of tripping `ProjectBot._claude` assertions.
+
+```python
+async def _switch_to_codex(bot: ProjectBot) -> None:
+    from link_project_to_chat.backends import codex as _codex  # noqa: F401
+
+    await bot._on_backend(_ci(["codex"]))
+    bot._transport.sent_messages.clear()
+
+
+async def test_codex_status_does_not_require_model_display(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_status_t(_ci([]))
+
+    sent = bot._transport.sent_messages
+    assert len(sent) == 1
+    assert "Backend: codex" in sent[0].text
+    assert "Model: default" in sent[0].text
+
+
+async def test_codex_effort_command_is_rejected_without_assertion(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_effort(_ci([]))
+
+    assert "doesn't support /effort" in bot._transport.sent_messages[-1].text
+
+
+async def test_codex_skill_activation_is_rejected_without_assertion(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    ci = _ci(["some-skill"])
+    ci.name = "skills"
+    await bot._on_skills(ci)
+
+    assert "doesn't support skills or personas" in bot._transport.sent_messages[-1].text
+```
+
+- [ ] **Step 2: Run the new bot-command tests to confirm failure**
+
+```bash
+pytest tests/test_backend_command.py::test_codex_status_does_not_require_model_display tests/test_backend_command.py::test_codex_effort_command_is_rejected_without_assertion tests/test_backend_command.py::test_codex_skill_activation_is_rejected_without_assertion -v
+```
+
+Expected: `/status` passes because Task 4 added `CodexBackend.model_display`; `/effort` and `/skills` fail because the command guards do not exist yet.
+
+- [ ] **Step 3: Add explicit guards around Claude-only command surfaces**
+
+Update `src/link_project_to_chat/bot.py`:
+
+```python
+def _backend_supports_claude_controls(self) -> bool:
+    return isinstance(self.task_manager.backend, ClaudeBackend)
+
+
+def _backend_supports_prompt_customization(self) -> bool:
+    return isinstance(self.task_manager.backend, ClaudeBackend)
+```
+
+Then apply these guards:
+
+```python
+async def _on_effort(self, ci) -> None:
+    if not self._auth_identity(ci.sender):
+        return
+    assert self._transport is not None
+    if not self._backend_supports_claude_controls():
+        await self._transport.send_text(ci.chat, "This backend doesn't support /effort.")
+        return
+    await self._transport.send_text(
+        ci.chat,
+        f"Current: {self._current_effort()}",
+        buttons=self._effort_buttons(),
+    )
+```
+
+In every command/button path that writes `self._claude.append_system_prompt`, `self._claude.team_system_note`, `self._claude.effort`, or Claude permission fields, return a clear unsupported message when `self._backend_supports_prompt_customization()` / `self._backend_supports_claude_controls()` is false. Keep the already-existing capability gates for `/thinking`, `/permissions`, `/compact`, and `/model`.
+
+Use this message for skill/persona activation while Codex is active:
+
+```python
+"This backend doesn't support skills or personas yet."
+```
+
+`_refresh_team_system_note()` should become a no-op unless the active backend is Claude, because Codex does not yet have an append-system-prompt equivalent in this phase.
+
+- [ ] **Step 4: Run the active-Codex bot-command tests**
+
+```bash
+pytest tests/test_backend_command.py::test_codex_status_does_not_require_model_display tests/test_backend_command.py::test_codex_effort_command_is_rejected_without_assertion tests/test_backend_command.py::test_codex_skill_activation_is_rejected_without_assertion -v
+```
+
+Expected: all tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/link_project_to_chat/bot.py tests/test_backend_command.py
+git commit -m "fix: guard claude-only bot commands under codex"
+```
+
+---
+
+### Task 6: Lock Capabilities, Cross-Backend Env Policy, And Live Coverage
 
 **Files:**
 - Create: `tests/backends/test_env_policy.py`
@@ -897,6 +1057,7 @@ git commit -m "feat: add conservative codex backend"
 - Create: `tests/backends/test_codex_live.py`
 - Modify: `pyproject.toml`
 - Modify: `CLAUDE.md`
+- Modify: `docs/TODO.md`
 
 - [ ] **Step 1: Write the failing capability and env regression tests**
 
@@ -977,6 +1138,7 @@ async def test_fake_backend_contract_probe_health(tmp_path):
 
 ```python
 # tests/backends/test_codex_live.py
+import os
 import shutil
 import subprocess
 
@@ -989,6 +1151,8 @@ pytestmark = pytest.mark.codex_live
 
 
 def _require_codex() -> None:
+    if os.environ.get("RUN_CODEX_LIVE") != "1":
+        pytest.skip("set RUN_CODEX_LIVE=1 to run live Codex CLI tests")
     if shutil.which("codex") is None:
         pytest.skip("codex CLI is not installed")
     status = subprocess.run(
@@ -1038,11 +1202,11 @@ async def test_codex_live_resume_reuses_session(tmp_path):
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "codex_live: requires a real codex CLI installation and local authentication",
+    "codex_live: requires RUN_CODEX_LIVE=1 plus a real codex CLI installation and local authentication",
 ]
 ```
 
-- [ ] **Step 4: Update `CLAUDE.md` to reflect the backend abstraction and opt-in Codex**
+- [ ] **Step 4: Update `CLAUDE.md` and `docs/TODO.md` to reflect opt-in Codex**
 
 ```markdown
 ## Architecture
@@ -1060,10 +1224,18 @@ markers = [
 Backend abstraction is rolling out in phases. Claude remains the default backend. Codex is opt-in and experimental through `/backend codex`.
 ```
 
+Also update `docs/TODO.md`:
+
+```markdown
+| Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | ✅ |
+```
+
+In the backend-abstraction evidence paragraph, add a short note that Phase 3 added `CodexBackend`, `codex_parser.py`, conservative Codex capabilities, `RUN_CODEX_LIVE=1` live tests, and per-backend env policy. If this work is still mid-implementation when committing Task 6, mark Phase 3 as `🟡` instead of `✅`.
+
 - [ ] **Step 5: Run the unit suites**
 
 ```bash
-pytest tests/backends/test_base_backend.py tests/backends/test_codex_parser.py tests/backends/test_codex_backend.py tests/backends/test_env_policy.py tests/backends/test_capability_declaration.py tests/backends/test_contract.py -v
+pytest tests/backends/test_base_backend.py tests/backends/test_codex_parser.py tests/backends/test_codex_backend.py tests/backends/test_env_policy.py tests/backends/test_capability_declaration.py tests/backends/test_contract.py tests/test_backend_command.py -v
 ```
 
 Expected: all tests PASS.
@@ -1071,17 +1243,18 @@ Expected: all tests PASS.
 - [ ] **Step 6: Run the manual live suite**
 
 ```bash
+$env:RUN_CODEX_LIVE = "1"
 pytest tests/backends/test_codex_live.py -m codex_live -v -s
 ```
 
 Expected:
 - On a machine with `codex` installed and authenticated, both tests PASS
-- On CI or an unauthenticated machine, the tests SKIP cleanly
+- On CI, an unauthenticated machine, or any run without `RUN_CODEX_LIVE=1`, the tests SKIP cleanly
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add tests/backends/test_env_policy.py tests/backends/test_capability_declaration.py tests/backends/test_contract.py tests/backends/test_codex_live.py pyproject.toml CLAUDE.md
+git add tests/backends/test_env_policy.py tests/backends/test_capability_declaration.py tests/backends/test_contract.py tests/backends/test_codex_live.py pyproject.toml CLAUDE.md docs/TODO.md
 git commit -m "test: lock codex backend capabilities and live coverage"
 ```
 
@@ -1097,4 +1270,6 @@ git commit -m "test: lock codex backend capabilities and live coverage"
 - [ ] `supports_resume` is `True` because resume was validated; other unsupported features remain `False`.
 - [ ] `OPENAI_*` is preserved for Codex and scrubbed for Claude.
 - [ ] Factory registration exposes `"codex"` without changing the default backend.
-- [ ] Live tests are marked `codex_live` and skipped cleanly when Codex is unavailable.
+- [ ] Active-Codex `/status`, `/effort`, `/skills`, and `/persona` paths do not assert through `ProjectBot._claude`.
+- [ ] Live tests are marked `codex_live` and skipped cleanly unless `RUN_CODEX_LIVE=1` is set.
+- [ ] `docs/TODO.md` reflects the implemented Phase 3 status.
