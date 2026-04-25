@@ -1045,3 +1045,50 @@ async def test_text_only_message_is_not_unsupported_media():
     await t._dispatch_message(update, ctx=None)
 
     assert received[0].has_unsupported_media is False
+
+
+async def test_send_text_retries_without_reply_to_when_target_deleted_preserving_html():
+    """If Telegram returns 'Message to be replied not found', send_text retries
+    once without reply_to_message_id, preserving parse_mode=HTML."""
+    t, bot = _make_transport_with_mock_bot()
+
+    # First call raises the specific BadRequest; second call (the retry) succeeds.
+    class _ReplyTargetMissing(Exception):
+        def __init__(self):
+            super().__init__("Message to be replied not found")
+            self.message = "Message to be replied not found"
+
+    success_native = SimpleNamespace(
+        message_id=99, chat=SimpleNamespace(id=12345, type="private")
+    )
+    bot.send_message = AsyncMock(side_effect=[_ReplyTargetMissing(), success_native])
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    reply_to = MessageRef(transport_id=TRANSPORT_ID, native_id="500", chat=chat)
+
+    ref = await t.send_text(chat, "<b>hi</b>", html=True, reply_to=reply_to)
+
+    assert ref.native_id == "99"
+    assert bot.send_message.await_count == 2
+    second_kwargs = bot.send_message.await_args_list[1].kwargs
+    assert "reply_to_message_id" not in second_kwargs, "retry must drop reply_to"
+    assert second_kwargs["parse_mode"] == "HTML", "retry must preserve HTML parse_mode"
+
+
+async def test_send_text_does_not_retry_for_unrelated_badrequest():
+    """Other BadRequest errors (e.g., chat not found) must NOT trigger the retry."""
+    t, bot = _make_transport_with_mock_bot()
+
+    class _OtherBadRequest(Exception):
+        def __init__(self):
+            super().__init__("Chat not found")
+            self.message = "Chat not found"
+
+    bot.send_message = AsyncMock(side_effect=_OtherBadRequest())
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    reply_to = MessageRef(transport_id=TRANSPORT_ID, native_id="500", chat=chat)
+
+    with pytest.raises(Exception) as excinfo:
+        await t.send_text(chat, "hi", reply_to=reply_to)
+    assert "Chat not found" in str(excinfo.value)
+    assert bot.send_message.await_count == 1, "no retry for unrelated errors"

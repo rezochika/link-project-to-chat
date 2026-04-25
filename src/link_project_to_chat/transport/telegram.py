@@ -377,6 +377,12 @@ class TelegramTransport:
         await self._app.shutdown()
 
     # ── Outbound ──────────────────────────────────────────────────────────
+    _DELETED_REPLY_TARGET_MARKERS = (
+        "message to be replied not found",
+        "replied message not found",
+        "reply message not found",
+    )
+
     async def send_text(
         self,
         chat: ChatRef,
@@ -386,7 +392,6 @@ class TelegramTransport:
         html: bool = False,
         reply_to: MessageRef | None = None,
     ) -> MessageRef:
-        # buttons handled in Task 17; ignore here.
         kwargs: dict[str, Any] = {
             "chat_id": int(chat.native_id),
             "text": text,
@@ -403,8 +408,35 @@ class TelegramTransport:
             remapped = _as_retry_after(e)
             if remapped is not None:
                 raise remapped from e
+            # Retry once without reply_to if the target message was deleted —
+            # preserving HTML/buttons. This restores the behavior previously
+            # hand-rolled in bot.py._send_html (commit 4b4c08d).
+            if reply_to is not None and self._is_deleted_reply_target(e):
+                logger.info(
+                    "send_text retry without reply_to: target message deleted",
+                )
+                # Safe to retry: Bot API validates reply_to_message_id before
+                # delivery, so the original send was rejected, not partially
+                # completed.
+                kwargs.pop("reply_to_message_id", None)
+                native_msg = await self._app.bot.send_message(**kwargs)
+                return message_ref_from_telegram(native_msg)
+            if reply_to is not None:
+                logger.warning(
+                    "send_text BadRequest with reply_to but markers did not match — "
+                    "Telegram wording may have changed: %r",
+                    getattr(e, "message", None) or str(e),
+                )
             raise
         return message_ref_from_telegram(native_msg)
+
+    @classmethod
+    def _is_deleted_reply_target(cls, exc: BaseException) -> bool:
+        """Recognize the BadRequest variants Telegram uses when the reply
+        target has been deleted (covers slight wording differences across
+        PTB versions)."""
+        message = (getattr(exc, "message", "") or str(exc) or "").lower()
+        return any(marker in message for marker in cls._DELETED_REPLY_TARGET_MARKERS)
 
     async def edit_text(
         self,

@@ -319,16 +319,23 @@ class ProjectBot(AuthMixin):
                 last_ref = await self._transport.send_text(
                     chat, chunk, html=True, reply_to=reply_to, buttons=btns,
                 )
-            except Exception:
-                logger.warning("HTML send failed, falling back to plain", exc_info=True)
+            except Exception as exc:
+                # The transport already retries on deleted-reply-target. Anything
+                # reaching here is genuinely unexpected (parse error, malformed
+                # HTML, network issue). Fall back to plain so the user gets *some*
+                # output; log so the cause is recoverable.
+                logger.warning("HTML send failed, falling back to plain: %s", exc, exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    last_ref = await self._transport.send_text(
-                        chat,
-                        plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to=reply_to,
-                        buttons=btns,
-                    )
+                    try:
+                        last_ref = await self._transport.send_text(
+                            chat,
+                            plain[:4096] if len(plain) > 4096 else plain,
+                            reply_to=reply_to,
+                            buttons=btns,
+                        )
+                    except Exception:
+                        logger.error("Plain-text fallback also failed", exc_info=True)
         return last_ref
 
     async def _send_to_chat(
