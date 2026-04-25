@@ -2032,8 +2032,12 @@ class ProjectBot(AuthMixin):
             self._backfill_own_bot_username()
         self._refresh_team_system_note()
 
-        # Startup ping to trusted users.
+        # Startup ping to trusted users. Skipped for team bots: they live in
+        # the team supergroup and have no DM with trusted users, so every send
+        # would fail with Forbidden / Chat not found.
         assert self._transport is not None
+        if self.team_name and self.role:
+            return
         for uid in self._get_trusted_user_ids():
             chat = ChatRef(
                 transport_id=self._transport.TRANSPORT_ID,

@@ -1203,6 +1203,76 @@ async def test_after_ready_backfills_team_username_into_instance_config(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_after_ready_team_bot_skips_startup_dm_ping(tmp_path):
+    """Team bots have no DM with trusted users; the startup ping must skip
+    them to avoid Forbidden / Chat-not-found stack traces on every restart."""
+    from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config
+
+    cfg_path = tmp_path / "custom-config.json"
+    save_config(
+        Config(
+            teams={
+                "acme": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=-100_111,
+                    bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+                ),
+            }
+        ),
+        cfg_path,
+    )
+
+    bot = ProjectBot(
+        name="acme_manager",
+        path=tmp_path,
+        token="t",
+        team_name="acme",
+        role="manager",
+        group_chat_id=-100_111,
+        config_path=cfg_path,
+    )
+    bot._transport = FakeTransport()
+    # Force a non-empty trusted-user list so the loop would run without the skip.
+    bot._get_trusted_user_ids = lambda: [8206818037]
+
+    await bot._after_ready(
+        Identity(
+            transport_id="fake",
+            native_id="1",
+            display_name="acme_manager_bot",
+            handle="acme_manager_bot",
+            is_bot=True,
+        )
+    )
+
+    assert not any(
+        "Bot started" in m.text for m in bot._transport.sent_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_after_ready_solo_bot_sends_startup_dm_ping(tmp_path):
+    """Solo (non-team) bots must still send the startup ping to trusted users."""
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    bot._transport = FakeTransport()
+    bot._get_trusted_user_ids = lambda: [8206818037]
+
+    await bot._after_ready(
+        Identity(
+            transport_id="fake",
+            native_id="1",
+            display_name="solo_bot",
+            handle="solo_bot",
+            is_bot=True,
+        )
+    )
+
+    pings = [m for m in bot._transport.sent_messages if "Bot started" in m.text]
+    assert len(pings) == 1
+    assert pings[0].chat.native_id == "8206818037"
+
+
+@pytest.mark.asyncio
 async def test_on_task_complete_team_bot_persists_session_in_team_config(tmp_path):
     from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, load_config, save_config
     from link_project_to_chat.task_manager import Task, TaskStatus, TaskType
