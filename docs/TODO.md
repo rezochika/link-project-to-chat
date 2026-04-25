@@ -1,0 +1,197 @@
+# Project TODO — Consolidated Specs & Plans
+
+_Generated 2026-04-25 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD._
+
+Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
+
+---
+
+## 1. Transport Abstraction Track
+
+Decouples bot logic from Telegram so other platforms can plug in.
+
+### 1.1 Shipped specs
+
+| Spec | Version | Spec doc | Plan | Status |
+|---|---|---|---|---|
+| #0 Core transport | v0.13.0 | [spec](superpowers/specs/2026-04-20-transport-abstraction-design.md) | [plan](superpowers/plans/2026-04-20-transport-abstraction.md) | ✅ |
+| #0b Voice port | v0.14.0 | [spec](superpowers/specs/2026-04-20-transport-voice-port-design.md) | [plan](superpowers/plans/2026-04-20-transport-voice-port.md) | ✅ |
+| #0a Group / team port | v0.15.0 | [spec](superpowers/specs/2026-04-21-transport-group-team-port-design.md) | [plan](superpowers/plans/2026-04-21-transport-group-team-port.md) | ✅ |
+| #0c Manager port | v0.16.0 | [spec](superpowers/specs/2026-04-21-transport-manager-port-design.md) | [plan](superpowers/plans/2026-04-21-transport-manager-port.md) | ✅ |
+
+`bot.py` has zero direct telegram imports; `manager/bot.py` runs through `TelegramTransport` with a 7-name allowlist for `Update`/`ConversationHandler` family pinned in [tests/test_manager_lockout.py](../tests/test_manager_lockout.py). See [where-are-we.md](../where-are-we.md) for full deliverable list.
+
+### 1.2 Spec #0 review-fix follow-ups
+
+Plan: [2026-04-25-transport-spec0-review-fixes.md](superpowers/plans/2026-04-25-transport-spec0-review-fixes.md) (Tasks 1–11; PR #6 review feedback).
+
+Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
+
+| ID | Item | Severity | Status |
+|---|---|---|---|
+| F1 | Soften filename sanitizer's dotfile rejection (`transport/telegram.py:_safe_basename`) | Low | ✅ closed in `4a0bb69` |
+| F2 | `bot.build()` should return `None` (`bot.py:1974`) | Trivial | ✅ closed in `4a0bb69` |
+| F3 | Document `TelegramTransport.start()` vs `run()` dual entry | Trivial | ✅ closed in `4a0bb69` |
+| A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | 📋 deferred to spec #1 |
+| A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 📋 deferred to spec #1 |
+| A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to spec #1 / Conversation primitive |
+| C1 | Port `manager/bot.py` to Transport Protocol | — | ✅ closed by spec #0c |
+
+### 1.3 New transport platforms (designed, not implemented)
+
+| Spec | Spec doc | Plan | Status | Notes |
+|---|---|---|---|---|
+| #1 Web UI | [spec](superpowers/specs/2026-04-21-transport-web-ui-design.md) | [plan](superpowers/plans/2026-04-21-web-transport.md) | 📋 | First non-Telegram transport; carries A1–A3. FastAPI + HTMX + SSE + SQLite. |
+| #2 Discord | [spec](superpowers/specs/2026-04-21-transport-discord-design.md) | [plan](superpowers/plans/2026-04-21-discord-transport.md) | 📋 | Uses discord.py 2.x, depends on #1 primitives. |
+| #3 Slack | [spec](superpowers/specs/2026-04-21-transport-slack-design.md) | [plan](superpowers/plans/2026-04-21-slack-transport.md) | 📋 | slack_bolt + Socket Mode; final cross-platform validation. |
+
+---
+
+## 2. Backend Abstraction Track
+
+Multi-backend support (Claude → Codex / others). All four phases designed; none implemented yet.
+
+| Phase | Spec | Plan | Status |
+|---|---|---|---|
+| Phase 1 — Claude extraction | [spec](superpowers/specs/2026-04-23-backend-phase-1-claude-extraction-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-1-claude-extraction.md) | 📋 |
+| Phase 2 — Config & `/backend` command | [spec](superpowers/specs/2026-04-23-backend-phase-2-config-and-backend-command-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-2-config-and-backend-command.md) | 📋 |
+| Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | 📋 |
+| Phase 4 — Capability expansion readiness | [spec](superpowers/specs/2026-04-23-backend-phase-4-capability-expansion-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-4-capability-expansion-readiness.md) | 📋 |
+
+PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
+
+---
+
+## 3. Earlier Feature Tracks (Shipped)
+
+| Feature | Spec | Plan | Status |
+|---|---|---|---|
+| Automated project creation | [spec](superpowers/specs/2026-04-13-automated-project-creation-design.md) | [plan](superpowers/plans/2026-04-13-automated-project-creation.md) | ✅ |
+| Claude skills / personas | [spec](superpowers/specs/2026-04-13-claude-skills-design.md) | (rolled into earlier work) | ✅ |
+| Voice messages | (folded into spec #0b) | [plan](superpowers/plans/2026-04-14-voice-messages.md) | ✅ |
+| `/create_team` command | [spec](superpowers/specs/2026-04-17-create-team-command-design.md) | [plan](superpowers/plans/2026-04-17-create-team-command.md) | ✅ |
+| Dual-agent AI team | [spec](superpowers/specs/2026-04-17-dual-agent-ai-team-design.md) | [plan](superpowers/plans/2026-04-17-dual-agent-ai-team.md), [merged v2](superpowers/plans/2026-04-19-dual-agent-team-merged.md) | ✅ |
+| Live streaming + thinking toggle | [spec](superpowers/specs/2026-04-20-live-stream-and-thinking-toggle-design.md) | [plan](superpowers/plans/2026-04-20-live-stream-and-thinking-toggle.md) | ✅ |
+
+---
+
+## 4. Security & Quality Audit
+
+Audit: [issues-2026-04-22.md](issues-2026-04-22.md) — 29 issues + 3 post-audit operational fixes. Remediation: [2026-04-22-remediation-plan.md](2026-04-22-remediation-plan.md). PM gate: [review-2026-04-22-batch1.md](review-2026-04-22-batch1.md).
+
+### 4.1 Batch 1 — Critical + High (security)
+
+| ID | File | Item | Status |
+|---|---|---|---|
+| C1 | `task_manager.py:329–336` | `/run` resource exhaustion — concurrent cap (3) | ✅ APPROVED |
+| H1 | `task_manager.py:241` | Scrub error messages (`_SENSITIVE_RE` for tokens, paths) | ✅ APPROVED w/ note |
+| H2 | `bot.py:1636` | `str.startswith` → `Path.is_relative_to` (path traversal) | ✅ APPROVED (commit `3710342`) |
+| H3 | `claude_client.py:255–261` | Scrub env vars (`*_TOKEN`, `*_KEY`, `AWS_*`, etc.) before subprocess | ✅ APPROVED (commit `3710342`) |
+| H4 | `botfather.py:110` | Session file chmod race — chmod before `client.start()` | ✅ APPROVED |
+| H5 | `tests/test_security.py` | Path-traversal tests for `_send_image` | ✅ APPROVED |
+| H6 | `tests/test_security.py` | Env-var scrubbing tests | ✅ APPROVED |
+
+**Batch 1: FULLY APPROVED.**
+
+### 4.2 Batch 2 — Medium (pending)
+
+| ID | File | Item | Status |
+|---|---|---|---|
+| M1 | `bot.py:564–570` | Atomic `find_by_message` + cancel under lock / `asyncio.shield` | ⏳ pending PM |
+| M2 | `claude_client.py:234–241` | `chat()` raises typed exception instead of `"Error:..."` strings | ⏳ pending PM |
+| M4 | `config.py:227` | Document predictable lock path | ⏳ doc-only |
+| M5 | `config.py:293–348` | Replace O(n) loop with dict-keyed update | ⏳ pending |
+| M6 | `task_manager.py:400–404` | `heapq.nlargest` instead of full sort in `list_tasks` | ⏳ pending |
+| M8 | `bot.py:1392` | `tempfile.gettempdir()` instead of hardcoded `/tmp/...` | ⏳ pending PM |
+| M10 | `tests/` | Auth tests: concurrent attempts, 30 msg/min boundary, multi-user precedence | ⏳ pending |
+| M11 | `tests/` | Config I/O: malformed JSON, perm errors, concurrent access | ⏳ pending |
+| M12 | `tests/` | `livestream._rotate_once` boundary tests | ⏳ pending |
+| M13 | `src/` + `docs/` | Document `_auth()` + `docs/auth-migration.md` | ⏳ pending |
+
+Retired: M3, M7, M9 (re-verified 2026-04-23).
+
+### 4.3 Batch 3 — Low (autonomous)
+
+| ID | File | Item | Status |
+|---|---|---|---|
+| L1 | `config.py:180–182` | Replace `print(..., file=sys.stderr)` with `logger.warning` | ⏳ pending |
+| L2 | `livestream.py:150–161` | Hard-truncate fallback after 5 binary-search iterations | ⏳ pending |
+| L3 | `group_state.py:29–30` | LRU eviction (max 500) on `_states` | ⏳ pending |
+| L4 | `livestream.py:18–20` | Move magic numbers to named constants | ⏳ pending |
+| L5 | `_auth.py:73` | Add `.strip()` before `.lower()` on usernames | ⏳ pending |
+| L6 | `task_manager.py:304–311` | Document `COMPACT_PROMPT` | ⏳ pending |
+| L7 | `docs/CHANGELOG.md` | Auth refactor entry | ⏳ pending |
+
+### 4.4 Flaky tests
+
+| ID | Test | Status |
+|---|---|---|
+| F1 | `tests/test_task_manager.py::test_cancelling_waiting_input_task_releases_next_claude_task` | ⏳ ~40% pass; async-race in setup |
+| F2 | `tests/transport/test_telegram_transport.py::test_enable_team_relay_lifecycle` | ⏳ pre-existing failure |
+
+### 4.5 Post-audit operational fixes
+
+| ID | Area | Resolution | Status |
+|---|---|---|---|
+| R1 | `bot.py` + `team_relay.py` | Partial-message relay short-circuit in `_on_stream_event` for group mode | ✅ commit `01f4645` |
+| R2 | `team_relay.py` | `(sender, reply_to_msg_id)` coalesce buffer w/ 3s window for split messages | ✅ commit `01f4645` |
+| R3 | `personas/software_manager.md` | Brevity guard (~3000 char cap on group messages) | ✅ commit `01f4645` |
+
+---
+
+## 5. Maintenance Fixes (Pending)
+
+Small-scope plans, ready to implement.
+
+| Plan | Scope | Status |
+|---|---|---|
+| [Fix CLI Telethon session permissions](superpowers/plans/2026-04-24-fix-cli-telethon-session-permissions.md) | Close perm race in `setup --phone`; mirror BotFatherClient pattern | ⏳ pending |
+| [Fix Windows config M11 collection](superpowers/plans/2026-04-24-fix-windows-config-m11-collection.md) | Make M11 tests collect on Windows; preserve Unix root-skip | ⏳ pending |
+| [Isolate OpenAI transcriber tests](superpowers/plans/2026-04-24-isolate-openai-transcriber-tests.md) | Tests pass without optional `openai` dep | ⏳ pending |
+| [Update team-relay lifecycle test](superpowers/plans/2026-04-24-update-team-relay-lifecycle-test.md) | Match current TeamRelay contract (new + edited handlers) | ⏳ pending |
+
+---
+
+## 6. Sandbox / Directory Jailing
+
+[sandbox-plan.md](../sandbox-plan.md) — 📋 designed, not implemented.
+
+Optionally restrict claude subprocess + `/run` to project directory. macOS Seatbelt (`sandbox-exec`) + Linux `bwrap`. Adds `ProjectConfig.jailed: bool = True`, `Config.projects_dir: str | None`, CLI flags `--jail/--no-jail`, manager wizard toggle.
+
+Open questions:
+1. Linux: use `landlock` package as fallback when `bwrap` absent?
+2. `start --jail` runtime-only vs persisted? (rec: runtime-only)
+3. `configure --projects-dir` create eagerly vs lazily? (rec: lazy)
+4. `~/.claude/` writes — allow / block? (rec: allow reads, block writes)
+
+---
+
+## 7. Known Pending Issues (from where-are-we.md)
+
+| Item | Location | Status |
+|---|---|---|
+| `_proc` on `ClaudeClient` is single slot — concurrent Claude tasks could overwrite | `claude_client.py` | ⏳ pending |
+| Manager bot `/add_project` wizard allows skipping token (inconsistent with CLI) | `manager/bot.py` | ⏳ pending |
+| `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`) | `livestream.py` | ⏳ pending removal |
+
+---
+
+## Summary by Status
+
+| Status | Count |
+|---|---|
+| ✅ Shipped (specs / plans / batches) | 11 specs + 6 batch-1 items + 3 post-audit + 3 follow-ups |
+| 🟡 In progress | Batch 2 / Batch 3 remediation, transport spec0 review-fix tasks (PR #6) |
+| 📋 Designed, not started | 7 specs (Web UI, Discord, Slack, Backend phases 1–4), sandbox |
+| ⏳ Small pending fixes | 4 maintenance plans, 17 medium/low audit items, 2 flaky tests, 3 known issues, 3 deferred follow-ups (A1–A3) |
+
+---
+
+## Source Documents
+
+**Specs:** [docs/superpowers/specs/](superpowers/specs/) (16 design docs)
+**Plans:** [docs/superpowers/plans/](superpowers/plans/) (23 implementation plans)
+**Audit:** [issues-2026-04-22.md](issues-2026-04-22.md) · [2026-04-22-remediation-plan.md](2026-04-22-remediation-plan.md) · [review-2026-04-22-batch1.md](review-2026-04-22-batch1.md)
+**Follow-ups:** [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
+**State:** [where-are-we.md](../where-are-we.md) · [CHANGELOG.md](CHANGELOG.md)
+**Sandbox:** [sandbox-plan.md](../sandbox-plan.md)
