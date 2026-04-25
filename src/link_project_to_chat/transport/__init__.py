@@ -25,7 +25,7 @@ from .base import (
     Transport,
     TransportRetryAfter,
 )
-from .fake import EditedMessage, FakeTransport, SentFile, SentMessage, SentVoice
+from .fake import ClosedPrompt, EditedMessage, FakeTransport, OpenedPrompt, SentFile, SentMessage, SentVoice
 from .telegram import TelegramTransport
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "Buttons",
     "ChatKind",
     "ChatRef",
+    "ClosedPrompt",
     "CommandHandler",
     "CommandInvocation",
     "EditedMessage",
@@ -47,6 +48,7 @@ __all__ = [
     "MessageHandler",
     "MessageRef",
     "OnReadyCallback",
+    "OpenedPrompt",
     "PromptHandler",
     "PromptKind",
     "PromptOption",

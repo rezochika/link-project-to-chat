@@ -23,6 +23,12 @@ from .base import (
     MessageHandler,
     MessageRef,
     OnReadyCallback,
+    PromptHandler,
+    PromptKind,
+    PromptOption,
+    PromptRef,
+    PromptSpec,
+    PromptSubmission,
 )
 
 
@@ -61,6 +67,20 @@ class SentVoice:
     message: MessageRef
 
 
+@dataclass
+class OpenedPrompt:
+    chat: ChatRef
+    spec: PromptSpec
+    ref: PromptRef
+    reply_to: MessageRef | None = None
+
+
+@dataclass
+class ClosedPrompt:
+    ref: PromptRef
+    final_text: str | None = None
+
+
 class FakeTransport:
     """In-memory implementation of the Transport Protocol."""
 
@@ -80,6 +100,10 @@ class FakeTransport:
         self._authorizer: AuthorizerCallback | None = None
         self._msg_counter = itertools.count(1)
         self._running = False
+        self.opened_prompts: list[OpenedPrompt] = []
+        self.closed_prompts: list[ClosedPrompt] = []
+        self._prompt_handlers: list[PromptHandler] = []
+        self._prompt_counter = itertools.count(1)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -160,6 +184,55 @@ class FakeTransport:
 
     def on_ready(self, callback: OnReadyCallback) -> None:
         self._on_ready_callbacks.append(callback)
+
+    # ── Prompt support ────────────────────────────────────────────────────
+    async def open_prompt(
+        self,
+        chat: ChatRef,
+        spec: PromptSpec,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> PromptRef:
+        ref = PromptRef(
+            transport_id=self.TRANSPORT_ID,
+            native_id=str(next(self._prompt_counter)),
+            chat=chat,
+            key=spec.key,
+        )
+        self.opened_prompts.append(OpenedPrompt(chat=chat, spec=spec, ref=ref, reply_to=reply_to))
+        return ref
+
+    async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
+        pass  # no-op in FakeTransport
+
+    async def close_prompt(
+        self,
+        prompt: PromptRef,
+        *,
+        final_text: str | None = None,
+    ) -> None:
+        self.closed_prompts.append(ClosedPrompt(ref=prompt, final_text=final_text))
+
+    def on_prompt_submit(self, handler: PromptHandler) -> None:
+        self._prompt_handlers.append(handler)
+
+    async def inject_prompt_submit(
+        self,
+        prompt: PromptRef,
+        sender: Identity,
+        *,
+        text: str | None = None,
+        option: str | None = None,
+    ) -> None:
+        submission = PromptSubmission(
+            chat=prompt.chat,
+            sender=sender,
+            prompt=prompt,
+            text=text,
+            option=option,
+        )
+        for handler in self._prompt_handlers:
+            await handler(submission)
 
     def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
         # FakeTransport has no native media-download path (files arrive pre-built
