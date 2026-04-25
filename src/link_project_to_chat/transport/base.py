@@ -116,11 +116,59 @@ class CommandInvocation:
     native: Any = None
 
 
+class PromptKind(Enum):
+    DISPLAY = "display"
+    TEXT = "text"
+    SECRET = "secret"
+    CHOICE = "choice"
+    CONFIRM = "confirm"
+
+
+@dataclass(frozen=True)
+class PromptOption:
+    value: str
+    label: str
+    description: str | None = None
+    style: ButtonStyle = ButtonStyle.DEFAULT
+
+
+@dataclass(frozen=True)
+class PromptSpec:
+    key: str
+    title: str
+    body: str
+    kind: PromptKind
+    placeholder: str = ""
+    initial_text: str = ""
+    submit_label: str = "Continue"
+    allow_cancel: bool = True
+    options: list[PromptOption] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PromptRef:
+    transport_id: str
+    native_id: str
+    chat: ChatRef
+    key: str
+
+
+@dataclass(frozen=True)
+class PromptSubmission:
+    chat: ChatRef
+    sender: Identity
+    prompt: PromptRef
+    text: str | None = None
+    option: str | None = None
+    native: Any = None
+
+
 MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 CommandHandler = Callable[[CommandInvocation], Awaitable[None]]
 ButtonHandler = Callable[[ButtonClick], Awaitable[None]]
 OnReadyCallback = Callable[["Identity"], Awaitable[None]]
 AuthorizerCallback = Callable[[Identity], Awaitable[bool]]
+PromptHandler = Callable[[PromptSubmission], Awaitable[None]]
 
 
 class TransportRetryAfter(Exception):
@@ -244,3 +292,22 @@ class Transport(Protocol):
         unchanged.
         """
         ...
+
+    async def open_prompt(
+        self,
+        chat: ChatRef,
+        spec: PromptSpec,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> PromptRef: ...
+
+    async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None: ...
+
+    async def close_prompt(
+        self,
+        prompt: PromptRef,
+        *,
+        final_text: str | None = None,
+    ) -> None: ...
+
+    def on_prompt_submit(self, handler: PromptHandler) -> None: ...
