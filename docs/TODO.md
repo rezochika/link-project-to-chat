@@ -32,6 +32,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | F1 | Soften filename sanitizer's dotfile rejection (`transport/telegram.py:_safe_basename`) | Low | ✅ closed in `4a0bb69` |
 | F2 | `bot.build()` should return `None` (`bot.py:1974`) | Trivial | ✅ closed in `4a0bb69` |
 | F3 | Document `TelegramTransport.start()` vs `run()` dual entry | Trivial | ✅ closed in `4a0bb69` |
+| F4 | Lockout test missing `encoding="utf-8"` on `Path.read_text()` (`tests/test_transport_lockout.py:37`) — fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | Trivial | ⏳ open |
 | A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | 📋 deferred to spec #1 |
 | A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 📋 deferred to spec #1 |
 | A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to spec #1 / Conversation primitive |
@@ -49,14 +50,16 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 
 ## 2. Backend Abstraction Track
 
-Multi-backend support (Claude → Codex / others). All four phases designed; none implemented yet.
+Multi-backend support (Claude → Codex / others). Phase 1 has shipped; phases 2–4 remain designed.
 
 | Phase | Spec | Plan | Status |
 |---|---|---|---|
-| Phase 1 — Claude extraction | [spec](superpowers/specs/2026-04-23-backend-phase-1-claude-extraction-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-1-claude-extraction.md) | 📋 |
+| Phase 1 — Claude extraction | [spec](superpowers/specs/2026-04-23-backend-phase-1-claude-extraction-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-1-claude-extraction.md) | ✅ |
 | Phase 2 — Config & `/backend` command | [spec](superpowers/specs/2026-04-23-backend-phase-2-config-and-backend-command-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-2-config-and-backend-command.md) | 📋 |
 | Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | 📋 |
 | Phase 4 — Capability expansion readiness | [spec](superpowers/specs/2026-04-23-backend-phase-4-capability-expansion-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-4-capability-expansion-readiness.md) | 📋 |
+
+Phase 1 evidence: `src/link_project_to_chat/backends/` (5 files: `base.py` `AgentBackend` Protocol, `claude.py` `ClaudeBackend`, `claude_parser.py`, `factory.py`, `__init__.py`). `claude_client.py` was removed; `ProjectBot` constructs a Claude backend via the factory. Commits: `0ab1c56` (Protocol+factory), `ee53d19` (move Claude client), `f1acefd` (inject into TaskManager), `f20d8d1` (route through factory + remove shim).
 
 PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
 
@@ -93,41 +96,42 @@ Audit: [issues-2026-04-22.md](issues-2026-04-22.md) — 29 issues + 3 post-audit
 
 **Batch 1: FULLY APPROVED.**
 
-### 4.2 Batch 2 — Medium (pending)
+### 4.2 Batch 2 — Medium
 
 | ID | File | Item | Status |
 |---|---|---|---|
-| M1 | `bot.py:564–570` | Atomic `find_by_message` + cancel under lock / `asyncio.shield` | ⏳ pending PM |
-| M2 | `claude_client.py:234–241` | `chat()` raises typed exception instead of `"Error:..."` strings | ⏳ pending PM |
-| M4 | `config.py:227` | Document predictable lock path | ⏳ doc-only |
-| M5 | `config.py:293–348` | Replace O(n) loop with dict-keyed update | ⏳ pending |
-| M6 | `task_manager.py:400–404` | `heapq.nlargest` instead of full sort in `list_tasks` | ⏳ pending |
-| M8 | `bot.py:1392` | `tempfile.gettempdir()` instead of hardcoded `/tmp/...` | ⏳ pending PM |
+| M1 | `bot.py` | Atomic `find_by_message` + cancel under lock / `asyncio.shield` | ⏳ pending |
+| M2 | `backends/claude.py` | `chat()` raises typed exception instead of `"Error:..."` strings (`ClaudeStreamError`) | ✅ shipped (PR #6 commit `04619cf`) |
+| M4 | `config.py` | Document predictable lock path | ⏳ doc-only |
+| M5 | `config.py` | Replace O(n) loop with dict-keyed update (`_merge_project_entry`) | ✅ shipped (commit `84ef5f0`) |
+| M6 | `task_manager.py:518–522` | `heapq.nlargest` instead of full sort in `list_tasks` | ✅ shipped (commit `84ef5f0`) |
+| M8 | `bot.py` | `tempfile.gettempdir()` instead of hardcoded `/tmp/...` | ⏳ pending |
 | M10 | `tests/` | Auth tests: concurrent attempts, 30 msg/min boundary, multi-user precedence | ⏳ pending |
 | M11 | `tests/` | Config I/O: malformed JSON, perm errors, concurrent access | ⏳ pending |
-| M12 | `tests/` | `livestream._rotate_once` boundary tests | ⏳ pending |
-| M13 | `src/` + `docs/` | Document `_auth()` + `docs/auth-migration.md` | ⏳ pending |
+| M12 | `tests/` | `LiveMessage._rotate_once` boundary tests (now in `transport/streaming.py`) | ⏳ pending |
+| M13 | `_auth.py` + `docs/` | Document `_auth()` + `docs/auth-migration.md` | ✅ shipped (commit `84ef5f0`) |
 
 Retired: M3, M7, M9 (re-verified 2026-04-23).
 
-### 4.3 Batch 3 — Low (autonomous)
+### 4.3 Batch 3 — Low (all shipped)
 
 | ID | File | Item | Status |
 |---|---|---|---|
-| L1 | `config.py:180–182` | Replace `print(..., file=sys.stderr)` with `logger.warning` | ⏳ pending |
-| L2 | `livestream.py:150–161` | Hard-truncate fallback after 5 binary-search iterations | ⏳ pending |
-| L3 | `group_state.py:29–30` | LRU eviction (max 500) on `_states` | ⏳ pending |
-| L4 | `livestream.py:18–20` | Move magic numbers to named constants | ⏳ pending |
-| L5 | `_auth.py:73` | Add `.strip()` before `.lower()` on usernames | ⏳ pending |
-| L6 | `task_manager.py:304–311` | Document `COMPACT_PROMPT` | ⏳ pending |
-| L7 | `docs/CHANGELOG.md` | Auth refactor entry | ⏳ pending |
+| L1 | `config.py` | Replace `print(..., file=sys.stderr)` with `logger.warning` | ✅ shipped (commit `60f3dba`) |
+| L2 | `transport/streaming.py` (was `livestream.py`) | Hard-truncate fallback after 5 binary-search iterations | ✅ shipped (commit `60f3dba`) |
+| L3 | `group_state.py` | LRU eviction (max 500) on `_states` | ✅ shipped (commit `60f3dba`) |
+| L4 | `transport/streaming.py` | Named constants for magic numbers | ✅ shipped (commit `60f3dba`) |
+| L5 | `_auth.py` | `.strip()` before `.lower()` on usernames | ✅ shipped (commit `60f3dba`) |
+| L6 | `task_manager.py` | Document `COMPACT_PROMPT` | ✅ shipped (commit `60f3dba`) |
+| L7 | `docs/CHANGELOG.md` | Auth refactor entry | ✅ shipped (commit `b8ee1af`) |
 
-### 4.4 Flaky tests
+### 4.4 Test issues
 
 | ID | Test | Status |
 |---|---|---|
-| F1 | `tests/test_task_manager.py::test_cancelling_waiting_input_task_releases_next_claude_task` | ⏳ ~40% pass; async-race in setup |
-| F2 | `tests/transport/test_telegram_transport.py::test_enable_team_relay_lifecycle` | ⏳ pre-existing failure |
+| F1 | `tests/test_task_manager.py::test_cancelling_waiting_input_task_releases_next_claude_task` | 🟡 intermittent; passed in latest full run; async-race suspected |
+| F2 | `tests/transport/test_telegram_transport.py::test_enable_team_relay_lifecycle` | 🟡 intermittent; passed in latest full run |
+| F3 | `tests/test_transport_lockout.py:37` — `Path(...).read_text()` missing `encoding="utf-8"`; fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | ⏳ open (1-line fix; tracked as F4 in §1.2) |
 
 ### 4.5 Post-audit operational fixes
 
@@ -170,9 +174,9 @@ Open questions:
 
 | Item | Location | Status |
 |---|---|---|
-| `_proc` on `ClaudeClient` is single slot — concurrent Claude tasks could overwrite | `claude_client.py` | ⏳ pending |
+| `_proc` is single slot — concurrent Claude tasks could overwrite | `backends/claude.py:158` (was `claude_client.py`) | ⏳ pending |
 | Manager bot `/add_project` wizard allows skipping token (inconsistent with CLI) | `manager/bot.py` | ⏳ pending |
-| `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`) | `livestream.py` | ⏳ pending removal |
+| ~~`livestream.LiveMessage` dead code~~ | ~~`livestream.py`~~ | ✅ removed (file no longer exists; project bot uses `transport/streaming.py`) |
 
 ---
 
@@ -180,10 +184,10 @@ Open questions:
 
 | Status | Count |
 |---|---|
-| ✅ Shipped (specs / plans / batches) | 11 specs + 6 batch-1 items + 3 post-audit + 3 follow-ups |
-| 🟡 In progress | Batch 2 / Batch 3 remediation, transport spec0 review-fix tasks (PR #6) |
-| 📋 Designed, not started | 7 specs (Web UI, Discord, Slack, Backend phases 1–4), sandbox |
-| ⏳ Small pending fixes | 4 maintenance plans, 17 medium/low audit items, 2 flaky tests, 3 known issues, 3 deferred follow-ups (A1–A3) |
+| ✅ Shipped | 5 transport specs (#0/#0a/#0b/#0c) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 4 follow-ups (F1/F2/F3 + livestream removal) |
+| 🟡 Intermittent | 2 flaky tests (F1, F2 in §4.4) |
+| 📋 Designed, not started | 6 specs (Web UI #1, Discord #2, Slack #3, Backend phases 2–4), sandbox |
+| ⏳ Small pending fixes | F4 lockout-test encoding · 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 3 deferred follow-ups (A1–A3) |
 
 ---
 
