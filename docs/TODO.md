@@ -34,7 +34,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | F3 | Document `TelegramTransport.start()` vs `run()` dual entry | Trivial | ✅ closed in `4a0bb69` |
 | F4 | Lockout test missing `encoding="utf-8"` on `Path.read_text()` (`tests/test_transport_lockout.py:37`) — fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | Trivial | ✅ closed |
 | A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | ✅ closed by spec #1 (`2a7b8e7`) |
-| A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 🟡 schema closed by spec #1 (`13dbdd9` adds `BotPeerRef`/`RoomBinding`); call-site rewrite pending |
+| A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | ✅ closed — schema in `13dbdd9` (`BotPeerRef`/`RoomBinding`), call-site rewrite in `8906b51` |
 | A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to future Conversation primitive spec |
 | C1 | Port `manager/bot.py` to Transport Protocol | — | ✅ closed by spec #0c |
 

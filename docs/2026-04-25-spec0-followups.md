@@ -75,18 +75,13 @@ In-memory trust now tolerates non-numeric `native_id` (PR #6 commit `0ad608e`). 
 
 ---
 
-### A2 — Replace `int(incoming.chat.native_id)` casts for `group_chat_id` — 🟡 Schema closed (`13dbdd9`); call-site rewrite pending
+### A2 — Replace `int(incoming.chat.native_id)` casts for `group_chat_id` — ✅ Closed in `8906b51`
 
 **Source:** Task 5 (I3) plan note; final-verification grep.
-**File:** `src/link_project_to_chat/bot.py:645, 653, 1272, 1289`.
-**Severity:** Medium — blocks Discord/Slack/Web group support.
+**File:** `src/link_project_to_chat/bot.py` — 4 call sites in `_handle_group_text` / `_on_halt` / `_on_resume`.
+**Severity:** Medium — blocked Discord/Slack/Web/Google-Chat group support.
 
-Four remaining `int(.native_id)` casts compare incoming chat id to the config-stored `self.group_chat_id` (Telegram-int). Out of scope for spec #0 because the config schema for groups is Telegram-specific.
-
-**Scope:**
-- Add transport-aware group identity to config schema (e.g., `group_id: str` keyed by `transport_id`).
-- Replace 4 call sites with platform-neutral comparison.
-- Backwards-compat read path for existing int-typed `group_chat_id` in user configs.
+Closed in `8906b51` (2026-04-26). `ProjectBot` gained a `room: RoomBinding | None` kwarg alongside the legacy `group_chat_id: int | None`; two helpers (`_is_wrong_room`, `_capture_room`) replace the four `int(...)` sites. Auto-capture writes the new RoomBinding shape and mirrors the legacy `group_chat_id` int for one release for downgrade safety (Telegram only) per spec #1's dual-write pattern. Test helpers (`_group_chat`, `_sender_identity`, `_group_incoming` in test_bot_team_wiring.py and test_group_halt_integration.py) now use `transport_id="telegram"` since they model Telegram-bound bots.
 
 ---
 
@@ -123,6 +118,6 @@ Four remaining `int(.native_id)` casts compare incoming chat id to the config-st
 | F2 `build() -> None` | Trivial | — | ✅ closed in `4a0bb69` |
 | F3 docstring note | Trivial | — | ✅ closed in `4a0bb69` |
 | A1 trust persistence | Medium | spec #1 (Web UI) | ✅ closed in `2a7b8e7` (Web UI Task 4b) |
-| A2 group_chat_id | Medium | spec #1 (Web UI) | 🟡 schema closed in `13dbdd9` (`BotPeerRef`/`RoomBinding`); the 4 `int(group_chat_id)` call sites in `bot.py` still need rewriting to `RoomBinding`-aware lookup |
+| A2 group_chat_id | Medium | spec #1 (Web UI) | ✅ closed — schema in `13dbdd9` (`BotPeerRef`/`RoomBinding`), call-site rewrite in `8906b51` |
 | A3 manager `_guard` int | Low | Conversation primitive (TBD) | open — disjoint in practice today |
 | C1 manager transport port | — | spec #0c | ✅ closed (manager runs through `TelegramTransport`; residue allowlisted) |
