@@ -150,11 +150,13 @@ git commit -m "docs: capture codex cli findings and parser fixtures"
 
 ---
 
-### Task 2: Extract `BaseBackend` Env Policy And Move Claude To It
+### Task 2: Create `BaseBackend` Env Policy And Migrate Claude's Inlined Scrubbing
+
+**Phase 2 starting state.** Phase 2 did NOT introduce a `BaseBackend` class. Today, `backends/base.py` contains only `BackendCapabilities`, `HealthStatus`, and the `AgentBackend` Protocol. Claude's env scrubbing lives inlined in `ClaudeBackend._start_proc` (`backends/claude.py:339–347`) as a local `_SCRUB_PATTERNS` tuple plus an `fnmatch` loop. So this task is a **two-part change**: (a) create a new shared `BaseBackend` with class-level `_env_keep_patterns` / `_env_scrub_patterns` and a `_prepare_env()` method, and (b) extract Claude's inlined patterns onto the new class. The plan calls this "Extract" / "Move" for narrative continuity, but the helper is genuinely new.
 
 **Files:**
-- Modify: `src/link_project_to_chat/backends/base.py`
-- Modify: `src/link_project_to_chat/backends/claude.py`
+- Modify: `src/link_project_to_chat/backends/base.py` (add `BaseBackend`)
+- Modify: `src/link_project_to_chat/backends/claude.py` (extract inlined env logic to class attrs + `_prepare_env()`)
 - Create: `tests/backends/test_base_backend.py`
 
 - [ ] **Step 1: Write the failing env-policy tests**
@@ -228,7 +230,7 @@ pytest tests/backends/test_base_backend.py -v
 
 Expected: import or attribute failures because `BaseBackend` and `_prepare_env()` do not exist yet.
 
-- [ ] **Step 3: Add `BaseBackend` to `backends/base.py` without changing the `AgentBackend` caller contract**
+- [ ] **Step 3: Create `BaseBackend` in `backends/base.py` (new class, additive — `AgentBackend` Protocol caller contract is unchanged)**
 
 ```python
 # src/link_project_to_chat/backends/base.py
@@ -317,7 +319,9 @@ class AgentBackend(Protocol):
         pass
 ```
 
-- [ ] **Step 4: Move Claude env scrubbing onto the shared helper**
+- [ ] **Step 4: Extract Claude's inlined env scrubbing onto the new `BaseBackend`**
+
+Today `ClaudeBackend._start_proc` (`backends/claude.py:339–347`) builds the env in-place with a local `_SCRUB_PATTERNS` tuple and an inline `fnmatch` loop. Replace that block: declare the patterns as class-level attributes, change the inheritance to `class ClaudeBackend(BaseBackend)`, and call `self._prepare_env()` in place of the local copy + scrub loop. Behavior is unchanged (same patterns, same `CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT` pops); the policy just moves up the class hierarchy so Codex can declare its own keep/scrub lists in Task 4.
 
 ```python
 # src/link_project_to_chat/backends/claude.py
