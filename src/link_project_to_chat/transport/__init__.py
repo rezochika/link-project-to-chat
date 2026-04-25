@@ -1,5 +1,6 @@
 """Transport abstraction — see docs/superpowers/specs/2026-04-20-transport-abstraction-design.md."""
 from .base import (
+    AuthorizerCallback,
     Button,
     ButtonClick,
     ButtonHandler,
@@ -22,6 +23,7 @@ from .fake import EditedMessage, FakeTransport, SentFile, SentMessage, SentVoice
 from .telegram import TelegramTransport
 
 __all__ = [
+    "AuthorizerCallback",
     "Button",
     "ButtonClick",
     "ButtonHandler",

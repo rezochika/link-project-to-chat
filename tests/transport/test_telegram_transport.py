@@ -913,3 +913,79 @@ async def test_audio_filename_with_absolute_path_is_sanitized():
     await t._dispatch_message(update, ctx=None)
 
     assert captured_path[0].name == "passwd"
+
+
+async def test_unauthorized_pre_dispatch_skips_downloads_and_handlers():
+    """Authorizer returning False must short-circuit before any get_file()/download."""
+    t, _bot = _make_transport_with_mock_bot()
+    handler_calls: list = []
+    download_calls: list = []
+
+    async def handler(msg):
+        handler_calls.append(msg)
+
+    t.on_message(handler)
+
+    async def authorizer(identity):
+        return False  # Always reject.
+
+    t.set_authorizer(authorizer)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Mallory", username="mallory", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        download_calls.append(path)
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    document = SimpleNamespace(
+        file_name="big.bin",
+        mime_type="application/octet-stream",
+        file_size=10**9,  # 1 GB - would burn disk if downloaded.
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=document, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert download_calls == [], "authorized=False must prevent download_to_drive"
+    assert document.get_file.await_count == 0, "authorized=False must skip get_file too"
+    assert handler_calls == [], "authorized=False must skip handler invocation"
+
+
+async def test_authorized_pre_dispatch_proceeds_with_downloads():
+    """Authorizer returning True allows the normal download path."""
+    t, _bot = _make_transport_with_mock_bot()
+    handler_calls: list = []
+
+    async def handler(msg):
+        handler_calls.append(msg)
+
+    t.on_message(handler)
+
+    async def authorizer(identity):
+        return identity.handle == "alice"
+
+    t.set_authorizer(authorizer)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text="hi", photo=None, document=None, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(handler_calls) == 1
+    assert handler_calls[0].text == "hi"

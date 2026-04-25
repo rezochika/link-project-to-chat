@@ -114,6 +114,7 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 CommandHandler = Callable[[CommandInvocation], Awaitable[None]]
 ButtonHandler = Callable[[ButtonClick], Awaitable[None]]
 OnReadyCallback = Callable[["Identity"], Awaitable[None]]
+AuthorizerCallback = Callable[[Identity], Awaitable[bool]]
 
 
 class TransportRetryAfter(Exception):
@@ -197,6 +198,16 @@ class Transport(Protocol):
     def on_message(self, handler: MessageHandler) -> None: ...
     def on_command(self, name: str, handler: CommandHandler) -> None: ...
     def on_button(self, handler: ButtonHandler) -> None: ...
+
+    def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
+        """Pre-message authorization gate. Called by the transport BEFORE any
+        expensive platform work (file downloads, etc.). Returning False causes
+        the transport to silently drop the message — no handlers, no downloads.
+
+        This is a DoS-defense layer; the bot SHOULD still re-auth in its message
+        handlers as defense-in-depth. Pass None to disable gating.
+        """
+        ...
 
     def on_ready(self, callback: OnReadyCallback) -> None:
         """Register a callback fired after the Transport completes platform-specific

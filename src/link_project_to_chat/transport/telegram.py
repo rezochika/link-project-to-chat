@@ -12,6 +12,7 @@ from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from .base import (
+    AuthorizerCallback,
     ButtonHandler,
     Buttons,
     ChatKind,
@@ -124,6 +125,7 @@ class TelegramTransport:
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list = []
+        self._authorizer: AuthorizerCallback | None = None
         self._menu: Any = None
         self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
         self._post_init_ran: bool = False
@@ -502,7 +504,8 @@ class TelegramTransport:
         """Convert a telegram Update into IncomingMessage and invoke handlers.
 
         Downloads photo/document attachments to per-handler temp directories,
-        then removes them after all handlers return.
+        then removes them after all handlers return. If an authorizer is set,
+        it is consulted BEFORE any download work; rejection drops the update.
         """
         import tempfile
 
@@ -510,6 +513,12 @@ class TelegramTransport:
         user = update.effective_user
         if msg is None or user is None:
             return
+
+        # Pre-download authorization gate (defends against unauth-DoS via large attachments).
+        if self._authorizer is not None:
+            sender = identity_from_telegram_user(user)
+            if not await self._authorizer(sender):
+                return
 
         from .base import IncomingFile, IncomingMessage
 
@@ -686,3 +695,6 @@ class TelegramTransport:
 
     def on_button(self, handler: ButtonHandler) -> None:
         self._button_handlers.append(handler)
+
+    def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
+        self._authorizer = authorizer

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .base import (
+    AuthorizerCallback,
     ButtonHandler,
     Buttons,
     ChatRef,
@@ -75,6 +76,7 @@ class FakeTransport:
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list[OnReadyCallback] = []
+        self._authorizer: AuthorizerCallback | None = None
         self._msg_counter = itertools.count(1)
         self._running = False
 
@@ -154,6 +156,11 @@ class FakeTransport:
     def on_ready(self, callback: OnReadyCallback) -> None:
         self._on_ready_callbacks.append(callback)
 
+    def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
+        # FakeTransport has no native media-download path (files arrive pre-built
+        # via inject_message), so the authorizer here only gates handler dispatch.
+        self._authorizer = authorizer
+
     # ── Test injection ────────────────────────────────────────────────────
     async def inject_message(
         self,
@@ -169,6 +176,8 @@ class FakeTransport:
         msg_ref = MessageRef(
             transport_id=self.TRANSPORT_ID, native_id=str(next(self._msg_counter)), chat=chat,
         )
+        if self._authorizer is not None and not await self._authorizer(sender):
+            return
         msg = IncomingMessage(
             chat=chat,
             sender=sender,

@@ -224,6 +224,58 @@ async def test_send_text_reply_to_attaches(transport):
     assert isinstance(child, MessageRef)
 
 
+async def test_set_authorizer_blocks_dispatch_when_returns_false(transport):
+    """Every transport must short-circuit message dispatch BEFORE invoking
+    handlers when the registered authorizer returns False. This is the C2
+    DoS-defense contract — without it a future transport could silently
+    regress by downloading attachments before consulting the authorizer.
+    """
+    if not hasattr(transport, "inject_message"):
+        pytest.skip(f"{type(transport).__name__} does not support inject_message")
+
+    chat = _chat(transport.TRANSPORT_ID)
+    sender = _sender(transport.TRANSPORT_ID)
+    received: list[IncomingMessage] = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    transport.on_message(handler)
+
+    async def reject(_identity):
+        return False
+
+    transport.set_authorizer(reject)
+    await transport.inject_message(chat, sender, "blocked")
+
+    assert received == [], "authorizer-rejected message must NOT reach handlers"
+
+
+async def test_set_authorizer_allows_dispatch_when_returns_true(transport):
+    """Symmetric to the rejection test: a True-returning authorizer must not
+    suppress dispatch."""
+    if not hasattr(transport, "inject_message"):
+        pytest.skip(f"{type(transport).__name__} does not support inject_message")
+
+    chat = _chat(transport.TRANSPORT_ID)
+    sender = _sender(transport.TRANSPORT_ID)
+    received: list[IncomingMessage] = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    transport.on_message(handler)
+
+    async def allow(_identity):
+        return True
+
+    transport.set_authorizer(allow)
+    await transport.inject_message(chat, sender, "allowed")
+
+    assert len(received) == 1
+    assert received[0].text == "allowed"
+
+
 async def test_send_text_with_button_styles_does_not_raise(transport):
     """Every ButtonStyle must be accepted; Transports that can't render a style
     are allowed to downgrade silently (Telegram ignores; Web/Discord may honor)."""

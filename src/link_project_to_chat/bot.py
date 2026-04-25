@@ -1877,6 +1877,12 @@ class ProjectBot(AuthMixin):
         self._app.post_init = self._transport.post_init
         self._app.post_stop = self._transport.post_stop
         self._transport.on_ready(self._after_ready)
+
+        async def _pre_authorize(identity) -> bool:
+            return self._auth_identity(identity)
+
+        self._transport.set_authorizer(_pre_authorize)
+
         app = self._app
 
         # All commands consume CommandInvocation directly — no legacy shim.
