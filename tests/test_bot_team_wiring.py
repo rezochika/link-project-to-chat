@@ -10,12 +10,16 @@ def _team_bot_with_fake_transport(bot: ProjectBot) -> ProjectBot:
 
 
 def _group_chat(chat_id: int) -> ChatRef:
-    return ChatRef(transport_id="fake", native_id=str(chat_id), kind=ChatKind.ROOM)
+    # transport_id="telegram" because the tests model Telegram-bound bots
+    # (constructed with the legacy `group_chat_id: int` kwarg, which synthesizes
+    # a Telegram-flavored RoomBinding). The bot's _transport is FakeTransport
+    # for assertion convenience; ChatRef.transport_id is independent metadata.
+    return ChatRef(transport_id="telegram", native_id=str(chat_id), kind=ChatKind.ROOM)
 
 
 def _sender_identity(uid: int, handle: str, is_bot: bool) -> Identity:
     return Identity(
-        transport_id="fake", native_id=str(uid),
+        transport_id="telegram", native_id=str(uid),
         display_name=handle, handle=handle, is_bot=is_bot,
     )
 
@@ -33,9 +37,9 @@ def _group_incoming(
     reply_to = None
     reply_to_sender = None
     if reply_to_bot_username:
-        reply_to = MessageRef(transport_id="fake", native_id="0", chat=chat)
+        reply_to = MessageRef(transport_id=chat.transport_id, native_id="0", chat=chat)
         reply_to_sender = Identity(
-            transport_id="fake", native_id="0",
+            transport_id=chat.transport_id, native_id="0",
             display_name=reply_to_bot_username,
             handle=reply_to_bot_username, is_bot=True,
         )
@@ -47,7 +51,7 @@ def _group_incoming(
         reply_to=reply_to,
         native=None,
         is_relayed_bot_to_bot=is_relayed,
-        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        message=MessageRef(transport_id=chat.transport_id, native_id="1", chat=chat),
         reply_to_sender=reply_to_sender,
     )
 
@@ -167,8 +171,16 @@ async def test_first_group_message_captures_chat_id(tmp_path, monkeypatch):
     )
     await bot._on_text_from_transport(incoming)
 
-    # Capture happened
-    assert captured == [("acme", {"group_chat_id": -100_999})]
+    # Capture happened — writes both the new RoomBinding shape and the legacy
+    # group_chat_id mirror (the latter only for Telegram, for one release of
+    # downgrade safety per spec #1's dual-write pattern).
+    assert captured == [(
+        "acme",
+        {
+            "room": {"transport_id": "telegram", "native_id": "-100999"},
+            "group_chat_id": -100_999,
+        },
+    )]
     assert bot.group_chat_id == -100_999
 
 
@@ -219,13 +231,20 @@ async def test_second_message_after_capture_routes_normally(tmp_path, monkeypatc
 
     chat = _group_chat(-100_999)
 
-    # First message captures.
+    # First message captures (dual-write: new RoomBinding + legacy mirror).
     incoming1 = _group_incoming(
         chat, "@acme_manager hi",
         sender_uid=12345, sender_handle="rezoc666",
     )
     await bot._on_text_from_transport(incoming1)
-    assert captured == [("acme", {"group_chat_id": -100_999})]
+    expected_capture = (
+        "acme",
+        {
+            "room": {"transport_id": "telegram", "native_id": "-100999"},
+            "group_chat_id": -100_999,
+        },
+    )
+    assert captured == [expected_capture]
     assert bot.group_chat_id == -100_999
 
     # Second message: must NOT re-trigger capture.
@@ -234,7 +253,7 @@ async def test_second_message_after_capture_routes_normally(tmp_path, monkeypatc
         sender_uid=12345, sender_handle="rezoc666",
     )
     await bot._on_text_from_transport(incoming2)
-    assert captured == [("acme", {"group_chat_id": -100_999})]  # still only one entry
+    assert captured == [expected_capture]  # still only one entry
 
 
 @pytest.mark.asyncio
@@ -262,6 +281,122 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
 
     # No capture should happen, nothing sent, no Claude submission.
     assert captured == []
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_agent.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A2 — RoomBinding-aware comparison for non-Telegram transports
+#
+# The four `int(incoming.chat.native_id) != self.group_chat_id` call sites in
+# bot.py (auto-capture + wrong-room ignore + /halt + /resume) crashed for any
+# transport whose native_id was not int-parseable (Web UUIDs, Google Chat
+# "spaces/..."). Spec #1 added RoomBinding(transport_id, native_id) to config.py
+# for this; A2 closes the call-site rewrite.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_capture_on_non_telegram_writes_only_room(tmp_path, monkeypatch):
+    """Auto-capture on a non-Telegram transport must write the RoomBinding
+    shape without trying to mirror a legacy `group_chat_id` int (which would
+    fail int() parse for "spaces/..."-style native_ids)."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager",
+    )
+    bot.bot_username = "acme_manager"
+    bot._auth_identity = MagicMock(return_value=True)
+    _team_bot_with_fake_transport(bot)
+
+    captured = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.patch_team",
+        lambda name, fields, *a, **k: captured.append((name, fields)),
+    )
+
+    chat = ChatRef(
+        transport_id="google_chat",
+        native_id="spaces/AAAA1234",
+        kind=ChatKind.ROOM,
+    )
+    incoming = _group_incoming(chat, "@acme_manager hi", sender_handle="rezoc666")
+    await bot._on_text_from_transport(incoming)
+
+    # Only the new shape; no legacy mirror because transport_id != "telegram".
+    assert captured == [(
+        "acme",
+        {"room": {"transport_id": "google_chat", "native_id": "spaces/AAAA1234"}},
+    )]
+    # Internal canonical state matches.
+    assert bot._room is not None
+    assert bot._room.transport_id == "google_chat"
+    assert bot._room.native_id == "spaces/AAAA1234"
+    # Legacy attribute remains None (not derivable from a non-int native_id).
+    assert bot.group_chat_id is None
+
+
+@pytest.mark.asyncio
+async def test_same_native_id_different_transport_treated_as_wrong_room(tmp_path):
+    """A bot bound to a Telegram chat with native_id "12345" must NOT accept a
+    message from a Web chat whose native_id is also "12345". Native IDs alone
+    are not unique across transports."""
+    from link_project_to_chat.config import RoomBinding
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager",
+        room=RoomBinding(transport_id="telegram", native_id="12345"),
+    )
+    bot.bot_username = "acme_manager"
+    bot._auth_identity = MagicMock(return_value=True)
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_agent = MagicMock()
+
+    # Same native_id, different transport — must be silently rejected.
+    foreign = ChatRef(transport_id="web", native_id="12345", kind=ChatKind.ROOM)
+    incoming = _group_incoming(foreign, "@acme_manager hi", sender_handle="rezoc666")
+    await bot._on_text_from_transport(incoming)
+
+    assert bot._transport.sent_messages == []
+    bot.task_manager.submit_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_group_mode_rejects_wrong_room_with_non_int_native_id(tmp_path):
+    """A bot bound to a non-Telegram room must silently ignore wrong-room
+    messages without crashing on int() parse of a string native_id.
+
+    Auth is bypassed so the only gate that can reject this message is the
+    wrong-room guard — otherwise the test would pass for the wrong reason.
+    """
+    from link_project_to_chat.config import RoomBinding
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager",
+        room=RoomBinding(transport_id="google_chat", native_id="spaces/RIGHT"),
+    )
+    bot.bot_username = "acme_manager"
+    bot._auth_identity = MagicMock(return_value=True)  # bypass auth
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager.submit_agent = MagicMock()
+
+    wrong = ChatRef(
+        transport_id="google_chat",
+        native_id="spaces/WRONG",
+        kind=ChatKind.ROOM,
+    )
+    incoming = _group_incoming(wrong, "@acme_manager hi", sender_handle="rezoc666")
+
+    # Must not raise ValueError from int("spaces/WRONG").
+    await bot._on_text_from_transport(incoming)
+
+    # Wrong-room guard correctly rejected — no submit, no transport sends.
     assert bot._transport.sent_messages == []
     bot.task_manager.submit_agent.assert_not_called()
 

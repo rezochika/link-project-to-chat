@@ -35,7 +35,11 @@ def _team_bot_with_fake_transport(bot: ProjectBot) -> ProjectBot:
 
 
 def _group_chat(chat_id: int) -> ChatRef:
-    return ChatRef(transport_id="fake", native_id=str(chat_id), kind=ChatKind.ROOM)
+    # transport_id="telegram" because the tests model Telegram-bound bots
+    # (constructed with the legacy `group_chat_id: int` kwarg, which synthesizes
+    # a Telegram-flavored RoomBinding). The bot's _transport is FakeTransport
+    # for assertion convenience; ChatRef.transport_id is independent metadata.
+    return ChatRef(transport_id="telegram", native_id=str(chat_id), kind=ChatKind.ROOM)
 
 
 def _telegram_group_chat(chat_id: int) -> ChatRef:
@@ -50,7 +54,7 @@ def _telegram_group_chat(chat_id: int) -> ChatRef:
 
 def _sender_identity(uid: int, handle: str, is_bot: bool) -> Identity:
     return Identity(
-        transport_id="fake", native_id=str(uid),
+        transport_id="telegram", native_id=str(uid),
         display_name=handle, handle=handle, is_bot=is_bot,
     )
 
@@ -68,9 +72,9 @@ def _group_incoming(
     reply_to = None
     reply_to_sender = None
     if reply_to_bot_username:
-        reply_to = MessageRef(transport_id="fake", native_id="0", chat=chat)
+        reply_to = MessageRef(transport_id="telegram", native_id="0", chat=chat)
         reply_to_sender = Identity(
-            transport_id="fake", native_id="0",
+            transport_id="telegram", native_id="0",
             display_name=reply_to_bot_username,
             handle=reply_to_bot_username, is_bot=True,
         )
@@ -82,7 +86,7 @@ def _group_incoming(
         reply_to=reply_to,
         native=None,
         is_relayed_bot_to_bot=is_relayed,
-        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        message=MessageRef(transport_id="telegram", native_id="1", chat=chat),
         reply_to_sender=reply_to_sender,
     )
 

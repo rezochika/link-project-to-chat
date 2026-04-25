@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from .config import (
     Config,
     DEFAULT_CONFIG,
+    RoomBinding,
     bind_project_trusted_user,
     clear_session,
     load_config,
@@ -103,6 +104,7 @@ class ProjectBot(AuthMixin):
         show_thinking: bool = False,
         team_name: str | None = None,
         group_chat_id: int | None = None,
+        room: RoomBinding | None = None,
         role: str | None = None,
         peer_bot_username: str = "",
         config_path: Path | None = None,
@@ -181,6 +183,16 @@ class ProjectBot(AuthMixin):
         self.team_name = team_name
         self.group_mode = team_name is not None
         self.group_chat_id = group_chat_id
+        # `_room` is the canonical transport-agnostic bound-room reference.
+        # Populated either from the `room` kwarg (new path, any transport) or
+        # synthesized from `group_chat_id` (legacy Telegram path) at the first
+        # opportunity. `0` is the legacy "not yet captured" sentinel.
+        if room is not None:
+            self._room: RoomBinding | None = room
+        elif group_chat_id is not None and group_chat_id != 0:
+            self._room = RoomBinding(transport_id="telegram", native_id=str(group_chat_id))
+        else:
+            self._room = None
         self.role = role
         self.peer_bot_username = peer_bot_username
         self.bot_username: str = ""  # populated in _after_ready via transport.on_ready
@@ -206,6 +218,44 @@ class ProjectBot(AuthMixin):
 
     def _effective_config_path(self) -> Path:
         return self._config_path or DEFAULT_CONFIG
+
+    def _is_wrong_room(self, chat: ChatRef) -> bool:
+        """True if this chat is not the bound room. Caller silently ignores."""
+        if self._room is None:
+            return False
+        return (
+            chat.transport_id != self._room.transport_id
+            or chat.native_id != self._room.native_id
+        )
+
+    def _capture_room(self, chat: ChatRef) -> None:
+        """Bind this team to `chat` and persist. Mirrors a legacy
+        Telegram-shaped `group_chat_id` int for one release for downgrade
+        safety; non-Telegram transports persist only the new shape."""
+        new_room = RoomBinding(transport_id=chat.transport_id, native_id=chat.native_id)
+        fields: dict = {
+            "room": {
+                "transport_id": new_room.transport_id,
+                "native_id": new_room.native_id,
+            }
+        }
+        if new_room.transport_id == "telegram":
+            try:
+                fields["group_chat_id"] = int(new_room.native_id)
+            except ValueError:
+                pass
+        assert self.team_name is not None
+        patch_team(
+            self.team_name,
+            fields,
+            self._effective_config_path(),
+        )
+        self._room = new_room
+        if new_room.transport_id == "telegram":
+            try:
+                self.group_chat_id = int(new_room.native_id)
+            except ValueError:
+                pass
 
     def _on_trust(self, user_id: int, username: str) -> None:
         if self._on_trust_fn:
@@ -656,18 +706,12 @@ class ProjectBot(AuthMixin):
         """
         from .group_filters import is_from_self, is_directed_at_me, is_from_other_bot
 
-        # Auto-capture: if chat_id not yet bound and sender is trusted, write it.
-        if self.group_chat_id in (0, None):
+        # Auto-capture: if no room is bound and sender is trusted, write it.
+        if self._room is None:
             if self._auth_identity(incoming.sender) and self.team_name:
-                new_chat_id = int(incoming.chat.native_id)
-                patch_team(
-                    self.team_name,
-                    {"group_chat_id": new_chat_id},
-                    self._effective_config_path(),
-                )
-                self.group_chat_id = new_chat_id
+                self._capture_room(incoming.chat)
                 # Fall through so this message still gets processed.
-        elif int(incoming.chat.native_id) != self.group_chat_id:
+        elif self._is_wrong_room(incoming.chat):
             return True  # wrong group — silent ignore
 
         if is_from_self(incoming, self.bot_username):
@@ -1388,7 +1432,7 @@ class ProjectBot(AuthMixin):
                 ci.chat, "/halt is only available in group mode.", reply_to=ci.message,
             )
             return
-        if self.group_chat_id is not None and int(ci.chat.native_id) != self.group_chat_id:
+        if self._is_wrong_room(ci.chat):
             return  # silently ignore — wrong group
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
@@ -1405,7 +1449,7 @@ class ProjectBot(AuthMixin):
                 ci.chat, "/resume is only available in group mode.", reply_to=ci.message,
             )
             return
-        if self.group_chat_id is not None and int(ci.chat.native_id) != self.group_chat_id:
+        if self._is_wrong_room(ci.chat):
             return  # silently ignore — wrong group
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
