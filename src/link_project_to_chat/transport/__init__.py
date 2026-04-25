@@ -28,6 +28,13 @@ from .base import (
 from .fake import ClosedPrompt, EditedMessage, FakeTransport, OpenedPrompt, SentFile, SentMessage, SentVoice
 from .telegram import TelegramTransport
 
+# WebTransport is optional — depends on the `web` extra (FastAPI, uvicorn, aiosqlite).
+try:
+    from ..web.transport import WebTransport  # noqa: F401
+    _WEB_AVAILABLE = True
+except ImportError:
+    _WEB_AVAILABLE = False
+
 __all__ = [
     "AuthorizerCallback",
     "Button",
@@ -62,3 +69,6 @@ __all__ = [
     "Transport",
     "TransportRetryAfter",
 ]
+
+if _WEB_AVAILABLE:
+    __all__.append("WebTransport")
