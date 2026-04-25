@@ -3,6 +3,9 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("fastapi")
+pytest.importorskip("aiosqlite")
+
 from link_project_to_chat.transport import (
     ChatKind,
     ChatRef,

@@ -3,6 +3,10 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("aiosqlite")
+
 from httpx import ASGITransport, AsyncClient
 
 from link_project_to_chat.web.app import create_app

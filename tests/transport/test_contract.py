@@ -18,7 +18,6 @@ from link_project_to_chat.transport import (
 )
 from link_project_to_chat.transport.fake import FakeTransport
 from link_project_to_chat.transport.telegram import TelegramTransport
-from link_project_to_chat.web.transport import WebTransport
 
 
 def _chat(transport_id: str) -> ChatRef:
@@ -147,6 +146,8 @@ async def transport(request, tmp_path):
     elif request.param == "web":
         # Defensive: skip web parametrization if FastAPI isn't installed.
         pytest.importorskip("fastapi")
+        pytest.importorskip("aiosqlite")
+        from link_project_to_chat.web.transport import WebTransport
         db_path = tmp_path / "contract.db"
         bot = Identity(
             transport_id="web",

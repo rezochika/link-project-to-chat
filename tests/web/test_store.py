@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("aiosqlite")
+
 from link_project_to_chat.web.store import WebStore
 
 
