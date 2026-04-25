@@ -97,6 +97,10 @@ class IncomingMessage:
     message: MessageRef | None = None
     reply_to_text: str | None = None
     reply_to_sender: Identity | None = None
+    has_unsupported_media: bool = False  # True if the platform delivered a
+    # video/sticker/location/contact/video-note that the transport can't decode.
+    # Bot SHOULD reject with a "media type not supported" reply rather than
+    # treating any caption as a normal prompt.
 
 
 @dataclass(frozen=True)

@@ -596,8 +596,11 @@ class ProjectBot(AuthMixin):
             await self._on_file_from_transport(incoming)
             return
 
-        # 3. Text.
-        if incoming.text.strip():
+        # 3. Text (or unsupported media that needs the specific rejection in
+        # `_on_text`). Caption-less stickers / muted videos / locations have
+        # `text==""` but `has_unsupported_media=True` — without the second
+        # clause they'd fall through to the generic branch 4 reply.
+        if incoming.text.strip() or incoming.has_unsupported_media:
             if self.group_mode:
                 handled = await self._handle_group_text(incoming)
                 if handled:
@@ -703,7 +706,9 @@ class ProjectBot(AuthMixin):
         telegram/ctx knowledge required.
         """
         assert self._transport is not None
-        if not incoming.text.strip():
+        # Empty text is only actionable when the dispatcher routed an
+        # unsupported-media message here for the specific rejection.
+        if not incoming.text.strip() and not incoming.has_unsupported_media:
             return
         if not self._auth_identity(incoming.sender):
             await self._transport.send_text(
@@ -713,6 +718,14 @@ class ProjectBot(AuthMixin):
         if self._rate_limited(int(incoming.sender.native_id)):
             await self._transport.send_text(
                 incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
+            )
+            return
+
+        if incoming.has_unsupported_media:
+            await self._transport.send_text(
+                incoming.chat,
+                "Unsupported media type. I can read text, photos, documents, voice notes, and audio.",
+                reply_to=incoming.message,
             )
             return
 

@@ -989,3 +989,59 @@ async def test_authorized_pre_dispatch_proceeds_with_downloads():
 
     assert len(handler_calls) == 1
     assert handler_calls[0].text == "hi"
+
+
+async def test_video_with_caption_marks_message_as_unsupported_media():
+    """Telegram allows video/sticker/etc. through the filter; the bot must NOT
+    treat their captions as plain text."""
+    t, _bot = _make_transport_with_mock_bot()
+    received: list = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None,
+        caption="please summarize this video",
+        photo=None, document=None, voice=None, audio=None,
+        video=SimpleNamespace(file_id="vid123"),
+        sticker=None, location=None, contact=None, video_note=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(received) == 1
+    assert received[0].has_unsupported_media is True
+    assert received[0].text == "please summarize this video"  # caption preserved for the rejection UX
+
+
+async def test_text_only_message_is_not_unsupported_media():
+    t, _bot = _make_transport_with_mock_bot()
+    received: list = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text="hi there",
+        photo=None, document=None, voice=None, audio=None,
+        video=None, sticker=None, location=None, contact=None, video_note=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert received[0].has_unsupported_media is False

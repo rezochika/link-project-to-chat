@@ -586,6 +586,17 @@ class TelegramTransport:
                 size_bytes=getattr(audio, "file_size", 0) or 0,
             ))
 
+        # Detect unsupported attachments delivered by the filter
+        # (filters.VIDEO | filters.Sticker.ALL | filters.LOCATION | filters.CONTACT | filters.VIDEO_NOTE).
+        # We surface a flag so the bot can reject instead of treating the caption as a prompt.
+        has_unsupported_media = (
+            len(files) == 0
+            and any(
+                getattr(msg, attr, None) is not None
+                for attr in ("video", "sticker", "location", "contact", "video_note")
+            )
+        )
+
         text = msg.text or getattr(msg, "caption", None) or ""
         is_relayed = False
         # The Telethon relay posts messages with this prefix (no '@' on the handle —
@@ -619,6 +630,7 @@ class TelegramTransport:
             message=message_ref_from_telegram(msg),
             reply_to_text=reply_to_text,
             reply_to_sender=reply_to_sender,
+            has_unsupported_media=has_unsupported_media,
         )
         try:
             for h in self._message_handlers:
