@@ -1,0 +1,6 @@
+{% for msg in messages %}
+<div class="message {{ 'bot' if msg.sender_is_bot else 'user' }}">
+  <span class="sender">{{ msg.sender_display_name }}</span>
+  <div class="text">{% if msg.html %}{{ msg.text | safe }}{% else %}{{ msg.text }}{% endif %}</div>
+</div>
+{% endfor %}
