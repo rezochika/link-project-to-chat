@@ -32,7 +32,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | F1 | Soften filename sanitizer's dotfile rejection (`transport/telegram.py:_safe_basename`) | Low | ✅ closed in `4a0bb69` |
 | F2 | `bot.build()` should return `None` (`bot.py:1974`) | Trivial | ✅ closed in `4a0bb69` |
 | F3 | Document `TelegramTransport.start()` vs `run()` dual entry | Trivial | ✅ closed in `4a0bb69` |
-| F4 | Lockout test missing `encoding="utf-8"` on `Path.read_text()` (`tests/test_transport_lockout.py:37`) — fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | Trivial | ⏳ open |
+| F4 | Lockout test missing `encoding="utf-8"` on `Path.read_text()` (`tests/test_transport_lockout.py:37`) — fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | Trivial | ✅ closed |
 | A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | 📋 deferred to spec #1 |
 | A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 📋 deferred to spec #1 |
 | A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to spec #1 / Conversation primitive |
@@ -131,7 +131,7 @@ Retired: M3, M7, M9 (re-verified 2026-04-23).
 |---|---|---|
 | F1 | `tests/test_task_manager.py::test_cancelling_waiting_input_task_releases_next_claude_task` | 🟡 intermittent; passed in latest full run; async-race suspected |
 | F2 | `tests/transport/test_telegram_transport.py::test_enable_team_relay_lifecycle` | 🟡 intermittent; passed in latest full run |
-| F3 | `tests/test_transport_lockout.py:37` — `Path(...).read_text()` missing `encoding="utf-8"`; fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | ⏳ open (1-line fix; tracked as F4 in §1.2) |
+| — | `tests/test_transport_lockout.py:37` — `Path(...).read_text()` encoding bug | ✅ closed (see F4 in §1.2) |
 
 ### 4.5 Post-audit operational fixes
 
@@ -187,7 +187,7 @@ Open questions:
 | ✅ Shipped | 5 transport specs (#0/#0a/#0b/#0c) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 4 follow-ups (F1/F2/F3 + livestream removal) |
 | 🟡 Intermittent | 2 flaky tests (F1, F2 in §4.4) |
 | 📋 Designed, not started | 6 specs (Web UI #1, Discord #2, Slack #3, Backend phases 2–4), sandbox |
-| ⏳ Small pending fixes | F4 lockout-test encoding · 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 3 deferred follow-ups (A1–A3) |
+| ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 3 deferred follow-ups (A1–A3) |
 
 ---
 

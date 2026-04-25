@@ -34,7 +34,7 @@ def test_bot_py_does_not_reference_ptb_application_internals():
     """Locks out runtime PTB coupling: bot.py must not name application-level
     attributes (run_polling, post_init, post_stop, ApplicationBuilder)
     directly. These are TelegramTransport's responsibility."""
-    src = (Path(__file__).parent.parent / "src" / "link_project_to_chat" / "bot.py").read_text()
+    src = (Path(__file__).parent.parent / "src" / "link_project_to_chat" / "bot.py").read_text(encoding="utf-8")
     forbidden = ["run_polling", ".post_init", ".post_stop", "ApplicationBuilder"]
     found = [tok for tok in forbidden if tok in src]
     assert not found, f"bot.py references PTB internals: {found}"
