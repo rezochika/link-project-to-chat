@@ -302,6 +302,8 @@ git commit -m "feat: add backend-aware config migration and dual-write persisten
 - Modify: `src/link_project_to_chat/cli.py`
 - Create: `tests/test_config_migration.py`
 
+Current repo note: older spec text says "22 call sites." Treat that as the full legacy persistence surface, not a literal count of `patch_project()`/`patch_team()` calls in the current tree. In this branch, review all reads/writes of the legacy backend-shaped fields (`model`, `effort`, `permissions`, `session_id`, `show_thinking`) across `config.py`, `bot.py`, `cli.py`, and `manager/bot.py`; the actual patch/manager call-site count is smaller.
+
 - [ ] **Step 1: Write the failing helper tests**
 
 ```python
@@ -718,6 +720,10 @@ import pytest
 from tests.backends.fakes import FakeBackend
 from tests.test_backend_command import _bot_with_fake_transport, _invocation
 
+# `tests/backends/fakes.py` exists from Phase 1. If this plan is executed on
+# an older branch, create that fake first or inline a minimal AgentBackend test
+# double with supports_thinking=False.
+
 
 @pytest.mark.asyncio
 async def test_thinking_command_rejected_when_backend_does_not_support_it(tmp_path):
@@ -1069,10 +1075,10 @@ Expected: the pytest check should pass or quickly show which file still has Clau
 
 Skip this step if the previous tasks already made Phase 2 large or risky. If you do it, preserve the existing guidance about Telegram rendering, channel fragility, and AskUserQuestion behavior; do not replace it with a much shorter prompt.
 
-Replace the fixed `_TELEGRAM_AWARENESS` constant in `src/link_project_to_chat/backends/claude.py` with a helper that can render command help from capabilities:
+The snippet below is a shape sketch, not a drop-in replacement. Keep the existing `_TELEGRAM_AWARENESS` prose intact and only replace the hardcoded command-list portion with capability-derived text. A safe implementation is to add a helper that produces the command sentence, then interpolate it into the existing long prompt.
 
 ```python
-def _telegram_awareness_prompt(capabilities: BackendCapabilities) -> str:
+def _telegram_command_summary(capabilities: BackendCapabilities) -> str:
     commands = [
         "/run <cmd>",
         "/tasks",
@@ -1090,12 +1096,10 @@ def _telegram_awareness_prompt(capabilities: BackendCapabilities) -> str:
     if capabilities.supports_compact:
         commands.append("/compact")
 
-    return (
-        "You are running inside `link-project-to-chat`, a Telegram bot. "
-        "Keep replies concise and scannable.\n\n"
-        "Relevant slash commands: " + ", ".join(commands) + "."
-    )
+    return "Relevant slash commands: " + ", ".join(commands) + "."
 ```
+
+Then keep the existing prompt sections (`OUTPUT`, AskUserQuestion behavior, and `CHANNEL FRAGILITY`) and substitute only the old hardcoded command paragraph with `_telegram_command_summary(self.capabilities)`.
 
 Then build the appended system prompt from `self.capabilities` instead of the fixed constant.
 
