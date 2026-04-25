@@ -18,6 +18,33 @@ def test_sanitize_bot_username_already_ends_with_bot():
     assert sanitize_bot_username("mybot") == "mybot_claude_bot"
 
 
+def test_sanitize_bot_username_starts_with_letter():
+    """Telegram bot usernames must start with a letter — names beginning
+    with a digit (e.g. '2024-foo') would otherwise yield '2024_foo_claude_bot',
+    which BotFather rejects with 'Sorry, this username is invalid.'
+    """
+    result = sanitize_bot_username("2024-foo")
+    assert result[0].isalpha()
+    assert result.endswith("_claude_bot")
+    assert result == "p_2024_foo_claude_bot"
+
+    # A name that sanitizes to a single digit also starts with a letter.
+    result = sanitize_bot_username("1")
+    assert result[0].isalpha()
+    assert result == "p_1_claude_bot"
+
+
+def test_sanitize_bot_username_fits_telegram_length_cap():
+    """Telegram bot usernames are capped at 32 characters; longer names
+    must be truncated so the suffix still fits.
+    """
+    long_name = "very-long-project-name-with-many-words-that-exceeds-the-cap"
+    result = sanitize_bot_username(long_name)
+    assert len(result) <= 32
+    assert result.endswith("_claude_bot")
+    assert result[0].isalpha()
+
+
 def test_extract_token_from_response():
     msg = "Done! Congratulations on your new bot. Use this token to access the HTTP API:\n7123456789:AAH-abc_DEFghiJKLmno_pqrSTUvwxYZ\nKeep your token secure."
     token = extract_token(msg)

@@ -518,6 +518,105 @@ async def test_edit_field_save_noop_without_pending(bot_env):
     update.effective_message.reply_text.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_setup_code_strips_non_digits_before_sign_in(bot_env):
+    """Telegram invalidates login codes typed verbatim into any chat, so the
+    setup wizard tells the user to obfuscate (e.g. 1 2 3 4 5). The handler
+    must strip non-digits before calling sign_in or the code will be rejected.
+    """
+    bot, _, _ = bot_env
+    _swap_fake_transport(bot)
+
+    fake_client = MagicMock()
+    fake_client.sign_in = AsyncMock()
+    fake_bf = MagicMock()
+    fake_bf._ensure_client = AsyncMock(return_value=fake_client)
+
+    update, ctx = _make_update(text="7 0 3 9 8")
+    ctx.user_data = {
+        "setup_awaiting": "code",
+        "setup_phone": "+995511166693",
+        "setup_bf_client": fake_bf,
+    }
+    await bot._edit_field_save(update, ctx)
+
+    fake_client.sign_in.assert_awaited_once_with("+995511166693", "70398")
+
+
+@pytest.mark.asyncio
+async def test_setup_promotes_authenticated_client_to_manager(bot_env):
+    """After /setup successfully signs in, the freshly-authenticated
+    TelegramClient must be promoted to ``self._telethon_client`` so that
+    /create_project reuses it instead of opening a second SQLite connection
+    against telethon.session (which would error with "database is locked").
+    """
+    bot, _, _ = bot_env
+    _swap_fake_transport(bot)
+    bot._telethon_client = None
+
+    fake_client = MagicMock(name="setup_telethon_client")
+    fake_client.sign_in = AsyncMock()
+    fake_bf = MagicMock()
+    fake_bf._ensure_client = AsyncMock(return_value=fake_client)
+    fake_bf._owns_client = True
+
+    update, ctx = _make_update(text="7 0 3 9 8")
+    ctx.user_data = {
+        "setup_awaiting": "code",
+        "setup_phone": "+995511166693",
+        "setup_bf_client": fake_bf,
+    }
+    await bot._edit_field_save(update, ctx)
+
+    assert bot._telethon_client is fake_client
+    # The wizard's BotFatherClient must surrender ownership so disconnect
+    # paths don't double-close the now-shared client.
+    assert fake_bf._owns_client is False
+
+
+@pytest.mark.asyncio
+async def test_execute_bot_creation_reuses_managers_telethon_client(
+    bot_env, tmp_path: Path, monkeypatch
+):
+    """The manager keeps a persistent Telethon client connected to the
+    telethon.session SQLite file. Constructing a new TelegramClient against
+    the same file in /create_project would raise "database is locked", so
+    BotFatherClient must adopt the manager's client when one exists.
+    """
+    bot, _, proj_cfg = bot_env
+    _swap_fake_transport(bot)
+
+    from link_project_to_chat.config import Config, save_config
+    save_config(Config(telegram_api_id=1, telegram_api_hash="x"), proj_cfg)
+
+    constructor_kwargs: dict = {}
+
+    class FakeBotFatherClient:
+        def __init__(self, api_id, api_hash, session_path, client=None):
+            constructor_kwargs["client"] = client
+
+        async def create_bot(self, display_name: str, username: str) -> str:
+            raise RuntimeError("stop here — we only care about constructor args")
+
+        async def disconnect(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "link_project_to_chat.botfather.BotFatherClient", FakeBotFatherClient
+    )
+
+    sentinel_client = MagicMock(name="manager_telethon_client")
+    bot._telethon_client = sentinel_client
+
+    update, ctx = _make_update()
+    ctx.user_data = {"create": {"config_path": str(proj_cfg), "name": "myproj"}}
+    await bot._execute_bot_creation(
+        ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM), ctx, "myproj"
+    )
+
+    assert constructor_kwargs["client"] is sentinel_client
+
+
 def _write_team(proj_cfg: Path, team: str, bots: dict, group_chat_id: int = -1001) -> None:
     raw = json.loads(proj_cfg.read_text())
     raw.setdefault("teams", {})[team] = {

@@ -326,6 +326,7 @@ class ManagerBot(AuthMixin):
                     api_id=config.telegram_api_id,
                     api_hash=config.telegram_api_hash,
                     session_path=cfg_path.parent / "telethon.session",
+                    client=getattr(self, "_telethon_client", None),
                 )
                 await bfc.delete_bot(bot_username)
                 notes.append(f"deleted @{bot_username} via BotFather")
@@ -865,7 +866,15 @@ class ManagerBot(AuthMixin):
                 ctx.user_data["setup_bf_client"] = bf
                 client = await bf._ensure_client()
                 await client.send_code_request(text)
-                await self._transport.send_text(chat, "Code sent to your Telegram. Enter the code:")
+                # Telegram invalidates login codes typed verbatim into any chat
+                # (security feature). Ask the user to obfuscate so the official
+                # client doesn't pattern-match it; we strip non-digits below.
+                await self._transport.send_text(
+                    chat,
+                    "Code sent to your Telegram. Enter the code with spaces "
+                    "between digits (e.g. 1 2 3 4 5) — Telegram auto-expires "
+                    "codes typed as plain digits.",
+                )
             except Exception as e:
                 ctx.user_data.pop("setup_awaiting", None)
                 await self._transport.send_text(chat, f"Error: {e}")
@@ -879,7 +888,9 @@ class ManagerBot(AuthMixin):
                 return
             try:
                 client = await bf._ensure_client()
-                await client.sign_in(phone, text)
+                code = "".join(ch for ch in text if ch.isdigit())
+                await client.sign_in(phone, code)
+                self._adopt_setup_client(bf, client)
                 ctx.user_data.pop("setup_awaiting")
                 ctx.user_data.pop("setup_bf_client", None)
                 ctx.user_data.pop("setup_phone", None)
@@ -903,6 +914,7 @@ class ManagerBot(AuthMixin):
             try:
                 client = await bf._ensure_client()
                 await client.sign_in(password=text)
+                self._adopt_setup_client(bf, client)
                 ctx.user_data.pop("setup_awaiting")
                 ctx.user_data.pop("setup_bf_client", None)
                 ctx.user_data.pop("setup_phone", None)
@@ -1162,7 +1174,14 @@ class ManagerBot(AuthMixin):
         path = Path(ctx.user_data["create"]["config_path"])
         config = load_config(path)
         session_path = path.parent / "telethon.session"
-        bf = BotFatherClient(config.telegram_api_id, config.telegram_api_hash, session_path)
+        # Reuse the manager's persistent Telethon client so we don't fight it
+        # for the same SQLite session file (would surface as "database is locked").
+        bf = BotFatherClient(
+            config.telegram_api_id,
+            config.telegram_api_hash,
+            session_path,
+            client=getattr(self, "_telethon_client", None),
+        )
         bot_username = sanitize_bot_username(name)
         try:
             token = await bf.create_bot(display_name=f"{name} Claude", username=bot_username)
@@ -2111,6 +2130,20 @@ class ManagerBot(AuthMixin):
             await self._start_telethon_client()
         except Exception:
             logger.exception("Starting Telethon client failed (team bots will still run)")
+
+    def _adopt_setup_client(self, bf, client) -> None:
+        """Promote a freshly-authenticated Telethon client from the /setup
+        wizard to the shared ``self._telethon_client`` slot.
+
+        Without this, the wizard leaves a connected ``TelegramClient`` against
+        ``telethon.session`` after sign_in, and the next /create_project opens
+        a second client against the same SQLite file — surfacing as
+        ``database is locked`` during disconnect. Mirrors the same adoption
+        pattern used by /create_team (commit 93c2048).
+        """
+        if getattr(self, "_telethon_client", None) is None:
+            self._telethon_client = client
+            bf._owns_client = False
 
     async def _start_telethon_client(self) -> None:
         """Initialize the shared Telethon client used by /create_team and

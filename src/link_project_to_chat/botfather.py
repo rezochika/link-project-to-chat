@@ -56,13 +56,29 @@ def _parse_rate_limit(text: str) -> float | None:
     return float(n)
 
 
+_BOT_USERNAME_SUFFIX = "_claude_bot"
+_BOT_USERNAME_MAX = 32  # Telegram cap
+
+
 def sanitize_bot_username(name: str) -> str:
-    """Convert a project name to a valid bot username (must end with 'bot')."""
+    """Convert a project name to a valid Telegram bot username.
+
+    Telegram requires the username to start with a letter, be 5–32 chars,
+    contain only Latin letters/digits/underscores, and end with "bot".
+    Without the leading-letter guard, digit-leading project names like
+    "2024-foo" produce "2024_foo_claude_bot" which BotFather rejects with
+    "Sorry, this username is invalid."
+    """
     clean = re.sub(r"[^a-z0-9_]", "_", name.lower().replace("-", "_"))
     clean = re.sub(r"_+", "_", clean).strip("_")
     if not clean:
         clean = "project"
-    return f"{clean}_claude_bot"
+    elif not clean[0].isalpha():
+        clean = "p_" + clean
+    max_prefix = _BOT_USERNAME_MAX - len(_BOT_USERNAME_SUFFIX)
+    if len(clean) > max_prefix:
+        clean = clean[:max_prefix].rstrip("_")
+    return f"{clean}{_BOT_USERNAME_SUFFIX}"
 
 
 def extract_token(text: str) -> str | None:
