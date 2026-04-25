@@ -183,13 +183,12 @@ async def test_team_bot_finalize_edits_placeholder_no_new_send():
     assert task.id not in bot._live_text
 
 
-# NOTE: `test_send_html_retries_without_reply_to_when_target_deleted` from main
-# is deliberately omitted on this branch. The transport refactor routes
-# `_send_html` through `self._transport.send_text`, which does not yet do a
-# BadRequest-triggered retry preserving HTML. Re-introducing that behaviour
-# belongs at the transport layer (transport/telegram.py) and is tracked
-# separately; until then, feat falls back to the plain-text path on a missing
-# reply target (via the generic `except Exception` branch).
+# NOTE: the historic `test_send_html_retries_without_reply_to_when_target_deleted`
+# bot-layer test is intentionally not present here. The retry now lives inside
+# `TelegramTransport.send_text` (commit reinstating spec #0 finding I1) and is
+# covered by `tests/transport/test_telegram_transport.py::
+# test_send_text_retries_without_reply_to_when_target_deleted_preserving_html`.
+# `_send_html` makes a single transport call; the retry is invisible to the bot.
 
 
 @pytest.mark.asyncio

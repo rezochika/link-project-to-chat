@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from .base import (
+    AuthorizerCallback,
     ButtonHandler,
     Buttons,
     ChatKind,
@@ -50,6 +51,23 @@ def _as_retry_after(exc: BaseException) -> TransportRetryAfter | None:
 # prefix is written.
 from ._telegram_relay import _RELAY_HANDLE_PATTERN
 _RELAY_PREFIX_RE = re.compile(rf"^\[auto-relay from {_RELAY_HANDLE_PATTERN}\]\n\n")
+
+
+def _safe_basename(raw: str | None, fallback: str) -> str:
+    """Reduce an attacker-controlled filename to a safe basename for tempdir use.
+
+    Strips path separators, parent-dir traversals, and leading dots. Falls back
+    to `fallback` if the result is empty or starts with '.'. The returned name
+    is suitable for direct concatenation under a tempfile.TemporaryDirectory.
+    """
+    name = (raw or "").strip()
+    if not name:
+        return fallback
+    candidate = PurePath(name.replace("\\", "/")).name
+    # Reject empty, '.', '..', and dotfile-like names that could shadow OS paths.
+    if not candidate or candidate in (".", "..") or candidate.startswith("."):
+        return fallback
+    return candidate
 
 
 def _buttons_to_inline_keyboard(buttons: Buttons | None) -> Any:
@@ -95,6 +113,7 @@ class TelegramTransport:
     """
 
     TRANSPORT_ID = TRANSPORT_ID
+    max_text_length: int = 4096  # Telegram's hard cap.
 
     def __init__(self, application: Any) -> None:
         """Construct from an already-built telegram.ext.Application.
@@ -107,6 +126,7 @@ class TelegramTransport:
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list = []
+        self._authorizer: AuthorizerCallback | None = None
         self._menu: Any = None
         self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
         self._post_init_ran: bool = False
@@ -334,7 +354,7 @@ class TelegramTransport:
                 try:
                     await self._team_relay.stop()
                 except Exception:
-                    logger.exception("post_stop fallback after post_init failure")
+                    logger.exception("post_init failure: unwinding partial startup")
             self._post_init_ran = False
             raise
 
@@ -357,7 +377,23 @@ class TelegramTransport:
         await self._app.stop()
         await self._app.shutdown()
 
+    def run(self) -> None:
+        """Run PTB's polling loop. Owns post_init/post_stop wiring so bot.py
+        never touches the Application by name.
+
+        Synchronous: PTB's run_polling creates and manages its own event loop.
+        """
+        self._app.post_init = self.post_init
+        self._app.post_stop = self.post_stop
+        self._app.run_polling()
+
     # ── Outbound ──────────────────────────────────────────────────────────
+    _DELETED_REPLY_TARGET_MARKERS = (
+        "message to be replied not found",
+        "replied message not found",
+        "reply message not found",
+    )
+
     async def send_text(
         self,
         chat: ChatRef,
@@ -367,7 +403,6 @@ class TelegramTransport:
         html: bool = False,
         reply_to: MessageRef | None = None,
     ) -> MessageRef:
-        # buttons handled in Task 17; ignore here.
         kwargs: dict[str, Any] = {
             "chat_id": int(chat.native_id),
             "text": text,
@@ -384,8 +419,35 @@ class TelegramTransport:
             remapped = _as_retry_after(e)
             if remapped is not None:
                 raise remapped from e
+            # Retry once without reply_to if the target message was deleted —
+            # preserving HTML/buttons. This restores the behavior previously
+            # hand-rolled in bot.py._send_html (commit 4b4c08d).
+            if reply_to is not None and self._is_deleted_reply_target(e):
+                logger.info(
+                    "send_text retry without reply_to: target message deleted",
+                )
+                # Safe to retry: Bot API validates reply_to_message_id before
+                # delivery, so the original send was rejected, not partially
+                # completed.
+                kwargs.pop("reply_to_message_id", None)
+                native_msg = await self._app.bot.send_message(**kwargs)
+                return message_ref_from_telegram(native_msg)
+            if reply_to is not None:
+                logger.warning(
+                    "send_text BadRequest with reply_to but markers did not match — "
+                    "Telegram wording may have changed: %r",
+                    getattr(e, "message", None) or str(e),
+                )
             raise
         return message_ref_from_telegram(native_msg)
+
+    @classmethod
+    def _is_deleted_reply_target(cls, exc: BaseException) -> bool:
+        """Recognize the BadRequest variants Telegram uses when the reply
+        target has been deleted (covers slight wording differences across
+        PTB versions)."""
+        message = (getattr(exc, "message", "") or str(exc) or "").lower()
+        return any(marker in message for marker in cls._DELETED_REPLY_TARGET_MARKERS)
 
     async def edit_text(
         self,
@@ -485,7 +547,8 @@ class TelegramTransport:
         """Convert a telegram Update into IncomingMessage and invoke handlers.
 
         Downloads photo/document attachments to per-handler temp directories,
-        then removes them after all handlers return.
+        then removes them after all handlers return. If an authorizer is set,
+        it is consulted BEFORE any download work; rejection drops the update.
         """
         import tempfile
 
@@ -493,6 +556,12 @@ class TelegramTransport:
         user = update.effective_user
         if msg is None or user is None:
             return
+
+        # Pre-download authorization gate (defends against unauth-DoS via large attachments).
+        if self._authorizer is not None:
+            sender = identity_from_telegram_user(user)
+            if not await self._authorizer(sender):
+                return
 
         from .base import IncomingFile, IncomingMessage
 
@@ -518,13 +587,14 @@ class TelegramTransport:
         if doc is not None:
             tmpdir = tempfile.TemporaryDirectory()
             tmpdirs.append(tmpdir)
-            name = getattr(doc, "file_name", None) or "document"
-            path = Path(tmpdir.name) / name
+            raw_name = getattr(doc, "file_name", None)
+            safe_name = _safe_basename(raw_name, "document")
+            path = Path(tmpdir.name) / safe_name
             tg_file = await doc.get_file()
             await tg_file.download_to_drive(path)
             files.append(IncomingFile(
                 path=path,
-                original_name=name,
+                original_name=safe_name,
                 mime_type=getattr(doc, "mime_type", None),
                 size_bytes=getattr(doc, "file_size", 0) or 0,
             ))
@@ -547,16 +617,28 @@ class TelegramTransport:
         if audio is not None:
             tmpdir = tempfile.TemporaryDirectory()
             tmpdirs.append(tmpdir)
-            name = getattr(audio, "file_name", None) or "audio"
-            path = Path(tmpdir.name) / name
+            raw_name = getattr(audio, "file_name", None)
+            safe_name = _safe_basename(raw_name, "audio")
+            path = Path(tmpdir.name) / safe_name
             tg_file = await audio.get_file()
             await tg_file.download_to_drive(path)
             files.append(IncomingFile(
                 path=path,
-                original_name=name,
+                original_name=safe_name,
                 mime_type=getattr(audio, "mime_type", None) or "audio/mpeg",
                 size_bytes=getattr(audio, "file_size", 0) or 0,
             ))
+
+        # Detect unsupported attachments delivered by the filter
+        # (filters.VIDEO | filters.Sticker.ALL | filters.LOCATION | filters.CONTACT | filters.VIDEO_NOTE).
+        # We surface a flag so the bot can reject instead of treating the caption as a prompt.
+        has_unsupported_media = (
+            len(files) == 0
+            and any(
+                getattr(msg, attr, None) is not None
+                for attr in ("video", "sticker", "location", "contact", "video_note")
+            )
+        )
 
         text = msg.text or getattr(msg, "caption", None) or ""
         is_relayed = False
@@ -591,6 +673,7 @@ class TelegramTransport:
             message=message_ref_from_telegram(msg),
             reply_to_text=reply_to_text,
             reply_to_sender=reply_to_sender,
+            has_unsupported_media=has_unsupported_media,
         )
         try:
             for h in self._message_handlers:
@@ -667,3 +750,6 @@ class TelegramTransport:
 
     def on_button(self, handler: ButtonHandler) -> None:
         self._button_handlers.append(handler)
+
+    def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
+        self._authorizer = authorizer

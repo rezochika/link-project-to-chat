@@ -63,6 +63,28 @@ async def test_start_and_stop_delegate_to_application():
     t._app.shutdown.assert_awaited_once()
 
 
+def test_run_wires_post_init_and_post_stop_then_calls_run_polling():
+    """TelegramTransport.run() owns the post_init/post_stop bindings and
+    drives PTB's polling loop. bot.py never touches the Application by name.
+    """
+    # Use a SimpleNamespace so attribute assignments are plain (MagicMock would
+    # wrap assigned values in mocks and break the identity check).
+    run_polling_calls: list = []
+    app = SimpleNamespace(
+        post_init=None,
+        post_stop=None,
+        run_polling=lambda: run_polling_calls.append(()),
+    )
+    t = TelegramTransport(app)
+
+    t.run()
+
+    # Bound methods compare equal when bound to the same instance/function.
+    assert app.post_init == t.post_init
+    assert app.post_stop == t.post_stop
+    assert run_polling_calls == [()]
+
+
 async def test_on_message_handler_fires_on_telegram_update():
     """Inbound text message from telegram lands as IncomingMessage on the handler."""
     t, _bot = _make_transport_with_mock_bot()
@@ -836,3 +858,259 @@ async def test_post_init_unwinds_partially_started_relay_on_failure():
     mock_client.disconnect.assert_awaited_once()
     # The guard is reset so a retry is possible.
     assert t._post_init_ran is False
+
+
+async def test_document_filename_with_path_separators_is_sanitized_to_basename():
+    """A malicious document filename like '../../etc/passwd' must not escape the temp dir."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured_path: list = []
+
+    async def handler(msg):
+        captured_path.append(msg.files[0].path)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    document = SimpleNamespace(
+        file_name="../../etc/passwd",
+        mime_type="text/plain",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=document, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    # Path must live under tempfile's tempdir; basename must NOT contain separators.
+    import tempfile as _tf
+    assert captured_path[0].name == "passwd", f"basename leaked separators: {captured_path[0].name}"
+    assert str(captured_path[0]).startswith(_tf.gettempdir()) or "tmp" in str(captured_path[0]).lower()
+
+
+async def test_audio_filename_with_absolute_path_is_sanitized():
+    """An audio filename like '/etc/passwd' must reduce to the basename inside tempdir."""
+    t, _bot = _make_transport_with_mock_bot()
+    captured_path: list = []
+
+    async def handler(msg):
+        captured_path.append(msg.files[0].path)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    audio = SimpleNamespace(
+        file_name="/etc/passwd",
+        mime_type="audio/mpeg",
+        file_size=7,
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=None, voice=None, audio=audio,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert captured_path[0].name == "passwd"
+
+
+async def test_unauthorized_pre_dispatch_skips_downloads_and_handlers():
+    """Authorizer returning False must short-circuit before any get_file()/download."""
+    t, _bot = _make_transport_with_mock_bot()
+    handler_calls: list = []
+    download_calls: list = []
+
+    async def handler(msg):
+        handler_calls.append(msg)
+
+    t.on_message(handler)
+
+    async def authorizer(identity):
+        return False  # Always reject.
+
+    t.set_authorizer(authorizer)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Mallory", username="mallory", is_bot=False)
+    tg_file = SimpleNamespace()
+
+    async def download_to_drive(path):
+        download_calls.append(path)
+        path.write_bytes(b"payload")
+
+    tg_file.download_to_drive = download_to_drive
+    document = SimpleNamespace(
+        file_name="big.bin",
+        mime_type="application/octet-stream",
+        file_size=10**9,  # 1 GB - would burn disk if downloaded.
+        get_file=AsyncMock(return_value=tg_file),
+    )
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None, caption=None, photo=None,
+        document=document, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert download_calls == [], "authorized=False must prevent download_to_drive"
+    assert document.get_file.await_count == 0, "authorized=False must skip get_file too"
+    assert handler_calls == [], "authorized=False must skip handler invocation"
+
+
+async def test_authorized_pre_dispatch_proceeds_with_downloads():
+    """Authorizer returning True allows the normal download path."""
+    t, _bot = _make_transport_with_mock_bot()
+    handler_calls: list = []
+
+    async def handler(msg):
+        handler_calls.append(msg)
+
+    t.on_message(handler)
+
+    async def authorizer(identity):
+        return identity.handle == "alice"
+
+    t.set_authorizer(authorizer)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text="hi", photo=None, document=None, voice=None, audio=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(handler_calls) == 1
+    assert handler_calls[0].text == "hi"
+
+
+async def test_video_with_caption_marks_message_as_unsupported_media():
+    """Telegram allows video/sticker/etc. through the filter; the bot must NOT
+    treat their captions as plain text."""
+    t, _bot = _make_transport_with_mock_bot()
+    received: list = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text=None,
+        caption="please summarize this video",
+        photo=None, document=None, voice=None, audio=None,
+        video=SimpleNamespace(file_id="vid123"),
+        sticker=None, location=None, contact=None, video_note=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert len(received) == 1
+    assert received[0].has_unsupported_media is True
+    assert received[0].text == "please summarize this video"  # caption preserved for the rejection UX
+
+
+async def test_text_only_message_is_not_unsupported_media():
+    t, _bot = _make_transport_with_mock_bot()
+    received: list = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    t.on_message(handler)
+
+    tg_chat = SimpleNamespace(id=12345, type="private")
+    tg_user = SimpleNamespace(id=42, full_name="Alice", username="alice", is_bot=False)
+    tg_msg = SimpleNamespace(
+        message_id=100, chat=tg_chat, from_user=tg_user,
+        text="hi there",
+        photo=None, document=None, voice=None, audio=None,
+        video=None, sticker=None, location=None, contact=None, video_note=None,
+        reply_to_message=None,
+    )
+    update = SimpleNamespace(effective_message=tg_msg, effective_user=tg_user)
+
+    await t._dispatch_message(update, ctx=None)
+
+    assert received[0].has_unsupported_media is False
+
+
+async def test_send_text_retries_without_reply_to_when_target_deleted_preserving_html():
+    """If Telegram returns 'Message to be replied not found', send_text retries
+    once without reply_to_message_id, preserving parse_mode=HTML."""
+    t, bot = _make_transport_with_mock_bot()
+
+    # First call raises the specific BadRequest; second call (the retry) succeeds.
+    class _ReplyTargetMissing(Exception):
+        def __init__(self):
+            super().__init__("Message to be replied not found")
+            self.message = "Message to be replied not found"
+
+    success_native = SimpleNamespace(
+        message_id=99, chat=SimpleNamespace(id=12345, type="private")
+    )
+    bot.send_message = AsyncMock(side_effect=[_ReplyTargetMissing(), success_native])
+
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    reply_to = MessageRef(transport_id=TRANSPORT_ID, native_id="500", chat=chat)
+
+    ref = await t.send_text(chat, "<b>hi</b>", html=True, reply_to=reply_to)
+
+    assert ref.native_id == "99"
+    assert bot.send_message.await_count == 2
+    second_kwargs = bot.send_message.await_args_list[1].kwargs
+    assert "reply_to_message_id" not in second_kwargs, "retry must drop reply_to"
+    assert second_kwargs["parse_mode"] == "HTML", "retry must preserve HTML parse_mode"
+
+
+async def test_send_text_does_not_retry_for_unrelated_badrequest():
+    """Other BadRequest errors (e.g., chat not found) must NOT trigger the retry."""
+    t, bot = _make_transport_with_mock_bot()
+
+    class _OtherBadRequest(Exception):
+        def __init__(self):
+            super().__init__("Chat not found")
+            self.message = "Chat not found"
+
+    bot.send_message = AsyncMock(side_effect=_OtherBadRequest())
+    chat = ChatRef(transport_id=TRANSPORT_ID, native_id="12345", kind=ChatKind.DM)
+    reply_to = MessageRef(transport_id=TRANSPORT_ID, native_id="500", chat=chat)
+
+    with pytest.raises(Exception) as excinfo:
+        await t.send_text(chat, "hi", reply_to=reply_to)
+    assert "Chat not found" in str(excinfo.value)
+    assert bot.send_message.await_count == 1, "no retry for unrelated errors"

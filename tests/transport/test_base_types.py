@@ -83,7 +83,10 @@ def test_incoming_file_carries_path():
 
 
 def test_incoming_message_has_empty_files_by_default():
-    m = IncomingMessage(chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None, native=None)
+    m = IncomingMessage(
+        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None,
+        message=MessageRef("test", "m", _chat()), native=None,
+    )
     assert m.files == []
 
 
@@ -107,7 +110,8 @@ def test_transport_is_importable():
 
 def test_incoming_message_has_is_relayed_bot_to_bot_field():
     m = IncomingMessage(
-        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None, native=None,
+        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None,
+        message=MessageRef("test", "m", _chat()), native=None,
     )
     # default is False
     assert m.is_relayed_bot_to_bot is False
@@ -115,7 +119,8 @@ def test_incoming_message_has_is_relayed_bot_to_bot_field():
 
 def test_incoming_message_accepts_is_relayed_bot_to_bot_true():
     m = IncomingMessage(
-        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None, native=None,
+        chat=_chat(), sender=_sender(), text="hi", files=[], reply_to=None,
+        message=MessageRef("test", "m", _chat()), native=None,
         is_relayed_bot_to_bot=True,
     )
     assert m.is_relayed_bot_to_bot is True

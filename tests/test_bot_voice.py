@@ -180,6 +180,7 @@ async def test_voice_with_reply_prefixes_prompt(tmp_path):
         text=incoming.text,
         files=incoming.files,
         reply_to=reply_ref,
+        message=incoming.message,
         reply_to_text="earlier message",
     )
     await bot._on_voice_from_transport(incoming_with_reply)
@@ -228,7 +229,8 @@ async def test_unified_dispatch_unsupported_fallback():
         handle="alice", is_bot=False,
     )
     incoming = IncomingMessage(
-        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+        chat=chat, sender=sender, text="", files=[], reply_to=None,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat), native=None,
     )
     await bot._on_text_from_transport(incoming)
     assert any(
@@ -247,10 +249,59 @@ async def test_unified_dispatch_unsupported_unauthorized_ignored():
         handle="alice", is_bot=False,
     )
     incoming = IncomingMessage(
-        chat=chat, sender=sender, text="", files=[], reply_to=None, native=None,
+        chat=chat, sender=sender, text="", files=[], reply_to=None,
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat), native=None,
     )
     await bot._on_text_from_transport(incoming)
     assert bot._transport.sent_messages == []
+
+
+async def test_unsupported_media_caption_routes_to_specific_rejection():
+    """Caption-bearing unsupported media (e.g. video with caption) hits the
+    specific 'Unsupported media type' rejection in `_on_text`, not the generic
+    fallback. The caption is NOT submitted to Claude.
+    """
+    bot = _make_project_bot_stub()
+    chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42", display_name="Alice",
+        handle="alice", is_bot=False,
+    )
+    incoming = IncomingMessage(
+        chat=chat, sender=sender, text="check this out", files=[],
+        reply_to=None, message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        native=None, has_unsupported_media=True,
+    )
+    await bot._on_text_from_transport(incoming)
+    assert any(
+        "Unsupported media type" in m.text
+        for m in bot._transport.sent_messages
+    ), f"expected specific rejection, got: {[m.text for m in bot._transport.sent_messages]}"
+    bot.task_manager.submit_agent.assert_not_called()
+
+
+async def test_unsupported_media_no_caption_routes_to_specific_rejection():
+    """Caption-LESS unsupported media (e.g. sticker, muted video, location) must
+    also hit the specific 'Unsupported media type' rejection — not the generic
+    fallback. Bug regression test for caption-less bypass of the new flag.
+    """
+    bot = _make_project_bot_stub()
+    chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42", display_name="Alice",
+        handle="alice", is_bot=False,
+    )
+    incoming = IncomingMessage(
+        chat=chat, sender=sender, text="", files=[],
+        reply_to=None, message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+        native=None, has_unsupported_media=True,
+    )
+    await bot._on_text_from_transport(incoming)
+    assert any(
+        "Unsupported media type" in m.text
+        for m in bot._transport.sent_messages
+    ), f"expected specific rejection, got: {[m.text for m in bot._transport.sent_messages]}"
+    bot.task_manager.submit_agent.assert_not_called()
 
 
 async def test_file_upload_uses_platform_temp_root(tmp_path, monkeypatch):

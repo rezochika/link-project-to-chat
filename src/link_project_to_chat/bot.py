@@ -39,7 +39,7 @@ from .backends.claude import (
 )
 from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
 from .transport.streaming import StreamingMessage
-from .stream import AskQuestion, Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
+from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
 
 logger = logging.getLogger(__name__)
@@ -319,16 +319,23 @@ class ProjectBot(AuthMixin):
                 last_ref = await self._transport.send_text(
                     chat, chunk, html=True, reply_to=reply_to, buttons=btns,
                 )
-            except Exception:
-                logger.warning("HTML send failed, falling back to plain", exc_info=True)
+            except Exception as exc:
+                # The transport already retries on deleted-reply-target. Anything
+                # reaching here is genuinely unexpected (parse error, malformed
+                # HTML, network issue). Fall back to plain so the user gets *some*
+                # output; log so the cause is recoverable.
+                logger.warning("HTML send failed, falling back to plain: %s", exc, exc_info=True)
                 plain = strip_html(chunk).replace("\x00", "")
                 if plain.strip():
-                    last_ref = await self._transport.send_text(
-                        chat,
-                        plain[:4096] if len(plain) > 4096 else plain,
-                        reply_to=reply_to,
-                        buttons=btns,
-                    )
+                    try:
+                        last_ref = await self._transport.send_text(
+                            chat,
+                            plain[:self._transport.max_text_length] if len(plain) > self._transport.max_text_length else plain,
+                            reply_to=reply_to,
+                            buttons=btns,
+                        )
+                    except Exception:
+                        logger.error("Plain-text fallback also failed", exc_info=True)
         return last_ref
 
     async def _send_to_chat(
@@ -451,14 +458,14 @@ class ProjectBot(AuthMixin):
     async def _send_voice_response(
         self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
     ) -> None:
+        assert self._transport is not None
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
         voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         plain = strip_html(md_to_telegram(text))
-        if len(plain) > 4096:
-            plain = plain[:4093] + "..."
+        if len(plain) > self._transport.max_text_length:
+            plain = plain[:self._transport.max_text_length - 3] + "..."
         out_path = voice_dir / f"tts_{uuid.uuid4().hex}.opus"
 
-        assert self._transport is not None
         try:
             await self._synthesizer.synthesize(plain, out_path)
             await self._transport.send_voice(chat, out_path, reply_to=reply_to)
@@ -596,8 +603,11 @@ class ProjectBot(AuthMixin):
             await self._on_file_from_transport(incoming)
             return
 
-        # 3. Text.
-        if incoming.text.strip():
+        # 3. Text (or unsupported media that needs the specific rejection in
+        # `_on_text`). Caption-less stickers / muted videos / locations have
+        # `text==""` but `has_unsupported_media=True` — without the second
+        # clause they'd fall through to the generic branch 4 reply.
+        if incoming.text.strip() or incoming.has_unsupported_media:
             if self.group_mode:
                 handled = await self._handle_group_text(incoming)
                 if handled:
@@ -686,12 +696,9 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
         self.task_manager.submit_agent(
             chat=incoming.chat,
-            message=message_ref,
+            message=incoming.message,
             prompt=prompt,
         )
 
@@ -703,16 +710,26 @@ class ProjectBot(AuthMixin):
         telegram/ctx knowledge required.
         """
         assert self._transport is not None
-        if not incoming.text.strip():
+        # Empty text is only actionable when the dispatcher routed an
+        # unsupported-media message here for the specific rejection.
+        if not incoming.text.strip() and not incoming.has_unsupported_media:
             return
         if not self._auth_identity(incoming.sender):
             await self._transport.send_text(
                 incoming.chat, "Unauthorized.", reply_to=incoming.message,
             )
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             await self._transport.send_text(
                 incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
+            )
+            return
+
+        if incoming.has_unsupported_media:
+            await self._transport.send_text(
+                incoming.chat,
+                "Unsupported media type. I can read text, photos, documents, voice notes, and audio.",
+                reply_to=incoming.message,
             )
             return
 
@@ -750,9 +767,7 @@ class ProjectBot(AuthMixin):
             )
             return
 
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
+        message_ref = incoming.message
 
         # Active Claude turn waiting on a question? Route as the answer.
         waiting = self.task_manager.waiting_input_task(incoming.chat)
@@ -1659,7 +1674,7 @@ class ProjectBot(AuthMixin):
 
         if not self._auth_identity(incoming.sender):
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return
@@ -1705,19 +1720,16 @@ class ProjectBot(AuthMixin):
             self.task_manager.submit_answer(waiting.id, prompt)
             return
 
-        message_ref = incoming.message or MessageRef(
-            transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-        )
         self.task_manager.submit_agent(
             chat=incoming.chat,
-            message=message_ref,
+            message=incoming.message,
             prompt=prompt,
         )
 
     async def _on_voice_from_transport(self, incoming) -> None:
         if not self._auth_identity(incoming.sender):
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return
@@ -1772,12 +1784,9 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
-            message_ref = incoming.message or MessageRef(
-                transport_id=incoming.chat.transport_id, native_id="0", chat=incoming.chat,
-            )
             task = self.task_manager.submit_agent(
                 chat=incoming.chat,
-                message=message_ref,
+                message=incoming.message,
                 prompt=prompt,
             )
             if self._synthesizer:
@@ -1874,9 +1883,13 @@ class ProjectBot(AuthMixin):
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
         self._app = self._transport.app
-        self._app.post_init = self._transport.post_init
-        self._app.post_stop = self._transport.post_stop
         self._transport.on_ready(self._after_ready)
+
+        async def _pre_authorize(identity) -> bool:
+            return self._auth_identity(identity)
+
+        self._transport.set_authorizer(_pre_authorize)
+
         app = self._app
 
         # All commands consume CommandInvocation directly — no legacy shim.
@@ -1949,6 +1962,14 @@ class ProjectBot(AuthMixin):
 
         return app
 
+    def run(self) -> None:
+        """Run the transport's main loop. Owns the lifecycle from here on.
+
+        Synchronous: matches the underlying Transport.run() contract.
+        """
+        assert self._transport is not None
+        self._transport.run()
+
 
 def run_bot(
     name: str,
@@ -2020,11 +2041,11 @@ def run_bot(
         bot.task_manager.backend.model = model
     if effort:
         bot.task_manager.backend.effort = effort
-    app = bot.build()
+    bot.build()
     logger.info(
         "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
     )
-    app.run_polling()
+    bot.run()
 
 
 def run_bots(

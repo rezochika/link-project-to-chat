@@ -23,8 +23,13 @@ class AuthMixin:
     _MAX_MESSAGES_PER_MINUTE: int = 30
 
     def _init_auth(self) -> None:
-        self._rate_limits: dict[int, collections.deque] = {}
-        self._failed_auth_counts: dict[int, int] = {}
+        self._rate_limits: dict[str, collections.deque] = {}
+        # Mixed-key dict: int for legacy Telegram callers (user.id is int post
+        # int-coercion in _auth_identity), str for non-numeric platforms
+        # (Discord snowflakes, Slack channel ids) that fall through the
+        # int-cast in _auth_identity. Migration of _auth itself to a
+        # platform-neutral key is deferred to spec #0a.
+        self._failed_auth_counts: dict[int | str, int] = {}
 
     def _get_allowed_usernames(self) -> list[str]:
         """Return the effective list of allowed usernames."""
@@ -39,7 +44,13 @@ class AuthMixin:
         return (username or "").lower().lstrip("@")
 
     def _get_trusted_user_bindings(self) -> dict[str, int]:
-        """Return trusted user bindings scoped to the current allowlist."""
+        """Return trusted user bindings scoped to the current allowlist.
+
+        Values are coerced to int when possible; non-numeric ids
+        (Discord/Slack) are passed through unchanged so the in-memory
+        trust dict can still hold them. Real multi-platform persistence
+        is spec #0a's problem.
+        """
         allowed = [self._normalize_username(username) for username in self._get_allowed_usernames()]
         allowed_set = set(allowed)
 
@@ -48,19 +59,32 @@ class AuthMixin:
         for username, user_id in trusted_users.items():
             normalized = self._normalize_username(username)
             if normalized in allowed_set:
-                effective[normalized] = int(user_id)
+                effective[normalized] = self._coerce_trust_value(user_id)
         if effective:
             return effective
 
         if self._trusted_user_id is not None and self._allowed_username:
             normalized = self._normalize_username(self._allowed_username)
             if normalized in allowed_set:
-                return {normalized: int(self._trusted_user_id)}
+                return {normalized: self._coerce_trust_value(self._trusted_user_id)}
 
         return {
-            username: int(user_id)
+            username: self._coerce_trust_value(user_id)
             for username, user_id in zip(allowed, self._trusted_user_ids)
         }
+
+    @staticmethod
+    def _coerce_trust_value(user_id) -> int:
+        """Coerce a stored trust id to int, passing non-numeric values through.
+
+        Non-numeric ids (Discord/Slack) stay as-is; type-check warnings about
+        the dict[str, int] return are accepted because spec #0a will widen
+        these signatures alongside persistence.
+        """
+        try:
+            return int(user_id)
+        except (TypeError, ValueError):
+            return user_id  # type: ignore[return-value]
 
     def _get_trusted_user_ids(self) -> list[int]:
         """Return the effective list of trusted user IDs."""
@@ -79,15 +103,26 @@ class AuthMixin:
         )
 
     def _trust_user(self, user_id: int, username: str) -> None:
-        """Record a newly trusted user binding in the appropriate field."""
+        """Record a newly trusted user binding in the appropriate field.
+
+        For non-numeric ids (Discord snowflakes, Slack ids) the int cast
+        falls back to storing the raw value; the int-trusted-id fast path
+        in ``_auth`` then silently mismatches by type and the user falls
+        through to the username match — functionally correct, small perf
+        hit. Real multi-platform persistence is spec #0a's problem.
+        """
         normalized = self._normalize_username(username)
+        try:
+            stored_id: int | str = int(user_id)
+        except (TypeError, ValueError):
+            stored_id = user_id
         trusted_users = self._get_trusted_user_bindings()
-        trusted_users[normalized] = int(user_id)
+        trusted_users[normalized] = stored_id  # type: ignore[assignment]
         self._trusted_users = trusted_users
         if self._is_multi_user_mode():
             self._trusted_user_ids = list(trusted_users.values())
         else:
-            self._trusted_user_id = int(user_id)
+            self._trusted_user_id = stored_id  # type: ignore[assignment]
 
     def _revoke_user(self, username: str) -> None:
         """Remove any stored trusted binding for a username."""
@@ -122,23 +157,41 @@ class AuthMixin:
         if username in allowed:
             self._trust_user(user.id, username)
             self._on_trust(user.id, username)
-            logger.info("Trusted user_id %d saved", user.id)
+            logger.info("Trusted user_id %s saved", user.id)
             return True
         self._failed_auth_counts[user.id] = self._failed_auth_counts.get(user.id, 0) + 1
         return False
 
     def _auth_identity(self, identity) -> bool:
-        """Authorize based on a transport Identity. Wraps _auth."""
+        """Authorize based on a transport Identity. Wraps _auth.
+
+        Telegram-only legacy: _auth still consumes user.id as int because
+        _trusted_users persistence is int-typed. We coerce here so the
+        boundary is contained, but rate-limit/failed-auth dicts use the
+        platform-neutral identity-key (transport_id:native_id) directly.
+        """
         from types import SimpleNamespace
-        user = SimpleNamespace(
-            id=int(identity.native_id),
-            username=identity.handle or "",
-        )
+        # _auth still expects user.id to be int-comparable against _trusted_users.values().
+        # Until persistence migrates, keep the cast scoped to this one site.
+        try:
+            uid = int(identity.native_id)
+        except (TypeError, ValueError):
+            uid = identity.native_id  # non-numeric: skip the int-trusted-id fast path; username match still works.
+        user = SimpleNamespace(id=uid, username=identity.handle or "")
         return self._auth(user)
 
-    def _rate_limited(self, user_id: int) -> bool:
+    @staticmethod
+    def _identity_key(identity) -> str:
+        """Stable string key for rate-limit / failed-auth bookkeeping.
+
+        Includes transport_id so the same numeric id from different platforms
+        doesn't collide (telegram:42 vs discord:42).
+        """
+        return f"{identity.transport_id}:{identity.native_id}"
+
+    def _rate_limited(self, identity_key: str) -> bool:
         now = time.monotonic()
-        timestamps = self._rate_limits.setdefault(user_id, collections.deque())
+        timestamps = self._rate_limits.setdefault(identity_key, collections.deque())
         while timestamps and now - timestamps[0] > 60:
             timestamps.popleft()
         if len(timestamps) >= self._MAX_MESSAGES_PER_MINUTE:

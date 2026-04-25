@@ -88,15 +88,18 @@ class IncomingMessage:
     text: str
     files: list[IncomingFile]
     reply_to: MessageRef | None
+    message: MessageRef  # Required: every transport-emitted message has a back-ref.
     native: Any = None
     is_relayed_bot_to_bot: bool = False
     # Optional platform-neutral fields populated by transports that have them.
-    # `message` identifies *this* incoming message so handlers can link tasks
-    # back to it without reaching into `native`. `reply_to_text`/`reply_to_sender`
-    # let group-routing and "[Replying to: ...]" prefixing stay transport-free.
-    message: MessageRef | None = None
+    # `reply_to_text`/`reply_to_sender` let group-routing and
+    # "[Replying to: ...]" prefixing stay transport-free.
     reply_to_text: str | None = None
     reply_to_sender: Identity | None = None
+    has_unsupported_media: bool = False  # True if the platform delivered a
+    # video/sticker/location/contact/video-note that the transport can't decode.
+    # Bot SHOULD reject with a "media type not supported" reply rather than
+    # treating any caption as a normal prompt.
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,7 @@ MessageHandler = Callable[[IncomingMessage], Awaitable[None]]
 CommandHandler = Callable[[CommandInvocation], Awaitable[None]]
 ButtonHandler = Callable[[ButtonClick], Awaitable[None]]
 OnReadyCallback = Callable[["Identity"], Awaitable[None]]
+AuthorizerCallback = Callable[[Identity], Awaitable[bool]]
 
 
 class TransportRetryAfter(Exception):
@@ -142,8 +146,20 @@ class Transport(Protocol):
     one. Transports that don't support thread-style replies MAY ignore the hint.
     """
 
+    max_text_length: int  # Largest single-message text length the platform accepts.
+
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
+
+    def run(self) -> None:
+        """Synchronously run the transport's main loop until cancelled.
+
+        Implementations own their event loop. PTB's Application.run_polling()
+        is sync and creates its own loop; async-native transports (Discord
+        client.start, uvicorn.serve) wrap with asyncio.run inside this method.
+        Returns when the transport stops.
+        """
+        ...
 
     async def send_text(
         self,
@@ -197,6 +213,16 @@ class Transport(Protocol):
     def on_message(self, handler: MessageHandler) -> None: ...
     def on_command(self, name: str, handler: CommandHandler) -> None: ...
     def on_button(self, handler: ButtonHandler) -> None: ...
+
+    def set_authorizer(self, authorizer: AuthorizerCallback | None) -> None:
+        """Pre-message authorization gate. Called by the transport BEFORE any
+        expensive platform work (file downloads, etc.). Returning False causes
+        the transport to silently drop the message — no handlers, no downloads.
+
+        This is a DoS-defense layer; the bot SHOULD still re-auth in its message
+        handlers as defense-in-depth. Pass None to disable gating.
+        """
+        ...
 
     def on_ready(self, callback: OnReadyCallback) -> None:
         """Register a callback fired after the Transport completes platform-specific
