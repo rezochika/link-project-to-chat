@@ -354,7 +354,7 @@ class TelegramTransport:
                 try:
                     await self._team_relay.stop()
                 except Exception:
-                    logger.exception("post_stop fallback after post_init failure")
+                    logger.exception("post_init failure: unwinding partial startup")
             self._post_init_ran = False
             raise
 
