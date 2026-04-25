@@ -103,7 +103,19 @@ class ProcessManager:
         elif permissions and permissions != "default":
             cmd.extend(["--permission-mode", permissions])
         cfg = load_config(self._project_config_path) if self._project_config_path else load_config()
-        model = project_config.get("model") or cfg.default_model
+        # Phase 2: prefer backend_state[<active_backend>].model over the legacy
+        # flat key, and fall back to the new ``default_model_claude`` global
+        # before the legacy ``default_model``. backend_state is the source of
+        # truth post-migration; the legacy reads remain only as a safety net
+        # for entries written by older code that wasn't yet migrated.
+        backend_name = project_config.get("backend") or "claude"
+        backend_state = project_config.get("backend_state", {}).get(backend_name, {})
+        model = (
+            backend_state.get("model")
+            or project_config.get("model")
+            or cfg.default_model_claude
+            or cfg.default_model
+        )
         if model:
             cmd.extend(["--model", model])
         return cmd

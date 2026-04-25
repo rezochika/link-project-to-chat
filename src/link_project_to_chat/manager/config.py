@@ -54,6 +54,17 @@ def set_project_autostart(project_name: str, value: bool, path: Path = PROJECT_C
     _patch_json(_patch, path)
 
 
+def set_project_backend(project_name: str, backend_name: str, path: Path = PROJECT_CONFIG) -> None:
+    """Persist the active backend for a project. No-op if the project is missing."""
+    def _patch(raw: dict) -> None:
+        project = raw.get("projects", {}).get(project_name)
+        if not isinstance(project, dict) or "path" not in project:
+            return
+        project["backend"] = backend_name
+
+    _patch_json(_patch, path)
+
+
 def set_team_bot_autostart(
     team_name: str, role: str, value: bool, path: Path = PROJECT_CONFIG
 ) -> None:

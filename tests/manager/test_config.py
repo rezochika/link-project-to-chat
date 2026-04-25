@@ -12,6 +12,7 @@ from link_project_to_chat.manager.config import (
     load_project_configs,
     save_project_configs,
     set_project_autostart,
+    set_project_backend,
     set_team_bot_autostart,
 )
 
@@ -78,6 +79,42 @@ def test_save_project_configs_creates_file(tmp_path: Path):
     path = tmp_path / "config.json"
     save_project_configs({"proj": {"path": "/p"}}, path)
     assert json.loads(path.read_text())["projects"]["proj"]["path"] == "/p"
+
+
+def test_save_project_configs_preserves_backend_state(tmp_path: Path):
+    """The raw-dict passthrough save must preserve the new backend/backend_state
+    shape on disk so callers writing the new shape see it round-trip cleanly."""
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "projects": {
+            "demo": {
+                "path": "/tmp/demo",
+                "backend": "claude",
+                "backend_state": {"claude": {"model": "opus"}},
+            }
+        }
+    }))
+    save_project_configs(load_project_configs(path), path)
+    raw = json.loads(path.read_text())
+    assert raw["projects"]["demo"]["backend"] == "claude"
+    assert raw["projects"]["demo"]["backend_state"]["claude"]["model"] == "opus"
+
+
+def test_set_project_backend_updates_active_backend(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"projects": {"myproj": {"path": "/p"}}}))
+    set_project_backend("myproj", "anthropic_api", path)
+    raw = json.loads(path.read_text())
+    assert raw["projects"]["myproj"]["backend"] == "anthropic_api"
+
+
+def test_set_project_backend_unknown_project_is_noop(tmp_path: Path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"projects": {"myproj": {"path": "/p"}}}))
+    set_project_backend("ghost", "anthropic_api", path)
+    raw = json.loads(path.read_text())
+    assert "ghost" not in raw["projects"]
+    assert "backend" not in raw["projects"]["myproj"]
 
 
 def test_set_project_autostart(tmp_path: Path):

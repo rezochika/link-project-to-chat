@@ -436,7 +436,13 @@ def start(
             group_chat_id=t.group_chat_id,
             role=role,
             active_persona=bot_cfg.active_persona,
-            model=model or bot_state.get("model") or config.default_model or None,
+            model=(
+                model
+                or bot_state.get("model")
+                or config.default_model_claude
+                or config.default_model
+                or None
+            ),
             skip_permissions=team_skip,
             permission_mode=team_pm,
             peer_bot_username=peer_username,

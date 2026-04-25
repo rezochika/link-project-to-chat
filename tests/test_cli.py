@@ -507,6 +507,86 @@ def test_start_team_explicit_model_overrides_default(tmp_path, monkeypatch):
     assert calls[0][1].get("model") == "haiku"
 
 
+def test_start_team_prefers_default_model_claude_over_legacy(tmp_path, monkeypatch):
+    """When ``default_model_claude`` is set but the legacy ``default_model``
+    isn't (e.g. a config that's only ever been touched by post-migration code),
+    the team-bot fallback must still pick up ``default_model_claude``. Reads
+    cannot depend on the legacy mirror being present."""
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    # NOTE: only ``default_model_claude`` is written — no legacy mirror. This
+    # asserts that the read path actually consults the new field.
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "default_model_claude": "haiku",
+                "teams": {
+                    "acme": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -1001,
+                        "bots": {"manager": {"telegram_bot_token": "t1"}},
+                    }
+                },
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("model") == "haiku"
+
+
+def test_start_project_prefers_backend_state_model_over_legacy(tmp_path, monkeypatch):
+    """When backend_state.claude.model is set, ``cli start --project`` uses
+    that for the model fallback even if the legacy flat ``model`` key disagrees.
+    backend_state is the source of truth post-Phase 2."""
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "myproj": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "TOK",
+                        "backend": "claude",
+                        "backend_state": {"claude": {"model": "opus"}},
+                        "model": "sonnet",  # stale legacy mirror
+                    }
+                }
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(cfg_path), "start", "--project", "myproj"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("model") == "opus"
+
+
 def test_start_team_missing_role_errors(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
     from link_project_to_chat.config import Config, TeamBotConfig, TeamConfig, save_config

@@ -642,13 +642,24 @@ class ManagerBot(AuthMixin):
     async def _add_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         incoming = self._incoming_from_update(update)
         text = incoming.text.strip()
-        if text != "/skip":
-            ctx.user_data["new_project"]["model"] = text
+        model_value = text if text != "/skip" else None
         data = ctx.user_data.pop("new_project", {})
+        # Drop any stale flat ``model`` from earlier user_data shapes; we now
+        # write the new backend/backend_state shape directly.
+        data.pop("model", None)
         name = data.pop("name", None)
         if not name:
             await self._transport.send_text(incoming.chat, "Something went wrong. Try again.")
             return ConversationHandler.END
+        # Phase 2: write new shape (backend + backend_state). Mirror the legacy
+        # flat ``model`` for downgrade safety, matching what cli.py:projects_add
+        # and patch_backend_state already do.
+        data["backend"] = "claude"
+        if model_value:
+            data["backend_state"] = {"claude": {"model": model_value}}
+            data["model"] = model_value  # legacy mirror for downgrade safety
+        else:
+            data["backend_state"] = {}
         projects = self._load_projects()
         projects[name] = data
         self._save_projects(projects)
@@ -795,9 +806,22 @@ class ManagerBot(AuthMixin):
             projects[name]["telegram_bot_token"] = value
             self._save_projects(projects)
             await self._transport.send_text(chat, f"Updated '{name}' token.")
-        elif field in ("username", "model", "permissions"):
+        elif field == "username":
             projects[name][field] = value
             self._save_projects(projects)
+            await self._transport.send_text(chat, f"Updated '{name}' {field} to {value}.")
+        elif field in ("model", "permissions"):
+            # Phase 2: route Claude-shaped fields through backend_state so
+            # multi-backend configs don't lose state on subsequent saves. The
+            # legacy flat key is still mirrored back onto the project entry by
+            # patch_backend_state for downgrade safety.
+            backend_name = projects[name].get("backend") or "claude"
+            patch_backend_state(
+                name,
+                backend_name,
+                {field: value},
+                self._project_config_path or DEFAULT_CONFIG,
+            )
             await self._transport.send_text(chat, f"Updated '{name}' {field} to {value}.")
         else:
             await self._transport.send_text(
@@ -2000,6 +2024,12 @@ class ManagerBot(AuthMixin):
                 from ..config import load_config, save_config
                 cfg_path = self._project_config_path or DEFAULT_CONFIG
                 cfg = load_config(cfg_path)
+                # Phase 2: write the new ``default_model_claude`` field as the
+                # source of truth. ``cfg.default_model`` is kept consistent so
+                # the in-memory dataclass stays coherent for the rest of this
+                # request; save_config also emits the legacy mirror on disk
+                # for downgrade safety.
+                cfg.default_model_claude = model_id
                 cfg.default_model = model_id
                 save_config(cfg, cfg_path)
                 label = next((l for m, l in MODEL_OPTIONS if m == model_id), model_id)

@@ -645,13 +645,12 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     else:
         raw.pop("tts_voice", None)
     raw["default_backend"] = config.default_backend
-    # Phase 2 transitional precedence: legacy ``default_model`` wins over the
-    # new ``default_model_claude`` so callers that only mutate the legacy field
-    # (e.g. manager/bot.py:1990) still have their changes persisted. Today no
-    # caller mutates ``default_model_claude`` directly, so this direction
-    # cannot cause reverse silent-loss. Task 9 of the Phase 2 plan migrates
-    # the last legacy mutation, after which precedence direction is moot.
-    effective_default_model_claude = config.default_model or config.default_model_claude
+    # Phase 2: ``default_model_claude`` is the source of truth. After Task 4
+    # migrated the manager's global /model callback to write the new field,
+    # no caller mutates the legacy ``default_model`` directly any more, so
+    # the new field wins on save and the legacy mirror is purely a
+    # downgrade-safety artifact.
+    effective_default_model_claude = config.default_model_claude or config.default_model
     if effective_default_model_claude:
         raw["default_model_claude"] = effective_default_model_claude
         raw["default_model"] = effective_default_model_claude
