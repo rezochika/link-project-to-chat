@@ -24,6 +24,20 @@ class ConfigError(Exception):
     """Raised when config.json contains structurally invalid data."""
 
 
+@dataclass(frozen=True)
+class BotPeerRef:
+    transport_id: str
+    native_id: str
+    handle: str | None = None
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class RoomBinding:
+    transport_id: str
+    native_id: str
+
+
 @dataclass
 class ProjectConfig:
     path: str
@@ -55,6 +69,7 @@ class TeamBotConfig:
     model: str | None = None
     effort: str | None = None
     show_thinking: bool = False
+    bot_peer: BotPeerRef | None = None
 
 
 @dataclass
@@ -62,6 +77,7 @@ class TeamConfig:
     path: str
     group_chat_id: int = 0  # 0 = sentinel "not yet captured"
     bots: dict[str, TeamBotConfig] = field(default_factory=dict)
+    room: RoomBinding | None = None
 
 
 @dataclass
@@ -366,7 +382,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     raise ConfigError(
                         f"Team {name!r} in {path} is missing required field {required!r}"
                     )
-            config.teams[name] = TeamConfig(
+            team_cfg = TeamConfig(
                 path=team["path"],
                 group_chat_id=team["group_chat_id"],
                 bots={
@@ -384,6 +400,25 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     for role, b in team.get("bots", {}).items()
                 },
             )
+            # Backward-compat migration: synthesize a Telegram RoomBinding from
+            # the legacy ``group_chat_id`` field so new code can prefer
+            # ``team_cfg.room`` while still reading existing configs.
+            if team_cfg.group_chat_id != 0 and team_cfg.room is None:
+                team_cfg.room = RoomBinding(
+                    transport_id="telegram",
+                    native_id=str(team_cfg.group_chat_id),
+                )
+            # Backward-compat migration: synthesize a Telegram BotPeerRef from
+            # the legacy ``bot_username`` field for each bot that has a handle
+            # but no structured peer ref yet.
+            for bot_cfg in team_cfg.bots.values():
+                if bot_cfg.bot_username and bot_cfg.bot_peer is None:
+                    bot_cfg.bot_peer = BotPeerRef(
+                        transport_id="telegram",
+                        native_id="",
+                        handle=bot_cfg.bot_username,
+                    )
+            config.teams[name] = team_cfg
     return config
 
 
