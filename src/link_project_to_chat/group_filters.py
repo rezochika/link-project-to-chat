@@ -44,9 +44,23 @@ def is_from_other_bot(msg: IncomingMessage, my_username: str) -> bool:
 
 
 def mentions_bot(msg: IncomingMessage, bot_username: str) -> bool:
-    """True when the message text mentions this bot via `@handle`."""
-    target = bot_username.lower()
-    return target in extract_mentions(msg.text)
+    """True if message mentions this bot.
+
+    Prefers structured `IncomingMessage.mentions` (Discord/Slack/Web); falls back
+    to regex text parsing only when `mentions` is empty (Telegram legacy path).
+    """
+    if msg.mentions:
+        target = bot_username.lower()
+        return any((m.handle or "").lower() == target for m in msg.mentions)
+    return bot_username.lower() in extract_mentions(msg.text)
+
+
+def mentions_bot_by_id(msg: IncomingMessage, transport_id: str, native_id: str) -> bool:
+    """True if `msg.mentions` contains an identity with the given transport_id + native_id."""
+    return any(
+        m.transport_id == transport_id and m.native_id == native_id
+        for m in msg.mentions
+    )
 
 
 def is_reply_to_bot(msg: IncomingMessage, bot_username: str) -> bool:
@@ -63,12 +77,13 @@ def is_reply_to_bot(msg: IncomingMessage, bot_username: str) -> bool:
 def is_directed_at_me(msg: IncomingMessage, my_username: str) -> bool:
     """Top-level decision: treat the message as addressed to this bot.
 
-    An explicit @mention always wins. A reply to this bot's prior message only
-    counts when the user did NOT @mention anyone else — otherwise replying to
-    bot A while pinging bot B would wake both A and B.
+    An explicit @mention always wins (structured `mentions` preferred over
+    regex text). A reply to this bot's prior message only counts when the user
+    did NOT @mention anyone else — otherwise replying to bot A while pinging
+    bot B would wake both A and B.
     """
     if mentions_bot(msg, my_username):
         return True
-    if extract_mentions(msg.text):
+    if msg.mentions or extract_mentions(msg.text):
         return False
     return is_reply_to_bot(msg, my_username)
