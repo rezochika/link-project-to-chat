@@ -722,7 +722,7 @@ class ProjectBot(AuthMixin):
                 incoming.chat, "Unauthorized.", reply_to=incoming.message,
             )
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             await self._transport.send_text(
                 incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
             )
@@ -1679,7 +1679,7 @@ class ProjectBot(AuthMixin):
 
         if not self._auth_identity(incoming.sender):
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return
@@ -1737,7 +1737,7 @@ class ProjectBot(AuthMixin):
     async def _on_voice_from_transport(self, incoming) -> None:
         if not self._auth_identity(incoming.sender):
             return
-        if self._rate_limited(int(incoming.sender.native_id)):
+        if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return

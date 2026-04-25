@@ -376,7 +376,7 @@ class ManagerBot(AuthMixin):
         if not sender or not self._auth_identity(sender):
             await self._transport.send_text(invocation.chat, "Unauthorized.")
             return False
-        if self._rate_limited(int(sender.native_id)):
+        if self._rate_limited(self._identity_key(sender)):
             await self._transport.send_text(invocation.chat, "Rate limited. Try again shortly.")
             return False
         return True

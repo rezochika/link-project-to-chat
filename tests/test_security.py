@@ -185,3 +185,102 @@ def test_claude_subprocess_env_scrubs_sensitive_vars(tmp_path):
 
     for key in sensitive:
         assert key not in captured_env, f"{key} leaked into Claude subprocess env"
+
+
+# ---------------------------------------------------------------------------
+# I3 — auth/rate-limit must not assume native_id is int-parseable
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limit_works_with_non_numeric_native_id():
+    """Auth/rate-limit must NOT assume native_id is int-parseable.
+
+    A Slack channel id 'C0XXXXXX' or Discord snowflake stays a string
+    end-to-end. Calling _rate_limited with a string identity-key must
+    succeed and return False on first call, True after exceeding the cap.
+    """
+    from link_project_to_chat._auth import AuthMixin
+
+    class _Bot(AuthMixin):
+        _allowed_usernames = ["alice"]
+
+    bot = _Bot()
+    bot._init_auth()
+
+    key = "discord:abc123-snowflake"
+    # 30 messages allowed per minute by default.
+    for _ in range(bot._MAX_MESSAGES_PER_MINUTE):
+        assert bot._rate_limited(key) is False
+    # 31st in the same window: rate limited.
+    assert bot._rate_limited(key) is True
+
+
+def test_failed_auth_count_works_with_string_key():
+    from link_project_to_chat._auth import AuthMixin
+
+    class _Bot(AuthMixin):
+        _allowed_usernames = ["alice"]
+
+    bot = _Bot()
+    bot._init_auth()
+    bot._failed_auth_counts["telegram:42"] = 5
+    # Direct check: lockout dict accepts string keys without TypeError.
+    assert bot._failed_auth_counts.get("telegram:42") == 5
+
+
+def test_auth_identity_with_non_numeric_native_id_uses_string_keyed_counts():
+    """Integration regression: when native_id is non-numeric (e.g. a Discord
+    snowflake), exercising _auth_identity through the username-mismatch path
+    must increment _failed_auth_counts with a single key.
+
+    This pins down the contract that the int-coercion fallback in
+    _auth_identity does not silently mix int and string keys inside
+    _failed_auth_counts when the same non-numeric user is denied twice.
+    """
+    from types import SimpleNamespace
+
+    from link_project_to_chat._auth import AuthMixin
+
+    class _Bot(AuthMixin):
+        _allowed_usernames = ["alice"]
+
+    bot = _Bot()
+    bot._init_auth()
+
+    identity = SimpleNamespace(
+        transport_id="discord",
+        native_id="snowflake-abc-123",
+        handle="mallory",
+    )
+
+    assert bot._auth_identity(identity) is False
+    assert bot._auth_identity(identity) is False
+
+    # Exactly one key — no mixed int/str collisions for the same user.
+    assert len(bot._failed_auth_counts) == 1
+    [only_key] = bot._failed_auth_counts.keys()
+    assert isinstance(only_key, str)
+    assert bot._failed_auth_counts[only_key] == 2
+
+
+def test_auth_identity_succeeds_for_non_numeric_native_id_with_allowed_username():
+    """A Discord/Slack user with non-numeric native_id whose handle matches the
+    allowlist must succeed (no ValueError) and be added to the trust dict.
+    Regression for the _trust_user int-cast bug."""
+    from link_project_to_chat._auth import AuthMixin
+    from types import SimpleNamespace
+
+    class _Bot(AuthMixin):
+        _allowed_usernames = ["bob"]
+
+    bot = _Bot()
+    bot._init_auth()
+
+    identity = SimpleNamespace(transport_id="discord", native_id="snowflake-abc-123", handle="bob")
+    assert bot._auth_identity(identity) is True
+    # Idempotent: a second call from the same identity also succeeds (cached trust).
+    assert bot._auth_identity(identity) is True
+    # _trust_user was called and the trusted-users dict contains an entry for "bob"
+    # (regardless of value type, the key must be present).
+    trusted = bot._get_trusted_user_bindings()
+    assert "bob" in trusted
