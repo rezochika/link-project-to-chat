@@ -4,6 +4,12 @@
 
 ### Added
 - **Spec #1 — Web UI Transport** (commits `6c12b39`..`d24ef52`) — first non-Telegram transport. FastAPI + HTMX + SSE + SQLite. New `WebTransport` implements the full Protocol; new `web/store.py`, `web/app.py`, Jinja2 templates, browser composer + live-update timeline. 11 commits, 768 tests pass.
+- **Spec #1 review-fix** (commits `77abcff`..`7b73b8d`) — closes 5 findings from external review:
+  - **P1.1** `--transport [telegram|web]` and `--port` CLI flags; `ProjectBot.__init__` accepts `transport_kind`/`web_port`; `build()` branches accordingly. The smoke command `link-project-to-chat start --project NAME --transport web --port 8080` now actually runs.
+  - **P1.2** Browser identity carries username through the auth gate. `WebTransport._dispatch_event` reads `sender_handle` from payload; `post_message` accepts optional `username` form field; `chat.html` renders a username input persisted via `localStorage`. Without this, every browser message was silently dropped by `_auth_identity`.
+  - **P1.3** `pytest.importorskip` at module scope on every web test file; `tests/transport/test_contract.py` defers `WebTransport` import into the `web` fixture branch. Core-only installs now collect cleanly without `[web]` extras.
+  - **P1.4** Multipart upload via `/chat/{id}/message`: `post_message` accepts `UploadFile`; saves to per-upload tempdir under `lp2c-web-*`; threads `files` array; `_dispatch_event` constructs `IncomingFile` list with `try/finally` cleanup. Composer template gains `enctype="multipart/form-data"` and a file input.
+  - **P2** SSE notify moved from `post_message` → `_dispatch_event` *after* `save_message`. Eliminates the race where the user's just-posted message could be missing from an immediate `/messages` refresh.
 - **Structured mentions** — `IncomingMessage.mentions: list[Identity]` field (`transport/base.py`); `group_filters.mentions_bot` prefers structured over regex; new `mentions_bot_by_id`. Foundational for non-Telegram transports.
 - **Prompt primitives** — `PromptKind`, `PromptOption`, `PromptSpec`, `PromptRef`, `PromptSubmission`, `PromptHandler` types; 4 new Protocol methods (`open_prompt`, `update_prompt`, `close_prompt`, `on_prompt_submit`). Wizard state above transport.
 - **Conversation sessions** — `ConversationSession` + `ConversationStore` in `manager/conversation.py` (transport-agnostic wizard state).
