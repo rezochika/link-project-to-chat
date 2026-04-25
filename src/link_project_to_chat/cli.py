@@ -282,6 +282,21 @@ def configure(ctx, username: str | None, remove_username: str | None, manager_to
     default=None,
     help='Comma-separated list of disallowed tools (e.g. "Bash(rm:*),Write")',
 )
+@click.option(
+    "--transport",
+    "transport_kind",
+    type=click.Choice(["telegram", "web"]),
+    default="telegram",
+    show_default=True,
+    help="Which transport to run the bot on.",
+)
+@click.option(
+    "--port",
+    "web_port",
+    type=int,
+    default=8080,
+    help="Listen port (web transport only).",
+)
 @click.pass_context
 def start(
     ctx,
@@ -297,6 +312,8 @@ def start(
     permission_mode: str | None,
     allowed_tools: str | None,
     disallowed_tools: str | None,
+    transport_kind: str,
+    web_port: int,
 ):
     """Start the Telegram bot.
 
@@ -326,6 +343,8 @@ def start(
             permission_mode=permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
+            transport_kind=transport_kind,
+            web_port=web_port,
         )
         return
 
@@ -398,6 +417,8 @@ def start(
             permission_mode=team_pm,
             peer_bot_username=peer_username,
             config_path=cfg_path,
+            transport_kind=transport_kind,
+            web_port=web_port,
         )
         return
 
@@ -440,6 +461,8 @@ def start(
             show_thinking=proj.show_thinking,
             trusted_users=effective_trusted_users,
             config_path=cfg_path,
+            transport_kind=transport_kind,
+            web_port=web_port,
         )
     else:
         run_bots(
@@ -452,6 +475,8 @@ def start(
             config_path=cfg_path,
             transcriber=transcriber,
             synthesizer=synthesizer,
+            transport_kind=transport_kind,
+            web_port=web_port,
         )
 
 

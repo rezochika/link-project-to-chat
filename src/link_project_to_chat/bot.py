@@ -37,7 +37,7 @@ from .backends.claude import (
     ClaudeStreamError,
     is_usage_cap_error,
 )
-from .transport import Button, Buttons, ChatKind, ChatRef, MessageRef
+from .transport import Button, Buttons, ChatKind, ChatRef, Identity, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
@@ -102,11 +102,15 @@ class ProjectBot(AuthMixin):
         role: str | None = None,
         peer_bot_username: str = "",
         config_path: Path | None = None,
+        transport_kind: str = "telegram",
+        web_port: int = 8080,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
         self._config_path = config_path
+        self.transport_kind = transport_kind
+        self.web_port = web_port
         if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
         else:
@@ -1880,9 +1884,25 @@ class ProjectBot(AuthMixin):
                 logger.error("Failed to send startup message to %d", uid, exc_info=True)
 
     def build(self) -> None:
-        from .transport.telegram import TelegramTransport
-        self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
-        self._app = self._transport.app
+        if self.transport_kind == "web":
+            from .web.transport import WebTransport
+            bot_identity = Identity(
+                transport_id="web",
+                native_id="bot1",
+                display_name=self.name,
+                handle=self.name.lower(),
+                is_bot=True,
+            )
+            db_path = Path.home() / ".link-project-to-chat" / "web" / f"{self.name}.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._transport = WebTransport(
+                db_path=db_path, bot_identity=bot_identity, port=self.web_port,
+            )
+            self._app = None  # WebTransport has no PTB Application
+        else:
+            from .transport.telegram import TelegramTransport
+            self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
+            self._app = self._transport.app  # PTB Application
         self._transport.on_ready(self._after_ready)
 
         async def _pre_authorize(identity) -> bool:
@@ -1922,41 +1942,42 @@ class ProjectBot(AuthMixin):
         for _name, _handler in ported_commands:
             self._transport.on_command(_name, _handler)
 
-        # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
-        self._transport.attach_telegram_routing(
-            group_mode=self.group_mode,
-            command_names=[n for n, _ in ported_commands],
-        )
+        if self.transport_kind == "telegram":
+            # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
+            self._transport.attach_telegram_routing(
+                group_mode=self.group_mode,
+                command_names=[n for n, _ in ported_commands],
+            )
 
-        # Team-mode bot: if the manager passed a Telethon session path, wire the
-        # bot-to-bot relay. Spec #0c: project bot owns its relay; the manager
-        # exposes the session-file absolute path via LP2C_TELETHON_SESSION when
-        # spawning team-mode subprocesses (see manager/process.py).
-        if self.team_name and self.group_chat_id:
-            session_env = os.environ.get("LP2C_TELETHON_SESSION")
-            if session_env:
-                cfg_path = self._effective_config_path()
-                config = load_config(cfg_path)
-                teams = load_teams(cfg_path)
-                team = teams.get(self.team_name)
-                team_bot_usernames = {
-                    b.bot_username for b in team.bots.values() if b.bot_username
-                } if team else set()
-                if not team_bot_usernames:
-                    logger.warning(
-                        "Team %r missing from config or has no bot usernames; "
-                        "skipping enable_team_relay (bot will operate without relay).",
-                        self.team_name,
-                    )
-                else:
-                    self._transport.enable_team_relay_from_session(
-                        session_path=session_env,
-                        api_id=config.telegram_api_id,
-                        api_hash=config.telegram_api_hash,
-                        team_bot_usernames=team_bot_usernames,
-                        group_chat_id=self.group_chat_id,
-                        team_name=self.team_name,
-                    )
+            # Team-mode bot: if the manager passed a Telethon session path, wire the
+            # bot-to-bot relay. Spec #0c: project bot owns its relay; the manager
+            # exposes the session-file absolute path via LP2C_TELETHON_SESSION when
+            # spawning team-mode subprocesses (see manager/process.py).
+            if self.team_name and self.group_chat_id:
+                session_env = os.environ.get("LP2C_TELETHON_SESSION")
+                if session_env:
+                    cfg_path = self._effective_config_path()
+                    config = load_config(cfg_path)
+                    teams = load_teams(cfg_path)
+                    team = teams.get(self.team_name)
+                    team_bot_usernames = {
+                        b.bot_username for b in team.bots.values() if b.bot_username
+                    } if team else set()
+                    if not team_bot_usernames:
+                        logger.warning(
+                            "Team %r missing from config or has no bot usernames; "
+                            "skipping enable_team_relay (bot will operate without relay).",
+                            self.team_name,
+                        )
+                    else:
+                        self._transport.enable_team_relay_from_session(
+                            session_path=session_env,
+                            api_id=config.telegram_api_id,
+                            api_hash=config.telegram_api_hash,
+                            team_bot_usernames=team_bot_usernames,
+                            group_chat_id=self.group_chat_id,
+                            team_name=self.team_name,
+                        )
 
     def run(self) -> None:
         """Run the transport's main loop. Owns the lifecycle from here on.
@@ -1993,6 +2014,8 @@ def run_bot(
     role: str | None = None,
     peer_bot_username: str = "",
     config_path: Path | None = None,
+    transport_kind: str = "telegram",
+    web_port: int = 8080,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -2026,6 +2049,8 @@ def run_bot(
         role=role,
         peer_bot_username=peer_bot_username,
         config_path=config_path,
+        transport_kind=transport_kind,
+        web_port=web_port,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -2054,6 +2079,8 @@ def run_bots(
     config_path: Path | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
+    transport_kind: str = "telegram",
+    web_port: int = 8080,
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
@@ -2085,6 +2112,8 @@ def run_bots(
             active_persona=proj.active_persona,
             show_thinking=proj.show_thinking,
             config_path=config_path,
+            transport_kind=transport_kind,
+            web_port=web_port,
         )
     else:
         names = ", ".join(config.projects.keys())
