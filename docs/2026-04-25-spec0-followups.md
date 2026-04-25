@@ -116,12 +116,12 @@ The PR #6 lockout test `test_bot_py_does_not_reference_ptb_application_internals
 
 ## Status as of 2026-04-25
 
-| Item | Severity | Owner |
-|---|---|---|
-| F1 dotfile policy | Low | unassigned |
-| F2 `build() -> None` | Trivial | unassigned |
-| F3 docstring note | Trivial | unassigned |
-| A1 trust persistence | Medium | spec #0a |
-| A2 group_chat_id | Medium | spec #0a |
-| A3 manager `_guard` int | Low | spec #0a / #0c |
-| C1 manager transport port | Medium | spec #0c |
+| Item | Severity | Owner | Status |
+|---|---|---|---|
+| F1 dotfile policy | Low | — | ✅ closed in `4a0bb69` |
+| F2 `build() -> None` | Trivial | — | ✅ closed in `4a0bb69` |
+| F3 docstring note | Trivial | — | ✅ closed in `4a0bb69` |
+| A1 trust persistence | Medium | spec #0a | open |
+| A2 group_chat_id | Medium | spec #0a | open |
+| A3 manager `_guard` int | Low | spec #0a / #0c | open |
+| C1 manager transport port | Medium | spec #0c | open |
