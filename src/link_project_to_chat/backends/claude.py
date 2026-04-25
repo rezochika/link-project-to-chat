@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import json
 import logging
-import os
 import re
 import subprocess
 import time
@@ -12,7 +10,7 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 from ..events import Error, Result, StreamEvent
-from .base import BackendCapabilities, HealthStatus
+from .base import BackendCapabilities, BaseBackend, HealthStatus
 from .claude_parser import parse_stream_line
 from .factory import register
 
@@ -162,7 +160,7 @@ def _build_telegram_awareness(capabilities: BackendCapabilities) -> str:
     )
 
 
-class ClaudeBackend:
+class ClaudeBackend(BaseBackend):
     name = "claude"
     capabilities = BackendCapabilities(
         models=MODELS,
@@ -172,6 +170,11 @@ class ClaudeBackend:
         supports_compact=True,
         supports_allowed_tools=True,
         supports_usage_cap_detection=True,
+    )
+    _env_keep_patterns = ()
+    _env_scrub_patterns = (
+        "*_TOKEN", "*_KEY", "*_SECRET",
+        "AWS_*", "OPENAI_*", "GITHUB_*", "DATABASE_*", "PASSWORD*",
     )
 
     def __init__(
@@ -336,15 +339,7 @@ class ClaudeBackend:
     ) -> subprocess.Popen:
         cmd = self._build_cmd()
 
-        env = os.environ.copy()
-        env.pop("CLAUDECODE", None)
-        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-        _SCRUB_PATTERNS = (
-            "*_TOKEN", "*_KEY", "*_SECRET",
-            "AWS_*", "OPENAI_*", "GITHUB_*", "DATABASE_*", "PASSWORD*",
-        )
-        for key in [k for k in env if any(fnmatch.fnmatch(k, p) for p in _SCRUB_PATTERNS)]:
-            del env[key]
+        env = self._prepare_env()
 
         proc = subprocess.Popen(
             cmd,

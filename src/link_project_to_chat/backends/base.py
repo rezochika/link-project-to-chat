@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fnmatch
+import os
 import subprocess
 from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass
@@ -25,6 +27,25 @@ class HealthStatus:
     ok: bool
     usage_capped: bool
     error_message: str | None = None
+
+
+class BaseBackend:
+    _env_keep_patterns: Sequence[str] = ()
+    _env_scrub_patterns: Sequence[str] = ()
+
+    def _matches(self, key: str, patterns: Sequence[str]) -> bool:
+        return any(fnmatch.fnmatch(key, pattern) for pattern in patterns)
+
+    def _prepare_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        for key in list(env):
+            if self._matches(key, self._env_keep_patterns):
+                continue
+            if self._matches(key, self._env_scrub_patterns):
+                del env[key]
+        return env
 
 
 class AgentBackend(Protocol):
