@@ -740,15 +740,19 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     assert "acme_dev_bot" in usernames
 
 
-def test_project_bot_build_installs_transport_lifecycle_hooks_for_run_polling(tmp_path):
-    """run_polling() only invokes Application post hooks, so build() must bridge
-    them to TelegramTransport's lifecycle.
+def test_project_bot_build_registers_after_ready_callback(tmp_path):
+    """build() must register the bot's _after_ready callback on the transport.
+
+    Note: post_init/post_stop wiring used to live here, but moved to
+    TelegramTransport.run() (Task 6 / I4). bot.py no longer touches the
+    Application by name; see test_bot_run_delegates_to_transport_run below
+    and tests/transport/test_telegram_transport.py for the wiring.
     """
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
 
     bot = ProjectBot(name="solo", path=tmp_path, token="t")
-    app = SimpleNamespace(post_init=None, post_stop=None)
+    app = SimpleNamespace()
     mock_transport = MagicMock()
     mock_transport.app = app
 
@@ -756,12 +760,23 @@ def test_project_bot_build_installs_transport_lifecycle_hooks_for_run_polling(tm
         "link_project_to_chat.transport.telegram.TelegramTransport.build",
         return_value=mock_transport,
     ):
-        returned_app = bot.build()
+        bot.build()
 
-    assert returned_app is app
-    assert app.post_init is mock_transport.post_init
-    assert app.post_stop is mock_transport.post_stop
     mock_transport.on_ready.assert_called_once_with(bot._after_ready)
+
+
+def test_bot_run_delegates_to_transport_run(tmp_path):
+    """ProjectBot.run() must call self._transport.run() — the Transport owns
+    the polling loop lifecycle (PTB run_polling, websocket loop, HTTP server)."""
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    mock_transport = MagicMock()
+    bot._transport = mock_transport
+
+    bot.run()
+
+    mock_transport.run.assert_called_once_with()
 
 
 @pytest.mark.asyncio

@@ -376,6 +376,16 @@ class TelegramTransport:
         await self._app.stop()
         await self._app.shutdown()
 
+    def run(self) -> None:
+        """Run PTB's polling loop. Owns post_init/post_stop wiring so bot.py
+        never touches the Application by name.
+
+        Synchronous: PTB's run_polling creates and manages its own event loop.
+        """
+        self._app.post_init = self.post_init
+        self._app.post_stop = self.post_stop
+        self._app.run_polling()
+
     # ── Outbound ──────────────────────────────────────────────────────────
     _DELETED_REPLY_TARGET_MARKERS = (
         "message to be replied not found",

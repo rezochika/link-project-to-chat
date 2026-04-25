@@ -289,3 +289,18 @@ async def test_send_text_with_button_styles_does_not_raise(transport):
     ]])
     ref = await transport.send_text(chat, "pick", buttons=buttons)
     assert isinstance(ref, MessageRef)
+
+
+def test_transport_has_run_method(transport):
+    """Every Transport must expose run() so bot.py never touches the native app.
+
+    Sync (not async): PTB's run_polling() creates its own event loop internally;
+    async-native transports (Discord) wrap in asyncio.run inside their run().
+    """
+    assert hasattr(transport, "run"), f"{type(transport).__name__} missing run()"
+    assert callable(transport.run)
+    import inspect
+    assert not inspect.iscoroutinefunction(transport.run), (
+        "run must be sync — PTB owns its event loop; async-native transports "
+        "internally wrap with asyncio.run inside their run()"
+    )

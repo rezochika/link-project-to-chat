@@ -150,6 +150,16 @@ class Transport(Protocol):
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
 
+    def run(self) -> None:
+        """Synchronously run the transport's main loop until cancelled.
+
+        Implementations own their event loop. PTB's Application.run_polling()
+        is sync and creates its own loop; async-native transports (Discord
+        client.start, uvicorn.serve) wrap with asyncio.run inside this method.
+        Returns when the transport stops.
+        """
+        ...
+
     async def send_text(
         self,
         chat: ChatRef,

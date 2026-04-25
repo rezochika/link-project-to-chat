@@ -87,6 +87,10 @@ class FakeTransport:
     async def stop(self) -> None:
         self._running = False
 
+    def run(self) -> None:
+        """Fake transport: no-op (tests drive dispatch synchronously)."""
+        return
+
     # ── Outbound ──────────────────────────────────────────────────────────
     async def send_text(
         self,

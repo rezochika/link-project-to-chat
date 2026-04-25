@@ -1894,8 +1894,6 @@ class ProjectBot(AuthMixin):
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
         self._app = self._transport.app
-        self._app.post_init = self._transport.post_init
-        self._app.post_stop = self._transport.post_stop
         self._transport.on_ready(self._after_ready)
 
         async def _pre_authorize(identity) -> bool:
@@ -1975,6 +1973,14 @@ class ProjectBot(AuthMixin):
 
         return app
 
+    def run(self) -> None:
+        """Run the transport's main loop. Owns the lifecycle from here on.
+
+        Synchronous: matches the underlying Transport.run() contract.
+        """
+        assert self._transport is not None
+        self._transport.run()
+
 
 def run_bot(
     name: str,
@@ -2046,11 +2052,11 @@ def run_bot(
         bot.task_manager.backend.model = model
     if effort:
         bot.task_manager.backend.effort = effort
-    app = bot.build()
+    bot.build()
     logger.info(
         "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
     )
-    app.run_polling()
+    bot.run()
 
 
 def run_bots(

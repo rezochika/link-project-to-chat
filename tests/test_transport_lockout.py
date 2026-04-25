@@ -28,3 +28,13 @@ def test_bot_py_has_no_telegram_imports():
         f"Unexpected telegram/telethon imports in bot.py: {unexpected}. "
         "All outbound/inbound code must go through the Transport abstraction."
     )
+
+
+def test_bot_py_does_not_reference_ptb_application_internals():
+    """Locks out runtime PTB coupling: bot.py must not name application-level
+    attributes (run_polling, post_init, post_stop, ApplicationBuilder)
+    directly. These are TelegramTransport's responsibility."""
+    src = (Path(__file__).parent.parent / "src" / "link_project_to_chat" / "bot.py").read_text()
+    forbidden = ["run_polling", ".post_init", ".post_stop", "ApplicationBuilder"]
+    found = [tok for tok in forbidden if tok in src]
+    assert not found, f"bot.py references PTB internals: {found}"

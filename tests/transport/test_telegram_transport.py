@@ -63,6 +63,28 @@ async def test_start_and_stop_delegate_to_application():
     t._app.shutdown.assert_awaited_once()
 
 
+def test_run_wires_post_init_and_post_stop_then_calls_run_polling():
+    """TelegramTransport.run() owns the post_init/post_stop bindings and
+    drives PTB's polling loop. bot.py never touches the Application by name.
+    """
+    # Use a SimpleNamespace so attribute assignments are plain (MagicMock would
+    # wrap assigned values in mocks and break the identity check).
+    run_polling_calls: list = []
+    app = SimpleNamespace(
+        post_init=None,
+        post_stop=None,
+        run_polling=lambda: run_polling_calls.append(()),
+    )
+    t = TelegramTransport(app)
+
+    t.run()
+
+    # Bound methods compare equal when bound to the same instance/function.
+    assert app.post_init == t.post_init
+    assert app.post_stop == t.post_stop
+    assert run_polling_calls == [()]
+
+
 async def test_on_message_handler_fires_on_telegram_update():
     """Inbound text message from telegram lands as IncomingMessage on the handler."""
     t, _bot = _make_transport_with_mock_bot()
