@@ -79,7 +79,13 @@ def test_save_config_preserves_project_unknown_keys(tmp_path: Path):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({
         "allowed_username": "alice",
-        "projects": {"myproj": {"path": "/p", "telegram_bot_token": "T", "model": "opus"}},
+        "projects": {
+            "myproj": {
+                "path": "/p",
+                "telegram_bot_token": "T",
+                "future_field": "future_value",
+            }
+        },
     }))
     cfg = Config(
         allowed_usernames=["alice"],
@@ -87,7 +93,12 @@ def test_save_config_preserves_project_unknown_keys(tmp_path: Path):
     )
     save_config(cfg, p)
     raw = json.loads(p.read_text())
-    assert raw["projects"]["myproj"]["model"] == "opus"
+    # Forward-compat: keys this code version does not know about must be
+    # preserved. Legacy Claude-shaped fields (``model``/``effort``/...) are
+    # NOT unknown — they are tracked by ``backend_state`` and are mirrored
+    # OUT at save time, so dropping them from the in-memory config drops
+    # them from disk too.
+    assert raw["projects"]["myproj"]["future_field"] == "future_value"
 
 
 def test_save_config_removes_deleted_projects(tmp_path: Path):

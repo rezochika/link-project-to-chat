@@ -52,6 +52,8 @@ class ProjectConfig:
     autostart: bool = False
     active_persona: str | None = None
     show_thinking: bool = False
+    backend: str = "claude"
+    backend_state: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,6 +72,8 @@ class TeamBotConfig:
     effort: str | None = None
     show_thinking: bool = False
     bot_peer: BotPeerRef | None = None
+    backend: str = "claude"
+    backend_state: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,7 +100,9 @@ class Config:
     tts_backend: str = ""            # "openai" or "" (disabled)
     tts_model: str = "tts-1"        # OpenAI TTS model
     tts_voice: str = "alloy"        # OpenAI TTS voice
-    default_model: str = ""          # global default model for all projects
+    default_model: str = ""          # legacy; mirrored from default_model_claude (kept for one release for downgrade safety)
+    default_backend: str = "claude"
+    default_model_claude: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     teams: dict[str, TeamConfig] = field(default_factory=dict)
 
@@ -183,6 +189,73 @@ def _load_permissions(proj: dict) -> str | None:
     if proj.get("dangerously_skip_permissions"):
         return "dangerously-skip-permissions"
     return proj.get("permission_mode") or None
+
+
+def _legacy_backend_state(
+    model: str | None,
+    effort: str | None,
+    permissions: str | None,
+    session_id: str | None,
+    show_thinking: bool,
+) -> dict[str, dict]:
+    """Fold legacy Claude-shaped flat fields into a backend_state map."""
+    state: dict[str, dict] = {}
+    claude: dict[str, object] = {}
+    if model is not None:
+        claude["model"] = model
+    if effort is not None:
+        claude["effort"] = effort
+    if permissions is not None:
+        claude["permissions"] = permissions
+    if session_id is not None:
+        claude["session_id"] = session_id
+    if show_thinking:
+        claude["show_thinking"] = True
+    if claude:
+        state["claude"] = claude
+    return state
+
+
+def _mirror_legacy_claude_fields(target: dict, backend_state: dict[str, dict]) -> None:
+    """Mirror Claude-shaped legacy flat keys onto *target* from backend_state.
+
+    The new shape is the source of truth; this only emits the legacy mirror
+    so old code reading raw JSON still finds the keys it expects (downgrade
+    safety). Keys absent from backend_state["claude"] are removed from target.
+    """
+    claude_state = backend_state.get("claude", {})
+    for key in ("model", "effort", "permissions", "session_id"):
+        if claude_state.get(key) is not None:
+            target[key] = claude_state[key]
+        else:
+            target.pop(key, None)
+    if claude_state.get("show_thinking"):
+        target["show_thinking"] = True
+    else:
+        target.pop("show_thinking", None)
+
+
+def _effective_backend_state(
+    backend_state: dict[str, dict],
+    *,
+    model: str | None,
+    effort: str | None,
+    permissions: str | None,
+    session_id: str | None,
+    show_thinking: bool,
+) -> dict[str, dict]:
+    """Resolve the canonical backend_state for save, folding in legacy fields.
+
+    ``backend_state`` is the source of truth. When it is empty (e.g. a freshly
+    constructed dataclass that only set legacy attributes), fall back to
+    folding the legacy fields into ``backend_state["claude"]`` so save still
+    persists them in the new shape. In particular, ``ProjectConfig(model=...)``
+    constructed by tests or by callers that haven't migrated yet should still
+    round-trip correctly through save.
+    """
+    if backend_state:
+        return backend_state
+    return _legacy_backend_state(model, effort, permissions, session_id, show_thinking)
 
 
 def resolve_permissions(permissions: str | None) -> tuple[bool, str | None]:
@@ -320,6 +393,35 @@ def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
         pass
 
 
+def _make_team_bot_config(b: dict) -> TeamBotConfig:
+    """Build a TeamBotConfig from a raw dict, folding legacy fields into backend_state."""
+    bot_model = b.get("model")
+    bot_effort = b.get("effort")
+    bot_permissions = b.get("permissions")
+    bot_session_id = b.get("session_id")
+    bot_show_thinking = b.get("show_thinking", False)
+    backend_state = b.get("backend_state") or _legacy_backend_state(
+        bot_model,
+        bot_effort,
+        bot_permissions,
+        bot_session_id,
+        bot_show_thinking,
+    )
+    return TeamBotConfig(
+        telegram_bot_token=b.get("telegram_bot_token", ""),
+        active_persona=b.get("active_persona"),
+        autostart=b.get("autostart", False),
+        permissions=bot_permissions,
+        bot_username=b.get("bot_username", ""),
+        session_id=bot_session_id,
+        model=bot_model,
+        effort=bot_effort,
+        show_thinking=bot_show_thinking,
+        backend=b.get("backend", "claude"),
+        backend_state=backend_state,
+    )
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     config = Config()
     if path.exists():
@@ -349,7 +451,11 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         config.tts_backend = raw.get("tts_backend", "")
         config.tts_model = raw.get("tts_model", "tts-1")
         config.tts_voice = raw.get("tts_voice", "alloy")
-        config.default_model = raw.get("default_model", "")
+        config.default_backend = raw.get("default_backend", "claude")
+        config.default_model_claude = raw.get(
+            "default_model_claude", raw.get("default_model", "")
+        )
+        config.default_model = raw.get("default_model", config.default_model_claude)
         valid_projects, malformed_projects = _split_project_entries(raw.get("projects", {}))
         for name in malformed_projects:
             # Tolerate phantom projects entries (no `path`) left over from a
@@ -364,6 +470,18 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
         for name, proj in valid_projects.items():
             project_allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
             trust_scope_usernames = project_allowed_usernames or config.allowed_usernames
+            proj_model = proj.get("model")
+            proj_effort = proj.get("effort")
+            proj_permissions = _load_permissions(proj)
+            proj_session_id = proj.get("session_id")
+            proj_show_thinking = proj.get("show_thinking", False)
+            backend_state = proj.get("backend_state") or _legacy_backend_state(
+                proj_model,
+                proj_effort,
+                proj_permissions,
+                proj_session_id,
+                proj_show_thinking,
+            )
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
@@ -376,13 +494,15 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     "trusted_user_id",
                 ),
                 trusted_user_ids=_migrate_user_ids(proj, "trusted_user_ids", "trusted_user_id"),
-                model=proj.get("model"),
-                effort=proj.get("effort"),
-                permissions=_load_permissions(proj),
-                session_id=proj.get("session_id"),
+                model=proj_model,
+                effort=proj_effort,
+                permissions=proj_permissions,
+                session_id=proj_session_id,
                 autostart=proj.get("autostart", False),
                 active_persona=proj.get("active_persona"),
-                show_thinking=proj.get("show_thinking", False),
+                show_thinking=proj_show_thinking,
+                backend=proj.get("backend", "claude"),
+                backend_state=backend_state,
             )
             if (
                 not config.projects[name].trusted_user_ids
@@ -401,17 +521,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 path=team["path"],
                 group_chat_id=team["group_chat_id"],
                 bots={
-                    role: TeamBotConfig(
-                        telegram_bot_token=b.get("telegram_bot_token", ""),
-                        active_persona=b.get("active_persona"),
-                        autostart=b.get("autostart", False),
-                        permissions=b.get("permissions"),
-                        bot_username=b.get("bot_username", ""),
-                        session_id=b.get("session_id"),
-                        model=b.get("model"),
-                        effort=b.get("effort"),
-                        show_thinking=b.get("show_thinking", False),
-                    )
+                    role: _make_team_bot_config(b)
                     for role, b in team.get("bots", {}).items()
                 },
             )
@@ -437,39 +547,29 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     return config
 
 
-def _merge_project_entry(existing: dict, p: "ProjectConfig") -> dict:
-    """Return an updated copy of *existing* with fields from *p*, preserving unknown keys."""
-    proj = dict(existing)
-    proj["path"] = p.path
-    proj["telegram_bot_token"] = p.telegram_bot_token
-    proj["allowed_usernames"] = p.allowed_usernames
-    proj.pop("username", None)
-    proj["trusted_user_ids"] = p.trusted_user_ids
-    proj.pop("trusted_user_id", None)
-    if p.model:
-        proj["model"] = p.model
-    if p.effort:
-        proj["effort"] = p.effort
-    if p.permissions:
-        proj["permissions"] = p.permissions
-    else:
-        proj.pop("permissions", None)
-    proj.pop("permission_mode", None)
-    proj.pop("dangerously_skip_permissions", None)
-    if p.session_id:
-        proj["session_id"] = p.session_id
-    else:
-        proj.pop("session_id", None)
-    proj["autostart"] = p.autostart
-    if p.active_persona:
-        proj["active_persona"] = p.active_persona
-    else:
-        proj.pop("active_persona", None)
-    if p.show_thinking:
-        proj["show_thinking"] = True
-    else:
-        proj.pop("show_thinking", None)
-    return proj
+def _serialize_team_bot(b: "TeamBotConfig") -> dict:
+    """Build the raw JSON dict for a team bot, dual-writing new + mirrored legacy."""
+    backend_state = _effective_backend_state(
+        b.backend_state,
+        model=b.model,
+        effort=b.effort,
+        permissions=b.permissions,
+        session_id=b.session_id,
+        show_thinking=b.show_thinking,
+    )
+    entry: dict = {
+        "telegram_bot_token": b.telegram_bot_token,
+        "backend": b.backend,
+        "backend_state": backend_state,
+    }
+    if b.active_persona:
+        entry["active_persona"] = b.active_persona
+    if b.autostart:
+        entry["autostart"] = True
+    if b.bot_username:
+        entry["bot_username"] = b.bot_username
+    _mirror_legacy_claude_fields(entry, backend_state)
+    return entry
 
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
@@ -544,16 +644,22 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw["tts_voice"] = config.tts_voice
     else:
         raw.pop("tts_voice", None)
-    if config.default_model:
-        raw["default_model"] = config.default_model
+    raw["default_backend"] = config.default_backend
+    # Phase 2 transitional precedence: legacy ``default_model`` wins over the
+    # new ``default_model_claude`` so callers that only mutate the legacy field
+    # (e.g. manager/bot.py:1990) still have their changes persisted. Today no
+    # caller mutates ``default_model_claude`` directly, so this direction
+    # cannot cause reverse silent-loss. Task 9 of the Phase 2 plan migrates
+    # the last legacy mutation, after which precedence direction is moot.
+    effective_default_model_claude = config.default_model or config.default_model_claude
+    if effective_default_model_claude:
+        raw["default_model_claude"] = effective_default_model_claude
+        raw["default_model"] = effective_default_model_claude
     else:
+        raw.pop("default_model_claude", None)
         raw.pop("default_model", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
-    # Keep inline merge here rather than using the _merge_project_entry helper:
-    # feat's multi-user trust model needs _write_raw_trusted_users +
-    # _effective_trusted_users, which the helper (from main) does not yet know
-    # how to invoke.
     for name, p in config.projects.items():
         proj = existing_projects.get(name, {})
         proj["path"] = p.path
@@ -573,29 +679,24 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             list_key="trusted_user_ids",
             singular_key="trusted_user_id",
         )
-        if p.model:
-            proj["model"] = p.model
-        if p.effort:
-            proj["effort"] = p.effort
-        if p.permissions:
-            proj["permissions"] = p.permissions
-        else:
-            proj.pop("permissions", None)
+        backend_state = _effective_backend_state(
+            p.backend_state,
+            model=p.model,
+            effort=p.effort,
+            permissions=p.permissions,
+            session_id=p.session_id,
+            show_thinking=p.show_thinking,
+        )
+        proj["backend"] = p.backend
+        proj["backend_state"] = backend_state
+        _mirror_legacy_claude_fields(proj, backend_state)
         proj.pop("permission_mode", None)
         proj.pop("dangerously_skip_permissions", None)
-        if p.session_id:
-            proj["session_id"] = p.session_id
-        else:
-            proj.pop("session_id", None)
         proj["autostart"] = p.autostart
         if p.active_persona:
             proj["active_persona"] = p.active_persona
         else:
             proj.pop("active_persona", None)
-        if p.show_thinking:
-            proj["show_thinking"] = True
-        else:
-            proj.pop("show_thinking", None)
         existing_projects[name] = proj
     # Merge teams
     existing_teams: dict = raw.get("teams", {})
@@ -604,17 +705,7 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         entry["path"] = team.path
         entry["group_chat_id"] = team.group_chat_id
         entry["bots"] = {
-            role: {
-                "telegram_bot_token": b.telegram_bot_token,
-                **({"active_persona": b.active_persona} if b.active_persona else {}),
-                **({"autostart": True} if b.autostart else {}),
-                **({"permissions": b.permissions} if b.permissions else {}),
-                **({"bot_username": b.bot_username} if b.bot_username else {}),
-                **({"session_id": b.session_id} if b.session_id else {}),
-                **({"model": b.model} if b.model else {}),
-                **({"effort": b.effort} if b.effort else {}),
-                **({"show_thinking": True} if b.show_thinking else {}),
-            }
+            role: _serialize_team_bot(b)
             for role, b in team.bots.items()
         }
         existing_teams[name] = entry
@@ -745,17 +836,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                     path=team["path"],
                     group_chat_id=team["group_chat_id"],
                     bots={
-                        role: TeamBotConfig(
-                            telegram_bot_token=b.get("telegram_bot_token", ""),
-                            active_persona=b.get("active_persona"),
-                            autostart=b.get("autostart", False),
-                            permissions=b.get("permissions"),
-                            bot_username=b.get("bot_username", ""),
-                            session_id=b.get("session_id"),
-                            model=b.get("model"),
-                            effort=b.get("effort"),
-                            show_thinking=b.get("show_thinking", False),
-                        )
+                        role: _make_team_bot_config(b)
                         for role, b in team.get("bots", {}).items()
                     },
                 )
