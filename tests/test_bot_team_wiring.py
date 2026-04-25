@@ -964,11 +964,80 @@ async def test_telegram_text_dispatch_preserves_context_and_submits_agent(tmp_pa
     )
 
 
+def test_team_mode_bot_uses_string_session_env_when_set(tmp_path, monkeypatch):
+    """Spec D′: when LP2C_TELETHON_SESSION_STRING is set, build() calls
+    enable_team_relay_from_session_string and ignores the path-mode fallback.
+
+    Each subprocess builds an in-memory StringSession instead of opening the
+    shared telethon.session file — eliminates the ``database is locked`` race.
+    """
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setenv("LP2C_TELETHON_SESSION_STRING", "1$encoded-session")
+    # Path env may also be present (back-compat); string must win.
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ):
+        bot.build()
+
+    mock_transport.enable_team_relay_from_session_string.assert_called_once()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
+    call_kwargs = mock_transport.enable_team_relay_from_session_string.call_args.kwargs
+    assert call_kwargs["session_string"] == "1$encoded-session"
+    assert call_kwargs["api_id"] == 12345
+    assert call_kwargs["api_hash"] == "fakehash"
+    assert call_kwargs["group_chat_id"] == -100123
+    assert call_kwargs["team_name"] == "acme"
+    assert "acme_manager_bot" in call_kwargs["team_bot_usernames"]
+    assert "acme_dev_bot" in call_kwargs["team_bot_usernames"]
+
+
+def test_no_relay_when_string_and_path_env_both_unset(tmp_path, monkeypatch):
+    """Neither env var → no relay, no surprise client construction."""
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
+    monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ):
+        bot.build()
+
+    mock_transport.enable_team_relay_from_session_string.assert_not_called()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
+
+
 def test_no_relay_when_session_env_unset(tmp_path, monkeypatch):
     """Without LP2C_TELETHON_SESSION, build() does NOT call enable_team_relay_from_session."""
     from unittest.mock import MagicMock, patch
 
     monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
 
     bot = _make_team_bot_for_relay_test(tmp_path)
 

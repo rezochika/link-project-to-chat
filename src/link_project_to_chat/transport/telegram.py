@@ -200,6 +200,36 @@ class TelegramTransport:
             team_name=team_name,
         )
 
+    def enable_team_relay_from_session_string(
+        self,
+        *,
+        session_string: str,
+        api_id: int,
+        api_hash: str,
+        team_bot_usernames: set[str],
+        group_chat_id: int,
+        team_name: str,
+    ) -> None:
+        """Like ``enable_team_relay_from_session`` but seeds the Telethon
+        client from an in-memory ``StringSession`` instead of a SQLite file.
+
+        Multiple subprocesses can each call this with the same string and
+        connect concurrently — Telethon treats them as parallel connections
+        of the same authorized account, with no shared SQLite write lock to
+        fight over. Spec D′ uses this to fix the ``database is locked`` race
+        that kills team-bot autostart when several bots open the same
+        ``telethon.session`` file at once.
+        """
+        from telethon import TelegramClient  # telethon is an optional extra
+        from telethon.sessions import StringSession
+        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        self.enable_team_relay(
+            telethon_client=client,
+            team_bot_usernames=team_bot_usernames,
+            group_chat_id=group_chat_id,
+            team_name=team_name,
+        )
+
     def attach_telegram_routing(
         self,
         *,

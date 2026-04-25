@@ -310,3 +310,135 @@ def test_build_project_bot_env_uses_absolute_session_path(tmp_path, monkeypatch)
     session = Path(env["LP2C_TELETHON_SESSION"])
     assert session.is_absolute()
     assert session == (tmp_path / "telethon.session").resolve()
+
+
+def test_build_project_bot_env_passes_session_string_when_provided(tmp_path, monkeypatch):
+    """Spec D′: when the caller supplies a StringSession export, the helper
+    sets LP2C_TELETHON_SESSION_STRING and skips the file-path fallback so
+    subprocesses don't open the shared SQLite session."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    monkeypatch.delenv("LP2C_TELETHON_SESSION", raising=False)
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
+    (tmp_path / "telethon.session").touch()
+    env = _build_project_bot_env(
+        team_name="acme",
+        config_dir=tmp_path,
+        session_string="1$abc",
+    )
+    assert env.get("LP2C_TELETHON_SESSION_STRING") == "1$abc"
+    assert "LP2C_TELETHON_SESSION" not in env
+
+
+def test_build_project_bot_env_solo_mode_ignores_session_string(tmp_path, monkeypatch):
+    """Solo bots have no relay; even an explicit session_string must not leak
+    into their env (would be ignored anyway, but cleaner to omit)."""
+    from link_project_to_chat.manager.process import _build_project_bot_env
+
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
+    env = _build_project_bot_env(
+        team_name=None,
+        config_dir=tmp_path,
+        session_string="1$abc",
+    )
+    assert "LP2C_TELETHON_SESSION_STRING" not in env
+
+
+def test_export_telethon_session_string_roundtrips_real_session(tmp_path):
+    """Exporting a real (empty but schema-initialised) Telethon SQLite session
+    yields a StringSession string that Telethon can parse back. Empty session
+    counts as 'no auth_key' → helper returns None so callers fall back."""
+    from telethon.sessions import SQLiteSession
+
+    from link_project_to_chat.manager.process import _export_telethon_session_string
+
+    session_path = tmp_path / "telethon.session"
+    # SQLiteSession's __init__ runs the schema migrations, leaving a valid but
+    # unauthorized session file on disk.
+    sql = SQLiteSession(str(session_path))
+    sql.close()
+
+    result = _export_telethon_session_string(session_path)
+    # Empty session = no auth_key → no useful StringSession, helper returns None.
+    assert result is None
+
+
+def test_export_telethon_session_string_returns_string_for_authorized_session(tmp_path):
+    """An authorized session (auth_key + dc info present) round-trips through
+    StringSession.save → StringSession(...) cleanly."""
+    from telethon.crypto import AuthKey
+    from telethon.sessions import SQLiteSession, StringSession
+
+    from link_project_to_chat.manager.process import _export_telethon_session_string
+
+    session_path = tmp_path / "telethon.session"
+    sql = SQLiteSession(str(session_path))
+    sql.set_dc(2, "149.154.167.51", 443)
+    sql.auth_key = AuthKey(b"\x01" * 256)
+    sql.save()
+    sql.close()
+
+    result = _export_telethon_session_string(session_path)
+    assert isinstance(result, str)
+    assert result.startswith("1")  # StringSession version prefix
+    # And it round-trips:
+    parsed = StringSession(result)
+    assert parsed.dc_id == 2
+    assert parsed.server_address == "149.154.167.51"
+    assert parsed.port == 443
+    assert parsed.auth_key.key == b"\x01" * 256
+
+
+def test_export_telethon_session_string_returns_none_when_file_missing(tmp_path):
+    """Missing session file → None (caller falls back to path-mode env var
+    or skips relay entirely)."""
+    from link_project_to_chat.manager.process import _export_telethon_session_string
+
+    result = _export_telethon_session_string(tmp_path / "does-not-exist.session")
+    assert result is None
+
+
+def test_start_team_passes_string_session_env_to_subprocess(tmp_path, monkeypatch):
+    """Spec D′ end-to-end: ``start_team`` exports the manager's Telethon session
+    once and passes it to the subprocess via ``LP2C_TELETHON_SESSION_STRING``,
+    so concurrent team-bot starts don't race for the SQLite write lock.
+    """
+    from telethon.crypto import AuthKey
+    from telethon.sessions import SQLiteSession
+
+    cfg_path = tmp_path / "config.json"
+    config = Config(
+        teams={
+            "acme": TeamConfig(
+                path=str(tmp_path),
+                group_chat_id=-100,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        }
+    )
+    save_config(config, cfg_path)
+
+    # Authorize a real session file in the manager's config dir so the export
+    # produces a non-empty StringSession.
+    session_path = tmp_path / "telethon.session"
+    sql = SQLiteSession(str(session_path))
+    sql.set_dc(2, "149.154.167.51", 443)
+    sql.auth_key = AuthKey(b"\x02" * 256)
+    sql.save()
+    sql.close()
+
+    captured: dict = {}
+
+    def fake_popen(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _running_proc(pid=99)
+
+    pm = ProcessManager(project_config_path=cfg_path)
+    monkeypatch.setattr("link_project_to_chat.manager.process.subprocess.Popen", fake_popen)
+    assert pm.start_team("acme", "manager") is True
+
+    env = captured["env"]
+    assert env is not None
+    assert env.get("LP2C_TELETHON_SESSION_STRING")
+    # Path-mode env var is suppressed when the string variant is set.
+    assert "LP2C_TELETHON_SESSION" not in env

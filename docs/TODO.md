@@ -156,6 +156,7 @@ Small-scope plans, ready to implement.
 | [Fix Windows config M11 collection](superpowers/plans/2026-04-24-fix-windows-config-m11-collection.md) | Make M11 tests collect on Windows; preserve Unix root-skip | ⏳ pending |
 | [Isolate OpenAI transcriber tests](superpowers/plans/2026-04-24-isolate-openai-transcriber-tests.md) | Tests pass without optional `openai` dep | ⏳ pending |
 | [Update team-relay lifecycle test](superpowers/plans/2026-04-24-update-team-relay-lifecycle-test.md) | Match current TeamRelay contract (new + edited handlers) | ⏳ pending |
+| Spec D′ — StringSession for team-bot relays | Manager exports `telethon.session` once and seeds subprocesses via `LP2C_TELETHON_SESSION_STRING`; eliminates the `database is locked` race on concurrent autostart (path-mode env var kept as fallback) | ✅ branch `fix/team-relay-string-session` |
 
 ---
 

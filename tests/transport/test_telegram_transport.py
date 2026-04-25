@@ -718,6 +718,52 @@ async def test_enable_team_relay_from_session_constructs_client(monkeypatch):
     assert t._team_relay is not None
 
 
+async def test_enable_team_relay_from_session_string_constructs_string_session(monkeypatch):
+    """Spec D′: enable_team_relay_from_session_string wraps the session string
+    in a Telethon StringSession and hands the resulting client to the relay.
+
+    Each subprocess gets its own in-memory session built from the same string,
+    so concurrent connect() calls don't race for a shared SQLite file lock.
+    """
+    from types import SimpleNamespace
+
+    constructed_clients: list = []
+    constructed_string_sessions: list = []
+
+    class FakeTelegramClient:
+        def __init__(self, session, api_id, api_hash):
+            constructed_clients.append((session, api_id, api_hash))
+
+    class FakeStringSession:
+        def __init__(self, s):
+            constructed_string_sessions.append(s)
+            self._s = s
+
+    fake_telethon = SimpleNamespace(TelegramClient=FakeTelegramClient)
+    fake_telethon_sessions = SimpleNamespace(StringSession=FakeStringSession)
+    sys_mod = __import__("sys")
+    monkeypatch.setitem(sys_mod.modules, "telethon", fake_telethon)
+    monkeypatch.setitem(sys_mod.modules, "telethon.sessions", fake_telethon_sessions)
+
+    t, _bot = _make_transport_with_mock_bot()
+    t.enable_team_relay_from_session_string(
+        session_string="1$abcdef",
+        api_id=12345,
+        api_hash="secret",
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100,
+        team_name="acme",
+    )
+
+    assert constructed_string_sessions == ["1$abcdef"]
+    assert len(constructed_clients) == 1
+    session_arg, api_id_arg, api_hash_arg = constructed_clients[0]
+    assert isinstance(session_arg, FakeStringSession)
+    assert api_id_arg == 12345
+    assert api_hash_arg == "secret"
+    assert t._team_relay is not None
+
+
 async def test_tempdir_cleanup_runs_even_when_handler_raises(tmp_path):
     """A handler exception must not leak the downloaded-attachment tempdir."""
     t, _bot = _make_transport_with_mock_bot()
