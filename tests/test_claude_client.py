@@ -43,7 +43,17 @@ def test_telegram_awareness_in_command():
     # Covers all four scopes: identity, output style, user commands, fragility.
     assert "link-project-to-chat" in prompt
     assert "MarkdownV2" in prompt
-    assert "/run" in prompt and "/effort" in prompt
+    # The command list paragraph is now built dynamically from
+    # BackendCapabilities (`_telegram_command_summary`); for ClaudeBackend the
+    # capability flags are all true, so capability-gated entries appear. Each
+    # command is wrapped in backticks so LLMs reliably parse the tokens.
+    assert "`/run <cmd>`" in prompt
+    assert "`/effort low|medium|high|xhigh|max`" in prompt
+    assert "`/stop_skill`" in prompt
+    assert "`/stop_persona`" in prompt
+    assert "`/thinking on|off`" in prompt
+    assert "`/permissions <mode>`" in prompt
+    assert "`/compact`" in prompt
     assert "CHANNEL FRAGILITY" in prompt
 
 

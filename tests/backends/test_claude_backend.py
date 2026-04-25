@@ -2,8 +2,27 @@ from pathlib import Path
 
 import pytest
 
-from link_project_to_chat.backends.base import HealthStatus
-from link_project_to_chat.backends.claude import ClaudeBackend, DEFAULT_MODEL
+from link_project_to_chat.backends.base import BackendCapabilities, HealthStatus
+from link_project_to_chat.backends.claude import (
+    ClaudeBackend,
+    DEFAULT_MODEL,
+    _build_telegram_awareness,
+    _telegram_command_summary,
+)
+
+
+def _capabilities(**overrides) -> BackendCapabilities:
+    defaults = dict(
+        models=("alpha", "beta"),
+        supports_thinking=True,
+        supports_permissions=True,
+        supports_resume=True,
+        supports_compact=True,
+        supports_allowed_tools=True,
+        supports_usage_cap_detection=True,
+    )
+    defaults.update(overrides)
+    return BackendCapabilities(**defaults)
 
 
 def test_claude_backend_declares_name_and_capabilities():
@@ -61,3 +80,105 @@ async def test_probe_health_reports_stream_error(monkeypatch):
     assert status.ok is False
     assert status.usage_capped is False
     assert status.error_message == "connection refused"
+
+
+# ---------------------------------------------------------------------------
+# Telegram-awareness preamble built from BackendCapabilities
+# ---------------------------------------------------------------------------
+
+
+def test_telegram_command_summary_includes_thinking_when_supported():
+    summary = _telegram_command_summary(_capabilities(supports_thinking=True))
+    assert "`/thinking on|off`" in summary
+
+
+def test_telegram_command_summary_omits_thinking_when_unsupported():
+    summary = _telegram_command_summary(_capabilities(supports_thinking=False))
+    assert "/thinking" not in summary
+
+
+def test_telegram_command_summary_omits_permissions_when_unsupported():
+    summary = _telegram_command_summary(_capabilities(supports_permissions=False))
+    assert "/permissions" not in summary
+
+
+def test_telegram_command_summary_omits_compact_when_unsupported():
+    summary = _telegram_command_summary(_capabilities(supports_compact=False))
+    assert "/compact" not in summary
+
+
+def test_telegram_command_summary_renders_models_pipe_joined():
+    summary = _telegram_command_summary(_capabilities(models=("alpha", "beta")))
+    assert "`/model alpha|beta`" in summary
+
+
+def test_telegram_command_summary_omits_model_when_no_models_declared():
+    summary = _telegram_command_summary(_capabilities(models=()))
+    assert "/model" not in summary
+
+
+def test_build_telegram_awareness_preserves_prefix_and_suffix_prose():
+    preamble = _build_telegram_awareness(_capabilities())
+    # Prefix prose must be intact.
+    assert "running inside `link-project-to-chat`" in preamble
+    assert "OUTPUT:" in preamble
+    assert "USER COMMANDS:" in preamble
+    # Prefix ends with "Suggest them when relevant: " and the helper output
+    # flows directly into it (no double-"relevant", no separate label).
+    assert "Suggest them when relevant: `/run <cmd>`" in preamble
+    # Suffix prose (channel fragility) must be intact.
+    assert "CHANNEL FRAGILITY:" in preamble
+    assert "rebuild.sh" in preamble
+
+
+def test_build_telegram_awareness_drops_unsupported_commands_for_minimal_backend():
+    preamble = _build_telegram_awareness(
+        _capabilities(
+            models=(),
+            supports_thinking=False,
+            supports_permissions=False,
+            supports_compact=False,
+        )
+    )
+    assert "/thinking" not in preamble
+    assert "/permissions" not in preamble
+    assert "/compact" not in preamble
+    # `/model` is also gated on declared models.
+    assert "/model" not in preamble
+    # Bot-level commands always appear regardless of capability flags —
+    # they are defined in bot.py and not gated on the active backend.
+    assert "`/run <cmd>`" in preamble
+    assert "`/help`" in preamble
+    assert "`/effort low|medium|high|xhigh|max`" in preamble
+    assert "`/stop_skill`" in preamble
+    assert "`/stop_persona`" in preamble
+
+
+def test_telegram_command_summary_always_includes_bot_level_commands():
+    """Bot-level commands (defined in bot.py) must appear regardless of
+    backend capabilities — they are not gated on supports_* flags."""
+    summary = _telegram_command_summary(
+        _capabilities(
+            models=(),
+            supports_thinking=False,
+            supports_permissions=False,
+            supports_compact=False,
+        )
+    )
+    # Original always-on commands (backtick-wrapped so LLMs reliably parse
+    # the command tokens).
+    assert "`/run <cmd>`" in summary
+    assert "`/tasks`" in summary
+    assert "`/skills`" in summary
+    assert "`/use [name]`" in summary
+    assert "`/persona [name]`" in summary
+    assert "`/voice`" in summary
+    assert "`/lang`" in summary
+    assert "`/reset`" in summary
+    assert "`/status`" in summary
+    assert "`/help`" in summary
+    # Restored always-on commands (regression: these were dropped in the
+    # initial parameterization and must remain bot-level, not capability-gated).
+    assert "`/effort low|medium|high|xhigh|max`" in summary
+    assert "`/stop_skill`" in summary
+    assert "`/stop_persona`" in summary

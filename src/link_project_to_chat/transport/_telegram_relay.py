@@ -81,7 +81,7 @@ async def _maybe_await(value: Any) -> Any:
 # of these patterns are pure acknowledgments and are never forwarded by the
 # relay. Echoing acks back and forth is the root shape of a ping-pong loop:
 # stopping them here prevents the loop from starting, regardless of whether
-# Claude decides to hand the work off or the halt cap eventually trips.
+# the agent decides to hand the work off or the halt cap eventually trips.
 _ACK_EMOJI_ONLY = re.compile(r"^\s*[\U0001F44D\U0001F44C\u2705\U0001F197\u2714\U0001F64F\U0001F64C]+\s*$")
 _ACK_WORDS = re.compile(
     r"^(?:"
@@ -459,7 +459,7 @@ class TeamRelay:
         if peer is None:
             # The peer @mention disappeared during streaming (edge case).
             return
-        # Skip relay while only the @mention has been written. Claude-driven
+        # Skip relay while only the @mention has been written. Agent-driven
         # bots follow a system note that starts every reply with the peer
         # handle on its own line; during a tool-call pause mid-stream, the
         # debounce can fire while the body is still empty. Returning here

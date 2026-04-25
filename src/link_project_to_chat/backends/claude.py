@@ -92,9 +92,11 @@ _ASK_DISMISSED_HINT = (
     "The user's answer will arrive as a follow-up message."
 )
 
-# Tells Claude it is running inside this Telegram bot so it adapts output, suggests
-# bot commands when relevant, and treats the channel-carrying files as fragile.
-_TELEGRAM_AWARENESS = """\
+# Tells the agent it is running inside this Telegram bot so it adapts output, suggests
+# bot commands when relevant, and treats the channel-carrying files as fragile. The
+# command list paragraph is built dynamically from BackendCapabilities so a backend
+# without `supports_compact` (etc.) does not advertise commands the bot will reject.
+_TELEGRAM_AWARENESS_PREFIX = """\
 You are running inside `link-project-to-chat`, a Telegram bot. Your responses are \
 delivered to a Telegram user via the bot's message handler in \
 `src/link_project_to_chat/bot.py`. Keep these constraints in mind:
@@ -105,17 +107,59 @@ Prefer concise, scannable replies. The user sees only your text output — not y
 tool calls or thinking — so narrate key actions in one short sentence each.
 
 USER COMMANDS: The user can invoke slash commands directly. Suggest them when \
-relevant: `/run <cmd>` (background shell, output via `/tasks`), `/tasks` \
-(list/cancel/log), `/effort low|medium|high|xhigh|max`, `/model \
-haiku|sonnet|opus|opus[1m]|sonnet[1m]`, `/permissions <mode>`, `/skills`, \
-`/use [name]`, `/stop_skill`, `/persona [name]`, `/stop_persona`, `/voice`, \
-`/lang`, `/compact`, `/reset`, `/status`, `/help`.
+relevant: """
+
+_TELEGRAM_AWARENESS_SUFFIX = """
 
 CHANNEL FRAGILITY: `src/link_project_to_chat/bot.py`, \
 `src/link_project_to_chat/claude_client.py`, and the `link-project-to-chat` systemd \
 unit are load-bearing for THIS conversation — a breaking change drops the user's \
 only channel to you. Confirm before editing those files, and note that running \
 `rebuild.sh` restarts the service (brief gap before the next message gets through)."""
+
+
+def _telegram_command_summary(capabilities: BackendCapabilities) -> str:
+    """Produce the comma-joined, backtick-wrapped command list for the preamble.
+
+    Bot-level commands (always available regardless of backend) come first; the
+    capability-gated ones are appended only when the backend declares support,
+    so a backend without (e.g.) `supports_compact` doesn't advertise `/compact`.
+    The returned string is concatenated directly after the prefix's "Suggest
+    them when relevant: " — it carries no leading label.
+    """
+    commands = [
+        "`/run <cmd>`",
+        "`/tasks`",
+        "`/effort low|medium|high|xhigh|max`",
+        "`/skills`",
+        "`/use [name]`",
+        "`/stop_skill`",
+        "`/persona [name]`",
+        "`/stop_persona`",
+        "`/voice`",
+        "`/lang`",
+        "`/reset`",
+        "`/status`",
+        "`/help`",
+    ]
+    if capabilities.supports_thinking:
+        commands.append("`/thinking on|off`")
+    if capabilities.models:
+        commands.append("`/model " + "|".join(capabilities.models) + "`")
+    if capabilities.supports_permissions:
+        commands.append("`/permissions <mode>`")
+    if capabilities.supports_compact:
+        commands.append("`/compact`")
+
+    return ", ".join(commands) + "."
+
+
+def _build_telegram_awareness(capabilities: BackendCapabilities) -> str:
+    return (
+        _TELEGRAM_AWARENESS_PREFIX
+        + _telegram_command_summary(capabilities)
+        + _TELEGRAM_AWARENESS_SUFFIX
+    )
 
 
 class ClaudeBackend:
@@ -198,7 +242,7 @@ class ClaudeBackend:
 
         # Combine Telegram awareness, AskUserQuestion hint, team context (if any),
         # and any user/skill prompt.
-        parts = [_TELEGRAM_AWARENESS, _ASK_DISMISSED_HINT]
+        parts = [_build_telegram_awareness(self.capabilities), _ASK_DISMISSED_HINT]
         if self.team_system_note:
             parts.append(self.team_system_note)
         if self.append_system_prompt:
