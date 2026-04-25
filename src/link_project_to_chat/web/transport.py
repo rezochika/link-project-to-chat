@@ -263,7 +263,7 @@ class WebTransport:
             transport_id=self.TRANSPORT_ID,
             native_id=payload.get("sender_native_id", BROWSER_USER_ID),
             display_name=payload.get("sender_display_name", "You"),
-            handle=None,
+            handle=payload.get("sender_handle"),  # may be None for unauthenticated/anonymous
             is_bot=False,
         )
         # Authorizer gate: silently drop if rejected. Mirrors the C2 DoS-defense

@@ -53,3 +53,11 @@ async def test_root_redirects_to_default_chat(app_client):
     resp = await client.get("/", follow_redirects=False)
     assert resp.status_code in (301, 302, 307, 308)
     assert "/chat/" in resp.headers["location"]
+
+
+async def test_post_with_username_flows_to_inbound_queue(app_client):
+    client, inbound_queue = app_client
+    resp = await client.post("/chat/default/message", data={"text": "hi", "username": "alice"})
+    assert resp.status_code in (200, 204)
+    event = inbound_queue.get_nowait()
+    assert event["payload"]["sender_handle"] == "alice"

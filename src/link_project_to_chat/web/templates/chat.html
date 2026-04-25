@@ -15,10 +15,19 @@
 
   <form class="composer"
         hx-post="/chat/{{ chat_id }}/message"
-        hx-on::after-request="this.reset()"
+        hx-on::after-request="this.text.value=''"
         hx-swap="none">
+    <input type="text" name="username" id="username-field"
+           placeholder="username" autocomplete="username"
+           value="" required>
     <input type="text" name="text" placeholder="Message…" autocomplete="off" autofocus required>
     <button type="submit">Send</button>
   </form>
+  <script>
+    // Persist username across reloads.
+    const u = document.getElementById("username-field");
+    u.value = localStorage.getItem("lp2c.username") || "";
+    u.addEventListener("input", () => localStorage.setItem("lp2c.username", u.value));
+  </script>
 </div>
 {% endblock %}

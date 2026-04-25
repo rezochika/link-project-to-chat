@@ -49,11 +49,21 @@ def create_app(
         )
 
     @app.post("/chat/{chat_id}/message")
-    async def post_message(chat_id: str, text: str = Form(...)):
+    async def post_message(
+        chat_id: str,
+        text: str = Form(...),
+        username: str | None = Form(None),
+    ):
+        payload = {
+            "text": text,
+            "sender_native_id": "browser_user",
+            "sender_display_name": username or "You",
+            "sender_handle": username,
+        }
         await inbound_queue.put({
             "event_type": "inbound_message",
             "chat_id": chat_id,
-            "payload": {"text": text, "sender_native_id": "browser_user", "sender_display_name": "You"},
+            "payload": payload,
         })
         await _notify_sse(sse_queues, chat_id)
         return HTMLResponse("", status_code=204)
