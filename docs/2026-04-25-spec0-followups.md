@@ -3,9 +3,9 @@
 Tracker for items deferred or surfaced during execution of `docs/superpowers/plans/2026-04-25-transport-spec0-review-fixes.md` (PR #6 on `rezochika/link-project-to-chat`).
 
 Categorized by spec milestone:
-- **F**: cleanup follow-ups from this PR's reviews (small, optional)
-- **A**: deferred to spec #0a (auth/persistence + group_chat_id config schema)
-- **C**: deferred to spec #0c (manager port)
+- **F**: cleanup follow-ups from this PR's reviews (small, optional) — ✅ closed in `4a0bb69`
+- **A**: re-targeted to spec #1 (Web UI) — initially tagged for spec #0a, but #0a (group/team port) shipped without addressing them. Web UI is the first transport that actually needs string-typed user IDs and per-transport group IDs.
+- **C**: ✅ closed by spec #0c (manager port) — only the documented residue (`cli.py:696 run_polling`, manager-lockout allowlist) remains, deferred to a future "Conversation primitive" spec.
 
 ---
 
@@ -54,7 +54,9 @@ grep -n "= bot.build()\|=bot.build()\|build()\." src/ tests/  # confirm nothing 
 
 ---
 
-## A — Deferred to spec #0a (persistence + config schema)
+## A — Re-targeted to spec #1 (Web UI)
+
+> **Re-tag note (2026-04-25):** Originally listed under spec #0a. Spec #0a (group/team port, `2026-04-21-transport-group-team-port-design.md`) has since shipped without addressing these — they don't block the Telegram-only path, so #0a closed cleanly. They become load-bearing the moment a non-Telegram transport ships. Spec #1 (Web UI) is the natural new home since it's the first transport with string-only user IDs and per-transport group identity.
 
 ### A1 — Migrate `_trusted_users` persistence to string identity ids
 
@@ -89,39 +91,36 @@ Four remaining `int(.native_id)` casts compare incoming chat id to the config-st
 ### A3 — Manager `_guard` legacy int path vs `_guard_invocation` string path
 
 **Source:** Final integration review, "Documented deferrals" note.
-**File:** `src/link_project_to_chat/manager/bot.py:362` (legacy `_guard(update)`) and `:379` (`_guard_invocation`).
+**File:** `src/link_project_to_chat/manager/bot.py` — legacy `_guard(update)` and `_guard_invocation`.
 **Severity:** Low — currently mutually exclusive in practice.
 
 `_guard` (legacy update path) still calls `self._rate_limited(user.id)` with `user.id` as int. `_guard_invocation` uses string keys. They share `_rate_limits` dict, producing mixed-key state for the same user if both fire. Currently disjoint by handler routing, but a future refactor could collide them.
 
-**Scope:** retire `_guard(update)` once the manager is fully ported to the transport (overlaps with spec #0c).
+**Scope:** retire `_guard(update)` when the residual `Update`-based handlers are migrated as part of the future "Conversation primitive" spec (which will close the remaining `tests/test_manager_lockout.py` allowlist).
 
 ---
 
-## C — Deferred to spec #0c (manager port)
+## C — ✅ Closed by spec #0c (manager port)
 
-### C1 — Port `manager/bot.py` to the Transport Protocol
+### C1 — Port `manager/bot.py` to the Transport Protocol — ✅ Closed
 
-**Source:** CLAUDE.md ("manager still Telegram-specific, pending port"); spec #0 scope boundary.
-**Files:** `src/link_project_to_chat/cli.py:696` (`ManagerBot.build().run_polling()`), `src/link_project_to_chat/manager/bot.py:2167-2168` (`post_init`/`post_stop`).
-**Severity:** Medium — the manager bot is the only remaining PTB-coupled code path.
+**Status:** Closed by spec #0c (`docs/superpowers/specs/2026-04-21-transport-manager-port-design.md`). Manager now runs through `TelegramTransport`; `manager/telegram_group.py` was relocated to `transport/_telegram_group.py` (commit `6702fac`); 11 commands ported via `transport.on_command`; wizards ported (`0188ac4`, `381a8cf`, `cb2036d`, `575b99e`); `tests/test_manager_lockout.py` pins the residual telegram-import allowlist. pyproject bumped to **0.16.0** (`10521b2`).
 
-The PR #6 lockout test `test_bot_py_does_not_reference_ptb_application_internals` only covers `bot.py`. The manager still names `run_polling`, `post_init`, `post_stop` directly. Spec #0c is the place to:
-- Extend the lockout to `manager/bot.py`
-- Apply the same `Transport.run()` delegation
-- Remove the legacy `_guard(update)` path (overlaps with A3)
-- Replace remaining `int(.native_id)` casts in manager code
+**Residue (intentional, allowlisted):**
+- `cli.py:696` calls `bot.build().run_polling()`. Spec #0c §2 explicitly defers the last `Update`/`ConversationHandler` references until a future "Conversation primitive" abstraction lands.
+- `manager/bot.py` attaches `_post_init`/`_post_stop` to the underlying Application because the manager owns its lifecycle via `run_polling`. Documented inline.
+- The 6-name `telegram.ext` import allowlist in `tests/test_manager_lockout.py` (`Update`, `ConversationHandler`, `ContextTypes`, `MessageHandler`, `CommandHandler`, `CallbackQueryHandler`, `filters`) is intentional surface preserved for the as-yet-unwritten Conversation primitive spec.
 
 ---
 
-## Status as of 2026-04-25
+## Status as of 2026-04-25 (re-verified after spec #0a/#0c closure)
 
 | Item | Severity | Owner | Status |
 |---|---|---|---|
 | F1 dotfile policy | Low | — | ✅ closed in `4a0bb69` |
 | F2 `build() -> None` | Trivial | — | ✅ closed in `4a0bb69` |
 | F3 docstring note | Trivial | — | ✅ closed in `4a0bb69` |
-| A1 trust persistence | Medium | spec #0a | open |
-| A2 group_chat_id | Medium | spec #0a | open |
-| A3 manager `_guard` int | Low | spec #0a / #0c | open |
-| C1 manager transport port | Medium | spec #0c | open |
+| A1 trust persistence | Medium | spec #1 (Web UI) | open — load-bearing once a non-Telegram transport ships |
+| A2 group_chat_id | Medium | spec #1 (Web UI) | open — same trigger as A1 |
+| A3 manager `_guard` int | Low | spec #1 / Conversation primitive | open — disjoint in practice today |
+| C1 manager transport port | — | spec #0c | ✅ closed (manager runs through `TelegramTransport`; residue allowlisted) |
