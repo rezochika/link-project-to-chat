@@ -330,7 +330,7 @@ class ProjectBot(AuthMixin):
                     try:
                         last_ref = await self._transport.send_text(
                             chat,
-                            plain[:4096] if len(plain) > 4096 else plain,
+                            plain[:self._transport.max_text_length] if len(plain) > self._transport.max_text_length else plain,
                             reply_to=reply_to,
                             buttons=btns,
                         )
@@ -458,14 +458,14 @@ class ProjectBot(AuthMixin):
     async def _send_voice_response(
         self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
     ) -> None:
+        assert self._transport is not None
         voice_dir = Path(tempfile.gettempdir()) / "link-project-to-chat" / self.name / "tts"
         voice_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         plain = strip_html(md_to_telegram(text))
-        if len(plain) > 4096:
-            plain = plain[:4093] + "..."
+        if len(plain) > self._transport.max_text_length:
+            plain = plain[:self._transport.max_text_length - 3] + "..."
         out_path = voice_dir / f"tts_{uuid.uuid4().hex}.opus"
 
-        assert self._transport is not None
         try:
             await self._synthesizer.synthesize(plain, out_path)
             await self._transport.send_voice(chat, out_path, reply_to=reply_to)

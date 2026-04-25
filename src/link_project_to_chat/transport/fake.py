@@ -65,6 +65,7 @@ class FakeTransport:
     """In-memory implementation of the Transport Protocol."""
 
     TRANSPORT_ID = "fake"
+    max_text_length: int = 4096  # Match the most-restrictive transport for test parity.
 
     def __init__(self) -> None:
         self.sent_messages: list[SentMessage] = []

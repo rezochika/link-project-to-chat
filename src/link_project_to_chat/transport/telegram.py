@@ -113,6 +113,7 @@ class TelegramTransport:
     """
 
     TRANSPORT_ID = TRANSPORT_ID
+    max_text_length: int = 4096  # Telegram's hard cap.
 
     def __init__(self, application: Any) -> None:
         """Construct from an already-built telegram.ext.Application.

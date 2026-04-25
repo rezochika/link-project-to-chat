@@ -147,6 +147,8 @@ class Transport(Protocol):
     one. Transports that don't support thread-style replies MAY ignore the hint.
     """
 
+    max_text_length: int  # Largest single-message text length the platform accepts.
+
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
 

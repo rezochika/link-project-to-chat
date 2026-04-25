@@ -304,3 +304,10 @@ def test_transport_has_run_method(transport):
         "run must be sync — PTB owns its event loop; async-native transports "
         "internally wrap with asyncio.run inside their run()"
     )
+
+
+def test_transport_exposes_max_text_length(transport):
+    """Every Transport declares its platform's max single-message text length."""
+    assert hasattr(transport, "max_text_length")
+    assert isinstance(transport.max_text_length, int)
+    assert transport.max_text_length > 0
