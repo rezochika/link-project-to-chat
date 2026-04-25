@@ -2,11 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add structured `mentions` + prompt/session primitives to the Transport layer, introduce transport-agnostic config types (`BotPeerRef`, `RoomBinding`), update group routing to prefer ID-based matching, and ship `WebTransport` backed by FastAPI + HTMX + SSE + SQLite.
+> **Updated 2026-04-25** — refreshed after spec #0 review-fix PR #6 closure: incorporates `set_authorizer`, `Transport.run()`, `max_text_length`, `has_unsupported_media` Protocol additions, adds Task 4b for A1 (trust-persistence migration), tags severity, adds explicit Exit Criteria.
+
+**Goal:** Add structured `mentions` + prompt/session primitives to the Transport layer, introduce transport-agnostic config types (`BotPeerRef`, `RoomBinding`), migrate `_trusted_users` persistence to string identity ids, update group routing to prefer ID-based matching, and ship `WebTransport` backed by FastAPI + HTMX + SSE + SQLite. The new transport must satisfy the post-PR-#6 contract: `set_authorizer`, sync `run()`, `max_text_length`, and `has_unsupported_media`.
 
 **Architecture:** Shared prompt and mention types live in `transport/base.py`; `FakeTransport` gains inject helpers for test-driving prompts; `WebTransport` runs an embedded FastAPI+uvicorn server with SQLite-backed message storage and SSE live updates; `ConversationSession` in `manager/conversation.py` owns wizard state above the transport layer.
 
 **Tech Stack:** Python 3.11+, FastAPI, Jinja2, HTMX (CDN), aiosqlite, uvicorn
+
+**Severity ordering — engineer SHOULD complete in order, MAY stop after Task 6:**
+- **Tasks 1–6 are infrastructure** that ships value independently — structured mentions, prompt primitives, transport-agnostic config types, A1 trust-persistence migration, ID-based group routing, conversation sessions. All reusable for any future non-Telegram transport (Discord, Slack). Land these even if Task 7+ is deferred.
+- **Tasks 7–10 are the Web transport** itself — package, FastAPI app, `WebTransport`, contract-test extension. Web-specific.
+- **Task 4b is required before Task 7** — without trust-persistence migration, the first non-numeric Web user crashes on first contact.
 
 ---
 
@@ -767,6 +774,132 @@ Expected: all 5 tests PASS.
 ```bash
 git add src/link_project_to_chat/config.py tests/test_config_peer_refs.py
 git commit -m "feat: add BotPeerRef/RoomBinding to config with backward-compat Telegram migration"
+```
+
+---
+
+### Task 4b: Migrate `_trusted_users` persistence to string identity ids (closes A1)
+
+**Findings closed:** A1 from `docs/2026-04-25-spec0-followups.md` — config persistence still calls `int(user_id)` unconditionally; non-numeric Web/Discord users crash on first auth-success contact.
+
+**Files:**
+- Modify: `src/link_project_to_chat/config.py` — `bind_trusted_user`, `bind_project_trusted_user`, `_normalize_trusted_users` callers
+- Modify: `src/link_project_to_chat/_auth.py` — `_trust_user` resilience already landed in PR #6 (`0ad608e`); confirm + extend
+- Create: `tests/test_trust_persistence_migration.py`
+
+- [ ] **Step 1: Failing tests**
+
+```python
+# tests/test_trust_persistence_migration.py
+import json
+from pathlib import Path
+
+from link_project_to_chat.config import bind_trusted_user, load_config
+
+
+def test_bind_trusted_user_accepts_non_numeric_id(tmp_path):
+    """A Web/Discord user_id (string snowflake or arbitrary id) must persist."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"telegram_bot_token": "x"}))
+    bind_trusted_user(cfg, username="alice", user_id="web-user-abc-123")
+    raw = json.loads(cfg.read_text())
+    assert raw["trusted_users"]["alice"] == "web-user-abc-123"
+
+
+def test_load_config_round_trips_string_trusted_user(tmp_path):
+    """Saved string ids must round-trip through load_config without int-coercion."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "telegram_bot_token": "x",
+        "trusted_users": {"alice": "web-user-abc-123"},
+    }))
+    loaded = load_config(cfg)
+    assert loaded.trusted_users["alice"] == "web-user-abc-123"
+
+
+def test_legacy_int_trusted_user_still_loads(tmp_path):
+    """Existing user configs with int values must keep working."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "telegram_bot_token": "x",
+        "trusted_users": {"bob": 42},
+    }))
+    loaded = load_config(cfg)
+    # Stored as-is; AuthMixin handles mixed-key lookups (per PR #6 0ad608e).
+    assert loaded.trusted_users["bob"] == 42
+
+
+def test_bind_project_trusted_user_accepts_non_numeric_id(tmp_path):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": "/tmp", "telegram_bot_token": "y"}},
+    }))
+    from link_project_to_chat.config import bind_project_trusted_user
+    bind_project_trusted_user(cfg, "myproj", username="carol", user_id="discord-snowflake-789")
+    raw = json.loads(cfg.read_text())
+    assert raw["projects"]["myproj"]["trusted_users"]["carol"] == "discord-snowflake-789"
+```
+
+- [ ] **Step 2: Run to verify FAIL**
+
+```
+pytest tests/test_trust_persistence_migration.py -v
+```
+Expected: FAIL on `bind_trusted_user(... "web-user-abc-123")` with `ValueError: invalid literal for int()`.
+
+- [ ] **Step 3: Drop `int(user_id)` in `config.py` write paths**
+
+Find all sites: `grep -n 'int(user_id)' src/link_project_to_chat/config.py` (expect 4 hits in `bind_trusted_user`, `bind_project_trusted_user`, `_normalize_trusted_users`, etc.).
+
+Change each from:
+```python
+trusted_users[normalized] = int(user_id)
+```
+to:
+```python
+try:
+    stored: int | str = int(user_id)
+except (TypeError, ValueError):
+    stored = user_id  # non-numeric ids (Web/Discord) persist as-is
+trusted_users[normalized] = stored
+```
+
+(This mirrors the in-memory pattern landed in PR #6 commit `0ad608e`.)
+
+- [ ] **Step 4: Update `_normalize_trusted_users` (load path)**
+
+The load-side normalization currently does `int(value)` to coerce JSON values. Mirror the same try/except pattern so legacy int-typed entries continue to load while new string entries pass through unchanged.
+
+- [ ] **Step 5: Confirm `_auth.py` already handles mixed-key dicts**
+
+Per PR #6 (`0ad608e`), `AuthMixin._auth_identity` and `_trust_user` already tolerate non-numeric ids. Run:
+```
+pytest tests/test_security.py::test_auth_identity_succeeds_for_non_numeric_native_id_with_allowed_username -v
+```
+Expected: PASS (regression already covered).
+
+- [ ] **Step 6: Run all relevant tests**
+
+```
+pytest tests/test_trust_persistence_migration.py tests/test_security.py tests/test_config.py tests/test_auth.py -v
+```
+Expected: all PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/link_project_to_chat/config.py tests/test_trust_persistence_migration.py
+git commit -m "$(cat <<'EOF'
+refactor(config): persist trusted_user ids as opaque strings (A1)
+
+Drop the int(user_id) cast in bind_trusted_user / bind_project_trusted_user.
+Non-numeric Web/Discord ids now round-trip through save→load without
+ValueError. Legacy int-typed entries still load (mixed-key dicts allowed
+per PR #6 0ad608e).
+
+Closes A1 from docs/2026-04-25-spec0-followups.md.
+EOF
+)"
 ```
 
 ---
@@ -1561,6 +1694,14 @@ git commit -m "feat: add WebTransport FastAPI app with SSE, Jinja2 templates, an
 - Modify: `src/link_project_to_chat/transport/__init__.py`
 - Create: `tests/web/test_web_transport.py`
 
+**Post-PR-#6 Protocol surface — `WebTransport` MUST implement:**
+- `set_authorizer(authorizer: AuthorizerCallback | None) -> None` — pre-dispatch DoS-defense gate. Store the callback and consult it at the top of inbound dispatch BEFORE any expensive work (file download, handler invocation). Mirror `TelegramTransport`'s pattern (`transport/telegram.py:512–521`).
+- `run() -> None` — sync entry point. For Web (async-native uvicorn), wrap with `asyncio.run(self._serve_forever())` where `_serve_forever` does `await uvicorn.Server(uvicorn.Config(app, ...)).serve()`. Returns when the server stops.
+- `max_text_length: int` — class-level attribute. Web has no platform hard cap; declare `max_text_length: int = 1_000_000` (1 MB conservative).
+- `IncomingMessage.has_unsupported_media: bool` — set on every constructed `IncomingMessage`. Web only handles text+files via the message form, so always pass `has_unsupported_media=False`. Document inline.
+
+These methods are enforced by parametrized contract tests in `tests/transport/test_contract.py`. Skipping them produces test failures, not silent gaps.
+
 - [ ] **Step 1: Write failing tests**
 
 ```python
@@ -2159,3 +2300,43 @@ Expected: all tests PASS (no regressions).
 git add tests/transport/test_contract.py
 git commit -m "test: extend contract tests with WebTransport, prompt lifecycle, and mention contract"
 ```
+
+---
+
+## Exit Criteria
+
+The plan is **complete** when ALL of the following hold:
+
+### Functional
+- [ ] `pytest -v` — full suite green (modulo pre-existing flaky `test_cancelling_waiting_input_task_releases_next_claude_task`).
+- [ ] `pytest tests/transport/test_contract.py -v` — every contract test passes parametrized across `fake`, `telegram`, AND `web`. Specifically including the post-PR-#6 contracts:
+  - `test_set_authorizer_blocks_dispatch_when_returns_false`
+  - `test_set_authorizer_allows_dispatch_when_returns_true`
+  - `test_transport_has_run_method`
+  - `test_transport_exposes_max_text_length`
+- [ ] `pytest tests/web/ -v` — Web-specific tests green.
+- [ ] `pytest tests/test_trust_persistence_migration.py -v` — A1 migration round-trips both numeric and non-numeric ids.
+
+### Static / structural
+- [ ] `grep -nE "int\(.*native_id" src/link_project_to_chat/bot.py` — exactly the 4 `incoming.chat.native_id` group_chat_id casts remain (these will be replaced by `RoomBinding`-based comparison once Task 4/4b lands; rerun after each refactor).
+- [ ] `grep -n "int(user_id)" src/link_project_to_chat/config.py` — empty (A1 closure).
+- [ ] `grep -nE "run_polling|\.post_init|\.post_stop|ApplicationBuilder" src/link_project_to_chat/bot.py` — empty (PR #6 lockout still passes).
+
+### Smoke (manual, run-once)
+- [ ] `link-project-to-chat start --project NAME --transport web --port 8080` (or equivalent) — starts a real WebTransport, browse to `http://localhost:8080`, send a message, see the bot reply via SSE.
+- [ ] Voice and document upload work via the web composer (Task 8 forms must support multipart).
+- [ ] Group routing: with `RoomBinding` in config, the bot recognizes a room mention by id; legacy int `group_chat_id` config still loads.
+
+### Documentation
+- [ ] `docs/2026-04-25-spec0-followups.md` — A1, A2 marked ✅ closed with the spec #1 commit references.
+- [ ] `docs/TODO.md` — spec #1 row moves from 📋 to ✅; A1/A2 rows close.
+- [ ] `docs/CHANGELOG.md` — entry for "Web UI transport landed; A1 trust persistence migrated."
+
+---
+
+## Notes for the executor
+
+- Tasks 1–6 deliver immediate value (structured mentions + prompt primitives + transport-agnostic config + A1 migration + ID-based group routing + conversation sessions). Land these first; even if Tasks 7–10 stall, Tasks 1–6 unlock Discord/Slack ports cheaply.
+- Task 4b (A1) is a hard prerequisite for Task 7: without string-id persistence, the very first non-numeric Web user crashes. Don't skip it.
+- The Web smoke test depends on FastAPI/uvicorn being installed (`pip install -e ".[web]"`). The plan adds the optional dep group in Task 7; tests in Tasks 7–10 should `pytest.importorskip("fastapi")` so the suite still runs without web deps installed.
+- After Task 10, the contract test will run **3×** — `fake`, `telegram`, `web`. CI runtime grows by ~2-3 seconds per parametrized test. Acceptable.
