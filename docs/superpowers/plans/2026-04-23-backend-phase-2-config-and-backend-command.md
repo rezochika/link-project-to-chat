@@ -127,7 +127,9 @@ pytest tests/test_config_migration.py tests/test_config.py -v
 
 Expected: `AttributeError` for missing `backend`, `backend_state`, and `default_model_claude`.
 
-- [ ] **Step 3: Extend the config dataclasses**
+- [ ] **Step 3: Extend the config dataclasses without dropping existing fields**
+
+Do **not** replace the current dataclass definitions wholesale. Add the backend fields to the existing classes, preserving current fields and types such as `trusted_users: dict[str, int | str]`, `bot_peer`, `room`, and any transport-abstraction fields that landed after this plan was written.
 
 ```python
 # src/link_project_to_chat/config.py
@@ -136,7 +138,7 @@ class ProjectConfig:
     path: str
     telegram_bot_token: str
     allowed_usernames: list[str] = field(default_factory=list)
-    trusted_users: dict[str, int] = field(default_factory=dict)
+    trusted_users: dict[str, int | str] = field(default_factory=dict)
     trusted_user_ids: list[int] = field(default_factory=list)
     backend: str = "claude"
     backend_state: dict[str, dict] = field(default_factory=dict)
@@ -162,10 +164,13 @@ class TeamBotConfig:
     model: str | None = None
     effort: str | None = None
     show_thinking: bool = False
+    # Preserve the existing bot_peer field in the real class.
 
 
 @dataclass
 class Config:
+    # Add these fields near the existing default_model field; do not remove
+    # projects, teams, voice config, or auth fields from the real class.
     default_backend: str = "claude"
     default_model_claude: str = ""
     default_model: str = ""
@@ -327,6 +332,35 @@ def test_save_session_writes_backend_state_and_legacy_mirror(tmp_path: Path):
     assert raw["projects"]["demo"]["session_id"] == "sess-1"
 
 
+def test_save_session_uses_active_non_claude_backend_without_legacy_mirror(tmp_path: Path):
+    from link_project_to_chat.config import save_session
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "demo": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "tok",
+                        "backend": "codex",
+                        "backend_state": {"codex": {}, "claude": {"session_id": "old-claude"}},
+                        "session_id": "old-claude",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    save_session("demo", "sess-codex", path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    assert raw["projects"]["demo"]["backend_state"]["codex"]["session_id"] == "sess-codex"
+    assert raw["projects"]["demo"]["backend_state"]["claude"]["session_id"] == "old-claude"
+    assert raw["projects"]["demo"]["session_id"] == "old-claude"
+
+
 def test_load_session_prefers_backend_state(tmp_path: Path):
     from link_project_to_chat.config import load_session
 
@@ -349,6 +383,34 @@ def test_load_session_prefers_backend_state(tmp_path: Path):
     )
 
     assert load_session("demo", path) == "new-shape"
+
+
+def test_clear_session_removes_backend_state_and_legacy_mirror(tmp_path: Path):
+    from link_project_to_chat.config import clear_session
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "demo": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "tok",
+                        "backend": "claude",
+                        "backend_state": {"claude": {"session_id": "sess-1"}},
+                        "session_id": "sess-1",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    clear_session("demo", path)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    assert "session_id" not in raw["projects"]["demo"]["backend_state"]["claude"]
+    assert "session_id" not in raw["projects"]["demo"]
 ```
 
 - [ ] **Step 2: Run the helper tests to confirm failure**
@@ -415,6 +477,10 @@ def _session_from_entry(entry: dict) -> str | None:
     return state.get("session_id") or entry.get("session_id")
 
 
+def _active_backend_name(entry: dict) -> str:
+    return entry.get("backend") or "claude"
+
+
 def load_session(
     project_name: str,
     path: Path = DEFAULT_CONFIG,
@@ -438,8 +504,6 @@ def load_session(
         except (json.JSONDecodeError, OSError):
             pass
     return None
-    entry = raw.get("projects", {}).get(project_name, {})
-    return _session_from_entry(entry)
 
 
 def save_session(
@@ -450,10 +514,52 @@ def save_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> None:
-    if team_name and role:
-        patch_team_bot_backend_state(team_name, role, "claude", {"session_id": session_id}, path)
-        return
-    patch_backend_state(project_name, "claude", {"session_id": session_id}, path)
+    def _patch(raw: dict) -> None:
+        if team_name and role:
+            entry = (
+                raw.setdefault("teams", {})
+                .setdefault(team_name, {})
+                .setdefault("bots", {})
+                .setdefault(role, {})
+            )
+        else:
+            entry = raw.setdefault("projects", {}).setdefault(project_name, {})
+        backend_name = _active_backend_name(entry)
+        backend_state = entry.setdefault("backend_state", {})
+        state = backend_state.setdefault(backend_name, {})
+        state["session_id"] = session_id
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(entry, backend_state)
+
+    _patch_json(_patch, path)
+
+
+def clear_session(
+    project_name: str,
+    path: Path = DEFAULT_CONFIG,
+    *,
+    team_name: str | None = None,
+    role: str | None = None,
+) -> None:
+    def _patch(raw: dict) -> None:
+        if team_name and role:
+            entry = (
+                raw.setdefault("teams", {})
+                .setdefault(team_name, {})
+                .setdefault("bots", {})
+                .setdefault(role, {})
+            )
+        else:
+            entry = raw.setdefault("projects", {}).setdefault(project_name, {})
+        backend_name = _active_backend_name(entry)
+        backend_state = entry.setdefault("backend_state", {})
+        state = backend_state.setdefault(backend_name, {})
+        state.pop("session_id", None)
+        entry.pop("session_id", None)
+        if backend_name == "claude":
+            _mirror_legacy_claude_fields(entry, backend_state)
+
+    _patch_json(_patch, path)
 ```
 
 Also add:
@@ -466,15 +572,59 @@ def patch_team_bot_backend(team_name: str, role: str, backend_name: str, path: P
     _patch_json(_patch, path)
 ```
 
-- [ ] **Step 5: Update the bot and manager call sites to use the new helpers**
+- [ ] **Step 5: Update `ProjectBot` startup and persistence call sites to use backend state**
 
 ```python
 # src/link_project_to_chat/bot.py
 from .config import patch_backend_state, patch_team_bot_backend, patch_team_bot_backend_state
 
-patch_backend_state(self.name, self.task_manager.backend.name, {"show_thinking": self.show_thinking}, self._effective_config_path())
-patch_backend_state(self.name, self.task_manager.backend.name, {"model": self.task_manager.backend.model}, self._effective_config_path())
+# Add constructor args; keep existing flat args during the transition so older
+# call sites keep working until this task migrates them.
+backend_name: str = "claude"
+backend_state: dict[str, dict] | None = None
+
+state = dict((backend_state or {}).get(backend_name, {}))
+state.setdefault(
+    "permissions",
+    "dangerously-skip-permissions" if skip_permissions else permission_mode,
+)
+state.setdefault("allowed_tools", allowed_tools or [])
+state.setdefault("disallowed_tools", disallowed_tools or [])
+state.setdefault("show_thinking", show_thinking)
+_backend = _create_backend(backend_name, self.path, state)
+self._backend_name = backend_name
+self._backend_state = backend_state or {backend_name: state}
+
+def _patch_backend_config(self, fields: dict) -> None:
+    cfg = self._effective_config_path()
+    backend_name = self.task_manager.backend.name
+    if self.team_name and self.role:
+        patch_team_bot_backend_state(self.team_name, self.role, backend_name, fields, cfg)
+    else:
+        patch_backend_state(self.name, backend_name, fields, cfg)
+
+def _backend_state_for(self, backend_name: str) -> dict:
+    return dict(self._backend_state.get(backend_name, {}))
+
+self._patch_backend_config({"show_thinking": self.show_thinking})
+self._patch_backend_config({"model": self.task_manager.backend.model})
 ```
+
+Update `run_bot()` and `start_project_bot()` so the loaded config supplies the active backend:
+
+```python
+project_state = proj.backend_state.get(proj.backend, {})
+bot = ProjectBot(
+    ...,
+    backend_name=proj.backend,
+    backend_state=proj.backend_state,
+    model=model or project_state.get("model") or config.default_model_claude or None,
+    effort=effort or project_state.get("effort"),
+    show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
+)
+```
+
+For team bots, use `bot_cfg.backend` / `bot_cfg.backend_state` and persist via `patch_team_bot_backend_state()`, not `patch_project()`.
 
 ```python
 # src/link_project_to_chat/manager/bot.py
@@ -510,6 +660,7 @@ git commit -m "feat: migrate backend-state helpers and persistence call sites"
 
 **Files:**
 - Modify: `src/link_project_to_chat/bot.py`
+- Modify: `src/link_project_to_chat/task_manager.py`
 - Create: `tests/test_backend_command.py`
 - Create: `tests/test_capability_gating.py`
 
@@ -519,7 +670,9 @@ git commit -m "feat: migrate backend-state helpers and persistence call sites"
 # tests/test_backend_command.py
 import pytest
 
+from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.transport import ChatKind, ChatRef, CommandInvocation, Identity, MessageRef
+from link_project_to_chat.transport.fake import FakeTransport
 
 
 def _invocation(name: str, *args: str) -> CommandInvocation:
@@ -535,9 +688,23 @@ def _invocation(name: str, *args: str) -> CommandInvocation:
     )
 
 
+def _bot_with_fake_transport(tmp_path):
+    bot = ProjectBot(
+        name="demo",
+        path=tmp_path,
+        token="tok",
+        allowed_usernames=["alice"],
+        trusted_users={"alice": "1"},
+        config_path=tmp_path / "config.json",
+    )
+    fake = FakeTransport()
+    bot._transport = fake
+    return bot, fake
+
+
 @pytest.mark.asyncio
-async def test_backend_command_reports_active_backend(project_bot_with_fake_transport):
-    bot, fake = project_bot_with_fake_transport
+async def test_backend_command_reports_active_backend(tmp_path):
+    bot, fake = _bot_with_fake_transport(tmp_path)
 
     await bot._on_backend(_invocation("backend"))
 
@@ -549,11 +716,12 @@ async def test_backend_command_reports_active_backend(project_bot_with_fake_tran
 import pytest
 
 from tests.backends.fakes import FakeBackend
+from tests.test_backend_command import _bot_with_fake_transport, _invocation
 
 
 @pytest.mark.asyncio
-async def test_thinking_command_rejected_when_backend_does_not_support_it(project_bot_with_fake_transport):
-    bot, fake = project_bot_with_fake_transport
+async def test_thinking_command_rejected_when_backend_does_not_support_it(tmp_path):
+    bot, fake = _bot_with_fake_transport(tmp_path)
     bot.task_manager._backend = FakeBackend(bot.path)
 
     await bot._on_thinking(_invocation("thinking", "on"))
@@ -571,10 +739,10 @@ Expected: missing handler methods and no capability-gating behavior.
 
 - [ ] **Step 3: Register the `/backend` command and implement activate-first switching**
 
-Add the command to the menu:
+Add the command directly to the `COMMANDS` list, near the other backend/session commands. Do not use `COMMANDS.append()` after `_CMD_HELP` is computed, because `/help` would stay stale.
 
 ```python
-COMMANDS.append(("backend", "Show or switch backend"))
+("backend", "Show or switch backend"),
 ```
 
 Implement the handler:
@@ -604,15 +772,24 @@ async def _on_backend(self, invocation) -> None:
             f"Unknown backend '{requested}'. Available: {', '.join(available_backends)}",
         )
         return
-    if self.task_manager.running_count:
+    if self.task_manager.has_live_agent_tasks():
         await self._transport.send_text(invocation.chat, "Cancel running tasks before switching backend.")
         return
 
     new_backend = create(requested, self.path, self._backend_state_for(requested))
     self.task_manager.backend.close_interactive()
     self.task_manager._backend = new_backend
+    self._backend_state.setdefault(requested, self._backend_state_for(requested))
     patch_project(self.name, {"backend": requested}, self._effective_config_path())
     await self._transport.send_text(invocation.chat, f"Switched to {requested}.")
+```
+
+Add `TaskManager.has_live_agent_tasks()` before using it:
+
+```python
+def has_live_agent_tasks(self) -> bool:
+    live = {TaskStatus.WAITING, TaskStatus.RUNNING, TaskStatus.WAITING_INPUT}
+    return any(t.type == TaskType.AGENT and t.status in live for t in self._tasks.values())
 ```
 
 Also add the command registration in `build()`:
@@ -690,7 +867,7 @@ Expected: all tests PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/link_project_to_chat/bot.py tests/test_backend_command.py tests/test_capability_gating.py
+git add src/link_project_to_chat/bot.py src/link_project_to_chat/task_manager.py tests/test_backend_command.py tests/test_capability_gating.py
 git commit -m "feat: add backend switching and capability-gated backend commands"
 ```
 
@@ -839,7 +1016,7 @@ git commit -m "feat: propagate backend-aware config through manager and cli flow
 
 ---
 
-### Task 5: Audit Group/Relay Code And Generalize The Claude Preamble
+### Task 5: Audit Group/Relay Code And Lightly Generalize The Claude Preamble
 
 **Files:**
 - Modify: `src/link_project_to_chat/group_filters.py`
@@ -847,6 +1024,8 @@ git commit -m "feat: propagate backend-aware config through manager and cli flow
 - Modify: `src/link_project_to_chat/transport/_telegram_relay.py`
 - Modify: `src/link_project_to_chat/backends/claude.py`
 - Create: `tests/test_backend_naming_lockout.py`
+
+This task should stay small. The required scope is the grep audit and any obvious user-facing wording fixes. The Claude awareness prompt may be parameterized only if the change is low-risk and covered by a focused test; otherwise leave it as a separate follow-up after Phase 2.
 
 - [ ] **Step 1: Write the failing grep-lockout test**
 
@@ -886,7 +1065,9 @@ PY
 
 Expected: the pytest check should pass or quickly show which file still has Claude-specific names; the one-off Python scan gives you the concrete audit list before you touch code.
 
-- [ ] **Step 3: Generalize the Claude awareness prompt builder**
+- [ ] **Step 3: Optionally generalize the Claude awareness prompt builder**
+
+Skip this step if the previous tasks already made Phase 2 large or risky. If you do it, preserve the existing guidance about Telegram rendering, channel fragility, and AskUserQuestion behavior; do not replace it with a much shorter prompt.
 
 Replace the fixed `_TELEGRAM_AWARENESS` constant in `src/link_project_to_chat/backends/claude.py` with a helper that can render command help from capabilities:
 
