@@ -56,16 +56,16 @@ _RELAY_PREFIX_RE = re.compile(rf"^\[auto-relay from {_RELAY_HANDLE_PATTERN}\]\n\
 def _safe_basename(raw: str | None, fallback: str) -> str:
     """Reduce an attacker-controlled filename to a safe basename for tempdir use.
 
-    Strips path separators, parent-dir traversals, and leading dots. Falls back
-    to `fallback` if the result is empty or starts with '.'. The returned name
-    is suitable for direct concatenation under a tempfile.TemporaryDirectory.
+    Strips path separators and parent-dir tokens. Falls back to `fallback` only
+    when the result is empty or is a pure traversal token ('.' or '..'). After
+    PurePath(...).name extraction, dotfile names like '.bashrc' are NOT
+    traversal vectors, so they pass through unchanged.
     """
     name = (raw or "").strip()
     if not name:
         return fallback
     candidate = PurePath(name.replace("\\", "/")).name
-    # Reject empty, '.', '..', and dotfile-like names that could shadow OS paths.
-    if not candidate or candidate in (".", "..") or candidate.startswith("."):
+    if not candidate or candidate in (".", ".."):
         return fallback
     return candidate
 
@@ -382,6 +382,12 @@ class TelegramTransport:
         never touches the Application by name.
 
         Synchronous: PTB's run_polling creates and manages its own event loop.
+
+        ``start()`` and ``run()`` are alternative entry points. ``run()`` is
+        the standalone path (CLI orchestration); ``start()`` is for tests
+        that drive the lifecycle manually. Both invoke ``post_init`` exactly
+        once via the ``_post_init_ran`` guard, so calling ``start()`` then
+        ``run()`` is safe but unusual.
         """
         self._app.post_init = self.post_init
         self._app.post_stop = self.post_stop

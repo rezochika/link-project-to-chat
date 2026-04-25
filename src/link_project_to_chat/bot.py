@@ -1879,7 +1879,7 @@ class ProjectBot(AuthMixin):
             except Exception:
                 logger.error("Failed to send startup message to %d", uid, exc_info=True)
 
-    def build(self):
+    def build(self) -> None:
         from .transport.telegram import TelegramTransport
         self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
         self._app = self._transport.app
@@ -1889,8 +1889,6 @@ class ProjectBot(AuthMixin):
             return self._auth_identity(identity)
 
         self._transport.set_authorizer(_pre_authorize)
-
-        app = self._app
 
         # All commands consume CommandInvocation directly — no legacy shim.
         ported_commands = (
@@ -1959,8 +1957,6 @@ class ProjectBot(AuthMixin):
                         group_chat_id=self.group_chat_id,
                         team_name=self.team_name,
                     )
-
-        return app
 
     def run(self) -> None:
         """Run the transport's main loop. Owns the lifecycle from here on.
