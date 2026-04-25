@@ -51,7 +51,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 
 ## 2. Backend Abstraction Track
 
-Multi-backend support (Claude → Codex / others). Phase 1 has shipped; phases 2–4 remain designed.
+Multi-backend support (Claude → Codex / others). Phases 1–2 have shipped; phases 3–4 remain designed.
 
 | Phase | Spec | Plan | Status |
 |---|---|---|---|
@@ -192,7 +192,7 @@ Open questions:
 |---|---|
 | ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
 | 🟡 Partial / intermittent | A2 (schema landed, call-sites pending) · 2 intermittent flaky tests (F1, F2 in §4.4) |
-| 📋 Designed, not started | 6 specs (Discord #2, Slack #3, Google Chat #4, Backend phases 2–4), sandbox |
+| 📋 Designed, not started | 5 specs (Discord #2, Slack #3, Google Chat #4, Backend phases 3–4), sandbox |
 | ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 1 deferred follow-up (A3) · WebTransport.stop() listener-release |
 
 ---

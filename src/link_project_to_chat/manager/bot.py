@@ -520,7 +520,7 @@ class ManagerBot(AuthMixin):
     def _global_model_buttons(self) -> Buttons:
         """Produce the transport-native global default-model keyboard."""
         from ..config import load_config
-        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
+        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model_claude
         rows = []
         for model_id, label in MODEL_OPTIONS:
             prefix = "● " if current == model_id else ""
@@ -532,7 +532,7 @@ class ManagerBot(AuthMixin):
         if not await self._guard_invocation(invocation):
             return
         from ..config import load_config
-        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model
+        current = load_config(self._project_config_path or DEFAULT_CONFIG).default_model_claude
         label = next((l for m, l in MODEL_OPTIONS if m == current), current or "not set")
         await self._transport.send_text(
             invocation.chat,
