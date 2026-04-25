@@ -24,8 +24,6 @@ from .base import (
     MessageRef,
     OnReadyCallback,
     PromptHandler,
-    PromptKind,
-    PromptOption,
     PromptRef,
     PromptSpec,
     PromptSubmission,

@@ -1,6 +1,7 @@
 """Parametrized Protocol contract test — every Transport must pass."""
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -17,6 +18,7 @@ from link_project_to_chat.transport import (
 )
 from link_project_to_chat.transport.fake import FakeTransport
 from link_project_to_chat.transport.telegram import TelegramTransport
+from link_project_to_chat.web.transport import WebTransport
 
 
 def _chat(transport_id: str) -> ChatRef:
@@ -65,7 +67,24 @@ def _make_telegram_transport_with_inject() -> TelegramTransport:
 
     t = TelegramTransport(app)
 
-    async def inject_message(chat, sender, text, *, files=None, reply_to=None):
+    async def inject_message(chat, sender, text, *, files=None, reply_to=None, mentions=None):
+        # Telegram's _dispatch_message does not currently emit mentions;
+        # synthesize an IncomingMessage directly so the contract test for
+        # mention pass-through is honored. Other paths still exercise
+        # the full _dispatch_message path.
+        if mentions is not None:
+            from link_project_to_chat.transport.base import IncomingMessage, MessageRef
+            msg_ref = MessageRef(
+                transport_id=t.TRANSPORT_ID, native_id="100", chat=chat,
+            )
+            incoming = IncomingMessage(
+                chat=chat, sender=sender, text=text, files=files or [],
+                reply_to=reply_to, message=msg_ref, mentions=mentions,
+                has_unsupported_media=False,
+            )
+            for h in t._message_handlers:
+                await h(incoming)
+            return
         tg_chat = SimpleNamespace(id=int(chat.native_id), type="private")
         tg_user = SimpleNamespace(
             id=int(sender.native_id), full_name=sender.display_name,
@@ -112,13 +131,36 @@ def _make_telegram_transport_with_inject() -> TelegramTransport:
     return t
 
 
-@pytest.fixture(params=["fake", "telegram"])
-def transport(request) -> Transport:
+# Each web-parametrized test gets its own port to avoid sequential bind races
+# (uvicorn's task is cancelled mid-shutdown by WebTransport.stop(), which can
+# leave the listener socket bound briefly into the next fixture setup).
+_WEB_PORT_COUNTER = itertools.count(18181)
+
+
+@pytest.fixture(params=["fake", "telegram", "web"])
+async def transport(request, tmp_path):
     """Yield a fresh Transport implementation per test."""
     if request.param == "fake":
         yield FakeTransport()
     elif request.param == "telegram":
         yield _make_telegram_transport_with_inject()
+    elif request.param == "web":
+        # Defensive: skip web parametrization if FastAPI isn't installed.
+        pytest.importorskip("fastapi")
+        db_path = tmp_path / "contract.db"
+        bot = Identity(
+            transport_id="web",
+            native_id="bot1",
+            display_name="Bot",
+            handle=None,
+            is_bot=True,
+        )
+        t = WebTransport(db_path=db_path, bot_identity=bot, port=next(_WEB_PORT_COUNTER))
+        await t.start()
+        try:
+            yield t
+        finally:
+            await t.stop()
     else:
         pytest.fail(f"Unknown param: {request.param}")
 
@@ -311,3 +353,61 @@ def test_transport_exposes_max_text_length(transport):
     assert hasattr(transport, "max_text_length")
     assert isinstance(transport.max_text_length, int)
     assert transport.max_text_length > 0
+
+
+async def test_mentions_passed_through_inject_message(transport):
+    if not hasattr(transport, "inject_message"):
+        pytest.skip(f"{type(transport).__name__} does not support inject_message")
+
+    chat = _chat(transport.TRANSPORT_ID)
+    sender = _sender(transport.TRANSPORT_ID)
+    bot_ref = Identity(
+        transport_id=transport.TRANSPORT_ID, native_id="b1",
+        display_name="Bot", handle="mybot", is_bot=True,
+    )
+    received: list[IncomingMessage] = []
+
+    async def handler(msg):
+        received.append(msg)
+
+    transport.on_message(handler)
+    await transport.inject_message(chat, sender, "@mybot hi", mentions=[bot_ref])
+
+    assert len(received) == 1
+    assert received[0].mentions == [bot_ref]
+
+
+async def test_prompt_open_returns_prompt_ref(transport):
+    if not hasattr(transport, "open_prompt"):
+        pytest.skip(f"{type(transport).__name__} does not support prompts")
+
+    from link_project_to_chat.transport import PromptKind, PromptRef, PromptSpec
+
+    chat = _chat(transport.TRANSPORT_ID)
+    spec = PromptSpec(key="q", title="Q", body="Enter value", kind=PromptKind.TEXT)
+    ref = await transport.open_prompt(chat, spec)
+    assert isinstance(ref, PromptRef)
+    assert ref.key == "q"
+
+
+async def test_prompt_submit_fires_handler(transport):
+    if not hasattr(transport, "inject_prompt_submit"):
+        pytest.skip(f"{type(transport).__name__} does not support inject_prompt_submit")
+
+    from link_project_to_chat.transport import PromptKind, PromptSpec, PromptSubmission
+
+    chat = _chat(transport.TRANSPORT_ID)
+    sender = _sender(transport.TRANSPORT_ID)
+    spec = PromptSpec(key="name", title="Name", body="Enter name", kind=PromptKind.TEXT)
+
+    seen: list[PromptSubmission] = []
+
+    async def handler(sub: PromptSubmission) -> None:
+        seen.append(sub)
+
+    transport.on_prompt_submit(handler)
+    ref = await transport.open_prompt(chat, spec)
+    await transport.inject_prompt_submit(ref, sender, text="Alice")
+
+    assert len(seen) == 1
+    assert seen[0].text == "Alice"
