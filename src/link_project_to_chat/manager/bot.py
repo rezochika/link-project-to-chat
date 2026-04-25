@@ -2189,11 +2189,20 @@ class ManagerBot(AuthMixin):
             return
 
     async def _post_stop(self, app) -> None:
-        """Called by python-telegram-bot on shutdown — disconnect Telethon client.
+        """Called by python-telegram-bot on shutdown — terminate spawned
+        project bot subprocesses and disconnect Telethon client.
+
+        Without stop_all() here, project bots get orphaned on Ctrl+C and keep
+        polling Telegram with their tokens; the next manager start hits
+        "Conflict: terminated by other getUpdates request".
 
         Project bots own their own TeamRelay instances (see #0c), so the manager
         no longer has relays to stop here.
         """
+        try:
+            self._pm.stop_all()
+        except Exception:
+            logger.exception("Failed to stop project bot subprocesses on shutdown")
         if self._telethon_client is not None:
             try:
                 await self._telethon_client.disconnect()

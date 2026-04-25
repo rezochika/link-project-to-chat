@@ -544,6 +544,22 @@ async def test_setup_code_strips_non_digits_before_sign_in(bot_env):
 
 
 @pytest.mark.asyncio
+async def test_post_stop_terminates_project_subprocesses(bot_env):
+    """PTB's post_stop runs on Ctrl+C. If it doesn't call _pm.stop_all(),
+    every project bot subprocess gets orphaned and keeps polling Telegram
+    with its token — the next manager start hits "Conflict: terminated by
+    other getUpdates request" until the user manually kills the strays.
+    """
+    bot, pm, _ = bot_env
+    pm.stop_all = MagicMock(return_value=0)
+    bot._telethon_client = None
+
+    await bot._post_stop(MagicMock())
+
+    pm.stop_all.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_setup_promotes_authenticated_client_to_manager(bot_env):
     """After /setup successfully signs in, the freshly-authenticated
     TelegramClient must be promoted to ``self._telethon_client`` so that
