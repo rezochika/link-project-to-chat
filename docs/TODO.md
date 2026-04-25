@@ -33,16 +33,16 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | F2 | `bot.build()` should return `None` (`bot.py:1974`) | Trivial | ✅ closed in `4a0bb69` |
 | F3 | Document `TelegramTransport.start()` vs `run()` dual entry | Trivial | ✅ closed in `4a0bb69` |
 | F4 | Lockout test missing `encoding="utf-8"` on `Path.read_text()` (`tests/test_transport_lockout.py:37`) — fails on non-UTF-8 default locales since `bot.py` contains em-dashes/emojis | Trivial | ✅ closed |
-| A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | 📋 deferred to spec #1 |
-| A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 📋 deferred to spec #1 |
-| A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to spec #1 / Conversation primitive |
+| A1 | Migrate `_trusted_users` persistence to string identity ids (`config.py:bind_trusted_user`) | Medium | ✅ closed by spec #1 (`2a7b8e7`) |
+| A2 | Replace `int(.native_id)` casts for `group_chat_id` (4 sites in `bot.py`) | Medium | 🟡 schema closed by spec #1 (`13dbdd9` adds `BotPeerRef`/`RoomBinding`); call-site rewrite pending |
+| A3 | Manager `_guard` legacy int path vs `_guard_invocation` string path | Low | 📋 deferred to future Conversation primitive spec |
 | C1 | Port `manager/bot.py` to Transport Protocol | — | ✅ closed by spec #0c |
 
 ### 1.3 New transport platforms (designed, not implemented)
 
 | Spec | Spec doc | Plan | Status | Notes |
 |---|---|---|---|---|
-| #1 Web UI | [spec](superpowers/specs/2026-04-21-transport-web-ui-design.md) | [plan](superpowers/plans/2026-04-21-web-transport.md) | 📋 | First non-Telegram transport; carries A1–A3. FastAPI + HTMX + SSE + SQLite. |
+| #1 Web UI | [spec](superpowers/specs/2026-04-21-transport-web-ui-design.md) | [plan](superpowers/plans/2026-04-21-web-transport.md) | ✅ | Shipped 2026-04-25 (commits `6c12b39`..`d24ef52`). First non-Telegram transport. FastAPI + HTMX + SSE + SQLite. Closed A1, partially closed A2 (schema only). |
 | #2 Discord | [spec](superpowers/specs/2026-04-21-transport-discord-design.md) | [plan](superpowers/plans/2026-04-21-discord-transport.md) | 📋 | Uses discord.py 2.x, depends on #1 primitives. |
 | #3 Slack | [spec](superpowers/specs/2026-04-21-transport-slack-design.md) | [plan](superpowers/plans/2026-04-21-slack-transport.md) | 📋 | slack_bolt + Socket Mode; final cross-platform validation. |
 
@@ -184,10 +184,10 @@ Open questions:
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 5 transport specs (#0/#0a/#0b/#0c) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 4 follow-ups (F1/F2/F3 + livestream removal) |
-| 🟡 Intermittent | 2 flaky tests (F1, F2 in §4.4) |
-| 📋 Designed, not started | 6 specs (Web UI #1, Discord #2, Slack #3, Backend phases 2–4), sandbox |
-| ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 3 deferred follow-ups (A1–A3) |
+| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
+| 🟡 Partial / intermittent | A2 (schema landed, call-sites pending) · 2 intermittent flaky tests (F1, F2 in §4.4) |
+| 📋 Designed, not started | 5 specs (Discord #2, Slack #3, Backend phases 2–4), sandbox |
+| ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 1 deferred follow-up (A3) · WebTransport.stop() listener-release |
 
 ---
 

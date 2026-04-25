@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+- **Spec #1 — Web UI Transport** (commits `6c12b39`..`d24ef52`) — first non-Telegram transport. FastAPI + HTMX + SSE + SQLite. New `WebTransport` implements the full Protocol; new `web/store.py`, `web/app.py`, Jinja2 templates, browser composer + live-update timeline. 11 commits, 768 tests pass.
+- **Structured mentions** — `IncomingMessage.mentions: list[Identity]` field (`transport/base.py`); `group_filters.mentions_bot` prefers structured over regex; new `mentions_bot_by_id`. Foundational for non-Telegram transports.
+- **Prompt primitives** — `PromptKind`, `PromptOption`, `PromptSpec`, `PromptRef`, `PromptSubmission`, `PromptHandler` types; 4 new Protocol methods (`open_prompt`, `update_prompt`, `close_prompt`, `on_prompt_submit`). Wizard state above transport.
+- **Conversation sessions** — `ConversationSession` + `ConversationStore` in `manager/conversation.py` (transport-agnostic wizard state).
+- **Transport-agnostic config types** — `BotPeerRef`, `RoomBinding` dataclasses in `config.py` with backward-compat synthesis from legacy `group_chat_id` / `bot_username` at load time.
+- **A1 (closed)** — `_trusted_users` persistence accepts non-numeric ids; `_coerce_user_id` helper drops `int()` from `bind_trusted_user`/`bind_project_trusted_user` (closes A1 from spec0-followups).
+- **Contract tests parametrized over `[fake, telegram, web]`** — 3 new contract tests (mentions, prompt open, prompt submit); existing PR #6 contracts (`set_authorizer`, `run`, `max_text_length`) verified across all 3 transports.
+
 ### Security
 - **C1** — Cap concurrent `/run` subprocesses at 3; excess commands fail immediately with a user-visible error (`task_manager.py`)
 - **H1** — Scrub API keys (40+ char tokens) and home/root paths from stream Error messages before raising (`task_manager.py`)

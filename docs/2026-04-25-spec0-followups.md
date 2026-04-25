@@ -54,11 +54,13 @@ grep -n "= bot.build()\|=bot.build()\|build()\." src/ tests/  # confirm nothing 
 
 ---
 
-## A — Re-targeted to spec #1 (Web UI)
+## A — Closed by spec #1 (Web UI) — see status notes below
 
-> **Re-tag note (2026-04-25):** Originally listed under spec #0a. Spec #0a (group/team port, `2026-04-21-transport-group-team-port-design.md`) has since shipped without addressing these — they don't block the Telegram-only path, so #0a closed cleanly. They become load-bearing the moment a non-Telegram transport ships. Spec #1 (Web UI) is the natural new home since it's the first transport with string-only user IDs and per-transport group identity.
+> **Re-tag note (2026-04-25):** Originally listed under spec #0a. Spec #0a (group/team port, `2026-04-21-transport-group-team-port-design.md`) has since shipped without addressing these — they don't block the Telegram-only path, so #0a closed cleanly. They became load-bearing the moment a non-Telegram transport shipped. Spec #1 (Web UI) absorbed them as Tasks 4 and 4b.
+>
+> **2026-04-25 update — spec #1 Web UI shipped (commits `6c12b39`..`d24ef52`).** A1 fully closed; A2 schema landed (`BotPeerRef`/`RoomBinding`), bot.py call-site rewrite still pending; A3 still open as a Conversation-primitive concern.
 
-### A1 — Migrate `_trusted_users` persistence to string identity ids
+### A1 — Migrate `_trusted_users` persistence to string identity ids — ✅ Closed (`2a7b8e7`)
 
 **Source:** Task 5 (I3) code-quality review, finding I-2; deliberately documented in `_auth_identity` docstring.
 **Files:** `src/link_project_to_chat/_auth.py:_trust_user`, `src/link_project_to_chat/config.py:bind_trusted_user`/`bind_project_trusted_user` (lines ~802, ~827).
@@ -73,7 +75,7 @@ In-memory trust now tolerates non-numeric `native_id` (PR #6 commit `0ad608e`). 
 
 ---
 
-### A2 — Replace `int(incoming.chat.native_id)` casts for `group_chat_id`
+### A2 — Replace `int(incoming.chat.native_id)` casts for `group_chat_id` — 🟡 Schema closed (`13dbdd9`); call-site rewrite pending
 
 **Source:** Task 5 (I3) plan note; final-verification grep.
 **File:** `src/link_project_to_chat/bot.py:645, 653, 1272, 1289`.
@@ -120,7 +122,7 @@ Four remaining `int(.native_id)` casts compare incoming chat id to the config-st
 | F1 dotfile policy | Low | — | ✅ closed in `4a0bb69` |
 | F2 `build() -> None` | Trivial | — | ✅ closed in `4a0bb69` |
 | F3 docstring note | Trivial | — | ✅ closed in `4a0bb69` |
-| A1 trust persistence | Medium | spec #1 (Web UI) | open — load-bearing once a non-Telegram transport ships |
-| A2 group_chat_id | Medium | spec #1 (Web UI) | open — same trigger as A1 |
-| A3 manager `_guard` int | Low | spec #1 / Conversation primitive | open — disjoint in practice today |
+| A1 trust persistence | Medium | spec #1 (Web UI) | ✅ closed in `2a7b8e7` (Web UI Task 4b) |
+| A2 group_chat_id | Medium | spec #1 (Web UI) | 🟡 schema closed in `13dbdd9` (`BotPeerRef`/`RoomBinding`); the 4 `int(group_chat_id)` call sites in `bot.py` still need rewriting to `RoomBinding`-aware lookup |
+| A3 manager `_guard` int | Low | Conversation primitive (TBD) | open — disjoint in practice today |
 | C1 manager transport port | — | spec #0c | ✅ closed (manager runs through `TelegramTransport`; residue allowlisted) |
