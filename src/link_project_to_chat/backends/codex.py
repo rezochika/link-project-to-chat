@@ -42,12 +42,15 @@ class CodexBackend(BaseBackend):
     capabilities = CODEX_CAPABILITIES
     # `/model` button picker entries — order mirrors the priority field in
     # ~/.codex/models_cache.json so the default frontier model surfaces first.
+    # Codex slugs ARE the wire identifiers — no aliases needed (passed
+    # straight through `--model <slug>`). Empty alias tuples keep the
+    # 4-tuple shape consistent with Claude's MODEL_OPTIONS.
     MODEL_OPTIONS = [
-        ("gpt-5.5", "GPT-5.5", "Frontier coding (default)"),
-        ("gpt-5.4", "GPT-5.4", ""),
-        ("gpt-5.4-mini", "GPT-5.4-Mini", "Fast, lighter reasoning"),
-        ("gpt-5.3-codex", "GPT-5.3-Codex", ""),
-        ("gpt-5.2", "GPT-5.2", ""),
+        ("gpt-5.5", "GPT-5.5", "Frontier coding (default)", ()),
+        ("gpt-5.4", "GPT-5.4", "", ()),
+        ("gpt-5.4-mini", "GPT-5.4-Mini", "Fast, lighter reasoning", ()),
+        ("gpt-5.3-codex", "GPT-5.3-Codex", "", ()),
+        ("gpt-5.2", "GPT-5.2", "", ()),
     ]
     _env_keep_patterns = ("OPENAI_*", "CODEX_*")
     _env_scrub_patterns = (

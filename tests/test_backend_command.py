@@ -356,6 +356,66 @@ async def test_status_omits_request_count_when_idle(tmp_path):
     assert "Requests:" not in text
 
 
+async def test_status_resolves_friendly_label_from_wire_identifier(tmp_path):
+    """After a Claude turn, `backend.model` is the wire id Claude CLI
+    echoes back (e.g. `claude-opus-4-7[1m]`), not the user-facing slug
+    (`opus[1m]`). _current_model must still resolve the friendly label
+    via the wire-alias prefix list in MODEL_OPTIONS — otherwise /status
+    falls back to showing the raw wire string."""
+    bot = _make_bot(tmp_path)
+    # Simulate Claude CLI's post-turn echo.
+    bot.task_manager._backend.model = "claude-opus-4-7[1m]"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Model: Opus 4.7 1M — Most capable, 1M context" in text
+
+
+async def test_status_wire_alias_prefix_match_handles_haiku_date_suffix(tmp_path):
+    """Haiku's wire id sometimes carries a date suffix
+    (`claude-haiku-4-5-20251001`). The wire alias is just
+    `claude-haiku-4-5`, so prefix match must succeed and resolve to the
+    Haiku label rather than falling back to the raw wire string."""
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend.model = "claude-haiku-4-5-20251001"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Model: Haiku 4.5 — Fastest for quick answers" in text
+
+
+async def test_status_wire_alias_does_not_misclassify_1m_variant(tmp_path):
+    """Order matters: `claude-opus-4-7[1m]` starts with `claude-opus-4-7`
+    too, so if MODEL_OPTIONS isn't ordered most-specific-first the bot
+    would resolve the 1M wire id to the plain 'Opus 4.7' label. Verify
+    the 1m variant resolves to the 1M row."""
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend.model = "claude-opus-4-7[1m]"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Opus 4.7 1M" in text
+    # Plain "Opus 4.7" without the 1M qualifier must NOT appear as the
+    # primary label.
+    assert "Model: Opus 4.7 —" not in text
+
+
+async def test_status_codex_slug_matches_directly(tmp_path):
+    """Codex slugs ARE the wire identifiers — no aliases needed; the
+    direct exact-match path must still resolve the friendly label."""
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+    bot.task_manager._backend.model = "gpt-5.5"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Model: GPT-5.5 — Frontier coding (default)" in text
+
+
 async def test_codex_effort_command_shows_picker_for_codex(tmp_path):
     """Phase 4 promoted /effort to be capability-driven; Codex now supports
     it, so /effort returns the picker (with the four Codex effort levels)

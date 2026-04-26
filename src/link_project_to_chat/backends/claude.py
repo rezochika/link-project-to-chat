@@ -177,12 +177,21 @@ class ClaudeBackend(BaseBackend):
     # `/model` button picker entries — kept here (not in bot.py) so each
     # backend owns its own labels/descriptions and the picker swaps when
     # the active backend changes.
+    # Each entry: (user-facing slug, display label, description, wire-id
+    # prefixes). The fourth field maps the wire identifiers Claude CLI
+    # echoes back after a turn (e.g. `claude-opus-4-7[1m]`,
+    # `claude-haiku-4-5-20251001`) to this row, so /status's
+    # `_current_model` lookup succeeds against the live `backend.model`
+    # value rather than falling back to the raw wire string.
+    # Order matters: more-specific variants (the [1m] forms) come first
+    # so prefix-matching picks the right row when one prefix is a prefix
+    # of another (e.g. `claude-opus-4-7` vs `claude-opus-4-7[1m]`).
     MODEL_OPTIONS = [
-        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context"),
-        ("opus", "Opus 4.7", "Most capable"),
-        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context"),
-        ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
-        ("haiku", "Haiku 4.5", "Fastest for quick answers"),
+        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context", ("claude-opus-4-7[1m]",)),
+        ("opus", "Opus 4.7", "Most capable", ("claude-opus-4-7",)),
+        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context", ("claude-sonnet-4-6[1m]",)),
+        ("sonnet", "Sonnet 4.6", "Best for everyday tasks", ("claude-sonnet-4-6",)),
+        ("haiku", "Haiku 4.5", "Fastest for quick answers", ("claude-haiku-4-5",)),
     ]
     _env_keep_patterns = ()
     _env_scrub_patterns = (

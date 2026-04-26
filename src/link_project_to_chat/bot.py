@@ -922,16 +922,27 @@ class ProjectBot(AuthMixin):
         backend = self.task_manager.backend
         current = backend.model
         rows: list[list[Button]] = []
-        for model_id, label, _ in backend.MODEL_OPTIONS:
+        for model_id, label, *_ in backend.MODEL_OPTIONS:
             prefix = "● " if current == model_id else ""
             rows.append([Button(label=f"{prefix}{label}", value=f"model_set_{model_id}")])
         return Buttons(rows=rows)
 
     def _current_model(self) -> str:
+        """Return the human-readable label for the active model.
+
+        Matches against both the user-facing slug (exact) AND the
+        wire-identifier prefixes the backend echoes back after a turn
+        (e.g. Claude reports `claude-opus-4-7[1m]` for the `opus[1m]`
+        slug). Wire-prefix order in MODEL_OPTIONS must list more-specific
+        variants first so we don't accidentally match `opus` for an
+        `opus[1m]` wire id.
+        """
         backend = self.task_manager.backend
-        raw = backend.model
-        for model_id, label, desc in backend.MODEL_OPTIONS:
-            if model_id == raw:
+        raw = backend.model or ""
+        for entry in backend.MODEL_OPTIONS:
+            model_id, label, desc = entry[0], entry[1], entry[2]
+            wire_aliases = entry[3] if len(entry) > 3 else ()
+            if raw == model_id or any(raw.startswith(a) for a in wire_aliases):
                 return f"{label} — {desc}" if desc else label
         return backend.model_display or raw or "default"
 
@@ -1853,14 +1864,14 @@ class ProjectBot(AuthMixin):
         backend = self.task_manager.backend
         st = backend.status
         caps = backend.capabilities
-        # `model_display` is a first-class AgentBackend Protocol attribute;
-        # backends without a pretty label return `None` and we fall back to `model`.
-        model_label = backend.model_display or backend.model
+        # Reuse _current_model so the friendly-label / wire-alias lookup
+        # matches what /model shows. _current_model falls back to
+        # model_display / raw / 'default' when no MODEL_OPTIONS row hits.
         lines = [
             f"Project: {self.name}",
             f"Path: {self.path}",
             f"Backend: {backend.name}",
-            f"Model: {model_label or 'default'}",
+            f"Model: {self._current_model()}",
         ]
         # Effort is capability-driven (Phase 4 slice 1). Skip line when the
         # backend doesn't support it (e.g. FakeBackend in tests).
