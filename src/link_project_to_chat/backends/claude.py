@@ -469,6 +469,19 @@ class ClaudeBackend(BaseBackend):
             return True
         return False
 
+    def current_permission(self) -> str:
+        if self.skip_permissions:
+            return "dangerously-skip-permissions"
+        return self.permission_mode or "default"
+
+    def set_permission(self, mode: str | None) -> None:
+        self.skip_permissions = mode == "dangerously-skip-permissions"
+        self.permission_mode = (
+            None
+            if mode in (None, "default", "dangerously-skip-permissions")
+            else mode
+        )
+
 
 def _make_claude(project_path: Path, state: dict) -> ClaudeBackend:
     permissions = state.get("permissions")

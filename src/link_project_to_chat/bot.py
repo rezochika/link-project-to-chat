@@ -1193,10 +1193,7 @@ class ProjectBot(AuthMixin):
         ])
 
     def _current_permission(self) -> str:
-        claude = self._claude
-        if claude.skip_permissions:
-            return "dangerously-skip-permissions"
-        return claude.permission_mode or "default"
+        return self.task_manager.backend.current_permission()
 
     async def _on_permissions(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1823,9 +1820,7 @@ class ProjectBot(AuthMixin):
                 return
             mode = value[len("permissions_set_"):]
             if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
-                skip, pm = resolve_permissions(mode)
-                self._claude.skip_permissions = skip
-                self._claude.permission_mode = pm
+                self.task_manager.backend.set_permission(mode)
                 self._patch_backend_config({"permissions": mode if mode != "default" else None})
             await self._transport.edit_text(
                 msg_ref,

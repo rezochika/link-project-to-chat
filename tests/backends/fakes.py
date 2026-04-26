@@ -29,8 +29,7 @@ class FakeBackend:
         self.model_display: str | None = None
         self.session_id: str | None = None
         self.effort: str = "medium"
-        self.skip_permissions: bool = False
-        self.permission_mode: str | None = None
+        self.permissions: str | None = None
         self.allowed_tools: list[str] = []
         self.disallowed_tools: list[str] = []
         self.append_system_prompt: str | None = None
@@ -66,6 +65,12 @@ class FakeBackend:
 
     def cancel(self) -> bool:
         return False
+
+    def current_permission(self) -> str:
+        return self.permissions or "default"
+
+    def set_permission(self, mode: str | None) -> None:
+        self.permissions = None if mode in (None, "default") else mode
 
     @property
     def status(self) -> dict:

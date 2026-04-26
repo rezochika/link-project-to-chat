@@ -93,6 +93,12 @@ class AgentBackend(Protocol):
     def cancel(self) -> bool:
         pass
 
+    def current_permission(self) -> str:
+        pass
+
+    def set_permission(self, mode: str | None) -> None:
+        pass
+
     @property
     def status(self) -> dict:
         pass

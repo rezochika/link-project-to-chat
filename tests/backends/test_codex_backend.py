@@ -87,6 +87,45 @@ def test_build_cmd_resume_includes_effort_too(tmp_path):
     assert cmd[-1] == "again"
 
 
+def test_build_cmd_includes_read_only_sandbox_for_plan_permissions(tmp_path):
+    backend = CodexBackend(tmp_path, {"permissions": "plan"})
+    cmd = backend._build_cmd("hi")
+
+    idx = cmd.index("-c")
+    assert cmd[idx:idx + 2] == ["-c", "sandbox_mode='read-only'"]
+
+
+def test_build_cmd_includes_full_auto_for_auto_permissions(tmp_path):
+    backend = CodexBackend(tmp_path, {"permissions": "auto"})
+
+    assert "--full-auto" in backend._build_cmd("hi")
+
+
+def test_build_cmd_includes_dangerous_bypass_for_skip_permissions(tmp_path):
+    backend = CodexBackend(tmp_path, {"permissions": "dangerously-skip-permissions"})
+
+    assert "--dangerously-bypass-approvals-and-sandbox" in backend._build_cmd("hi")
+
+
+def test_build_cmd_resume_includes_permission_flags_before_positionals(tmp_path):
+    backend = CodexBackend(tmp_path, {"session_id": "s", "permissions": "plan"})
+    cmd = backend._build_cmd("again")
+
+    assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "sandbox_mode='read-only'"
+    assert cmd[-2] == "s"
+    assert cmd[-1] == "again"
+
+
+def test_codex_permission_state_defaults_and_updates(tmp_path):
+    backend = CodexBackend(tmp_path, {})
+
+    assert backend.current_permission() == "default"
+    backend.set_permission("plan")
+    assert backend.current_permission() == "plan"
+    backend.set_permission("default")
+    assert backend.current_permission() == "default"
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})

@@ -27,7 +27,7 @@ CODEX_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"
 CODEX_CAPABILITIES = BackendCapabilities(
     models=CODEX_MODELS,
     supports_thinking=False,
-    supports_permissions=False,
+    supports_permissions=True,
     supports_resume=True,
     supports_compact=False,
     supports_allowed_tools=False,
@@ -64,6 +64,7 @@ class CodexBackend(BaseBackend):
         self.model_display: str | None = None
         self.session_id: str | None = state.get("session_id")
         self.effort: str | None = state.get("effort")
+        self.permissions: str | None = state.get("permissions")
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
@@ -83,10 +84,23 @@ class CodexBackend(BaseBackend):
             cmd.extend(["--model", self.model])
         if self.effort:
             cmd.extend(["-c", f"model_reasoning_effort={self.effort}"])
+        cmd.extend(self._permission_args())
         if self.session_id:
             cmd.append(self.session_id)
         cmd.append(user_message)
         return cmd
+
+    def _permission_args(self) -> list[str]:
+        mode = self.permissions
+        if mode in (None, "default"):
+            return []
+        if mode == "plan":
+            return ["-c", "sandbox_mode='read-only'", "-c", "approval_policy='never'"]
+        if mode in ("acceptEdits", "dontAsk", "auto"):
+            return ["--full-auto"]
+        if mode in ("bypassPermissions", "dangerously-skip-permissions"):
+            return ["--dangerously-bypass-approvals-and-sandbox"]
+        raise ValueError(f"Unsupported Codex permissions mode: {mode}")
 
     # ------------------------------------------------------------------
     # Process spawning
@@ -233,6 +247,12 @@ class CodexBackend(BaseBackend):
             return False
         proc.kill()
         return True
+
+    def current_permission(self) -> str:
+        return self.permissions or "default"
+
+    def set_permission(self, mode: str | None) -> None:
+        self.permissions = None if mode in (None, "default") else mode
 
     @property
     def status(self) -> dict:

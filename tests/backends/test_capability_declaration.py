@@ -9,7 +9,7 @@ def test_codex_capabilities_match_validated_findings():
         "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2",
     )
     assert CODEX_CAPABILITIES.supports_thinking is False
-    assert CODEX_CAPABILITIES.supports_permissions is False
+    assert CODEX_CAPABILITIES.supports_permissions is True
     assert CODEX_CAPABILITIES.supports_resume is True
     assert CODEX_CAPABILITIES.supports_compact is False
     assert CODEX_CAPABILITIES.supports_allowed_tools is False

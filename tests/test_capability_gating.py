@@ -14,6 +14,7 @@ import pytest
 from link_project_to_chat.backends.base import BackendCapabilities
 from link_project_to_chat.bot import ProjectBot
 from link_project_to_chat.transport import (
+    ButtonClick,
     ChatKind,
     ChatRef,
     CommandInvocation,
@@ -87,6 +88,28 @@ async def test_permissions_command_rejected_when_backend_does_not_support_it(tmp
     sent = bot._transport.sent_messages
     assert sent
     assert "doesn't support /permissions" in sent[-1].text
+
+
+async def test_permissions_command_uses_active_backend_permission_hooks(tmp_path):
+    bot = _bot_with_backend(tmp_path, supports_permissions=True)
+
+    await bot._on_permissions(_ci("permissions", []))
+
+    sent = bot._transport.sent_messages
+    assert sent
+    assert sent[-1].text == "Current: default"
+
+
+async def test_permissions_button_updates_active_backend_permissions(tmp_path):
+    bot = _bot_with_backend(tmp_path, supports_permissions=True)
+    chat = _chat()
+    msg = MessageRef(transport_id="fake", native_id="100", chat=chat)
+    click = ButtonClick(chat=chat, message=msg, sender=_sender(), value="permissions_set_plan")
+
+    await bot._on_button(click)
+
+    assert bot.task_manager.backend.current_permission() == "plan"
+    assert bot._transport.edited_messages[-1].text == "Permissions: plan"
 
 
 async def test_compact_command_rejected_when_backend_does_not_support_it(tmp_path):
