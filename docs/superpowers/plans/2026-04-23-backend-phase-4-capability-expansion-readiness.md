@@ -40,6 +40,27 @@ Expected:
 - Unit suites PASS
 - Live Codex suite either PASSes on an authenticated machine or SKIPs cleanly
 - Backend command and capability-gating tests still PASS after Codex support landed
+- Known Phase 3 backend lifecycle regressions are fixed or covered by focused tests, including Codex subprocess cleanup after a successful `turn.completed`
+
+- [ ] **Step 1a: Add or run a focused Codex subprocess cleanup regression check**
+
+Before any readiness verdict, verify the Phase 3 Codex adapter still reaps its subprocess on the successful-turn path. This was fixed after Phase 3 review and must remain covered as a regression. The specific behavior to preserve is:
+
+- `CodexBackend.chat_stream()` receives `turn.completed`
+- It yields the closing `Result`
+- It still reads/drains stderr as needed and awaits `proc.wait()` before clearing `_proc`
+- A process that exits non-zero after a syntactically complete JSONL turn is not silently treated as a clean success unless that behavior is explicitly documented and accepted
+
+Suggested focused test target:
+
+```bash
+pytest tests/backends/test_codex_backend.py -v
+```
+
+Expected:
+- The suite includes a regression test proving successful Codex turns do not leave an unreaped process
+- The regression test passes
+- If the regression returns, record it in the gap inventory and mark Phase 4 `NOT READY`
 
 - [ ] **Step 2: Run one direct CLI smoke check so stderr/noise is captured alongside the test results**
 
@@ -85,6 +106,7 @@ Expected:
 ## Error-surface gaps
 - Record every error or warning pattern that leaked through in a confusing way.
 - Include the exact command or test that surfaced it.
+- Include known Phase 3 lifecycle findings that were fixed and regression-tested, especially the Codex successful-turn path where `turn.completed` could previously yield `Result` before `proc.wait()`.
 
 ## Protocol fit concerns
 - Record any place where `AgentBackend` or `BackendCapabilities` felt awkward in real use.
@@ -115,6 +137,7 @@ Expected:
 
 ## Trigger checklist
 - [ ] Phase 3 has been opt-in for at least the agreed soak window
+- [ ] Known Phase 3 P1/P2 backend correctness findings are fixed with regression coverage or explicitly accepted as non-blocking
 - [ ] At least one capability promotion has direct evidence and a clear implementation path
 - [ ] At least one `/status` improvement has direct user or test evidence
 - [ ] At least one error-surface improvement has direct evidence from live or unit runs
@@ -126,6 +149,7 @@ Expected:
 ## Readiness decision
 - Write `READY` only if two or more trigger checkboxes are checked.
 - Write `NOT READY` if fewer than two trigger checkboxes are checked.
+- Always write `NOT READY` if the known Phase 3 P1/P2 backend correctness checkbox is unchecked, even if two other trigger boxes are checked.
 - Add one short paragraph explaining the decision in plain language.
 ```
 
@@ -198,6 +222,8 @@ git commit -m "docs: connect phase 4 stub to readiness evidence"
 Phase 4 is `READY` for concrete implementation planning because two or more trigger conditions are satisfied.
 ```
 
+Only use the `READY` verdict if known Phase 3 P1/P2 backend correctness findings are fixed with regression coverage or explicitly accepted as non-blocking.
+
 Or, if the trigger threshold is not met:
 
 ```markdown
@@ -205,6 +231,8 @@ Or, if the trigger threshold is not met:
 
 Phase 4 is `NOT READY` for concrete implementation planning because fewer than two trigger conditions are satisfied.
 ```
+
+Also use the `NOT READY` verdict if any known Phase 3 P1/P2 backend correctness finding remains unresolved, untested, and unaccepted, even when the trigger threshold is otherwise met.
 
 - [ ] **Step 2: Add the exact next command the team should run**
 
@@ -236,6 +264,7 @@ git commit -m "docs: record phase 4 backend readiness verdict"
 
 - [ ] The readiness package does not invent unsupported Codex capabilities.
 - [ ] Every capability promotion candidate is backed by a concrete test or live smoke reference.
+- [ ] Known Phase 3 P1/P2 backend correctness findings are fixed with regression coverage or recorded as explicit readiness blockers.
 - [ ] The stub spec now points at the evidence docs instead of standing alone.
 - [ ] The rollout review contains a plain `READY` or `NOT READY` decision.
 - [ ] The next action is explicit for both outcomes.
