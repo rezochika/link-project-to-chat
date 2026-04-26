@@ -8,7 +8,6 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 from ..events import Error, Result, StreamEvent, TextDelta
-from ..task_manager import _command_popen_kwargs, _terminate_process_tree
 from .base import BackendCapabilities, BaseBackend, HealthStatus
 from .codex_parser import parse_codex_line
 from .factory import register
@@ -73,6 +72,9 @@ class CodexBackend(BaseBackend):
     # ------------------------------------------------------------------
 
     def _popen(self, cmd: list[str]) -> subprocess.Popen:
+        # Lazy import: task_manager imports backends.base, so importing it at
+        # module load creates a circular-import path through backends/__init__.
+        from ..task_manager import _command_popen_kwargs
         kwargs = _command_popen_kwargs()
         proc = subprocess.Popen(
             cmd,
@@ -174,6 +176,8 @@ class CodexBackend(BaseBackend):
     # ------------------------------------------------------------------
 
     def close_interactive(self) -> None:
+        from ..task_manager import _terminate_process_tree  # lazy: see _popen
+
         proc = self._proc
         if proc and proc.poll() is None:
             _terminate_process_tree(proc)

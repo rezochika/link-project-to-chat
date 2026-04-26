@@ -195,6 +195,47 @@ async def test_backend_command_unauthorized_user_silent(tmp_path):
     assert bot._transport.sent_messages == []
 
 
+async def _switch_to_codex(bot: ProjectBot) -> None:
+    from link_project_to_chat.backends import codex as _codex  # noqa: F401
+
+    await bot._on_backend(_ci(["codex"]))
+    bot._transport.sent_messages.clear()
+
+
+async def test_codex_status_does_not_require_model_display(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_status_t(_ci([]))
+
+    sent = bot._transport.sent_messages
+    assert len(sent) == 1
+    assert "Backend: codex" in sent[0].text
+    assert "Model: default" in sent[0].text
+
+
+async def test_codex_effort_command_is_rejected_without_assertion(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_effort(_ci([]))
+
+    assert "doesn't support /effort" in bot._transport.sent_messages[-1].text
+
+
+async def test_codex_skill_activation_is_rejected_without_assertion(tmp_path):
+    import dataclasses
+
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    ci = dataclasses.replace(_ci(["some-skill"]), name="skills")
+    await bot._on_skills(ci)
+
+    assert "doesn't support skills" in bot._transport.sent_messages[-1].text
+    assert "personas still work" in bot._transport.sent_messages[-1].text
+
+
 async def test_backend_command_switch_persists_for_team_bot(tmp_path):
     """The team-bot branch in `_on_backend` must route to
     `patch_team_bot_backend`, not `patch_project`. Verified by reading the

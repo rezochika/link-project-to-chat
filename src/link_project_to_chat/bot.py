@@ -216,6 +216,12 @@ class ProjectBot(AuthMixin):
         assert isinstance(backend, ClaudeBackend), "Tier-2 Claude-only access requires ClaudeBackend"
         return backend
 
+    def _backend_supports_claude_controls(self) -> bool:
+        return isinstance(self.task_manager.backend, ClaudeBackend)
+
+    def _backend_supports_prompt_customization(self) -> bool:
+        return isinstance(self.task_manager.backend, ClaudeBackend)
+
     def _effective_config_path(self) -> Path:
         return self._config_path or DEFAULT_CONFIG
 
@@ -967,6 +973,9 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self._backend_supports_claude_controls():
+            await self._transport.send_text(ci.chat, "This backend doesn't support /effort.")
+            return
         await self._transport.send_text(
             ci.chat,
             f"Current: {self._current_effort()}",
@@ -1157,6 +1166,11 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self._backend_supports_prompt_customization():
+            await self._transport.send_text(
+                ci.chat, "This backend doesn't support skills yet (personas still work)."
+            )
+            return
         if ci.args:
             name = ci.args[0].lower()
             from .skills import load_skill
@@ -1190,6 +1204,11 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
+        if not self._backend_supports_prompt_customization():
+            await self._transport.send_text(
+                ci.chat, "This backend doesn't support skills yet (personas still work)."
+            )
+            return
         if not self._active_skill:
             await self._transport.send_text(ci.chat, "No active skill.")
             return
@@ -1254,7 +1273,12 @@ class ProjectBot(AuthMixin):
         carries both). Without the self handle Claude tends to invent one from
         the persona name — e.g. the pre-suffix-bump ``@..._dev_claude_bot``
         when the real handle is ``@..._dev_2_claude_bot``.
+
+        No-op for non-Claude backends — Codex doesn't expose an
+        append-system-prompt equivalent in this phase.
         """
+        if not self._backend_supports_prompt_customization():
+            return
         if not self.peer_bot_username:
             self._claude.team_system_note = None
             return
@@ -1585,6 +1609,9 @@ class ProjectBot(AuthMixin):
                 buttons=self._model_buttons(),
             )
         elif value.startswith("effort_set_"):
+            if not self._backend_supports_claude_controls():
+                await self._transport.edit_text(msg_ref, "This backend doesn't support /effort.")
+                return
             level = value[len("effort_set_"):]
             if level in EFFORT_LEVELS:
                 self._claude.effort = level
@@ -1605,6 +1632,9 @@ class ProjectBot(AuthMixin):
                 buttons=self._thinking_buttons(),
             )
         elif value.startswith("permissions_set_"):
+            if not self.task_manager.backend.capabilities.supports_permissions:
+                await self._transport.edit_text(msg_ref, "This backend doesn't support /permissions.")
+                return
             mode = value[len("permissions_set_"):]
             if mode == "dangerously-skip-permissions" or mode in PERMISSION_MODES:
                 skip, pm = resolve_permissions(mode)
@@ -1644,7 +1674,8 @@ class ProjectBot(AuthMixin):
             self.task_manager.backend.session_id = None
             self._active_skill = None
             self._active_persona = None
-            self._claude.append_system_prompt = None
+            if self._backend_supports_prompt_customization():
+                self._claude.append_system_prompt = None
             clear_session(
                 self.name,
                 self._effective_config_path(),
@@ -1662,7 +1693,8 @@ class ProjectBot(AuthMixin):
             _delete_skill(name, self.path, scope=scope)
             if self._active_skill == name:
                 self._active_skill = None
-                self._claude.append_system_prompt = None
+                if self._backend_supports_prompt_customization():
+                    self._claude.append_system_prompt = None
             await self._transport.edit_text(msg_ref, f"Skill '{name}' deleted.")
         elif value == "skill_delete_cancel":
             await self._transport.edit_text(msg_ref, "Cancelled.")
@@ -1674,6 +1706,11 @@ class ProjectBot(AuthMixin):
             await self._transport.edit_text(msg_ref, f"Send the content for skill '{name}':")
         elif value.startswith("pick_skill_"):
             name = value[len("pick_skill_"):]
+            if not self._backend_supports_prompt_customization():
+                await self._transport.edit_text(
+                    msg_ref, "This backend doesn't support skills yet (personas still work)."
+                )
+                return
             from .skills import load_skill
             skill = load_skill(name, self.path)
             if not skill:
