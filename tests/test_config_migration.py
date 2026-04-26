@@ -213,3 +213,156 @@ def test_clear_session_removes_backend_state_and_legacy_mirror(tmp_path: Path):
 
     assert "session_id" not in raw["projects"]["demo"]["backend_state"]["claude"]
     assert "session_id" not in raw["projects"]["demo"]
+
+
+# ---------------------------------------------------------------------------
+# Team safety: loader leniency + writer safeguard against partial team entries
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_skips_team_missing_path(tmp_path: Path, caplog):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "acme": {
+                        "bots": {
+                            "manager": {
+                                "permissions": "acceptEdits",
+                                "backend_state": {"claude": {"permissions": "acceptEdits"}},
+                            }
+                        }
+                    },
+                    "valid": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -100123,
+                        "bots": {"manager": {"telegram_bot_token": "t2"}},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        config = load_config(path)
+
+    assert "acme" not in config.teams
+    assert "valid" in config.teams
+    assert any("acme" in r.message for r in caplog.records)
+
+
+def test_load_config_skips_team_missing_group_chat_id(tmp_path: Path, caplog):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "incomplete": {
+                        "path": "/tmp/incomplete",
+                        "bots": {"manager": {"telegram_bot_token": "t"}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        config = load_config(path)
+
+    assert "incomplete" not in config.teams
+
+
+def test_load_config_cleans_up_malformed_team_on_disk(tmp_path: Path):
+    """Loader rewrites the file to drop incomplete team entries (matches the
+    project-side cleanup precedent so the warning stops repeating)."""
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "acme": {
+                        "bots": {"manager": {"permissions": "acceptEdits"}}
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    load_config(path)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "acme" not in raw.get("teams", {})
+
+
+def test_patch_team_bot_backend_state_refuses_unknown_team(tmp_path: Path, caplog):
+    from link_project_to_chat.config import patch_team_bot_backend_state
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"teams": {}}), encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        patch_team_bot_backend_state(
+            "acme", "manager", "claude", {"permissions": "acceptEdits"}, path
+        )
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "acme" not in raw.get("teams", {})
+    assert any("acme" in r.message for r in caplog.records)
+
+
+def test_patch_team_bot_backend_state_writes_when_team_configured(tmp_path: Path):
+    from link_project_to_chat.config import patch_team_bot_backend_state
+
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "teams": {
+                    "alpha": {
+                        "path": "/tmp/alpha",
+                        "group_chat_id": -100123,
+                        "bots": {"manager": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    patch_team_bot_backend_state(
+        "alpha", "manager", "claude", {"permissions": "plan"}, path
+    )
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert (
+        raw["teams"]["alpha"]["bots"]["manager"]["backend_state"]["claude"]["permissions"]
+        == "plan"
+    )
+
+
+def test_patch_team_bot_backend_refuses_unknown_team(tmp_path: Path):
+    from link_project_to_chat.config import patch_team_bot_backend
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"teams": {}}), encoding="utf-8")
+
+    patch_team_bot_backend("acme", "manager", "codex", path)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "acme" not in raw.get("teams", {})
+
+
+def test_save_session_for_unknown_team_is_noop(tmp_path: Path):
+    from link_project_to_chat.config import save_session
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"teams": {}}), encoding="utf-8")
+
+    save_session("acme", "sess-x", path, team_name="acme", role="manager")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "acme" not in raw.get("teams", {})

@@ -821,7 +821,12 @@ def test_load_config_self_heals_phantom_project_without_path(tmp_path: Path):
     assert raw["future_key"] == "kept"
 
 
-def test_load_config_team_missing_path_raises_config_error(tmp_path: Path):
+def test_load_config_team_missing_path_skipped_with_warning(tmp_path: Path, caplog):
+    """A team missing 'path' is skipped with a warning (was: raised ConfigError).
+
+    Strict-fail made one stray phantom entry take down the whole manager
+    service; skip-and-warn matches the project-side leniency precedent.
+    """
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({
         "teams": {
@@ -831,14 +836,17 @@ def test_load_config_team_missing_path_raises_config_error(tmp_path: Path):
             }
         },
     }))
-    with pytest.raises(ConfigError) as exc:
-        load_config(p)
-    msg = str(exc.value)
-    assert "acme" in msg
-    assert "path" in msg
+    with caplog.at_level("WARNING"):
+        cfg = load_config(p)
+    assert "acme" not in cfg.teams
+    assert any(
+        "acme" in r.message and "path" in r.message for r in caplog.records
+    )
 
 
-def test_load_config_team_missing_group_chat_id_raises_config_error(tmp_path: Path):
+def test_load_config_team_missing_group_chat_id_skipped_with_warning(
+    tmp_path: Path, caplog
+):
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({
         "teams": {
@@ -848,24 +856,31 @@ def test_load_config_team_missing_group_chat_id_raises_config_error(tmp_path: Pa
             }
         },
     }))
-    with pytest.raises(ConfigError) as exc:
-        load_config(p)
-    msg = str(exc.value)
-    assert "beta" in msg
-    assert "group_chat_id" in msg
+    with caplog.at_level("WARNING"):
+        cfg = load_config(p)
+    assert "beta" not in cfg.teams
+    assert any(
+        "beta" in r.message and "group_chat_id" in r.message
+        for r in caplog.records
+    )
 
 
-def test_load_config_team_missing_everything_names_first_missing_field(tmp_path: Path):
-    """A stub team entry (only bots) must raise ConfigError naming the team."""
+def test_load_config_team_missing_everything_skipped_with_warning(
+    tmp_path: Path, caplog
+):
+    """A stub team entry (only bots) is skipped, naming all missing fields."""
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({
         "teams": {
             "acme": {"bots": {"manager": {"active_persona": "developer"}}},
         },
     }))
-    with pytest.raises(ConfigError) as exc:
-        load_config(p)
-    assert "acme" in str(exc.value)
+    with caplog.at_level("WARNING"):
+        cfg = load_config(p)
+    assert "acme" not in cfg.teams
+    record = next(r for r in caplog.records if "acme" in r.message)
+    assert "path" in record.message
+    assert "group_chat_id" in record.message
 
 
 def test_save_config_drops_phantom_project_on_next_write(tmp_path: Path):

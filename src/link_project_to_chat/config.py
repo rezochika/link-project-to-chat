@@ -393,6 +393,64 @@ def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
         pass
 
 
+def _split_team_entries(
+    teams: object,
+) -> tuple[dict[str, dict], list[tuple[str, list[str]]]]:
+    """Partition raw team entries into valid configs and malformed leftovers.
+
+    Returns ``(valid, malformed)`` where ``malformed`` is a list of
+    ``(team_name, missing_fields)`` tuples. A team is valid when its raw
+    entry is a dict and contains both ``path`` and ``group_chat_id``.
+    """
+    if not isinstance(teams, dict):
+        return {}, []
+
+    valid: dict[str, dict] = {}
+    malformed: list[tuple[str, list[str]]] = []
+    for name, team in teams.items():
+        if not isinstance(team, dict):
+            malformed.append((name, ["entry-not-dict"]))
+            continue
+        missing = [r for r in ("path", "group_chat_id") if r not in team]
+        if missing:
+            malformed.append((name, missing))
+        else:
+            valid[name] = team
+    return valid, malformed
+
+
+def _cleanup_malformed_teams(path: Path, names: list[str]) -> None:
+    """Best-effort removal of partial team entries that the loader skipped."""
+    if not names:
+        return
+
+    def _patch(raw: dict) -> None:
+        teams = raw.get("teams")
+        if not isinstance(teams, dict):
+            return
+        for name in names:
+            teams.pop(name, None)
+
+    try:
+        _patch_json(_patch, path)
+    except OSError:
+        pass
+
+
+def _team_is_configured(raw: dict, team_name: str) -> bool:
+    """True if a team entry has the required fields to be loaded.
+
+    Used by team-bot writer helpers to refuse creating partial entries
+    when the team has not been fully configured yet.
+    """
+    team = raw.get("teams", {}).get(team_name)
+    return (
+        isinstance(team, dict)
+        and "path" in team
+        and "group_chat_id" in team
+    )
+
+
 def _make_team_bot_config(b: dict) -> TeamBotConfig:
     """Build a TeamBotConfig from a raw dict, folding legacy fields into backend_state."""
     bot_model = b.get("model")
@@ -511,12 +569,17 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 config.projects[name].trusted_user_ids = list(
                     config.projects[name].trusted_users.values()
                 )
-        for name, team in raw.get("teams", {}).items():
-            for required in ("path", "group_chat_id"):
-                if required not in team:
-                    raise ConfigError(
-                        f"Team {name!r} in {path} is missing required field {required!r}"
-                    )
+        valid_teams, malformed_teams = _split_team_entries(raw.get("teams", {}))
+        if malformed_teams:
+            for name, missing in malformed_teams:
+                logger.warning(
+                    "Skipping malformed team %r in %s — missing required field(s): %s",
+                    name, path, ", ".join(missing),
+                )
+            _cleanup_malformed_teams(
+                path, [name for name, _ in malformed_teams]
+            )
+        for name, team in valid_teams.items():
             team_cfg = TeamConfig(
                 path=team["path"],
                 group_chat_id=team["group_chat_id"],
@@ -899,9 +962,15 @@ def save_session(
     """Persist session_id into backend_state[<active_backend>] and mirror legacy when claude."""
     def _patch(raw: dict) -> None:
         if team_name and role:
+            if not _team_is_configured(raw, team_name):
+                logger.warning(
+                    "Ignoring session save for team %r role %r — "
+                    "team not configured.",
+                    team_name, role,
+                )
+                return
             entry = (
-                raw.setdefault("teams", {})
-                .setdefault(team_name, {})
+                raw["teams"][team_name]
                 .setdefault("bots", {})
                 .setdefault(role, {})
             )
@@ -927,9 +996,15 @@ def clear_session(
     """Drop session_id from backend_state[<active_backend>] and the legacy mirror."""
     def _patch(raw: dict) -> None:
         if team_name and role:
+            if not _team_is_configured(raw, team_name):
+                logger.warning(
+                    "Ignoring session clear for team %r role %r — "
+                    "team not configured.",
+                    team_name, role,
+                )
+                return
             entry = (
-                raw.setdefault("teams", {})
-                .setdefault(team_name, {})
+                raw["teams"][team_name]
                 .setdefault("bots", {})
                 .setdefault(role, {})
             )
@@ -988,11 +1063,22 @@ def patch_team_bot_backend_state(
     flat fields on the team-bot entry are re-mirrored from backend_state for
     downgrade safety. Legacy flat fields are folded into ``backend_state["claude"]``
     first when the on-disk entry only has the legacy shape.
+
+    Refuses to materialize a team that hasn't been configured (no ``path`` /
+    ``group_chat_id``). Without this guard a stray write from a team-bot
+    process whose team was deleted upstream would re-create a partial entry
+    that the loader then rejects, taking down the manager service.
     """
     def _patch(raw: dict) -> None:
+        if not _team_is_configured(raw, team_name):
+            logger.warning(
+                "Ignoring backend_state write for team %r role %r — "
+                "team not configured (missing 'path' / 'group_chat_id').",
+                team_name, role,
+            )
+            return
         bot = (
-            raw.setdefault("teams", {})
-            .setdefault(team_name, {})
+            raw["teams"][team_name]
             .setdefault("bots", {})
             .setdefault(role, {})
         )
@@ -1015,11 +1101,21 @@ def patch_team_bot_backend(
     backend_name: str,
     path: Path = DEFAULT_CONFIG,
 ) -> None:
-    """Set the active backend on a team-bot entry without touching state."""
+    """Set the active backend on a team-bot entry without touching state.
+
+    Refuses to write if the team is not configured; see the safety note on
+    ``patch_team_bot_backend_state``.
+    """
     def _patch(raw: dict) -> None:
+        if not _team_is_configured(raw, team_name):
+            logger.warning(
+                "Ignoring backend write for team %r role %r — "
+                "team not configured (missing 'path' / 'group_chat_id').",
+                team_name, role,
+            )
+            return
         bot = (
-            raw.setdefault("teams", {})
-            .setdefault(team_name, {})
+            raw["teams"][team_name]
             .setdefault("bots", {})
             .setdefault(role, {})
         )
