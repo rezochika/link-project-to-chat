@@ -2,6 +2,10 @@
 
 **Captured:** 2026-04-26 at HEAD `9280aef`. Phase 3 (Codex adapter, opt-in via `/backend codex`) shipped earlier the same day; the spec stub set the soak window at "≥2 weeks" before Phase 4 should be planned.
 
+## Re-check log
+
+- 2026-04-26 (afternoon): trigger checklist re-evaluated at unchanged HEAD `03ef9e0` (`git log 03ef9e0..HEAD` is empty). Soak window still UNCHECKED — Phase 3 shipped today, no meaningful soak time elapsed between captures. P1/P2 fixes still CHECKED. Capability promotion still UNCHECKED — re-ran the live smoke (thread `019dc923-7953-7be3-a7cc-3706085fbc7d`) and saw the same conservative event surface (no thinking event, no rate-limit signal in `turn.completed.usage`). `/status` improvement still UNCHECKED — no new user-asked-for improvement landed. Error-surface improvement still CHECKED. Two trigger boxes total, only one of which is a soak-evidence trigger; verdict remains `NOT READY`. Next re-check: after the agreed soak window has elapsed and at least one capability or `/status` improvement has direct user/test evidence.
+
 ## Trigger checklist
 
 - [ ] Phase 3 has been opt-in for at least the agreed soak window

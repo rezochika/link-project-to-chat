@@ -2,6 +2,10 @@
 
 **Captured:** 2026-04-26 from automated tests at HEAD `9280aef` plus one direct Codex CLI smoke run (thread `019dc8db-0ea5-7193-8f58-d28059401947`).
 
+## Re-check log
+
+- 2026-04-26 (afternoon): matrix re-validated against the same test/smoke evidence at unchanged HEAD `03ef9e0`. `tests/backends/test_capability_declaration.py::test_codex_capabilities_match_validated_findings` still pins every `False`/`()` Codex flag. Live smoke (thread `019dc923-7953-7be3-a7cc-3706085fbc7d`) reproduced the same event sequence (`thread.started` / `turn.started` / `item.completed (agent_message)` / `turn.completed`) — no thinking event, no rate-limit signal, no new model identifier on stdout. No capabilities flipped; no matrix update needed.
+
 | Capability | Claude | Codex | Evidence |
 |------------|--------|-------|----------|
 | Resume/session reuse | yes | yes | Claude: `tests/test_stream.py::test_result_event` proves `session_id` round-trips through `parse_stream_line`; `src/link_project_to_chat/backends/claude.py:255-256` shows `--resume <session_id>` is wired into `_build_cmd`. Codex: `tests/backends/test_codex_live.py::test_codex_live_resume_reuses_session` asserts `backend.session_id` is unchanged after a second `chat()`; bash smoke run on 2026-04-26 saw the resume turn echo the original `thread_id`. |

@@ -4,6 +4,10 @@
 **Phase 3 shipped:** Earlier on 2026-04-26 (Codex adapter opt-in via `/backend codex`).
 **Caveat:** The Phase 3 soak window has not elapsed; this inventory captures evidence only from automated tests and a single live smoke pair, not from real user dogfooding.
 
+## Re-check log
+
+- 2026-04-26 (afternoon): re-ran the verification suites and the direct Codex CLI smoke against an unchanged code state at HEAD `03ef9e0`. Backend unit suites: 15 passed + 1 skipped (`tests/backends/test_env_policy.py` + `test_capability_declaration.py` + `test_codex_backend.py` + `test_contract.py`). Bot-level suites: 36 passed (`tests/test_backend_command.py` + `test_capability_gating.py` + `test_bot_streaming.py`). Live smoke: 2 passed in 18.20s (`tests/backends/test_codex_live.py`). Direct CLI smoke: first turn rc=0 + turn.completed reached, resume rc=0 + turn.completed reached, same `thread_id` (`019dc923-7953-7be3-a7cc-3706085fbc7d`); stderr emitted only the now-known noise pattern (`ERROR codex_core::session: failed to record rollout items: thread <id> not found`, 2 lines + 1 stdin notice). No new gaps surfaced. Verdict unchanged.
+
 ---
 
 ## Validated capabilities that are already working
