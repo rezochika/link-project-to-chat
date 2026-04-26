@@ -47,7 +47,7 @@
   - `TelegramTransport` implementation wraps python-telegram-bot end-to-end: send_text/edit_text (with html + reply_to), send_file, send_typing, on_message/on_command/on_button, and build() + attach_telegram_routing() for bootstrap
   - `FakeTransport` in-memory double for tests; parametrized contract test in `tests/transport/test_contract.py` enforces the Protocol across all implementations
   - `StreamingMessage` transport-agnostic streaming-edit helper with throttling, chunking, HTML rendering on finalize, and `TransportRetryAfter` back-off (replaces `livestream.LiveMessage` in the project bot)
-  - `bot.py` only imports `Update`, `ContextTypes`, `MessageHandler`, and `filters` from telegram (voice + unsupported-type handlers, pending spec #0b)
+  - `bot.py` has zero direct telegram imports; platform calls go through Transport
   - `tests/test_transport_lockout.py` prevents future direct-telegram coupling via an import allowlist
 - **Voice port — transport complete** (spec #0b, v0.14.0):
   - `Transport.send_voice` primitive added; TelegramTransport and FakeTransport both implement
@@ -73,6 +73,16 @@
   - Internal helpers `_execute_bot_creation`, `_execute_clone`, `_finalize_create`, `_show_repo_page`, and `_create_team_execute` orchestrator ported to take `ChatRef` / use `self._transport.*`
   - `tests/test_manager_lockout.py` enforces the residual telegram allowlist (Update + ConversationHandler family = 7 names)
   - `TelegramTransport.app` accessor exposes the underlying `telegram.ext.Application` for ConversationHandler integration (TelegramTransport-specific, not on Protocol)
+- **Web UI transport** (spec #1):
+  - `WebTransport` implements the transport Protocol with FastAPI + HTMX + SSE + SQLite
+  - Browser identity/auth, file upload, and SSE timeline refresh are wired through the same ProjectBot handler path
+  - Transport contract tests cover fake, Telegram, and web implementations
+- **Backend abstraction phases 1–4**:
+  - `AgentBackend` Protocol with Claude and Codex implementations under `src/link_project_to_chat/backends/`
+  - `/backend` switches between Claude and Codex; no-arg form renders a picker
+  - Codex supports `/model`, `/effort`, `/permissions`, resume, and token usage reporting
+  - `/status` is provider-aware: model labels, effort, permissions, request count, last duration, token usage, Claude tool allow/deny lists, usage-cap state, and last backend error where available
+  - `/context` persists per-chat conversation history so backend switches keep recent conversational context visible
 
 ## Coding Style
 - Single-purpose functions
@@ -85,6 +95,7 @@
 - No over-engineering: minimum complexity for the current task
 
 ## Pending
-- `_proc` on `ClaudeClient` is a single slot — concurrent Claude tasks could overwrite it
+- `_proc` on `ClaudeBackend` is a single slot — concurrent Claude tasks could overwrite it
 - Manager bot `/add_project` wizard allows skipping token — inconsistent with CLI requirement
-- `livestream.LiveMessage` is dead code (project bot uses `StreamingMessage`); remove once confident no other code paths use it
+- `WebTransport.stop()` doesn't fully release uvicorn listener in all end-to-end test runs; fixed-port tests can see `[Errno 98]` flakes
+- `tests/test_cli_transport.py` depends on `/tmp/x` existing; replace with `tmp_path`

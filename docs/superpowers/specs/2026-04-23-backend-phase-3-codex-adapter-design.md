@@ -1,6 +1,6 @@
 # Backend Abstraction Phase 3 — Codex Adapter (Conservative)
 
-**Status:** Designed (2026-04-23). Not yet implemented.
+**Status:** Shipped (2026-04-26). Phase 4 later promoted Codex `/model`, `/effort`, and `/permissions` after additional CLI validation.
 **Date:** 2026-04-23
 **Part of:** Backend-abstraction track, spec #3 of 4.
 **Depends on:** Spec #2 (backend-aware config + `/backend` + factory + capability gating).
