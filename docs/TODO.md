@@ -57,12 +57,14 @@ Multi-backend support (Claude → Codex / others). Phases 1–2 have shipped; ph
 |---|---|---|---|
 | Phase 1 — Claude extraction | [spec](superpowers/specs/2026-04-23-backend-phase-1-claude-extraction-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-1-claude-extraction.md) | ✅ |
 | Phase 2 — Config & `/backend` command | [spec](superpowers/specs/2026-04-23-backend-phase-2-config-and-backend-command-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-2-config-and-backend-command.md) | ✅ |
-| Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | 📋 |
+| Phase 3 — Codex adapter | [spec](superpowers/specs/2026-04-23-backend-phase-3-codex-adapter-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-3-codex-adapter.md) | ✅ |
 | Phase 4 — Capability expansion readiness | [spec](superpowers/specs/2026-04-23-backend-phase-4-capability-expansion-design.md) | [plan](superpowers/plans/2026-04-23-backend-phase-4-capability-expansion-readiness.md) | 📋 |
 
 Phase 1 evidence: `src/link_project_to_chat/backends/` (5 files: `base.py` `AgentBackend` Protocol, `claude.py` `ClaudeBackend`, `claude_parser.py`, `factory.py`, `__init__.py`). `claude_client.py` was removed; `ProjectBot` constructs a Claude backend via the factory. Commits: `0ab1c56` (Protocol+factory), `ee53d19` (move Claude client), `f1acefd` (inject into TaskManager), `f20d8d1` (route through factory + remove shim).
 
 Phase 2 evidence: `ProjectConfig.backend` + `backend_state` dataclass fields (`config.py:55-56`), `Config.default_backend` (`config.py:104`), legacy-flat-field migration helpers (`_legacy_backend_state`, `_mirror_legacy_claude_fields`, `_effective_backend_state` at `config.py:194-241`), `/backend` command registered in `bot.py:53`, `ProjectBot.__init__(backend_name, backend_state)` (`bot.py:111`), capability-gated `/thinking`/`/permissions`/`/compact` responses, and manager-side propagation. Commits: `4828120` (config migration + dual-write), `7917b44` (helper migration + persistence call sites), `f73b43e` (`/backend` switching + capability gating), `283c5ed` (manager+CLI propagation), `cb91bb4` (parameterize Telegram-awareness preamble), `552df09` (post-phase-2 cleanup).
+
+Phase 3 evidence: `CodexBackend` (`backends/codex.py`) implements the `AgentBackend` Protocol against the `codex exec --json` / `codex exec resume --json` CLI surface, registered with the factory under name `codex` and selectable via `/backend codex`. `codex_parser.py` translates the Codex JSONL stream (`thread.started`, `item.completed` agent_message, `turn.completed`, error frames) into the shared `StreamEvent` taxonomy. The new `BaseBackend` helper (`backends/base.py`) hosts a shared `_prepare_env` with per-backend keep/scrub allowlists — Claude scrubs `OPENAI_*` and `ANTHROPIC_*`, while Codex keeps `OPENAI_*`/`CODEX_*` but still scrubs `ANTHROPIC_*` and other token patterns. `CODEX_CAPABILITIES` declares conservative flags (no thinking, no permissions, no compact, no allowed_tools, no usage-cap detection; resume only) so the bot's capability-gated commands continue to refuse cleanly when Codex is active. Live coverage runs only when `RUN_CODEX_LIVE=1` is set and the `codex_live` pytest marker is selected (`tests/backends/test_codex_live.py`); the live tests spawn a real `codex` subprocess inside a fresh git-initialised tmp dir, verify the round-trip emits OK as both a `TextDelta` and the closing `Result`, and confirm a follow-up turn replies AGAIN while reusing the same `session_id`. Commits: `da86be3` (codex CLI findings + parser fixtures), `5cccb8b` (shared env-policy helper), `efa1ea6` (codex JSONL parser), `01d5b80` (codex backend adapter), `7d216ec` (guard claude-only bot commands under codex), plus this Task 6 commit locking capability declarations, env policy, contract test, and live coverage.
 
 PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
 
@@ -191,9 +193,9 @@ Open questions:
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phase 1 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
+| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–3 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
 | 🟡 Partial / intermittent | A2 (schema landed, call-sites pending) · 2 intermittent flaky tests (F1, F2 in §4.4) |
-| 📋 Designed, not started | 5 specs (Discord #2, Slack #3, Google Chat #4, Backend phases 3–4), sandbox |
+| 📋 Designed, not started | 4 specs (Discord #2, Slack #3, Google Chat #4, Backend phase 4), sandbox |
 | ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · 2 known issues · 1 deferred follow-up (A3) · WebTransport.stop() listener-release |
 
 ---

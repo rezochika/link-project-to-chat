@@ -34,7 +34,7 @@ No Makefile, tox, or linter configured. Build system is hatchling. Entry point: 
 - **bot.py** — Main ProjectBot handler. Zero direct Telegram imports (enforced by `tests/test_transport_lockout.py`). All platform calls go through Transport.
 - **transport/** — `Transport` Protocol (base.py), `TelegramTransport` (telegram.py), `FakeTransport` (fake.py) for tests, `StreamingMessage` (streaming.py) for rate-limited edits. Telegram-specific helpers (`_telegram_relay.py`, `_telegram_group.py`) live alongside but are private.
 - **web/** — `WebTransport` (transport.py), FastAPI app + SSE (app.py), SQLite store (store.py). First non-Telegram transport, shipped under spec #1.
-- **backends/** — `AgentBackend` Protocol (base.py), `ClaudeBackend` (claude.py), parser (claude_parser.py), `factory.py`. The bot constructs a backend via the factory; backend extraction landed under backend phase 1.
+- **backends/** — `AgentBackend` Protocol + `BaseBackend` env-policy helper (base.py), `ClaudeBackend` (claude.py) and Claude JSONL parser (claude_parser.py), `CodexBackend` (codex.py) and Codex JSONL parser (codex_parser.py), `factory.py`. The bot constructs a backend via the factory; backend extraction landed under backend phase 1, and Codex landed under phase 3 as an opt-in via `/backend codex`. Per-backend env scrub/keep allowlists run through `BaseBackend._prepare_env`. Live Codex coverage gates behind `RUN_CODEX_LIVE=1` and the `codex_live` pytest marker.
 - **stream.py** — Event types: TextDelta, ThinkingDelta, ToolUse, AskQuestion, Result, Error.
 - **task_manager.py** — Tracks concurrent Claude tasks and shell commands with lifecycle callbacks.
 - **manager/** — `ManagerBot` (ported to `TelegramTransport` under spec #0c, with a 7-name allowlist for `Update`/`ConversationHandler` family enforced by `tests/test_manager_lockout.py`). `ProcessManager` handles project-bot subprocess lifecycle. Wizard state lives in `conversation.py` above the transport layer.
@@ -73,7 +73,7 @@ The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only commun
 
 Active branch `feat/transport-abstraction` carries the transport-abstraction track plus the first non-Telegram transport.
 
-- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`) and 2 (backend-aware config + `/backend` command) also shipped.
-- Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4), backend phases 3 (Codex adapter) and 4 (capability expansion).
+- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`), 2 (backend-aware config + `/backend` command), and 3 (Codex adapter behind `/backend codex`) also shipped.
+- Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4), backend phase 4 (capability expansion).
 
 [docs/TODO.md](docs/TODO.md) is the live status source — update there first; this section is a pointer.

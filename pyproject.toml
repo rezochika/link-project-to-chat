@@ -53,3 +53,6 @@ link-project-to-chat = "link_project_to_chat.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "codex_live: requires RUN_CODEX_LIVE=1 plus a real codex CLI installation and local authentication",
+]

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from link_project_to_chat.backends.claude import ClaudeBackend
+from link_project_to_chat.backends.codex import CodexBackend
 from link_project_to_chat.events import Result
 from tests.backends.fakes import FakeBackend
 
@@ -26,6 +27,18 @@ async def test_backend_contract_chat_returns_string(tmp_path, backend_factory):
         )
     result = await backend.chat("hello")
     assert isinstance(result, str)
+
+
+@pytest.mark.asyncio
+async def test_codex_backend_contract_chat_returns_string(tmp_path, monkeypatch):
+    backend = CodexBackend(tmp_path, {})
+
+    async def _fake_chat(user_message: str, on_proc=None) -> str:
+        return "ok"
+
+    monkeypatch.setattr(backend, "chat", _fake_chat)
+
+    assert isinstance(await backend.chat("hello"), str)
 
 
 @pytest.mark.asyncio
