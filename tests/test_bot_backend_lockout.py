@@ -38,7 +38,6 @@ TIER2_ATTRS = frozenset({
     "allowed_tools",
     "disallowed_tools",
     "append_system_prompt",
-    "team_system_note",
     "show_thinking",
 })
 

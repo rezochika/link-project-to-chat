@@ -65,6 +65,7 @@ class CodexBackend(BaseBackend):
         self.session_id: str | None = state.get("session_id")
         self.effort: str | None = state.get("effort")
         self.permissions: str | None = state.get("permissions")
+        self.team_system_note: str | None = None
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
@@ -81,6 +82,7 @@ class CodexBackend(BaseBackend):
         if self.session_id:
             cmd.append("resume")
         cmd.append("--json")
+        prompt = self._build_prompt(user_message)
         if self.model:
             cmd.extend(["--model", self.model])
         if self.effort:
@@ -88,8 +90,18 @@ class CodexBackend(BaseBackend):
         cmd.extend(self._permission_args())
         if self.session_id:
             cmd.append(self.session_id)
-        cmd.append(user_message)
+        cmd.append(prompt)
         return cmd
+
+    def _build_prompt(self, user_message: str) -> str:
+        if not self.team_system_note:
+            return user_message
+        return (
+            "<system-reminder>\n"
+            f"{self.team_system_note}\n"
+            "</system-reminder>\n\n"
+            f"{user_message}"
+        )
 
     def _permission_args(self) -> list[str]:
         mode = self.permissions

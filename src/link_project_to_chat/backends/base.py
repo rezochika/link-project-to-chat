@@ -69,6 +69,9 @@ class AgentBackend(Protocol):
     # support it ignore writes; the bot still gates /effort on
     # ``capabilities.supports_effort`` before mutating this attribute.
     effort: str | None
+    # Team-mode routing instructions. ProjectBot sets this for every backend;
+    # each backend decides how to inject it into its own CLI surface.
+    team_system_note: str | None
 
     async def chat_stream(
         self,

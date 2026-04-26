@@ -54,6 +54,17 @@ def test_build_cmd_for_resume_uses_exec_resume_json(tmp_path):
     ]
 
 
+def test_build_cmd_injects_team_system_note_into_prompt(tmp_path):
+    backend = CodexBackend(tmp_path, {})
+    backend.team_system_note = "Use @peer_bot for handoffs."
+
+    cmd = backend._build_cmd("hello")
+
+    assert cmd[-1].startswith("<system-reminder>")
+    assert "Use @peer_bot for handoffs." in cmd[-1]
+    assert cmd[-1].endswith("hello")
+
+
 def test_build_cmd_includes_model_reasoning_effort_when_set(tmp_path):
     backend = CodexBackend(tmp_path, {"effort": "high"})
     cmd = backend._build_cmd("hi")

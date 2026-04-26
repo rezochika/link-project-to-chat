@@ -609,6 +609,47 @@ def test_team_bot_with_peer_username_sets_team_system_note(tmp_path):
     assert "developer" in note  # peer role label
 
 
+def test_codex_team_bot_with_peer_username_sets_team_system_note(tmp_path):
+    """Codex team bots should get the same relay-routing note as Claude bots."""
+    from link_project_to_chat.backends import codex as _codex  # noqa: F401
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="acme_dev_codex_bot",
+        backend_name="codex",
+        backend_state={"codex": {}},
+    )
+
+    note = bot.task_manager.backend.team_system_note
+    assert note is not None
+    assert "acme_dev_codex_bot" in note
+    assert "BEGIN the reply with @acme_dev_codex_bot" in note
+
+
+@pytest.mark.asyncio
+async def test_switching_team_bot_to_codex_refreshes_team_system_note(tmp_path):
+    """A runtime backend switch should populate the new backend with team context."""
+    from link_project_to_chat.backends import codex as _codex  # noqa: F401
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        peer_bot_username="acme_dev_codex_bot",
+        config_path=tmp_path / "config.json",
+    )
+    assert bot.task_manager.backend.name == "claude"
+
+    await bot._switch_backend("codex")
+
+    assert bot.task_manager.backend.name == "codex"
+    note = bot.task_manager.backend.team_system_note
+    assert note is not None
+    assert "acme_dev_codex_bot" in note
+
+
 def test_team_system_note_discourages_ack_echoing(tmp_path):
     """The note must tell the bot not to echo acknowledgments — the ping-pong cause.
 

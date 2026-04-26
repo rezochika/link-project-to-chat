@@ -233,8 +233,9 @@ class ProjectBot(AuthMixin):
 
     @property
     def _claude(self) -> ClaudeBackend:
-        """Tier-2 accessor for Claude-specific behavior (effort, permissions,
-        append_system_prompt, team_system_note). Only valid while the
+        """Tier-2 accessor for Claude-specific behavior.
+
+        Only valid while the
         configured backend is ClaudeBackend; asserts so other backends
         surface a clear error rather than silent attribute misses."""
         backend = self.task_manager.backend
@@ -1264,6 +1265,7 @@ class ProjectBot(AuthMixin):
         self.task_manager._backend = new_backend
         self._backend_name = requested
         self._backend_state.setdefault(requested, {})
+        self._refresh_team_system_note()
 
         cfg = self._effective_config_path()
         if self.team_name and self.role:
@@ -1436,21 +1438,17 @@ class ProjectBot(AuthMixin):
     # --- Persona handlers ---
 
     def _refresh_team_system_note(self) -> None:
-        """(Re)build the Claude system note that pins the bot's own + peer @handle.
+        """(Re)build the team system note that pins own + peer @handle.
 
         Called from __init__ (self handle still unknown — note carries peer only)
         and from _after_ready after get_me() fills self.bot_username (note now
-        carries both). Without the self handle Claude tends to invent one from
+        carries both). Without the self handle agents tend to invent one from
         the persona name — e.g. the pre-suffix-bump ``@..._dev_claude_bot``
         when the real handle is ``@..._dev_2_claude_bot``.
-
-        No-op for non-Claude backends — Codex doesn't expose an
-        append-system-prompt equivalent in this phase.
         """
-        if not self._backend_supports_prompt_customization():
-            return
+        backend = self.task_manager.backend
         if not self.peer_bot_username:
-            self._claude.team_system_note = None
+            backend.team_system_note = None
             return
         peer_role = "developer" if self.role == "manager" else "manager"
         self_line = (
@@ -1458,7 +1456,7 @@ class ProjectBot(AuthMixin):
             if self.bot_username
             else ""
         )
-        self._claude.team_system_note = (
+        backend.team_system_note = (
             f"You are the '{self.role}' role bot in a dual-agent team group. "
             f"{self_line}"
             f"Your team peer (role: {peer_role}) in this group is @{self.peer_bot_username}. "
