@@ -1,5 +1,7 @@
 # Backend Phase 4 Capability Expansion Readiness Implementation Plan
 
+> **2026-04-26 update:** Completed. The readiness package produced concrete follow-up slices, and Phase 4 is now shipped for the evidence-backed Claude + Codex scope.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the Phase 4 stub into an evidence-backed readiness package so the real post-Phase-3 capability-expansion work is planned from observed behavior instead of guesses.

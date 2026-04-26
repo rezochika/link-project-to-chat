@@ -1,5 +1,7 @@
 # Backend Phase 3 Codex Adapter Implementation Plan
 
+> **2026-04-26 update:** Implemented and shipped. This plan is retained as implementation history; Phase 4 later promoted Codex `/model`, `/effort`, and `/permissions` after additional CLI validation.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add an opt-in `codex` backend that works through the existing backend abstraction, persists its own session state, and stays conservative about unsupported capabilities.

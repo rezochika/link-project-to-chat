@@ -1,17 +1,17 @@
 # link-project-to-chat
 
-Chat with Claude about a project via Telegram or a local web UI. Links a local directory to a chat surface — send messages, get responses with full project context.
+Chat with an LLM agent about a project via Telegram or a local web UI. Links a local directory to a chat surface — send messages, get responses with full project context. Claude is the default backend; Codex is available via `/backend codex`.
 
 ## Security warning
 
-This tool exposes Claude Code and a `/run` command for shell execution. It is effectively a **remote shell** on your machine. On Telegram, only use it with bot tokens you control and never share them. With the web UI, bind to `127.0.0.1` and don't expose the port to the public internet without your own auth in front.
+This tool exposes agent CLIs and a `/run` command for shell execution. It is effectively a **remote shell** on your machine. On Telegram, only use it with bot tokens you control and never share them. With the web UI, bind to `127.0.0.1` and don't expose the port to the public internet without your own auth in front.
 
 On Telegram, access is restricted to configured usernames. On first contact, the bot locks each user's numeric Telegram ID — subsequent requests are validated by ID, not username, so a username change cannot bypass access. Multiple users are supported.
 
 ## Requirements
 
 - Python 3.11+
-- [Claude Code](https://claude.ai/code) installed and authenticated (`claude` on PATH)
+- [Claude Code](https://claude.ai/code) installed and authenticated (`claude` on PATH) for the default backend; optional Codex CLI (`codex` on PATH) for `/backend codex`
 - For Telegram: a Telegram bot token — create a bot via [@BotFather](https://t.me/BotFather) on Telegram
 - For local Web UI: nothing extra beyond the `[web]` install extra
 
@@ -71,13 +71,13 @@ The web UI is local-only — bind to `127.0.0.1` and never expose it to the publ
 
 ```
 You: what does the auth module do?
-Claude: The auth module handles JWT token validation and...
+Agent: The auth module handles JWT token validation and...
 
 You: /run npm run dev
 (runs in background, check output with /tasks → Log)
 
 You: add a test for expired token handling
-Claude: I'll add a test for that. [edits file]...
+Agent: I'll add a test for that. [edits file]...
 
 You: /tasks
 > #1 npm run dev
@@ -86,19 +86,21 @@ You: /tasks
 
 ## How it works
 
-`/run` commands execute in parallel with Claude work. Claude turns within a single bot session are now **serialized** so they keep one consistent shared session and can't step on each other during interactive follow-ups.
+`/run` commands execute in parallel with agent work. Agent turns within a single bot session are **serialized** so they keep one consistent shared session and can't step on each other during interactive follow-ups.
 
 ## Project bot commands
 
 | Command | Description |
 |---|---|
-| (message) | Chat with Claude in the project context |
+| (message) | Chat with the active backend in the project context |
 | `/run <cmd>` | Run a shell command in the background |
 | `/tasks` | List tasks with per-task buttons (log, cancel) |
-| `/model haiku/sonnet/opus` | Set Claude model |
-| `/effort low/medium/high/max` | Set Claude thinking depth |
+| `/backend [claude\|codex]` | Show or switch the active backend |
+| `/model [name]` | Set backend model |
+| `/effort low/medium/high/xhigh/max` | Set backend reasoning depth |
 | `/thinking on/off` | Stream Claude's internal reasoning live to chat |
-| `/permissions <mode>` | Set permission mode |
+| `/context [on\|off\|N]` | Show or set per-chat conversation history depth |
+| `/permissions <mode>` | Set backend permission / sandbox mode |
 | `/skills` | List available skills |
 | `/use [skill]` | Activate a skill (system prompt) — or pick from list |
 | `/stop_skill` | Deactivate current skill |
@@ -110,10 +112,12 @@ You: /tasks
 | `/delete_persona <name>` | Delete a persona |
 | `/voice` | Show voice transcription status |
 | `/compact` | Compress session context |
-| `/reset` | Clear the Claude session |
-| `/status` | Show bot status |
+| `/reset` | Clear the active backend session |
+| `/status` | Show bot and backend status |
 | `/version` | Show version |
 | `/help` | Show available commands |
+
+Claude remains the default backend. Codex is opt-in via `/backend codex` and supports `/model`, `/effort`, `/permissions`, session resume, and token usage reporting in `/status`. Some commands stay capability-gated: for example, live `/thinking`, `/compact`, skills, personas, and allowed/disallowed tool lists are Claude-only unless another backend exposes equivalent support.
 
 ## Skills
 
@@ -148,7 +152,7 @@ Then `/persona reviewer` to activate.
 
 ## Voice messages
 
-Send voice messages in Telegram and they'll be transcribed and sent to Claude as text.
+Send voice messages in Telegram and they'll be transcribed and sent to the active backend as text.
 
 ### Setup with OpenAI Whisper API (recommended)
 
@@ -305,13 +309,13 @@ sudo systemctl enable --now link-project-to-chat
 - Voice messages (Whisper API or local whisper.cpp)
 - Multi-project manager bot, team chats, group/team relay
 - Skills and personas
-- Pluggable agent backend with `/backend` command and capability-gated commands. Two backends ship: Claude (default) and Codex (opt-in via `/backend codex`); phases 1–3 of multi-backend
+- Pluggable agent backend with `/backend` command and capability-gated commands. Two backends ship: Claude (default) and Codex (opt-in via `/backend codex`); backend abstraction phases 1–4 are complete.
+- Provider-aware `/status`, `/context` cross-backend conversation history, Codex `/model`, Codex `/effort`, and Codex `/permissions`.
 
 **Planned (designed, not yet implemented):**
 - Discord transport
 - Slack transport
 - Google Chat transport
-- Capability-expansion polish (backend phase 4)
 
 Contributions welcome.
 

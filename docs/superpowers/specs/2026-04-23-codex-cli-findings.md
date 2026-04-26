@@ -44,6 +44,16 @@ codex exec resume --sandbox read-only --json 019dc702-1602-7381-a86f-94950237eab
 - `codex login status` exits `0` and prints `Logged in using ChatGPT` when authenticated.
 - The CLI reads from stdin during `codex exec`; the message `Reading additional input from stdin...` appearing on stderr at startup is normal and not a failure signal.
 
+## 2026-04-26 Phase 4 update
+
+Phase 4 superseded one initial conclusion below. The CLI still exposes no direct `--permission` flag, but the adapter now supports `/permissions` through validated Codex sandbox/approval controls:
+
+- `plan` maps to `-c sandbox_mode='read-only' -c approval_policy='never'`
+- `acceptEdits`, `dontAsk`, and `auto` map to `--full-auto`
+- `bypassPermissions` and `dangerously-skip-permissions` map to `--dangerously-bypass-approvals-and-sandbox`
+
+The remaining unsupported capabilities (`thinking`, `compact`, allowed-tools, and usage-cap detection) are still unsupported by evidence from the observed CLI surface, not by a missing adapter implementation.
+
 ## Captured `usage` fields
 
 Both `turn.completed` events carry a `usage` object with these keys:
@@ -59,8 +69,8 @@ The presence of `reasoning_output_tokens` confirms the model reasons internally 
 
 - `supports_resume = True` — `codex exec resume --json <thread_id>` works and reuses the original thread id.
 - `supports_thinking = False` — no thinking delta stream and no `--thinking` flag.
-- `supports_permissions = False` — no `--permission` / approval flag in the non-interactive surface.
+- `supports_permissions = True` as of Phase 4 — no direct `--permission` flag exists, but Codex sandbox/approval flags cover the bot's permission modes.
 - `supports_compact = False` — no `--compact` or session-management subcommand.
 - `supports_allowed_tools = False` — no `--allowed-tools` / tool-allowlist flag.
 - `supports_usage_cap_detection = False` — no usage-cap signal observed; the CLI emitted only token counts.
-- `models = ()` for now — the CLI advertises `--model` but not a validated fixed list, and the plan-template `--model` cross-check (`codex exec resume --json --model gpt-5.4 ...`) was not exercised in this capture.
+- `models = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2")` as of Phase 4 — the original capture only proved that the CLI advertises `--model`; the shipped adapter now uses the validated model-cache slugs.

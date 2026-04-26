@@ -2,6 +2,8 @@
 
 _Analyzed: 2026-04-23 | Branch: `feat/transport-abstraction`_
 
+> **2026-04-26 update:** This is a historical PM analysis. Backend phases 1–4 are now shipped for the Claude + Codex pair; see [TODO.md](TODO.md#2-backend-abstraction-track) for the current evidence list.
+
 ## 1. Goal
 
 Extract Claude-specific runtime details behind an `AgentBackend` Protocol, then add Codex as an opt-in second backend, enabling per-project backend selection and capability-aware command gating without breaking existing Claude behavior.
@@ -13,7 +15,7 @@ Extract Claude-specific runtime details behind an `AgentBackend` Protocol, then 
 | **1** | Claude Extraction | `ClaudeClient` → `ClaudeBackend` Protocol impl; split `stream.py` → `events.py` + parser; inject backend into `TaskManager`; rename `claude_*` to agent-neutral names | **Low** (refactor, zero behavior change) | **M** |
 | **2** | Config & `/backend` | `ProjectConfig.backend` + `backend_state`; migrate 22 call sites; `/backend` command; capability-gate `/thinking` `/permissions` `/compact` `/model` | **Med** (config migration, many sites) | **L** |
 | **3** | Codex Adapter | Validate real Codex CLI; implement `CodexBackend` + JSONL parser; opt-in registration; per-backend env scrub policy | **High** (unknown CLI behavior) | **M** |
-| **4** | Capability Readiness | Post-soak review; expand capability declarations; `/status` improvements; third-backend docs. Approval-gated. | **Low** | **S** |
+| **4** | Capability Expansion & Hardening | Codex `/model`/`/effort`/`/permissions`; `/backend` picker; provider-aware `/status`; `/context` cross-backend history; backend error/usage-cap reporting. Shipped 2026-04-26. | **Low** | **S** |
 
 ## 3. Architecture
 
@@ -68,6 +70,8 @@ Phase 1 is pure refactoring. All needed info is in the codebase. Plan is broken 
 **One caveat:** The spec was written 2026-04-23. If `task_manager.py` or `bot.py` have diverged since then (e.g., the 2026-04-22 remediation on `main` touched both), the code diffs in the plan may need adjustment. Worth a sanity-check pass before the dev bot starts.
 
 ## Recommended Next Steps
+
+> **Superseded 2026-04-26:** The recommendations below were the pre-implementation rollout order. Current next steps are the pending maintenance/audit items in [TODO.md](TODO.md), plus future transport specs #2–#4.
 
 1. **Rebase `feat/transport-abstraction` onto latest `main`** so the 2026-04-22 security remediation is included before Phase 1 implementation starts.
 2. **Start Phase 1 Task 1** (split `stream.py` into `events.py` + `claude_parser.py`) — smallest, lowest risk, proves the structure works before committing to the full rename.

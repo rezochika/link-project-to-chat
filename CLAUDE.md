@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Keep in sync with [AGENTS.md](AGENTS.md); both are pointers to [docs/TODO.md](docs/TODO.md) for live status.
 
 ## Project Overview
 
-A Python CLI that connects a local project directory to a Telegram bot for chat-based interactions with Claude. Features: streaming Claude responses, background shell execution, task management, skills/personas, voice transcription, multi-project management via a manager bot, and team/group chat support.
+A Python CLI that connects a local project directory to a chat platform (Telegram, or a local web UI) for chat-based interactions with an LLM agent. Two backends ship today: Claude (via the `claude` CLI, default) and Codex (via the `codex` CLI, opt-in via `/backend codex`). Features: streaming responses, background shell execution, task management, skills/personas, voice transcription, multi-project management via a manager bot, and team/group chat support.
 
 ## Commands
 
@@ -36,7 +36,7 @@ No Makefile, tox, or linter configured. Build system is hatchling. Entry point: 
 - **web/** — `WebTransport` (transport.py), FastAPI app + SSE (app.py), SQLite store (store.py). First non-Telegram transport, shipped under spec #1.
 - **backends/** — `AgentBackend` Protocol + `BaseBackend` env-policy helper (base.py), `ClaudeBackend` (claude.py) and Claude JSONL parser (claude_parser.py), `CodexBackend` (codex.py) and Codex JSONL parser (codex_parser.py), `factory.py`. The bot constructs a backend via the factory; backend extraction landed under backend phase 1, and Codex landed under phase 3 as an opt-in via `/backend codex`. Per-backend env scrub/keep allowlists run through `BaseBackend._prepare_env`. Live Codex coverage gates behind `RUN_CODEX_LIVE=1` and the `codex_live` pytest marker.
 - **stream.py** — Event types: TextDelta, ThinkingDelta, ToolUse, AskQuestion, Result, Error.
-- **task_manager.py** — Tracks concurrent Claude tasks and shell commands with lifecycle callbacks.
+- **task_manager.py** — Tracks concurrent agent tasks and shell commands with lifecycle callbacks.
 - **manager/** — `ManagerBot` (ported to `TelegramTransport` under spec #0c, with a 7-name allowlist for `Update`/`ConversationHandler` family enforced by `tests/test_manager_lockout.py`). `ProcessManager` handles project-bot subprocess lifecycle. Wizard state lives in `conversation.py` above the transport layer.
 - **_auth.py** — AuthMixin: username-based auth, user ID locking, brute-force protection, rate limiting.
 - **skills.py** — Skill/persona loading with priority: project > global > Claude Code user > bundled.
@@ -73,7 +73,7 @@ The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only commun
 
 Active branch `feat/transport-abstraction` carries the transport-abstraction track plus the first non-Telegram transport.
 
-- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`), 2 (backend-aware config + `/backend` command), and 3 (Codex adapter behind `/backend codex`) also shipped.
-- Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4), backend phase 4 (capability expansion).
+- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`), 2 (backend-aware config + `/backend` command), 3 (Codex adapter behind `/backend codex`), and 4 (capability expansion: Codex `/model`/`/effort`/`/permissions`, `/backend` picker, provider-aware `/status`, `/context`) also shipped.
+- Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4).
 
 [docs/TODO.md](docs/TODO.md) is the live status source — update there first; this section is a pointer.
