@@ -253,6 +253,11 @@ Open questions:
 
 | Item | Location | Status |
 |---|---|---|
+| Browser username spoofing enables web command execution: client-controlled `username` + constant `browser_user` can satisfy allowlist auth and reach `/run` | `web/app.py:52-78`, `_auth.py:138-181`, `bot.py:955-968` | 🔴 P0 pending — add real web auth, CSRF/origin protection, and server-generated identity/session binding |
+| Streamed Web UI output is rendered as trusted HTML: `render_markdown()` passes model text through, then `messages.html` uses `|safe` | `web/transport.py:193-195`, `transport/streaming.py:218-226`, `web/templates/messages.html:4` | 🔴 P1 pending — sanitize/render markdown for web or store escaped text when `html=True` |
+| Web transport drops `Buttons`, making picker-only workflows unusable (`/backend`, `/model`, `/effort`, `/permissions`, `/reset`, task controls, AskUserQuestion) | `web/transport.py:135-154`, `web/templates/messages.html` | 🟠 P1 pending — persist/render button metadata and add a web button-submit path, or add typed fallbacks |
+| Non-Telegram team `room` bindings are written but not loaded/saved/passed on restart, allowing wrong-room recapture | `config.py:594-621`, `config.py:790-799`, `cli.py:426-456` | 🟡 P2 pending — load/save `RoomBinding` and pass `room=` into `ProjectBot` startup |
+| Codex subprocess can be orphaned if `chat_stream()` exits before `turn.completed` because `_proc` is cleared before termination/reap | `backends/codex.py:214-218` | 🟡 P2 pending — terminate/reap before clearing `_proc`, with an early-generator-close regression test |
 | `_proc` is single slot — concurrent Claude tasks could overwrite | `backends/claude.py:158` (was `claude_client.py`) | ⏳ pending |
 | Manager bot `/add_project` wizard allows skipping token (inconsistent with CLI) | `manager/bot.py` | ⏳ pending |
 | ~~`livestream.LiveMessage` dead code~~ | ~~`livestream.py`~~ | ✅ removed (file no longer exists; project bot uses `transport/streaming.py`) |
