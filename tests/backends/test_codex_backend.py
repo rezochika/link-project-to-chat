@@ -19,6 +19,7 @@ class _FakeProc:
         self.returncode = returncode
         self.pid = 4242
         self.killed = False
+        self.wait_count = 0
 
     def poll(self):
         if self.killed:
@@ -28,6 +29,7 @@ class _FakeProc:
         return None
 
     def wait(self, timeout=None):
+        self.wait_count += 1
         return -9 if self.killed else self.returncode
 
     def kill(self):
@@ -108,3 +110,40 @@ def test_cancel_terminates_running_process(tmp_path):
 
     assert backend.cancel() is True
     assert proc.killed is True
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_drains_proc_after_turn_completed(tmp_path, monkeypatch):
+    """After turn.completed, the generator must wait() and read stderr so the
+    process is reaped (no zombie / fd leak) before `_proc` is cleared."""
+    proc = _FakeProc(_lines("codex_exec_ok.jsonl"), stderr_text="warn", returncode=0)
+    backend = CodexBackend(tmp_path, {})
+    monkeypatch.setattr(backend, "_popen", lambda cmd: proc)
+
+    events = [event async for event in backend.chat_stream("hello")]
+
+    assert isinstance(events[-1], Result)
+    assert proc.wait_count == 1
+    assert proc.stderr.tell() == len(proc.stderr.getvalue())  # stderr fully drained
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_logs_post_turn_nonzero_exit(tmp_path, monkeypatch, caplog):
+    """A non-zero exit that arrives after a syntactically complete turn must
+    be surfaced (was silently swallowed by the early return)."""
+    proc = _FakeProc(
+        _lines("codex_exec_ok.jsonl"),
+        stderr_text="cleanup error after turn",
+        returncode=1,
+    )
+    backend = CodexBackend(tmp_path, {})
+    monkeypatch.setattr(backend, "_popen", lambda cmd: proc)
+
+    with caplog.at_level("WARNING", logger="link_project_to_chat.backends.codex"):
+        events = [event async for event in backend.chat_stream("hello")]
+
+    assert isinstance(events[-1], Result)  # turn still surfaces a Result
+    assert any(
+        "exited 1" in r.message and "cleanup error" in r.message
+        for r in caplog.records
+    )

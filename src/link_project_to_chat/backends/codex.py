@@ -136,6 +136,22 @@ class CodexBackend(BaseBackend):
                     )
                     if usage is not None:
                         self._last_usage = usage
+                    # Drain stderr and reap the process before returning so
+                    # we don't leak fds or leave a zombie. Without this the
+                    # `finally` clears `_proc` and the task layer's later
+                    # `close_interactive()` has nothing to clean up. Also
+                    # surfaces a non-zero exit that arrives after a
+                    # syntactically complete turn.
+                    stderr_bytes = await asyncio.to_thread(proc.stderr.read)
+                    await asyncio.to_thread(proc.wait)
+                    if proc.returncode != 0:
+                        err = stderr_bytes.decode("utf-8", errors="replace").strip()
+                        logger.warning(
+                            "codex pid=%s exited %s after turn.completed; stderr=%s",
+                            proc.pid,
+                            proc.returncode,
+                            err[:200] or "(empty)",
+                        )
                     return
 
             # stdout EOF without a turn.completed event
