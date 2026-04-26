@@ -126,9 +126,20 @@ def test_codex_permission_state_defaults_and_updates(tmp_path):
     assert backend.current_permission() == "default"
 
 
+def test_status_includes_permission_and_last_error(tmp_path):
+    backend = CodexBackend(tmp_path, {"permissions": "plan"})
+    backend._last_error = "codex failed"
+
+    status = backend.status
+
+    assert status["permission"] == "plan"
+    assert status["last_error"] == "codex failed"
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})
+    backend._last_error = "old error"
     monkeypatch.setattr(backend, "_popen", lambda cmd: _FakeProc(_lines("codex_exec_ok.jsonl")))
 
     events = [event async for event in backend.chat_stream("hello")]
@@ -140,6 +151,7 @@ async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
         model=None,
     )
     assert backend.session_id == ACTUAL_THREAD_ID
+    assert backend.status["last_error"] is None
 
 
 @pytest.mark.asyncio
@@ -163,6 +175,7 @@ async def test_successful_stderr_warning_does_not_fail_turn(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_probe_health_returns_ok(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})
+    backend._last_error = "old error"
 
     async def _fake_chat(user_message: str, on_proc=None) -> str:
         return "PONG"
@@ -173,6 +186,7 @@ async def test_probe_health_returns_ok(tmp_path, monkeypatch):
     assert status.ok is True
     assert status.usage_capped is False
     assert status.error_message is None
+    assert backend.status["last_error"] is None
 
 
 def test_cancel_terminates_running_process(tmp_path):

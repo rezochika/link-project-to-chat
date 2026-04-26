@@ -228,6 +228,8 @@ class ClaudeBackend(BaseBackend):
         self._started_at: float | None = None
         self._last_message: str | None = None
         self._last_duration: float | None = None
+        self._last_error: str | None = None
+        self._usage_capped: bool = False
         self._total_requests: int = 0
 
     # ------------------------------------------------------------------
@@ -341,13 +343,19 @@ class ClaudeBackend(BaseBackend):
             result = await self.chat("ping")
         except ClaudeStreamError as exc:
             message = str(exc)
+            self._last_error = message
+            self._usage_capped = is_usage_cap_error(message)
             return HealthStatus(
                 ok=False,
-                usage_capped=is_usage_cap_error(message),
+                usage_capped=self._usage_capped,
                 error_message=message,
             )
         if is_usage_cap_error(result):
+            self._last_error = result
+            self._usage_capped = True
             return HealthStatus(ok=False, usage_capped=True, error_message=result)
+        self._last_error = None
+        self._usage_capped = False
         return HealthStatus(ok=True, usage_capped=False, error_message=None)
 
     # ------------------------------------------------------------------
@@ -404,6 +412,8 @@ class ClaudeBackend(BaseBackend):
                     self.session_id = event.session_id or self.session_id
                     if event.model:
                         self.model_display = event.model
+                    self._last_error = None
+                    self._usage_capped = False
                 yield event
                 if isinstance(event, Result):
                     return  # Turn finished; process stays alive for follow-ups
@@ -414,9 +424,15 @@ class ClaudeBackend(BaseBackend):
         if proc.returncode != 0:
             err = stderr_bytes.decode("utf-8", errors="replace").strip()
             if _detect_usage_cap(err):
-                yield Error(message="USAGE_CAP:" + _sanitize_error(err))
+                message = "USAGE_CAP:" + _sanitize_error(err)
+                self._last_error = message
+                self._usage_capped = True
+                yield Error(message=message)
             else:
-                yield Error(message=_sanitize_error(err) if err else f"exit code {proc.returncode}")
+                message = _sanitize_error(err) if err else f"exit code {proc.returncode}"
+                self._last_error = message
+                self._usage_capped = False
+                yield Error(message=message)
         # Clean up reference
         if self._proc is proc:
             self._proc = None
@@ -458,6 +474,11 @@ class ClaudeBackend(BaseBackend):
             "last_duration": round(self._last_duration, 1)
             if self._last_duration
             else None,
+            "permission": self.current_permission(),
+            "allowed_tools": list(self.allowed_tools),
+            "disallowed_tools": list(self.disallowed_tools),
+            "last_error": self._last_error,
+            "usage_capped": self._usage_capped,
         }
         if running and self._started_at:
             info["elapsed"] = round(time.monotonic() - self._started_at, 1)

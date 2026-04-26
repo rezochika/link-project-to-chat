@@ -2045,6 +2045,15 @@ class ProjectBot(AuthMixin):
         # backend doesn't support it (e.g. FakeBackend in tests).
         if caps.supports_effort:
             lines.append(f"Effort: {backend.effort or 'medium'}")
+        if caps.supports_permissions:
+            lines.append(f"Permissions: {st.get('permission') or backend.current_permission()}")
+        if caps.supports_allowed_tools:
+            allowed_tools = st.get("allowed_tools") or []
+            disallowed_tools = st.get("disallowed_tools") or []
+            lines.append(f"Allowed tools: {', '.join(allowed_tools) if allowed_tools else 'none'}")
+            lines.append(
+                f"Disallowed tools: {', '.join(disallowed_tools) if disallowed_tools else 'none'}"
+            )
         lines.extend([
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st.get('session_id') or 'none'}",
@@ -2066,11 +2075,23 @@ class ProjectBot(AuthMixin):
             in_t = last_usage.get("input_tokens", 0)
             out_t = last_usage.get("output_tokens", 0)
             lines.append(f"Last tokens: {in_t} in / {out_t} out")
+        if caps.supports_usage_cap_detection:
+            lines.append(f"Usage capped: {'yes' if st.get('usage_capped') else 'no'}")
+        last_error = st.get("last_error")
+        if last_error:
+            lines.append(f"Last error: {self._short_status_value(str(last_error))}")
         lines.extend([
             f"Skill: {self._active_skill or 'none'}",
             f"Persona: {self._active_persona or 'none'}",
         ])
         return "\n".join(lines)
+
+    @staticmethod
+    def _short_status_value(value: str, limit: int = 240) -> str:
+        value = " ".join(value.split())
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
 
     async def _on_status_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):

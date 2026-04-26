@@ -1,3 +1,5 @@
+import io
+import json
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,62 @@ def test_claude_backend_declares_name_and_capabilities():
     assert backend.capabilities.supports_usage_cap_detection is True
 
 
+def test_status_includes_permission_tools_and_usage_cap_state():
+    backend = ClaudeBackend(
+        project_path=Path("/tmp/project"),
+        skip_permissions=False,
+        permission_mode="acceptEdits",
+        allowed_tools=["Read", "Grep"],
+        disallowed_tools=["Bash"],
+    )
+    backend._last_error = "USAGE_CAP: usage limit reached"
+    backend._usage_capped = True
+
+    status = backend.status
+
+    assert status["permission"] == "acceptEdits"
+    assert status["allowed_tools"] == ["Read", "Grep"]
+    assert status["disallowed_tools"] == ["Bash"]
+    assert status["last_error"] == "USAGE_CAP: usage limit reached"
+    assert status["usage_capped"] is True
+
+
+class _FakeProc:
+    def __init__(self, stdout_lines: list[str], stderr_text: str = "", returncode: int = 0):
+        payload = "".join(line + "\n" for line in stdout_lines).encode("utf-8")
+        self.stdout = io.BytesIO(payload)
+        self.stderr = io.BytesIO(stderr_text.encode("utf-8"))
+        self.returncode = returncode
+        self.pid = 4242
+
+    def poll(self):
+        if self.stdout.tell() >= len(self.stdout.getvalue()):
+            return self.returncode
+        return None
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_successful_result_clears_stale_error_state():
+    backend = ClaudeBackend(project_path=Path("/tmp/project"))
+    backend._last_error = "old error"
+    backend._usage_capped = True
+    line = json.dumps({
+        "type": "result",
+        "result": "ok",
+        "session_id": "s1",
+        "modelUsage": {"claude-3": 1},
+    })
+
+    events = [event async for event in backend._read_events(_FakeProc([line]))]
+
+    assert events
+    assert backend.status["last_error"] is None
+    assert backend.status["usage_capped"] is False
+
+
 @pytest.mark.asyncio
 async def test_probe_health_returns_ok_when_chat_succeeds(monkeypatch):
     backend = ClaudeBackend(project_path=Path("/tmp/project"))
@@ -64,6 +122,8 @@ async def test_probe_health_detects_usage_cap(monkeypatch):
 
     assert status.ok is False
     assert status.usage_capped is True
+    assert backend.status["usage_capped"] is True
+    assert backend.status["last_error"] == "USAGE_CAP: usage limit reached"
 
 
 @pytest.mark.asyncio

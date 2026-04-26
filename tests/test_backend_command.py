@@ -289,6 +289,40 @@ async def test_status_includes_effort_when_backend_supports_it(tmp_path):
     assert "Effort: medium" in text
 
 
+async def test_status_includes_permissions_for_supporting_backend(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+    bot.task_manager.backend.set_permission("plan")
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Permissions: plan" in text
+
+
+async def test_status_includes_claude_allowed_and_disallowed_tools(tmp_path):
+    bot = _make_bot(tmp_path)
+    bot.task_manager.backend.allowed_tools = ["Read", "Grep"]
+    bot.task_manager.backend.disallowed_tools = ["Bash"]
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Allowed tools: Read, Grep" in text
+    assert "Disallowed tools: Bash" in text
+
+
+async def test_status_omits_tool_lines_when_backend_does_not_support_tools(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Allowed tools:" not in text
+    assert "Disallowed tools:" not in text
+
+
 async def test_status_omits_effort_when_backend_does_not_support_it(tmp_path):
     """FakeBackend (and any future backend with supports_effort=False) must
     not get an Effort line — that signal would be misleading."""
@@ -300,6 +334,7 @@ async def test_status_omits_effort_when_backend_does_not_support_it(tmp_path):
 
     text = bot._transport.sent_messages[-1].text
     assert "Effort:" not in text
+    assert "Permissions:" not in text
 
 
 async def test_status_surfaces_codex_last_usage_tokens(tmp_path):
@@ -354,6 +389,27 @@ async def test_status_omits_request_count_when_idle(tmp_path):
 
     text = bot._transport.sent_messages[-1].text
     assert "Requests:" not in text
+
+
+async def test_status_surfaces_usage_cap_flag_for_claude(tmp_path):
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend._usage_capped = True
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Usage capped: yes" in text
+
+
+async def test_status_surfaces_last_backend_error(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+    bot.task_manager._backend._last_error = "codex failed loudly"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Last error: codex failed loudly" in text
 
 
 async def test_status_resolves_friendly_label_from_wire_identifier(tmp_path):

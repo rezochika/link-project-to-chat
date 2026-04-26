@@ -69,6 +69,7 @@ class CodexBackend(BaseBackend):
         self._started_at: float | None = None
         self._last_message: str | None = None
         self._last_usage: dict | None = None
+        self._last_error: str | None = None
         self._total_requests: int = 0
 
     # ------------------------------------------------------------------
@@ -164,6 +165,7 @@ class CodexBackend(BaseBackend):
                 if parsed.usage is not None:
                     usage = parsed.usage
                 if parsed.turn_completed:
+                    self._last_error = None
                     yield Result(
                         text="".join(collected_text) or "[No response]",
                         session_id=self.session_id,
@@ -194,8 +196,9 @@ class CodexBackend(BaseBackend):
             await asyncio.to_thread(proc.wait)
             if proc.returncode != 0:
                 err = stderr_bytes.decode("utf-8", errors="replace").strip()
-                yield Error(message=err or f"exit code {proc.returncode}")
-                raise CodexStreamError(err or f"exit code {proc.returncode}")
+                self._last_error = err or f"exit code {proc.returncode}"
+                yield Error(message=self._last_error)
+                raise CodexStreamError(self._last_error)
         finally:
             if self._proc is proc:
                 self._proc = None
@@ -219,7 +222,9 @@ class CodexBackend(BaseBackend):
         try:
             await self.chat("Reply with exactly PONG and do not run any commands.")
         except CodexStreamError as exc:
-            return HealthStatus(ok=False, usage_capped=False, error_message=str(exc))
+            self._last_error = str(exc)
+            return HealthStatus(ok=False, usage_capped=False, error_message=self._last_error)
+        self._last_error = None
         return HealthStatus(ok=True, usage_capped=False, error_message=None)
 
     # ------------------------------------------------------------------
@@ -264,6 +269,8 @@ class CodexBackend(BaseBackend):
             "total_requests": self._total_requests,
             "last_message": self._last_message,
             "last_usage": self._last_usage,
+            "permission": self.current_permission(),
+            "last_error": self._last_error,
         }
 
 
