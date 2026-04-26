@@ -8,7 +8,7 @@ Optionally restrict all user-triggered execution (claude subprocess + `/run` com
 
 | Level | Applied by | Covers | Status |
 |---|---|---|---|
-| Execution-point jail | `claude_client.py` + `task_manager.py` | `claude` subprocess + `/run` commands | **This plan** |
+| Execution-point jail | `backends/claude.py` + `backends/codex.py` + `task_manager.py` | agent subprocesses + `/run` commands | **This plan** |
 | Whole-bot jail (manager wraps `start`) | `manager/process.py` | entire bot process tree | Future / optional extension |
 
 Execution-point jailing covers all user-reachable paths. The Python bot process itself is unjailed but trusted — its own code is not user-executable.
@@ -97,21 +97,25 @@ Round-trip both new fields. `jailed` defaults to `True` when absent from JSON (n
 
 ---
 
-## 3. Execution point: `claude_client.py`
+## 3. Execution point: agent backends (`backends/claude.py`, `backends/codex.py`)
 
-`ClaudeClient.__init__` gains `jailed: bool = True`.
+After Phase 1 + 3 of the backend abstraction track, the agent subprocess execution lives in two backend adapters that both inherit from `BaseBackend` (`backends/base.py`). The cleanest hook is on `BaseBackend` so any future backend inherits the jail behavior:
 
-In `chat_stream()`, before `subprocess.Popen`:
+`BaseBackend.__init__` gains `jailed: bool = True` (or each concrete backend forwards a constructor arg from the factory).
+
+In each backend's `_start_proc` / `_popen`, before `subprocess.Popen`:
 ```python
 if self.jailed:
     cmd = sandbox.wrap(cmd, str(self.project_path))
 ```
 
+Apply the same pattern to `ClaudeBackend._start_proc` (`claude.py`) and `CodexBackend._popen` (`codex.py`).
+
 ---
 
 ## 4. Execution point: `task_manager.py`
 
-`TaskManager.__init__` gains `jailed: bool = True`. Passes it to `ClaudeClient`.
+`TaskManager.__init__` gains `jailed: bool = True`. Passes it (via the factory) to whichever backend it constructs.
 
 In `_exec_command()`, before `subprocess.Popen`:
 ```python
@@ -130,8 +134,9 @@ ProjectConfig.jailed
   -> run_bot(jailed=...)          [bot.py]
     -> ProjectBot.__init__
       -> TaskManager(jailed=...)
-        -> ClaudeClient(jailed=...)
-          -> sandbox.wrap() in chat_stream()
+        -> factory.create(<backend>, ..., jailed=...)
+          -> ClaudeBackend / CodexBackend (jailed=...)
+            -> sandbox.wrap() in _start_proc / _popen
         -> sandbox.wrap() in _exec_command()
 ```
 
