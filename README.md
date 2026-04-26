@@ -305,13 +305,13 @@ sudo systemctl enable --now link-project-to-chat
 - Voice messages (Whisper API or local whisper.cpp)
 - Multi-project manager bot, team chats, group/team relay
 - Skills and personas
-- Pluggable agent backend with `/backend` command and capability-gated commands (Claude is the only registered backend today; phases 1+2 of multi-backend)
+- Pluggable agent backend with `/backend` command and capability-gated commands. Two backends ship: Claude (default) and Codex (opt-in via `/backend codex`); phases 1–3 of multi-backend
 
 **Planned (designed, not yet implemented):**
 - Discord transport
 - Slack transport
 - Google Chat transport
-- Codex backend (phase 3); capability-expansion polish (phase 4)
+- Capability-expansion polish (backend phase 4)
 
 Contributions welcome.
 
