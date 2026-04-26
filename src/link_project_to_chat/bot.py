@@ -34,8 +34,6 @@ from .config import (
 from ._auth import AuthMixin
 from .formatting import md_to_telegram, split_html, strip_html
 from .backends.claude import (
-    EFFORT_LEVELS,
-    MODELS,
     PERMISSION_MODES,
     ClaudeBackend,
     ClaudeStreamError,
@@ -215,9 +213,6 @@ class ProjectBot(AuthMixin):
         backend = self.task_manager.backend
         assert isinstance(backend, ClaudeBackend), "Tier-2 Claude-only access requires ClaudeBackend"
         return backend
-
-    def _backend_supports_claude_controls(self) -> bool:
-        return isinstance(self.task_manager.backend, ClaudeBackend)
 
     def _backend_supports_prompt_customization(self) -> bool:
         return isinstance(self.task_manager.backend, ClaudeBackend)
@@ -923,18 +918,11 @@ class ProjectBot(AuthMixin):
             buttons=buttons,
         )
 
-    MODEL_OPTIONS = [
-        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context"),
-        ("opus", "Opus 4.7", "Most capable"),
-        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context"),
-        ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
-        ("haiku", "Haiku 4.5", "Fastest for quick answers"),
-    ]
-
     def _model_buttons(self) -> Buttons:
-        current = self.task_manager.backend.model
+        backend = self.task_manager.backend
+        current = backend.model
         rows: list[list[Button]] = []
-        for model_id, label, _ in self.MODEL_OPTIONS:
+        for model_id, label, _ in backend.MODEL_OPTIONS:
             prefix = "● " if current == model_id else ""
             rows.append([Button(label=f"{prefix}{label}", value=f"model_set_{model_id}")])
         return Buttons(rows=rows)
@@ -942,10 +930,10 @@ class ProjectBot(AuthMixin):
     def _current_model(self) -> str:
         backend = self.task_manager.backend
         raw = backend.model
-        for model_id, label, desc in self.MODEL_OPTIONS:
+        for model_id, label, desc in backend.MODEL_OPTIONS:
             if model_id == raw:
-                return f"{label} — {desc}"
-        return backend.model_display or raw
+                return f"{label} — {desc}" if desc else label
+        return backend.model_display or raw or "default"
 
     async def _on_model(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -961,19 +949,20 @@ class ProjectBot(AuthMixin):
         )
 
     def _effort_buttons(self) -> Buttons:
+        levels = self.task_manager.backend.capabilities.effort_levels
         return Buttons(rows=[
             [Button(label=e, value=f"effort_set_{e}")]
-            for e in EFFORT_LEVELS
+            for e in levels
         ])
 
     def _current_effort(self) -> str:
-        return self._claude.effort
+        return self.task_manager.backend.effort or "medium"
 
     async def _on_effort(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
-        if not self._backend_supports_claude_controls():
+        if not self.task_manager.backend.capabilities.supports_effort:
             await self._transport.send_text(ci.chat, "This backend doesn't support /effort.")
             return
         await self._transport.send_text(
@@ -1598,7 +1587,7 @@ class ProjectBot(AuthMixin):
 
         if value.startswith("model_set_"):
             name = value[len("model_set_"):]
-            valid = {m[0] for m in self.MODEL_OPTIONS}
+            valid = {m[0] for m in self.task_manager.backend.MODEL_OPTIONS}
             if name in valid:
                 self.task_manager.backend.model = name
                 self.task_manager.backend.model_display = None
@@ -1609,12 +1598,13 @@ class ProjectBot(AuthMixin):
                 buttons=self._model_buttons(),
             )
         elif value.startswith("effort_set_"):
-            if not self._backend_supports_claude_controls():
+            backend = self.task_manager.backend
+            if not backend.capabilities.supports_effort:
                 await self._transport.edit_text(msg_ref, "This backend doesn't support /effort.")
                 return
             level = value[len("effort_set_"):]
-            if level in EFFORT_LEVELS:
-                self._claude.effort = level
+            if level in backend.capabilities.effort_levels:
+                backend.effort = level
                 self._patch_backend_config({"effort": level})
             await self._transport.edit_text(
                 msg_ref,

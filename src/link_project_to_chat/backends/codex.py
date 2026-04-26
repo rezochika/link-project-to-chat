@@ -19,20 +19,36 @@ class CodexStreamError(Exception):
     """Raised by CodexBackend.chat() when the stream returns an Error event."""
 
 
+# Reasoning-effort levels accepted by `codex exec -c model_reasoning_effort=...`.
+# Codex tops out at ``xhigh`` (Claude also exposes ``max``, but Codex doesn't).
+CODEX_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
+CODEX_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2")
+
 CODEX_CAPABILITIES = BackendCapabilities(
-    models=(),
+    models=CODEX_MODELS,
     supports_thinking=False,
     supports_permissions=False,
     supports_resume=True,
     supports_compact=False,
     supports_allowed_tools=False,
     supports_usage_cap_detection=False,
+    supports_effort=True,
+    effort_levels=CODEX_EFFORT_LEVELS,
 )
 
 
 class CodexBackend(BaseBackend):
     name = "codex"
     capabilities = CODEX_CAPABILITIES
+    # `/model` button picker entries — order mirrors the priority field in
+    # ~/.codex/models_cache.json so the default frontier model surfaces first.
+    MODEL_OPTIONS = [
+        ("gpt-5.5", "GPT-5.5", "Frontier coding (default)"),
+        ("gpt-5.4", "GPT-5.4", ""),
+        ("gpt-5.4-mini", "GPT-5.4-Mini", "Fast, lighter reasoning"),
+        ("gpt-5.3-codex", "GPT-5.3-Codex", ""),
+        ("gpt-5.2", "GPT-5.2", ""),
+    ]
     _env_keep_patterns = ("OPENAI_*", "CODEX_*")
     _env_scrub_patterns = (
         "*_TOKEN", "*_KEY", "*_SECRET",
@@ -44,6 +60,7 @@ class CodexBackend(BaseBackend):
         self.model: str | None = state.get("model")
         self.model_display: str | None = None
         self.session_id: str | None = state.get("session_id")
+        self.effort: str | None = state.get("effort")
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
@@ -55,15 +72,16 @@ class CodexBackend(BaseBackend):
     # ------------------------------------------------------------------
 
     def _build_cmd(self, user_message: str) -> list[str]:
+        cmd = ["codex", "exec"]
         if self.session_id:
-            cmd = ["codex", "exec", "resume", "--json"]
-            if self.model:
-                cmd.extend(["--model", self.model])
-            cmd.extend([self.session_id, user_message])
-            return cmd
-        cmd = ["codex", "exec", "--json"]
+            cmd.append("resume")
+        cmd.append("--json")
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.effort:
+            cmd.extend(["-c", f"model_reasoning_effort={self.effort}"])
+        if self.session_id:
+            cmd.append(self.session_id)
         cmd.append(user_message)
         return cmd
 

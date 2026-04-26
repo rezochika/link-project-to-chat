@@ -20,6 +20,8 @@ class BackendCapabilities:
     supports_compact: bool
     supports_allowed_tools: bool
     supports_usage_cap_detection: bool
+    supports_effort: bool = False
+    effort_levels: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,12 @@ class HealthStatus:
 
 
 class BaseBackend:
+    # ``MODEL_OPTIONS`` powers the `/model` button picker in bot.py — each entry
+    # is (model_id, label, description). Backends that don't support model
+    # switching keep this empty (and `capabilities.models` is also empty), so
+    # bot.py's gate falls through to "this backend doesn't support /model".
+    MODEL_OPTIONS: list[tuple[str, str, str]] = []
+
     _env_keep_patterns: Sequence[str] = ()
     _env_scrub_patterns: Sequence[str] = ()
 
@@ -57,6 +65,10 @@ class AgentBackend(Protocol):
     # should fall back to `model` in that case.
     model_display: str | None
     session_id: str | None
+    # Reasoning-effort level (low/medium/high/...). Backends that don't
+    # support it ignore writes; the bot still gates /effort on
+    # ``capabilities.supports_effort`` before mutating this attribute.
+    effort: str | None
 
     async def chat_stream(
         self,

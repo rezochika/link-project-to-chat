@@ -20,6 +20,8 @@ def _capabilities(**overrides) -> BackendCapabilities:
         supports_compact=True,
         supports_allowed_tools=True,
         supports_usage_cap_detection=True,
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
     )
     defaults.update(overrides)
     return BackendCapabilities(**defaults)
@@ -138,6 +140,8 @@ def test_build_telegram_awareness_drops_unsupported_commands_for_minimal_backend
             supports_thinking=False,
             supports_permissions=False,
             supports_compact=False,
+            supports_effort=False,
+            effort_levels=(),
         )
     )
     assert "/thinking" not in preamble
@@ -145,11 +149,13 @@ def test_build_telegram_awareness_drops_unsupported_commands_for_minimal_backend
     assert "/compact" not in preamble
     # `/model` is also gated on declared models.
     assert "/model" not in preamble
+    # `/effort` is gated on supports_effort; minimal backend has it False so
+    # `/effort` is correctly absent here — see the supports_effort=True test.
+    assert "/effort" not in preamble
     # Bot-level commands always appear regardless of capability flags —
     # they are defined in bot.py and not gated on the active backend.
     assert "`/run <cmd>`" in preamble
     assert "`/help`" in preamble
-    assert "`/effort low|medium|high|xhigh|max`" in preamble
     assert "`/stop_skill`" in preamble
     assert "`/stop_persona`" in preamble
 
@@ -163,6 +169,8 @@ def test_telegram_command_summary_always_includes_bot_level_commands():
             supports_thinking=False,
             supports_permissions=False,
             supports_compact=False,
+            supports_effort=False,
+            effort_levels=(),
         )
     )
     # Original always-on commands (backtick-wrapped so LLMs reliably parse
@@ -179,6 +187,8 @@ def test_telegram_command_summary_always_includes_bot_level_commands():
     assert "`/help`" in summary
     # Restored always-on commands (regression: these were dropped in the
     # initial parameterization and must remain bot-level, not capability-gated).
-    assert "`/effort low|medium|high|xhigh|max`" in summary
+    # `/effort` was promoted to a capability flag in the Codex /model+/effort
+    # slice, so it's no longer always-on — see the
+    # test_telegram_command_summary_includes_effort_when_supported test below.
     assert "`/stop_skill`" in summary
     assert "`/stop_persona`" in summary

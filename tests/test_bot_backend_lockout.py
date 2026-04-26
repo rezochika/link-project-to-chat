@@ -28,8 +28,11 @@ BOT_PY = (
 
 # Attributes that live on ClaudeBackend but are NOT part of the AgentBackend
 # Protocol. Access to these must go through ProjectBot._claude.
+#
+# Note: ``effort`` was originally tier-2 (Claude-only), but Phase 4 promoted
+# it to the Protocol (Codex also supports reasoning effort), so it's now a
+# tier-1 attribute and must NOT appear in this set.
 TIER2_ATTRS = frozenset({
-    "effort",
     "permission_mode",
     "skip_permissions",
     "allowed_tools",
@@ -118,22 +121,22 @@ def test_ast_checker_flags_direct_backend_tier2_access():
     source = (
         "class Bot:\n"
         "    def f(self):\n"
-        "        self.task_manager.backend.effort = 'high'\n"
+        "        self.task_manager.backend.permission_mode = 'dontAsk'\n"
     )
     violations = _find_tier2_violations(source)
-    assert any("effort" in v for v in violations)
+    assert any("permission_mode" in v for v in violations)
 
 
 def test_ast_checker_flags_single_hop_alias_bypass():
-    """``bd = self.task_manager.backend; bd.effort`` must be caught."""
+    """``bd = self.task_manager.backend; bd.permission_mode`` must be caught."""
     source = (
         "class Bot:\n"
         "    def f(self):\n"
         "        bd = self.task_manager.backend\n"
-        "        bd.effort = 'high'\n"
+        "        bd.permission_mode = 'dontAsk'\n"
     )
     violations = _find_tier2_violations(source)
-    assert any("bd.effort" in v for v in violations)
+    assert any("bd.permission_mode" in v for v in violations)
 
 
 def test_ast_checker_flags_chained_alias_bypass():
@@ -154,7 +157,7 @@ def test_ast_checker_allows_self_claude_tier2_access():
     source = (
         "class Bot:\n"
         "    def f(self):\n"
-        "        self._claude.effort = 'high'\n"
+        "        self._claude.append_system_prompt = 'p'\n"
         "        self._claude.permission_mode = 'dontAsk'\n"
     )
     violations = _find_tier2_violations(source)

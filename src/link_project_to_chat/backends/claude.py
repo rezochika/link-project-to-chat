@@ -128,7 +128,6 @@ def _telegram_command_summary(capabilities: BackendCapabilities) -> str:
     commands = [
         "`/run <cmd>`",
         "`/tasks`",
-        "`/effort low|medium|high|xhigh|max`",
         "`/skills`",
         "`/use [name]`",
         "`/stop_skill`",
@@ -140,6 +139,8 @@ def _telegram_command_summary(capabilities: BackendCapabilities) -> str:
         "`/status`",
         "`/help`",
     ]
+    if capabilities.supports_effort and capabilities.effort_levels:
+        commands.append("`/effort " + "|".join(capabilities.effort_levels) + "`")
     if capabilities.supports_thinking:
         commands.append("`/thinking on|off`")
     if capabilities.models:
@@ -170,7 +171,19 @@ class ClaudeBackend(BaseBackend):
         supports_compact=True,
         supports_allowed_tools=True,
         supports_usage_cap_detection=True,
+        supports_effort=True,
+        effort_levels=EFFORT_LEVELS,
     )
+    # `/model` button picker entries — kept here (not in bot.py) so each
+    # backend owns its own labels/descriptions and the picker swaps when
+    # the active backend changes.
+    MODEL_OPTIONS = [
+        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context"),
+        ("opus", "Opus 4.7", "Most capable"),
+        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context"),
+        ("sonnet", "Sonnet 4.6", "Best for everyday tasks"),
+        ("haiku", "Haiku 4.5", "Fastest for quick answers"),
+    ]
     _env_keep_patterns = ()
     _env_scrub_patterns = (
         "*_TOKEN", "*_KEY", "*_SECRET",

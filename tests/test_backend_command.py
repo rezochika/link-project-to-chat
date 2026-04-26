@@ -214,13 +214,45 @@ async def test_codex_status_does_not_require_model_display(tmp_path):
     assert "Model: default" in sent[0].text
 
 
-async def test_codex_effort_command_is_rejected_without_assertion(tmp_path):
+async def test_codex_effort_command_shows_picker_for_codex(tmp_path):
+    """Phase 4 promoted /effort to be capability-driven; Codex now supports
+    it, so /effort returns the picker (with the four Codex effort levels)
+    instead of the legacy 'doesn't support' rejection."""
     bot = _make_bot(tmp_path)
     await _switch_to_codex(bot)
 
     await bot._on_effort(_ci([]))
 
-    assert "doesn't support /effort" in bot._transport.sent_messages[-1].text
+    last = bot._transport.sent_messages[-1]
+    assert "doesn't support" not in last.text
+    assert "Current: medium" in last.text  # default effort when state is empty
+    button_values = [btn.value for row in last.buttons.rows for btn in row]
+    assert button_values == [
+        "effort_set_low",
+        "effort_set_medium",
+        "effort_set_high",
+        "effort_set_xhigh",
+    ]
+
+
+async def test_codex_model_command_shows_picker_for_codex(tmp_path):
+    """/model on Codex returns the GPT-5 family picker. Mirrors Claude's
+    behaviour now that MODEL_OPTIONS lives on the backend class."""
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_model(_ci([]))
+
+    last = bot._transport.sent_messages[-1]
+    assert "doesn't support /model" not in last.text
+    button_values = [btn.value for row in last.buttons.rows for btn in row]
+    assert button_values == [
+        "model_set_gpt-5.5",
+        "model_set_gpt-5.4",
+        "model_set_gpt-5.4-mini",
+        "model_set_gpt-5.3-codex",
+        "model_set_gpt-5.2",
+    ]
 
 
 async def test_codex_skill_activation_is_rejected_without_assertion(tmp_path):

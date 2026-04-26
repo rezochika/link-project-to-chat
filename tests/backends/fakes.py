@@ -18,6 +18,10 @@ class FakeBackend:
         supports_allowed_tools=False,
         supports_usage_cap_detection=False,
     )
+    # Keep empty so existing /model gating tests can rely on the FakeBackend's
+    # `MODEL_OPTIONS == []` to short-circuit the picker; tests that exercise
+    # the picker explicitly seed entries.
+    MODEL_OPTIONS: list[tuple[str, str, str]] = []
 
     def __init__(self, project_path: Path, turns: list[list[StreamEvent]] | None = None):
         self.project_path = project_path

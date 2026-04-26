@@ -54,6 +54,39 @@ def test_build_cmd_for_resume_uses_exec_resume_json(tmp_path):
     ]
 
 
+def test_build_cmd_includes_model_reasoning_effort_when_set(tmp_path):
+    backend = CodexBackend(tmp_path, {"effort": "high"})
+    cmd = backend._build_cmd("hi")
+    # The override is passed via Codex CLI's `-c` config flag.
+    assert "-c" in cmd
+    idx = cmd.index("-c")
+    assert cmd[idx + 1] == "model_reasoning_effort=high"
+
+
+def test_build_cmd_omits_effort_when_unset(tmp_path):
+    backend = CodexBackend(tmp_path, {})
+    cmd = backend._build_cmd("hi")
+    assert all("model_reasoning_effort" not in part for part in cmd)
+
+
+def test_build_cmd_combines_model_and_effort(tmp_path):
+    backend = CodexBackend(tmp_path, {"model": "gpt-5.5", "effort": "low"})
+    cmd = backend._build_cmd("hi")
+    assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "gpt-5.5"
+    assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "model_reasoning_effort=low"
+
+
+def test_build_cmd_resume_includes_effort_too(tmp_path):
+    backend = CodexBackend(tmp_path, {"session_id": "s", "effort": "xhigh"})
+    cmd = backend._build_cmd("again")
+    # Resume path also wires the override so a persisted effort sticks across
+    # reconnections.
+    assert "-c" in cmd and cmd[cmd.index("-c") + 1] == "model_reasoning_effort=xhigh"
+    # session_id and message must still be tail-positional.
+    assert cmd[-2] == "s"
+    assert cmd[-1] == "again"
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})
