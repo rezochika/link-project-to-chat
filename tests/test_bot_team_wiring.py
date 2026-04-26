@@ -930,6 +930,7 @@ async def test_telegram_text_dispatch_preserves_context_and_submits_agent(tmp_pa
         path=tmp_path,
         token="t",
         allowed_usernames=["alice"],
+        context_enabled=False,
     )
     bot._transport = transport
     bot.task_manager.submit_agent = MagicMock()

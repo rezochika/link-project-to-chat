@@ -54,6 +54,11 @@ class ProjectConfig:
     show_thinking: bool = False
     backend: str = "claude"
     backend_state: dict[str, dict] = field(default_factory=dict)
+    # Per-chat conversation history (cross-backend). Bot-level — independent
+    # of the active backend, so swapping ``/backend codex`` keeps the same
+    # log visible to the next prompt.
+    context_enabled: bool = True
+    context_history_limit: int = 10
 
 
 @dataclass
@@ -74,6 +79,9 @@ class TeamBotConfig:
     bot_peer: BotPeerRef | None = None
     backend: str = "claude"
     backend_state: dict[str, dict] = field(default_factory=dict)
+    # Per-chat conversation history (see ProjectConfig).
+    context_enabled: bool = True
+    context_history_limit: int = 10
 
 
 @dataclass
@@ -477,6 +485,8 @@ def _make_team_bot_config(b: dict) -> TeamBotConfig:
         show_thinking=bot_show_thinking,
         backend=b.get("backend", "claude"),
         backend_state=backend_state,
+        context_enabled=bool(b.get("context_enabled", True)),
+        context_history_limit=int(b.get("context_history_limit", 10)),
     )
 
 
@@ -561,6 +571,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 show_thinking=proj_show_thinking,
                 backend=proj.get("backend", "claude"),
                 backend_state=backend_state,
+                context_enabled=bool(proj.get("context_enabled", True)),
+                context_history_limit=int(proj.get("context_history_limit", 10)),
             )
             if (
                 not config.projects[name].trusted_user_ids
@@ -631,6 +643,10 @@ def _serialize_team_bot(b: "TeamBotConfig") -> dict:
         entry["autostart"] = True
     if b.bot_username:
         entry["bot_username"] = b.bot_username
+    if not b.context_enabled:
+        entry["context_enabled"] = False
+    if b.context_history_limit != 10:
+        entry["context_history_limit"] = b.context_history_limit
     _mirror_legacy_claude_fields(entry, backend_state)
     return entry
 
@@ -759,6 +775,16 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             proj["active_persona"] = p.active_persona
         else:
             proj.pop("active_persona", None)
+        # Conversation-log toggles. Persist only when non-default to keep the
+        # JSON tidy; loader treats absent keys as the defaults.
+        if not p.context_enabled:
+            proj["context_enabled"] = False
+        else:
+            proj.pop("context_enabled", None)
+        if p.context_history_limit != 10:
+            proj["context_history_limit"] = p.context_history_limit
+        else:
+            proj.pop("context_history_limit", None)
         existing_projects[name] = proj
     # Merge teams
     existing_teams: dict = raw.get("teams", {})

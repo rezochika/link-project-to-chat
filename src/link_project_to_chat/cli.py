@@ -451,6 +451,8 @@ def start(
             web_port=web_port,
             backend_name=bot_cfg.backend,
             backend_state=bot_cfg.backend_state,
+            context_enabled=bot_cfg.context_enabled,
+            context_history_limit=bot_cfg.context_history_limit,
         )
         return
 
@@ -498,6 +500,8 @@ def start(
             web_port=web_port,
             backend_name=proj.backend,
             backend_state=proj.backend_state,
+            context_enabled=proj.context_enabled,
+            context_history_limit=proj.context_history_limit,
         )
     else:
         run_bots(

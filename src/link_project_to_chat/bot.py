@@ -32,6 +32,13 @@ from .config import (
     save_session,
 )
 from ._auth import AuthMixin
+from .conversation_log import (
+    ASSISTANT_ROLE,
+    USER_ROLE,
+    ConversationLog,
+    default_db_path,
+    format_history_block,
+)
 from .formatting import md_to_telegram, split_html, strip_html
 from .backends.claude import (
     PERMISSION_MODES,
@@ -53,6 +60,7 @@ COMMANDS = [
     ("model", "Set backend model"),
     ("effort", "Set thinking depth (low/medium/high/max)"),
     ("thinking", "Toggle live thinking display (on/off)"),
+    ("context", "Toggle per-chat conversation history (on/off/N)"),
     ("permissions", "Set permission mode"),
     ("compact", "Compact backend session"),
     ("status", "Bot status"),
@@ -110,6 +118,9 @@ class ProjectBot(AuthMixin):
         web_port: int = 8080,
         backend_name: str = "claude",
         backend_state: dict[str, dict] | None = None,
+        context_enabled: bool = True,
+        context_history_limit: int = 10,
+        conversation_log: ConversationLog | None = None,
     ):
         self.name = name
         self.path = path.resolve()
@@ -178,6 +189,22 @@ class ProjectBot(AuthMixin):
             on_stream_event=self._on_stream_event,
             on_waiting_input=self._on_waiting_input,
         )
+        # Per-chat conversation log. Bot-level (not backend-level) so a
+        # ``/backend codex`` swap doesn't lose Claude-era context. When the
+        # caller supplied ``config_path`` (typically tests with a tmp_path
+        # config) the conversation DB lives next to it so tests don't write
+        # under the user's home; production callers fall back to the
+        # standard ``~/.link-project-to-chat/conversations/<name>.db``.
+        self.context_enabled = context_enabled
+        self.context_history_limit = context_history_limit
+        if conversation_log is not None:
+            self.conversation_log = conversation_log
+        else:
+            if self._config_path is not None:
+                db_path = self._config_path.parent / "conversations" / f"{self.name}.db"
+            else:
+                db_path = default_db_path(self.name)
+            self.conversation_log = ConversationLog(db_path)
         self.team_name = team_name
         self.group_mode = team_name is not None
         self.group_chat_id = group_chat_id
@@ -216,6 +243,53 @@ class ProjectBot(AuthMixin):
 
     def _backend_supports_prompt_customization(self) -> bool:
         return isinstance(self.task_manager.backend, ClaudeBackend)
+
+    def _history_block(self, chat: ChatRef) -> str:
+        """Render the recent-history prepend for a turn in ``chat``.
+
+        Returns an empty string when context history is disabled OR the log
+        for this chat is empty, so callers can concatenate unconditionally.
+        Tolerates a stub bot (constructed via ``__new__``) that didn't run
+        ``__init__`` by treating missing attributes as "feature disabled".
+        """
+        if not getattr(self, "context_enabled", False):
+            return ""
+        log = getattr(self, "conversation_log", None)
+        if log is None:
+            return ""
+        turns = log.recent(chat, limit=getattr(self, "context_history_limit", 10))
+        return format_history_block(turns)
+
+    def _log_user_turn(self, chat: ChatRef, text: str) -> None:
+        """Capture a conversational user turn for cross-backend continuity.
+
+        Only conversational text — slash commands, button clicks, file
+        uploads, and ``/run`` output stay out of the log.
+        """
+        if not text or not text.strip():
+            return
+        log = getattr(self, "conversation_log", None)
+        if log is None:
+            return
+        log.append(
+            chat,
+            USER_ROLE,
+            text,
+            backend=self.task_manager.backend.name,
+        )
+
+    def _log_assistant_turn(self, chat: ChatRef, text: str) -> None:
+        if not text or not text.strip():
+            return
+        log = getattr(self, "conversation_log", None)
+        if log is None:
+            return
+        log.append(
+            chat,
+            ASSISTANT_ROLE,
+            text,
+            backend=self.task_manager.backend.name,
+        )
 
     def _effective_config_path(self) -> Path:
         return self._config_path or DEFAULT_CONFIG
@@ -573,6 +647,15 @@ class ProjectBot(AuthMixin):
                     logger.exception(
                         "Failed to persist session_id for task #%d", task.id
                     )
+            # Capture the assistant's final reply text into the per-chat
+            # conversation log. Skip /compact tasks (they don't represent a
+            # conversational reply) and skip when the turn produced no text.
+            if (
+                not task._compact
+                and task.status == TaskStatus.DONE
+                and task.result
+            ):
+                self._log_assistant_turn(task.chat, task.result)
             await self._finalize_claude_task(task)
         else:
             await self._finalize_command_task(task)
@@ -758,6 +841,10 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
+        # Build history BEFORE logging this turn so the current message
+        # doesn't appear in its own prepend.
+        prompt = self._history_block(incoming.chat) + prompt
+        self._log_user_turn(incoming.chat, incoming.text)
         self.task_manager.submit_agent(
             chat=incoming.chat,
             message=incoming.message,
@@ -853,6 +940,11 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
+        # Build history BEFORE logging this turn so the current message
+        # doesn't appear in its own prepend. Logging the user entry happens
+        # last so the next turn's prepend will include it.
+        prompt = self._history_block(incoming.chat) + prompt
+        self._log_user_turn(incoming.chat, incoming.text)
         self.task_manager.submit_agent(
             chat=incoming.chat,
             message=message_ref,
@@ -1015,6 +1107,79 @@ class ProjectBot(AuthMixin):
             f"Live thinking: {self._current_thinking()}",
             buttons=self._thinking_buttons(),
         )
+
+    _CONTEXT_LIMIT_MIN = 1
+    _CONTEXT_LIMIT_MAX = 50
+
+    def _context_status_text(self) -> str:
+        if self.context_enabled:
+            return f"Context history: ON ({self.context_history_limit} turns)"
+        return "Context history: OFF"
+
+    def _persist_context_settings(
+        self, *, enabled: bool, limit: int,
+    ) -> None:
+        """Persist context_enabled / context_history_limit to disk.
+
+        Bot-level fields — backend-agnostic — so we route through the same
+        ``_patch_config`` helper that updates active_persona / show_thinking.
+
+        Skips writing values that match the dataclass defaults so the
+        on-disk JSON stays clean. The team-bot save path applies these
+        verbatim into the entry without re-checking defaults, so a
+        toggled-then-toggled-back sequence would otherwise leave stale
+        ``context_enabled: true`` lines in the team config.
+        """
+        fields: dict = {}
+        if enabled is not True:
+            fields["context_enabled"] = enabled
+        else:
+            fields["context_enabled"] = None  # signal to remove the key
+        if limit != 10:
+            fields["context_history_limit"] = limit
+        else:
+            fields["context_history_limit"] = None
+        self._patch_config(fields)
+
+    async def _on_context(self, ci) -> None:
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+        args = ci.args or []
+        if not args:
+            await self._transport.send_text(ci.chat, self._context_status_text())
+            return
+        arg = args[0].lower()
+        if arg in ("on", "off"):
+            self.context_enabled = arg == "on"
+            self._persist_context_settings(
+                enabled=self.context_enabled,
+                limit=self.context_history_limit,
+            )
+            await self._transport.send_text(ci.chat, self._context_status_text())
+            return
+        try:
+            n = int(arg)
+        except ValueError:
+            await self._transport.send_text(
+                ci.chat,
+                f"Usage: /context [on|off|<N>] where N is "
+                f"{self._CONTEXT_LIMIT_MIN}–{self._CONTEXT_LIMIT_MAX}",
+            )
+            return
+        if not self._CONTEXT_LIMIT_MIN <= n <= self._CONTEXT_LIMIT_MAX:
+            await self._transport.send_text(
+                ci.chat,
+                f"N must be between {self._CONTEXT_LIMIT_MIN} and {self._CONTEXT_LIMIT_MAX}.",
+            )
+            return
+        self.context_history_limit = n
+        self.context_enabled = True
+        self._persist_context_settings(
+            enabled=self.context_enabled,
+            limit=self.context_history_limit,
+        )
+        await self._transport.send_text(ci.chat, self._context_status_text())
 
     _PERMISSION_OPTIONS = (
         *PERMISSION_MODES,
@@ -1397,6 +1562,10 @@ class ProjectBot(AuthMixin):
                     entry["effort"] = bot.effort
                 if bot.show_thinking:
                     entry["show_thinking"] = True
+                if not bot.context_enabled:
+                    entry["context_enabled"] = False
+                if bot.context_history_limit != 10:
+                    entry["context_history_limit"] = bot.context_history_limit
 
                 if role == self.role:
                     for k, v in fields.items():
@@ -1699,6 +1868,10 @@ class ProjectBot(AuthMixin):
                 team_name=self.team_name,
                 role=self.role,
             )
+            # Drop the per-chat conversation log so the user gets a true fresh
+            # start. Leaving prior turns would defeat the purpose of /reset
+            # since the next prompt would still inject them.
+            self.conversation_log.clear(chat)
             await self._transport.edit_text(msg_ref, "Session reset.")
         elif value == "reset_cancel":
             await self._transport.edit_text(msg_ref, "Reset cancelled.")
@@ -2029,6 +2202,9 @@ class ProjectBot(AuthMixin):
                 if persona:
                     prompt = format_persona_prompt(persona, prompt)
 
+            prompt = self._history_block(incoming.chat) + prompt
+            self._log_user_turn(incoming.chat, text)
+
             task = self.task_manager.submit_agent(
                 chat=incoming.chat,
                 message=incoming.message,
@@ -2165,6 +2341,7 @@ class ProjectBot(AuthMixin):
             ("model", self._on_model),
             ("effort", self._on_effort),
             ("thinking", self._on_thinking),
+            ("context", self._on_context),
             ("permissions", self._on_permissions),
             ("compact", self._on_compact),
             ("reset", self._on_reset),
@@ -2280,6 +2457,8 @@ def run_bot(
     web_port: int = 8080,
     backend_name: str = "claude",
     backend_state: dict[str, dict] | None = None,
+    context_enabled: bool = True,
+    context_history_limit: int = 10,
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -2317,6 +2496,8 @@ def run_bot(
         web_port=web_port,
         backend_name=backend_name,
         backend_state=backend_state,
+        context_enabled=context_enabled,
+        context_history_limit=context_history_limit,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -2383,6 +2564,8 @@ def run_bots(
             web_port=web_port,
             backend_name=proj.backend,
             backend_state=proj.backend_state,
+            context_enabled=proj.context_enabled,
+            context_history_limit=proj.context_history_limit,
         )
     else:
         names = ", ".join(config.projects.keys())
