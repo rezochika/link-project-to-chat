@@ -99,16 +99,25 @@ def _make_fake(project_path: Path, name: str) -> FakeBackend:
     return fb
 
 
-async def test_backend_command_reports_active_backend(tmp_path):
+async def test_backend_command_renders_picker_with_active_marker(tmp_path):
+    """`/backend` (no args) renders a button picker — one row per registered
+    backend, the active one prefixed with ●."""
     bot = _make_bot(tmp_path)
     await bot._on_backend(_ci([]))
 
     sent = bot._transport.sent_messages
     assert len(sent) == 1
     text = sent[0].text.lower()
-    assert "claude" in text
-    # The available list is included.
-    assert "available" in text
+    assert "active backend: claude" in text
+    # Buttons render the available list, one per registered backend.
+    assert sent[0].buttons is not None
+    button_values = [b.value for row in sent[0].buttons.rows for b in row]
+    assert "backend_set_claude" in button_values
+    assert "backend_set_codex" in button_values
+    # The active backend's button is marked.
+    button_labels = {b.value: b.label for row in sent[0].buttons.rows for b in row}
+    assert button_labels["backend_set_claude"].startswith("● ")
+    assert not button_labels["backend_set_codex"].startswith("● ")
 
 
 async def test_backend_command_no_op_on_active(tmp_path):
@@ -193,6 +202,59 @@ async def test_backend_command_unauthorized_user_silent(tmp_path):
     await bot._on_backend(_ci([]))
     # _auth_identity returns False; handler returns early without sending.
     assert bot._transport.sent_messages == []
+
+
+def _backend_button_click(value: str) -> "ButtonClick":
+    """Build a ButtonClick for `value` using the same chat/sender as _ci."""
+    from link_project_to_chat.transport.base import ButtonClick
+
+    chat = _chat()
+    return ButtonClick(
+        chat=chat,
+        message=MessageRef(transport_id="fake", native_id="100", chat=chat),
+        sender=_sender(),
+        value=value,
+    )
+
+
+async def test_backend_button_click_switches_backend(tmp_path):
+    """Clicking a backend button performs the same switch as `/backend <name>`,
+    edits the original message in place, and the picker re-renders with the
+    new active marker."""
+    bot = _make_bot(tmp_path)
+    await bot._on_button(_backend_button_click("backend_set_fake"))
+
+    assert bot.task_manager.backend.name == "fake"
+    edits = bot._transport.edited_messages
+    assert len(edits) == 1
+    assert "Switched to fake" in edits[0].text
+    assert "Active backend: fake" in edits[0].text
+    # New picker shows fake marked active.
+    button_labels = {b.value: b.label for row in edits[0].buttons.rows for b in row}
+    assert button_labels["backend_set_fake"].startswith("● ")
+    assert not button_labels["backend_set_claude"].startswith("● ")
+
+
+async def test_backend_button_click_on_active_is_noop(tmp_path):
+    """Clicking the already-active backend's button must not swap, must not
+    write to disk, and must surface the 'already active' message."""
+    bot = _make_bot(tmp_path)
+    await bot._on_button(_backend_button_click("backend_set_claude"))
+
+    assert bot.task_manager.backend.name == "claude"
+    cfg_path = tmp_path / "config.json"
+    assert not cfg_path.exists()
+    edits = bot._transport.edited_messages
+    assert len(edits) == 1
+    assert "already active" in edits[0].text.lower()
+
+
+async def test_backend_button_click_unauthorized_silent(tmp_path):
+    bot = _make_bot(tmp_path, allowed="bob")
+    await bot._on_button(_backend_button_click("backend_set_fake"))
+    # _auth_identity rejects; no edits performed.
+    assert bot._transport.edited_messages == []
+    assert bot.task_manager.backend.name == "claude"
 
 
 async def _switch_to_codex(bot: ProjectBot) -> None:

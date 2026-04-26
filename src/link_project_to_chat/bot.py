@@ -1050,60 +1050,46 @@ class ProjectBot(AuthMixin):
             message=ci.message,
         )
 
-    async def _on_backend(self, ci) -> None:
-        """Show or switch the active backend.
+    def _backend_buttons(self) -> Buttons:
+        """One row per registered backend; active marked with ●."""
+        from .backends.factory import available
 
-        - No args: print active + available backends.
-        - `<active>`: no-op, no disk write.
-        - `<unknown>`: error listing available backends.
-        - `<other>` while a live agent task runs: rejected.
-        - `<other>` otherwise: build new backend, swap, persist (project or
-          team-bot path) — activate first, persist on success per spec §4.5.
+        current = self.task_manager.backend.name
+        rows = []
+        for name in available():
+            prefix = "● " if name == current else ""
+            rows.append([Button(label=f"{prefix}{name}", value=f"backend_set_{name}")])
+        return Buttons(rows=rows)
+
+    async def _switch_backend(self, requested: str) -> str:
+        """Activate-first backend swap. Returns the user-visible reply text.
+
+        Per Phase 2 spec §4.5: build new → close_interactive(old) → swap →
+        persist on success. Disk follows runtime so a crash mid-swap leaves
+        the bot recoverable on the previous backend.
+
+        Returns one of: "<x> is already active.", an unknown-backend error,
+        a live-task rejection, or "Switched to <x>." on success.
         """
-        if not self._auth_identity(ci.sender):
-            return
-        assert self._transport is not None
-
         from .backends.factory import available, create
 
-        current_name = self.task_manager.backend.name
         available_backends = available()
+        current_name = self.task_manager.backend.name
 
-        if not ci.args:
-            await self._transport.send_text(
-                ci.chat,
-                f"Active backend: {current_name}\n"
-                f"Available: {', '.join(available_backends)}",
-            )
-            return
-
-        requested = ci.args[0].lower()
         if requested == current_name:
-            await self._transport.send_text(
-                ci.chat, f"{requested} is already active."
-            )
-            return
+            return f"{requested} is already active."
         if requested not in available_backends:
-            await self._transport.send_text(
-                ci.chat,
+            return (
                 f"Unknown backend '{requested}'. "
-                f"Available: {', '.join(available_backends)}",
+                f"Available: {', '.join(available_backends)}"
             )
-            return
         if self.task_manager.has_live_agent_tasks():
-            await self._transport.send_text(
-                ci.chat, "Cancel running tasks before switching backend."
-            )
-            return
+            return "Cancel running tasks before switching backend."
 
-        # Activate first (build + swap), persist on success.
         new_backend = create(requested, self.path, self._backend_state_for(requested))
         self.task_manager.backend.close_interactive()
         self.task_manager._backend = new_backend
         self._backend_name = requested
-        # _backend_state_for returns a fresh dict regardless of whether
-        # `requested` was previously persisted, so seeding with `{}` is
-        # equivalent and avoids a wasted dict copy on the no-key path.
         self._backend_state.setdefault(requested, {})
 
         cfg = self._effective_config_path()
@@ -1112,7 +1098,29 @@ class ProjectBot(AuthMixin):
         else:
             patch_project(self.name, {"backend": requested}, cfg)
 
-        await self._transport.send_text(ci.chat, f"Switched to {requested}.")
+        return f"Switched to {requested}."
+
+    async def _on_backend(self, ci) -> None:
+        """Show or switch the active backend.
+
+        - No args: render a button picker (one row per registered backend).
+        - `<name>` typed: same four-form switch logic via `_switch_backend`,
+          text reply.
+        """
+        if not self._auth_identity(ci.sender):
+            return
+        assert self._transport is not None
+
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat,
+                f"Active backend: {self.task_manager.backend.name}",
+                buttons=self._backend_buttons(),
+            )
+            return
+
+        msg = await self._switch_backend(ci.args[0].lower())
+        await self._transport.send_text(ci.chat, msg)
 
     async def _on_version_t(self, ci) -> None:
         if not self._auth_identity(ci.sender):
@@ -1596,6 +1604,14 @@ class ProjectBot(AuthMixin):
                 msg_ref,
                 f"Select model\nCurrent: {self._current_model()}",
                 buttons=self._model_buttons(),
+            )
+        elif value.startswith("backend_set_"):
+            requested = value[len("backend_set_"):]
+            reply = await self._switch_backend(requested)
+            await self._transport.edit_text(
+                msg_ref,
+                f"{reply}\nActive backend: {self.task_manager.backend.name}",
+                buttons=self._backend_buttons(),
             )
         elif value.startswith("effort_set_"):
             backend = self.task_manager.backend
