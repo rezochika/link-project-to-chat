@@ -276,6 +276,86 @@ async def test_codex_status_does_not_require_model_display(tmp_path):
     assert "Model: default" in sent[0].text
 
 
+async def test_status_includes_effort_when_backend_supports_it(tmp_path):
+    """Phase 4 slice 2: /status surfaces effort when the active backend
+    declares supports_effort. Default reads as 'medium' for Codex (None →
+    'medium' fallback covers both backends' default reasoning level)."""
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Effort: medium" in text
+
+
+async def test_status_omits_effort_when_backend_does_not_support_it(tmp_path):
+    """FakeBackend (and any future backend with supports_effort=False) must
+    not get an Effort line — that signal would be misleading."""
+    from tests.backends.fakes import FakeBackend
+
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend = FakeBackend(tmp_path)
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Effort:" not in text
+
+
+async def test_status_surfaces_codex_last_usage_tokens(tmp_path):
+    """When Codex has just completed a turn, /status shows the in/out token
+    counts from turn.completed.usage. Cached + reasoning tokens are
+    intentionally omitted to keep the line scannable."""
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+    bot.task_manager._backend._last_usage = {
+        "input_tokens": 24298,
+        "cached_input_tokens": 3456,
+        "output_tokens": 36,
+        "reasoning_output_tokens": 10,
+    }
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Last tokens: 24298 in / 36 out" in text
+
+
+async def test_status_surfaces_claude_last_duration(tmp_path):
+    """ClaudeBackend.status returns last_duration when a turn has finished;
+    /status surfaces it as 'Last duration: <seconds>s'."""
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend._last_duration = 12.7
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Last duration: 12.7s" in text
+
+
+async def test_status_surfaces_total_requests_when_nonzero(tmp_path):
+    """Surface total_requests when > 0; idle backend (0 requests) keeps the
+    status output clean by omitting the line."""
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend._total_requests = 5
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Requests: 5" in text
+
+
+async def test_status_omits_request_count_when_idle(tmp_path):
+    """Idle bot has total_requests=0; the line is omitted to keep /status
+    output focused on actually-meaningful state."""
+    bot = _make_bot(tmp_path)
+    # ClaudeBackend default: _total_requests=0
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Requests:" not in text
+
+
 async def test_codex_effort_command_shows_picker_for_codex(tmp_path):
     """Phase 4 promoted /effort to be capability-driven; Codex now supports
     it, so /effort returns the picker (with the four Codex effort levels)

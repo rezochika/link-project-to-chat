@@ -1852,6 +1852,7 @@ class ProjectBot(AuthMixin):
 
         backend = self.task_manager.backend
         st = backend.status
+        caps = backend.capabilities
         # `model_display` is a first-class AgentBackend Protocol attribute;
         # backends without a pretty label return `None` and we fall back to `model`.
         model_label = backend.model_display or backend.model
@@ -1860,14 +1861,36 @@ class ProjectBot(AuthMixin):
             f"Path: {self.path}",
             f"Backend: {backend.name}",
             f"Model: {model_label or 'default'}",
+        ]
+        # Effort is capability-driven (Phase 4 slice 1). Skip line when the
+        # backend doesn't support it (e.g. FakeBackend in tests).
+        if caps.supports_effort:
+            lines.append(f"Effort: {backend.effort or 'medium'}")
+        lines.extend([
             f"Uptime: {h}h {m}m {s}s",
-            f"Session: {st['session_id'] or 'none'}",
+            f"Session: {st.get('session_id') or 'none'}",
             f"Agent: {'RUNNING' if st['running'] else 'idle'}",
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
+        ])
+        # Per-backend usage stats. Each backend's `.status` exposes a slightly
+        # different dict — surface only the keys that are actually present and
+        # non-trivial. Phase 4 slice 2: makes /status useful for both Claude
+        # (last_duration, total_requests) and Codex (last_usage tokens).
+        if st.get("total_requests", 0) > 0:
+            lines.append(f"Requests: {st['total_requests']}")
+        last_duration = st.get("last_duration")
+        if last_duration is not None:
+            lines.append(f"Last duration: {last_duration}s")
+        last_usage = st.get("last_usage")
+        if last_usage:
+            in_t = last_usage.get("input_tokens", 0)
+            out_t = last_usage.get("output_tokens", 0)
+            lines.append(f"Last tokens: {in_t} in / {out_t} out")
+        lines.extend([
             f"Skill: {self._active_skill or 'none'}",
             f"Persona: {self._active_persona or 'none'}",
-        ]
+        ])
         return "\n".join(lines)
 
     async def _on_status_t(self, ci) -> None:
