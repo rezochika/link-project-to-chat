@@ -49,3 +49,11 @@ Bash smoke pair (2026-04-26):
 `NOT READY`.
 
 Phase 3 shipped earlier today. The stub design's trigger-write threshold is two trigger boxes other than the P1/P2-fixes prerequisite, and only the error-surface box is currently checked. The capability-promotion and `/status`-improvement boxes both require evidence Phase 3's smoke run cannot provide on its own — capability promotion would need a concrete CLI feature whose `False` declaration was over-conservative, and `/status` improvement would need a real user-asked-for field. Neither has surfaced. The soak-window prerequisite is also unmet by definition. Re-run this readiness pass after the agreed two-week soak window and append fresh evidence to the same three docs; do not flip the verdict from a fresh testing pass alone.
+
+## Final verdict
+
+Phase 4 is `NOT READY` for concrete implementation planning because fewer than two trigger conditions are satisfied.
+
+## Next action
+
+Re-run the readiness plan after the next Codex soak window and append new evidence to the same three docs.
