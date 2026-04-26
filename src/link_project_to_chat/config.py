@@ -275,6 +275,31 @@ def resolve_permissions(permissions: str | None) -> tuple[bool, str | None]:
     return False, None
 
 
+def resolve_start_model(
+    backend_name: str,
+    *,
+    explicit_model: str | None = None,
+    backend_model: str | None = None,
+    legacy_claude_model: str | None = None,
+    default_model_claude: str | None = None,
+    default_model: str | None = None,
+) -> str | None:
+    """Resolve the model passed to a starting bot.
+
+    ``backend_state[backend].model`` and an explicit CLI override belong to
+    the active backend. Legacy flat project/team model fields and global
+    defaults are Claude-shaped, so they must not seed Codex/Gemini/etc. with
+    stale Claude slugs like ``opus[1m]``.
+    """
+    if explicit_model:
+        return explicit_model
+    if backend_model:
+        return backend_model
+    if backend_name == "claude":
+        return legacy_claude_model or default_model_claude or default_model or None
+    return None
+
+
 def _migrate_usernames(raw: dict, list_key: str, singular_key: str) -> list[str]:
     """Load a list of usernames, migrating from old singular key if needed."""
     if list_key in raw:

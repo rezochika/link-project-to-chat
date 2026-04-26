@@ -548,6 +548,88 @@ def test_start_team_prefers_default_model_claude_over_legacy(tmp_path, monkeypat
     assert calls[0][1].get("model") == "haiku"
 
 
+def test_start_team_codex_ignores_claude_default_model(tmp_path, monkeypatch):
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "default_model_claude": "opus[1m]",
+                "teams": {
+                    "acme": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -1001,
+                        "bots": {
+                            "manager": {
+                                "telegram_bot_token": "t1",
+                                "backend": "codex",
+                            }
+                        },
+                    }
+                },
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("backend_name") == "codex"
+    assert calls[0][1].get("model") is None
+
+
+def test_start_team_codex_prefers_codex_backend_state_model(tmp_path, monkeypatch):
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "default_model_claude": "opus[1m]",
+                "teams": {
+                    "acme": {
+                        "path": str(tmp_path),
+                        "group_chat_id": -1001,
+                        "bots": {
+                            "manager": {
+                                "telegram_bot_token": "t1",
+                                "backend": "codex",
+                                "backend_state": {"codex": {"model": "gpt-5.5"}},
+                            }
+                        },
+                    }
+                },
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("model") == "gpt-5.5"
+
+
 def test_start_project_prefers_backend_state_model_over_legacy(tmp_path, monkeypatch):
     """When backend_state.claude.model is set, ``cli start --project`` uses
     that for the model fallback even if the legacy flat ``model`` key disagrees.
@@ -585,6 +667,76 @@ def test_start_project_prefers_backend_state_model_over_legacy(tmp_path, monkeyp
     )
     assert result.exit_code == 0, result.output
     assert calls[0][1].get("model") == "opus"
+
+
+def test_start_project_codex_ignores_legacy_claude_model(tmp_path, monkeypatch):
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "myproj": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "TOK",
+                        "backend": "codex",
+                        "model": "opus[1m]",
+                    }
+                }
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(
+        cli.main, ["--config", str(cfg_path), "start", "--project", "myproj"]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("backend_name") == "codex"
+    assert calls[0][1].get("model") is None
+
+
+def test_start_single_project_codex_ignores_legacy_claude_model(tmp_path, monkeypatch):
+    import json
+
+    import link_project_to_chat.cli as cli
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "myproj": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "TOK",
+                        "backend": "codex",
+                        "model": "opus[1m]",
+                    }
+                }
+            }
+        )
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "link_project_to_chat.bot.run_bot",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    from click.testing import CliRunner
+    result = CliRunner().invoke(cli.main, ["--config", str(cfg_path), "start"])
+    assert result.exit_code == 0, result.output
+    assert calls[0][1].get("backend_name") == "codex"
+    assert calls[0][1].get("model") is None
 
 
 def test_start_team_missing_role_errors(tmp_path, monkeypatch):

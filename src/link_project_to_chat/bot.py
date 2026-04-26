@@ -29,6 +29,7 @@ from .config import (
     patch_team_bot_backend_state,
     resolve_permissions,
     resolve_project_auth_scope,
+    resolve_start_model,
     save_session,
 )
 from ._auth import AuthMixin
@@ -2560,7 +2561,12 @@ def run_bots(
             name,
             Path(proj.path),
             proj.telegram_bot_token,
-            model=model or project_state.get("model") or proj.model,
+            model=resolve_start_model(
+                proj.backend,
+                explicit_model=model,
+                backend_model=project_state.get("model"),
+                legacy_claude_model=proj.model,
+            ),
             effort=project_state.get("effort") or proj.effort,
             skip_permissions=skip_permissions or proj_skip,
             permission_mode=permission_mode or proj_pm,

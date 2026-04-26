@@ -139,6 +139,68 @@ def test_start_uses_custom_config_path_and_default_model(tmp_path: Path):
     assert "--model" in call_args and "opus[1m]" in call_args
 
 
+def test_start_codex_project_ignores_claude_default_model(tmp_path: Path):
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            default_model_claude="opus[1m]",
+            projects={
+                "proj": ProjectConfig(
+                    path=str(tmp_path),
+                    telegram_bot_token="tok",
+                    backend="codex",
+                ),
+            },
+        ),
+        cfg_path,
+    )
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.pid = 123
+        mock_proc.poll.return_value = None
+        mock_proc.stdout = []
+        mock_popen.return_value = mock_proc
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        assert pm.start("proj") is True
+
+    call_args = mock_popen.call_args[0][0]
+    assert "--project" in call_args and "proj" in call_args
+    assert "--model" not in call_args
+
+
+def test_start_codex_project_uses_codex_backend_state_model(tmp_path: Path):
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            default_model_claude="opus[1m]",
+            projects={
+                "proj": ProjectConfig(
+                    path=str(tmp_path),
+                    telegram_bot_token="tok",
+                    backend="codex",
+                    backend_state={"codex": {"model": "gpt-5.5"}},
+                ),
+            },
+        ),
+        cfg_path,
+    )
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.pid = 123
+        mock_proc.poll.return_value = None
+        mock_proc.stdout = []
+        mock_popen.return_value = mock_proc
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        assert pm.start("proj") is True
+
+    call_args = mock_popen.call_args[0][0]
+    assert "--model" in call_args and "gpt-5.5" in call_args
+
+
 def test_start_uses_process_group_kwargs(tmp_path: Path):
     with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()

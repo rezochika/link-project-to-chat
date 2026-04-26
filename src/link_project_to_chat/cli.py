@@ -13,6 +13,7 @@ from .config import (
     patch_backend_state,
     resolve_project_auth_scope,
     resolve_permissions,
+    resolve_start_model,
     save_config,
     unbind_trusted_user,
 )
@@ -436,12 +437,13 @@ def start(
             group_chat_id=t.group_chat_id,
             role=role,
             active_persona=bot_cfg.active_persona,
-            model=(
-                model
-                or bot_state.get("model")
-                or config.default_model_claude
-                or config.default_model
-                or None
+            model=resolve_start_model(
+                bot_cfg.backend,
+                explicit_model=model,
+                backend_model=bot_state.get("model"),
+                legacy_claude_model=bot_cfg.model,
+                default_model_claude=config.default_model_claude,
+                default_model=config.default_model,
             ),
             skip_permissions=team_skip,
             permission_mode=team_pm,
@@ -478,7 +480,12 @@ def start(
             proj.telegram_bot_token,
             allowed_usernames=effective_usernames,
             session_id=session_id,
-            model=model or project_state.get("model") or proj.model,
+            model=resolve_start_model(
+                proj.backend,
+                explicit_model=model,
+                backend_model=project_state.get("model"),
+                legacy_claude_model=proj.model,
+            ),
             effort=project_state.get("effort") or proj.effort,
             skip_permissions=skip_permissions or proj_skip,
             permission_mode=permission_mode or proj_pm,
