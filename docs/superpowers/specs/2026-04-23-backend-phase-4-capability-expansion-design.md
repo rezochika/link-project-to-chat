@@ -1,38 +1,50 @@
 # Backend Abstraction Phase 4 — Capability Expansion & Hardening
 
-**Status:** Stub (2026-04-23). Intentionally under-specified pending Phase 3 outcomes.
-**Date:** 2026-04-23
+**Status:** Active — readiness package complete, first slice shipped (2026-04-26).
+**Originally drafted:** 2026-04-23 as a deliberately under-specified stub pending Phase 3 outcomes.
 **Part of:** Backend-abstraction track, spec #4 of 4.
-**Depends on:** Spec #3 (Codex adapter shipped opt-in).
+**Depends on:** Spec #3 (Codex adapter shipped opt-in, 2026-04-26).
 
 ---
 
 ## 1. Current readiness status
+
+**Verdict: `READY` as of HEAD `e2e2143` (2026-04-26 late afternoon).**
 
 Phase 3 follow-up evidence lives in:
 - [Gap inventory](2026-04-23-backend-phase-4-gap-inventory.md)
 - [Capability matrix](2026-04-23-backend-phase-4-capability-matrix.md)
 - [Rollout review](2026-04-23-backend-phase-4-rollout-review.md)
 
-Readiness decision:
-- `READY` if the rollout review checked two or more trigger boxes
-- `NOT READY` otherwise
+The readiness decision rule was: `READY` when the rollout review checks two or more trigger boxes (with the P1/P2 fixes box as gating prerequisite). Three are now checked: P1/P2 fixes, error-surface improvement, and capability promotion.
 
-## 2. Why this spec is a stub
+**First validated slice already shipped:**
+- `93f8b9c` — Codex `/model` (5 cached GPT-5 slugs) + `/effort` (low/medium/high/xhigh) with `-c model_reasoning_effort=<level>` config override on the CLI command. Triggered by a real user-reported gap (`/model` rejected as "doesn't support /model" even though Codex CLI accepts `--model <slug>`). Adds `supports_effort` and `effort_levels` to `BackendCapabilities`; lifts `effort` to the `AgentBackend` Protocol.
+- `e2e2143` — `/backend` is now a button picker; the four-form switch logic is shared between the typed-arg and button paths via an extracted `_switch_backend` helper.
 
-Phase 3 ships `CodexBackend` with **conservative capabilities**: only features validated against the installed Codex CLI are declared `True`; the rest are declared `False` and gated out by the spec #2 capability machinery.
+Future slices proceed from the gap inventory's remaining gaps (most concrete: `/status` reporting — the data is tracked on each backend, just not surfaced).
 
-Phase 4's purpose is to **expand that surface once the adapter has been used in practice and the gaps are known**. Writing a detailed Phase 4 spec now would force guesses about:
+## 2. Why this spec was originally a stub (and what changed)
+
+Phase 3 shipped `CodexBackend` with **conservative capabilities**: only features validated against the installed Codex CLI were declared `True`; the rest were declared `False` and gated out by the spec #2 capability machinery.
+
+Phase 4's purpose was to **expand that surface once the adapter had been used in practice and the gaps were known**. Writing a detailed Phase 4 spec at the time of Phase 3 design would have forced guesses about:
 
 - Which Codex features Phase 3 left unsupported and why.
 - Whether those gaps come from Codex CLI limitations (won't change) or adapter conservatism (fixable).
-- Whether real Codex usage revealed error-surface issues (stderr noise, rate-limit shape, cancel edge cases) that need adapter-side hardening.
-- Whether the Protocol needs a second-pass extension.
+- Whether real Codex usage would reveal error-surface issues (stderr noise, rate-limit shape, cancel edge cases) that need adapter-side hardening.
+- Whether the Protocol would need a second-pass extension.
 - Whether `default_backend` should be configurable via command surface.
 
-These questions are **answerable only after Phase 3 is implemented and exercised**. Attempting to answer them now produces a spec that either repeats Phase 3 content or drifts from reality.
+These questions were answered the day Phase 3 shipped, faster than the design anticipated:
 
-The full Phase 4 spec is therefore **written after Phase 3 lands**, using this stub as the scope skeleton.
+- **Codex CLI accepts `--model <slug>` and `~/.codex/models_cache.json` enumerates the visible models.** Phase 3's `models = ()` was over-conservative; the cache file makes the promotion mechanical. Slice 1 shipped this on 2026-04-26.
+- **Codex CLI accepts `-c model_reasoning_effort=<level>`** for `low/medium/high/xhigh`. Live-CLI-verified before commit. `effort` was a Claude-only tier-2 attribute; Phase 4's first slice promotes it to a real `BackendCapabilities` flag with per-backend `effort_levels`. Per-backend levels handle Claude's extra `max` cleanly.
+- **Adapter-side hardening surfaced one real bug** (post-`turn.completed` proc not reaped, fixed in `7bbbbd3` with regression tests) and one config-layer bug (partial team entries crashing the manager loader, fixed in `ceca7ca`). Both pre-empted in the same day Phase 3 shipped.
+- **Protocol second-pass was minor:** lifted `model_display` (Phase 3 review fix `f73b43e`) and `effort` (Phase 4 slice 1) from tier-2 to Protocol level. No Protocol reshaping needed.
+- **`default_backend` command:** `/backend` button picker (Phase 4 slice 1, `e2e2143`) addresses the muscle-memory part of this question. A separate `/default_backend` for the manager-bot global default is still future work.
+
+The remaining gaps are documented in the [gap inventory](2026-04-23-backend-phase-4-gap-inventory.md). The most concrete is `/status` reporting (§3.2 below).
 
 ## 3. Provisional scope (to be validated after Phase 3)
 
@@ -86,6 +98,18 @@ Writing the full spec earlier risks over-designing for hypothetical usage.
 
 ## 6. Sign-off
 
-If the rollout review is `NOT READY`, keep this file as a stub and continue gathering evidence.
+The rollout review is `READY` and the first Phase 4 slice has shipped at `e2e2143` (Codex `/model` + `/effort` + `/backend` button picker). The next slice should be planned from the gap inventory's "Status/reporting gaps" section as the concrete design input — `/status` is the most evidence-backed remaining gap.
 
-If the rollout review is `READY`, do not add speculative code here. Start a new concrete implementation plan for the first validated Phase 4 slice, using the evidence docs above as the only source of truth.
+Do not add speculative code to this spec. Each future slice gets its own short implementation plan once the gap is concrete and the user-visible improvement is identified. Keep this file as the running index of what shipped, what's next, and what stays out of scope.
+
+### Shipped slices
+
+| Slice | Commit(s) | Trigger | What landed |
+|-------|-----------|---------|-------------|
+| 1 — `/model` + `/effort` for Codex; `/backend` button picker | `93f8b9c`, `e2e2143` | User-reported `/model` gap | `CODEX_CAPABILITIES.models` = 5-tuple; `BackendCapabilities.supports_effort`/`effort_levels`; `effort` lifted to Protocol; per-backend `MODEL_OPTIONS`; `_switch_backend` helper; button-picker UX for `/backend`.
+
+### Suggested next slices (in evidence-backed priority order)
+
+1. `/status` reporting (Phase 4 §3.2 — most concrete remaining gap; data is already tracked, just not surfaced).
+2. Codex usage-cap detection IF a stderr pattern emerges from real ChatGPT-tier traffic (Phase 4 §3.3 — currently no evidence).
+3. Manager-level `/default_backend` command IF config-edit-only proves friction-y (Phase 4 §3.5 — currently no evidence).
