@@ -1,6 +1,6 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD after TODO hardening commit `b396b1e`. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
+_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, root-level planning docs, and direct code audit findings. Reflects status as of branch `feat/transport-abstraction` HEAD after TODO hardening commit `b396b1e` plus docs commit `5494753`. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
 
@@ -270,6 +270,18 @@ Open questions:
 | `tests/test_cli_transport.py` depends on `/tmp/x` existing (Click `Path(exists=True)` validation) | `tests/test_cli_transport.py:21,42` | ✅ closed |
 | No end-to-end test wires `ProjectBot` + `WebTransport` + `_auth_identity` + handler in one flow | new test | ✅ closed (`tests/web/test_projectbot_web_e2e.py`) |
 
+### 7.1 Direct code audit findings — 2026-04-27
+
+These were found by reading current code paths directly, not by reusing the documented backlog or existing tests.
+
+| ID | Severity | Item | Location | Status |
+|---|---|---|---|---|
+| CA-1 | 🔴 Critical | Web UI still has no real user authentication. The old client-controlled username spoofing path is closed, but `ProjectBot.build()` maps every Web browser session to the single configured allowed username via `authenticated_handle`; any browser that can load the UI receives cookies/CSRF and reaches the normal authorizer as that user. Fix: add a real Web login/token gate or bind server-side sessions to authenticated users before command dispatch. | `bot.py:2529-2537`, `web/app.py:66-126`, `web/transport.py:297-307`, `_auth.py:138-181` | ⏳ pending |
+| CA-2 | 🟠 Important | Rejected Web uploads leak temp files and can consume memory/disk. `post_message()` reads the whole upload into memory and writes a `lp2c-web-*` tempdir before auth dispatch; if `_dispatch_event()` rejects the identity, it returns before the upload cleanup block. Fix: authenticate before accepting file bodies where possible, enforce a size cap, and clean payload tempdirs on rejected dispatch. | `web/app.py:90-126`, `web/transport.py:296-307`, `web/transport.py:364-391` | ⏳ pending |
+| CA-3 | 🟠 Important | `/run` concurrency cap is racy. Each command checks `len(_active_run_pids)` before awaiting `_on_task_started`, and the PID is recorded only after `Popen`; concurrent `/run` tasks can all pass the check and exceed the max-3 limit. Fix: reserve a slot under a lock/semaphore before the first await and release it on every exit path. | `task_manager.py:430-459` | ⏳ pending |
+| CA-4 | 🟠 Important | Codex early cancellation can leave child processes alive. Codex is launched in a new session/process group, but the early-close cleanup path calls only `proc.kill()` instead of the shared process-tree terminator. Fix: use the same tree/group termination path used by task cancellation. | `backends/codex.py:141-157`, `backends/codex.py:241-244` | ⏳ pending |
+| CA-5 | 🟡 Minor | Web dispatch failures are swallowed silently. `_dispatch_loop()` catches every handler exception and drops it without logging or notifying the user, making broken commands/buttons look like no-ops. Fix: log with context and, where possible, send a failure message to the originating chat. | `web/transport.py:284-291` | ⏳ pending |
+
 ---
 
 ## Summary by Status
@@ -279,7 +291,7 @@ Open questions:
 | ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path |
 | 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) |
 | 📋 Designed, not started | 3 transport specs (Discord #2, Slack #3, Google Chat #4), Backend Phase 5 (Gemini adapter), sandbox |
-| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec) |
+| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec) + 5 direct code-audit findings (CA-1..CA-5) |
 
 ---
 
