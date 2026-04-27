@@ -51,10 +51,17 @@ def _fake_task(task_id: int = 1) -> Task:
     t.message = MessageRef(transport_id="telegram", native_id="7", chat=chat)
     t.status = TaskStatus.RUNNING
     t.type = TaskType.AGENT
+    t.input = "hello"
+    t.name = "agent"
     t.result = ""
     t.error = None
+    t.exit_code = None
+    t.created_at = 0.0
+    t.started_at = None
+    t.finished_at = None
     t.pending_questions = []
     t._compact = False
+    t._log = []
     return t
 
 
@@ -234,13 +241,15 @@ async def test_thinking_delta_with_toggle_off_uses_buffer():
 
 
 @pytest.mark.asyncio
-async def test_finalize_with_live_text_does_not_resend():
-    """Live-text path: keeps the accumulated buffer, edits in place, no new message sent."""
+async def test_finalize_with_live_text_sends_completion_notice():
+    """Live-text path edits the stream in place, then sends a fresh completion ping."""
     bot = await _stub_bot()
     bot._is_image = lambda p: False
     bot._synthesizer = None
     task = _fake_task(task_id=10)
     task.status = TaskStatus.DONE
+    task.started_at = 10.0
+    task.finished_at = 14.0
     # task.result contains only the LAST assistant text block; the streamed buffer
     # has every text delta (narration + final). The finalized message must preserve
     # the buffer's content, not clobber it with task.result.
@@ -251,11 +260,33 @@ async def test_finalize_with_live_text_does_not_resend():
 
     await bot._finalize_claude_task(task)
 
-    # No new send_message call — the live message was edited in place.
-    assert len(bot._app.bot.sent) == sent_before
+    # The answer stays in the live message edit, and a short new message gives
+    # Telegram a final notification + visible elapsed time.
+    assert len(bot._app.bot.sent) == sent_before + 1
+    assert bot._app.bot.sent[-1]["text"] == "Done in 4s."
     assert task.id not in bot._live_text
     # Full streamed buffer preserved (narration survives, not just task.result).
     assert any("narration before tool use" in e["text"] for e in bot._app.bot.edits)
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_live_error_sends_failure_notice():
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    task = _fake_task(task_id=14)
+    task.status = TaskStatus.FAILED
+    task.error = "boom"
+    task.started_at = 20.0
+    task.finished_at = 23.0
+    await bot._on_stream_event(task, TextDelta(text="working"))
+    sent_before = len(bot._app.bot.sent)
+
+    await bot._finalize_claude_task(task)
+
+    assert len(bot._app.bot.sent) == sent_before + 1
+    assert bot._app.bot.sent[-1]["text"] == "Failed in 3s."
+    assert any("Error: boom" in e["text"] for e in bot._app.bot.edits)
 
 
 @pytest.mark.asyncio
@@ -317,6 +348,27 @@ async def test_finalize_without_live_text_falls_back_to_send_to_chat():
     await bot._finalize_claude_task(task)
 
     assert sent_chats == [(task.chat, "tool-only answer")]
+
+
+@pytest.mark.asyncio
+async def test_finalize_command_task_includes_elapsed_duration():
+    bot = await _stub_bot()
+    sent: list[str] = []
+
+    async def fake_send_raw(chat, text, reply_to=None):
+        sent.append(text)
+
+    bot._send_raw = fake_send_raw
+    task = _fake_task(task_id=15)
+    task.type = TaskType.COMMAND
+    task.status = TaskStatus.DONE
+    task.result = "compiled"
+    task.started_at = 30.0
+    task.finished_at = 36.0
+
+    await bot._finalize_command_task(task)
+
+    assert sent == ["compiled\n[exit 0 | 6s]"]
 
 
 @pytest.mark.asyncio

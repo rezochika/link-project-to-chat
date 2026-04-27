@@ -615,6 +615,7 @@ class ProjectBot(AuthMixin):
                 else:
                     fallback = task.result if not has_buffer else None
                     await live_text.finalize(fallback, render=True)
+                await self._send_completion_notice(task)
             else:
                 await self._send_to_chat(task.chat, task.result, reply_to=task.message)
             if live_thinking is not None:
@@ -640,10 +641,25 @@ class ProjectBot(AuthMixin):
                 return
             if live_text is not None:
                 await live_text.finalize(error_text, render=False)
+                await self._send_completion_notice(task, failed=True)
             else:
                 await self._send_to_chat(task.chat, error_text, reply_to=task.message)
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
+
+    async def _send_completion_notice(self, task: Task, *, failed: bool = False) -> None:
+        """Send a fresh completion ping after a live-edited agent response.
+
+        Telegram edits keep the original timestamp and usually do not notify.
+        This short message gives users a final notification and visible elapsed
+        time without duplicating the full answer.
+        """
+        if self.group_mode:
+            return
+        assert self._transport is not None
+        status = "Failed" if failed else "Done"
+        elapsed = f" in {task.elapsed_human}" if task.elapsed_human else ""
+        await self._transport.send_text(task.chat, f"{status}{elapsed}.", reply_to=task.message)
 
     def _schedule_cap_probe(self, chat: ChatRef, interval_s: int = 1800) -> None:
         """Probe the backend every `interval_s` seconds; on success, resume the group."""
@@ -694,10 +710,11 @@ class ProjectBot(AuthMixin):
         output = (task.result or "").rstrip() or (task.error or "").rstrip() or "(no output)"
         if len(output) > 3000:
             output = output[:3000] + "\n... (truncated, use /log)"
+        elapsed = f" | {task.elapsed_human}" if task.elapsed_human else ""
         if task.status == TaskStatus.DONE:
-            await self._send_raw(task.chat, f"{output}\n[exit 0]")
+            await self._send_raw(task.chat, f"{output}\n[exit 0{elapsed}]")
         else:
-            await self._send_raw(task.chat, f"[exit {task.exit_code}]\n\n{output}")
+            await self._send_raw(task.chat, f"[exit {task.exit_code}{elapsed}]\n\n{output}")
 
     async def _on_task_complete(self, task: Task) -> None:
         typing = self._typing_tasks.pop(task.id, None)
