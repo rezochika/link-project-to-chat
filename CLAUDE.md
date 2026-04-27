@@ -73,7 +73,7 @@ The `Transport` Protocol decouples bot logic from Telegram. `bot.py` only commun
 
 Active branch `feat/transport-abstraction` carries the transport-abstraction track plus the first non-Telegram transport.
 
-- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`), 2 (backend-aware config + `/backend` command), 3 (Codex adapter behind `/backend codex`), and 4 (capability expansion: Codex `/model`/`/effort`/`/permissions`, `/backend` picker, provider-aware `/status`, `/context`) also shipped.
+- Shipped: spec #0 (core, v0.13.0), #0b (voice, v0.14.0), #0a (group/team, v0.15.0), #0c (manager, v0.16.0), #1 (Web UI). Backend abstraction phases 1 (Claude extraction behind `AgentBackend`), 2 (backend-aware config + `/backend` command), 3 (Codex adapter behind `/backend codex`), and 4 (capability expansion: Codex `/model`/`/effort`/`/permissions`, `/backend` picker, provider-aware `/status`, `/context`) also shipped. TODO hardening commit `b396b1e` closed the active Phase 4/Web security, process lifecycle, context-history, and test portability follow-ups.
 - Designed but not yet implemented: Discord (#2), Slack (#3), Google Chat (#4).
 
 [docs/TODO.md](docs/TODO.md) is the live status source — update there first; this section is a pointer.

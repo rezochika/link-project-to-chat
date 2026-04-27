@@ -1,8 +1,10 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD after the TODO hardening batch. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
+_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD after TODO hardening commit `b396b1e`. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
+
+Latest verification for the TODO hardening batch: `pytest -q` → **992 passed, 5 skipped, 2 warnings**; `git diff --check` and `python3 -m compileall -q src/link_project_to_chat` passed.
 
 ---
 
