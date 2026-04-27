@@ -166,6 +166,47 @@ async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_joins_multi_agent_messages_with_blank_line(tmp_path, monkeypatch):
+    """When codex emits multiple item.completed agent_message events in a
+    single turn (planning preamble, mid-action summary, final answer), the
+    Result.text must visibly separate them with blank lines rather than
+    concatenating into a run-on bubble. The 2026-04-27 incident showed the
+    "I'll review... I'm running... Done." manager bubbles concatenated as
+    one undifferentiated thought; that's a render bug, not a model bug."""
+    import json
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "abc-123"}),
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "i0", "type": "agent_message", "text": "I'll review the diff.",
+        }}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "i1", "type": "agent_message", "text": "Running the focused test suite.",
+        }}),
+        json.dumps({"type": "item.completed", "item": {
+            "id": "i2", "type": "agent_message", "text": "Done. Tests pass.",
+        }}),
+        json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 100, "output_tokens": 30,
+        }}),
+    ]
+    backend = CodexBackend(tmp_path, {})
+    monkeypatch.setattr(backend, "_popen", lambda cmd: _FakeProc(lines))
+
+    events = [event async for event in backend.chat_stream("review")]
+    result = events[-1]
+
+    assert isinstance(result, Result)
+    assert result.text == (
+        "I'll review the diff."
+        "\n\n"
+        "Running the focused test suite."
+        "\n\n"
+        "Done. Tests pass."
+    )
+
+
+@pytest.mark.asyncio
 async def test_successful_stderr_warning_does_not_fail_turn(tmp_path, monkeypatch):
     backend = CodexBackend(tmp_path, {})
     warning = (FIXTURES / "codex_stderr_warning.txt").read_text(encoding="utf-8")

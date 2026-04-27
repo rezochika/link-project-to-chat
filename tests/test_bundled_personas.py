@@ -48,6 +48,34 @@ def test_load_persona_falls_back_to_bundled(tmp_path, monkeypatch):
     assert "Senior Software Project Manager" in sm.content
 
 
+def test_software_manager_persona_has_idempotency_clause():
+    """The manager persona must explicitly tell the agent not to re-dispatch
+    or re-summarize work already recorded as shipped — this is the core
+    behavioral guard against the bot-to-bot loop pattern from 2026-04-27.
+    Removing this clause re-opens the failure mode."""
+    p = files("link_project_to_chat.personas").joinpath("software_manager.md")
+    content = p.read_text().lower()
+    # Phrase must be present in some form. Match on the key terms rather than
+    # exact wording so cosmetic edits don't break the invariant.
+    assert "idempoten" in content
+    assert "do not re-dispatch" in content or "do not re-issue" in content
+    assert (
+        "already" in content and ("shipped" in content or "approved" in content)
+    )
+
+
+def test_software_dev_persona_has_message_brevity_rule():
+    """The dev persona must carry the same Telegram-constraint brevity rule
+    the manager has — long evidence belongs in `docs/<date>-evidence.md`,
+    not inline in the chat reply. Without this, dev's batch reports overflow
+    and depend on the relay's coalesce path, which is brittle."""
+    p = files("link_project_to_chat.personas").joinpath("software_dev.md")
+    content = p.read_text().lower()
+    assert "brevity" in content or "under" in content and "characters" in content
+    assert "3000" in content
+    assert "docs/" in content
+
+
 def test_project_persona_overrides_bundled(tmp_path, monkeypatch):
     from link_project_to_chat import skills
 

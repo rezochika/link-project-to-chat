@@ -50,21 +50,38 @@ class RelayUnauthorizedError(RuntimeError):
 
 
 _EDIT_DEBOUNCE_SECONDS = 6.0
-# Halt the relay if `_MAX_CONSECUTIVE_BOT_RELAYS` forwards land within
-# `_ROUND_WINDOW_SECONDS`. The raw-count halt used previously treated a
-# long legitimate multi-round delegation the same as a fast ping-pong; a
-# time-windowed count distinguishes the two because real work has tool
-# calls between messages (10s+ minimum) while loops fire back-to-back.
-_MAX_CONSECUTIVE_BOT_RELAYS = 10
-_ROUND_WINDOW_SECONDS = 120.0
+# Two complementary halt rules for runaway loops:
+#
+# 1. Time-window count: halt if `_MAX_CONSECUTIVE_BOT_RELAYS` forwards land
+#    within `_ROUND_WINDOW_SECONDS`. Catches fast machine-gun loops.
+#
+# 2. Same-author streak: halt if the last `_MAX_SAME_AUTHOR_STREAK`
+#    forwards are all from the same sender. Catches the slow loop shape
+#    where one bot re-issues the same dispatch repeatedly without the
+#    peer's relay-visible response landing between attempts — that pattern
+#    paces by tool calls and never trips a count/window cap by itself, but
+#    is unambiguously a loop.
+#
+# Tightened from 10/120s to 6/180s after the 2026-04-27 quota incident,
+# where sustained loops at 5-7 forwards per 120s never tripped the old cap.
+_MAX_CONSECUTIVE_BOT_RELAYS = 6
+_ROUND_WINDOW_SECONDS = 180.0
+_MAX_SAME_AUTHOR_STREAK = 3
 _FALLBACK_DELETE_SECONDS = 60.0
 # Telegram splits bot messages longer than 4096 chars into separate parts,
 # each delivered as its own NewMessage event. Without coalescing, each part
 # becomes an independent forward and spawns its own task in the peer bot's
-# queue (the garbled-parallel-output failure mode). Parts share the same
-# sender and reply_to_message_id; we buffer by (sender, reply_to) for this
+# queue (the garbled-parallel-output failure mode). Buffer by sender for this
 # many seconds before forwarding the combined text once.
-_COALESCE_WINDOW_SECONDS = 3.0
+#
+# The 2026-04-27 incident showed split parts can land with different
+# reply_to_msg_id values (some pointing to the original prompt, some None,
+# some to an intermediate placeholder), so the old (sender, reply_to) key
+# scattered fragments into separate buckets and silently dropped continuations.
+# Sender-only keying merges them; the same-sender streak guard above caps
+# legitimate-but-rapid back-to-back dispatches at 3 forwards. Window extended
+# from 3s to 10s to catch slower streaming-throttled splits.
+_COALESCE_WINDOW_SECONDS = 10.0
 
 # Shared with transport/telegram.py's _RELAY_PREFIX_RE — keep these in sync.
 # Telegram bot usernames are constrained to [A-Za-z][A-Za-z0-9_]*.
@@ -171,11 +188,12 @@ def find_peer_mention(text: str, self_username: str, team_bot_usernames: set[str
 
 
 class _CoalescePending:
-    """Buffer for consecutive bot messages that share a reply_to target.
+    """Buffer for consecutive same-sender bot messages awaiting forward.
 
     Used by TeamRelay to merge split-message parts (and any other rapid-fire
     multi-part posts) into a single forward, so the peer bot sees one logical
-    delegation rather than N independent tasks.
+    delegation rather than N independent tasks. Keyed by sender alone; see
+    ``_COALESCE_WINDOW_SECONDS`` for the merge window rationale.
     """
 
     __slots__ = ("parts", "timer")
@@ -215,10 +233,14 @@ class TeamRelay:
         # Pending debounced relay tasks, keyed by message_id. The livestream
         # emits many edits per reply; we only relay once the stream goes quiet.
         self._debounce_tasks: dict[int, asyncio.Task] = {}
-        # Loop guard: timestamps of recent bot-to-bot forwards. Halts when
-        # `_max_rounds` of them land within `_ROUND_WINDOW_SECONDS`.
+        # Loop guard: timestamps + senders of recent bot-to-bot forwards.
+        # Halts when `_max_rounds` of them land within `_ROUND_WINDOW_SECONDS`,
+        # OR when the last `_MAX_SAME_AUTHOR_STREAK` are all from the same
+        # sender (covers slow loops that don't trip the time-window cap).
+        # Two parallel deques stay in sync via _record_round.
         self._max_rounds = max_consecutive_bot_relays
         self._round_times: deque[float] = deque()
+        self._round_senders: deque[str] = deque()
         self._halted = False
         # Telegram message IDs the relay itself has sent (forwards + halt
         # notices). Needed because Telethon delivers our own sends back as
@@ -231,9 +253,10 @@ class TeamRelay:
         # if the peer never responds.
         self._pending_deletes: dict[int, str] = {}
         self._pending_delete_timers: dict[int, asyncio.Task] = {}
-        # Coalesce buffer keyed by (sender_username, reply_to_msg_id). See
-        # `_COALESCE_WINDOW_SECONDS` for rationale.
-        self._coalesce_pending: dict[tuple[str, int | None], _CoalescePending] = {}
+        # Coalesce buffer keyed by sender_username. See `_COALESCE_WINDOW_SECONDS`
+        # for the merge-window rationale; sender-only key (no reply_to) catches
+        # split parts that land with mismatched reply_to values.
+        self._coalesce_pending: dict[str, _CoalescePending] = {}
 
     async def start(self) -> None:
         """Register NewMessage + MessageEdited handlers on the shared Telethon client.
@@ -357,6 +380,7 @@ class TeamRelay:
             # just be the user cleaning up a prior message.
             if not is_edit:
                 self._round_times.clear()
+                self._round_senders.clear()
                 self._halted = False
             return
         sender_username = (getattr(sender, "username", "") or "").lower()
@@ -368,22 +392,22 @@ class TeamRelay:
         if not is_edit:
             await self._delete_pending_for_peer(sender_username)
         text = msg.message or ""
-        reply_to = getattr(msg, "reply_to_msg_id", None)
 
         # Continuation of a coalescing message: append regardless of whether
         # this chunk carries its own @peer mention. Telegram splits long bot
-        # messages past 4096 chars into separate parts; usually only the first
-        # part contains the @peer mention.
+        # messages past 4096 chars into separate parts; only the first part
+        # carries the @peer mention. Keyed by sender alone — same-sender parts
+        # within the window combine even if reply_to_msg_id differs across
+        # parts, which it can under streaming-edit splits and middleware.
         if not is_edit:
-            coalesce_key = (sender_username, reply_to)
-            pending = self._coalesce_pending.get(coalesce_key)
+            pending = self._coalesce_pending.get(sender_username)
             if pending is not None:
                 if self._halted:
                     return
                 pending.parts.append((msg_id, text))
                 if pending.timer is not None and not pending.timer.done():
                     pending.timer.cancel()
-                pending.timer = asyncio.create_task(self._coalesce_flush(coalesce_key))
+                pending.timer = asyncio.create_task(self._coalesce_flush(sender_username))
                 return
 
         peer = find_peer_mention(text, sender_username, self._bot_usernames)
@@ -405,13 +429,12 @@ class TeamRelay:
             # Start a new coalesce buffer; the timer flushes it once no more
             # parts arrive within `_COALESCE_WINDOW_SECONDS`. Single-part
             # messages still pay the delay but behave identically otherwise.
-            coalesce_key = (sender_username, reply_to)
             new_pending = _CoalescePending()
             new_pending.parts.append((msg_id, text))
-            new_pending.timer = asyncio.create_task(self._coalesce_flush(coalesce_key))
-            self._coalesce_pending[coalesce_key] = new_pending
+            new_pending.timer = asyncio.create_task(self._coalesce_flush(sender_username))
+            self._coalesce_pending[sender_username] = new_pending
 
-    async def _coalesce_flush(self, key: tuple[str, int | None]) -> None:
+    async def _coalesce_flush(self, key: str) -> None:
         """Forward the buffered parts for `key` as a single relay message.
 
         Called from the timer armed in `_handle_event`. If the timer was
@@ -425,7 +448,7 @@ class TeamRelay:
         pending = self._coalesce_pending.pop(key, None)
         if pending is None or not pending.parts:
             return
-        sender_username, _ = key
+        sender_username = key
         combined = "\n\n".join(text for _, text in pending.parts if text)
         first_msg_id = pending.parts[0][0]
         # Every input msg_id belongs to this one logical delegation; mark the
@@ -493,18 +516,33 @@ class TeamRelay:
             self._pending_delete_timers[sent_id] = asyncio.create_task(
                 self._fallback_delete(sent_id)
             )
-        self._record_round()
-        if len(self._round_times) >= self._max_rounds and not self._halted:
+        self._record_round(sender_username)
+        if not self._halted and (
+            len(self._round_times) >= self._max_rounds
+            or self._is_same_author_streak()
+        ):
             self._halted = True
             await self._send_halt_notice()
 
-    def _record_round(self) -> None:
-        """Append now() and drop entries older than the rolling window."""
+    def _record_round(self, sender_username: str) -> None:
+        """Append now() + sender, drop time entries older than the rolling window."""
         now = time.monotonic()
         self._round_times.append(now)
+        self._round_senders.append(sender_username)
         cutoff = now - _ROUND_WINDOW_SECONDS
         while self._round_times and self._round_times[0] < cutoff:
             self._round_times.popleft()
+            self._round_senders.popleft()
+
+    def _is_same_author_streak(self) -> bool:
+        """True when the last `_MAX_SAME_AUTHOR_STREAK` recorded forwards are
+        all from the same sender. Old entries pruned by the time-window are
+        already gone, so this naturally reflects "recent" same-author runs.
+        """
+        if len(self._round_senders) < _MAX_SAME_AUTHOR_STREAK:
+            return False
+        last_n = list(self._round_senders)[-_MAX_SAME_AUTHOR_STREAK:]
+        return len(set(last_n)) == 1
 
     @property
     def _rounds(self) -> int:
@@ -530,9 +568,18 @@ class TeamRelay:
             return None
 
     async def _send_halt_notice(self) -> None:
+        if self._is_same_author_streak():
+            last_sender = self._round_senders[-1] if self._round_senders else "?"
+            reason = (
+                f"{_MAX_SAME_AUTHOR_STREAK} consecutive forwards from @{last_sender} "
+                f"with no peer reply between"
+            )
+        else:
+            reason = (
+                f"{self._rounds} rounds within {int(_ROUND_WINDOW_SECONDS)}s"
+            )
         notice = (
-            f"Bot-to-bot relay paused after {self._rounds} rounds within "
-            f"{int(_ROUND_WINDOW_SECONDS)}s in team '{self._team_name}'. "
+            f"Bot-to-bot relay paused: {reason} in team '{self._team_name}'. "
             f"Send any message to resume."
         )
         try:

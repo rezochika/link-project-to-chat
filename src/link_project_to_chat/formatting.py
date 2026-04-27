@@ -127,6 +127,42 @@ def strip_html(html: str) -> str:
     return text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
 
 
+# `split_or_attach` is the team-mode alternative to `split_html`: instead of
+# producing N consecutive messages when content overflows, it returns a single
+# truncated head plus the full original text as overflow so the caller can
+# attach it as one file. Telegram bot replies that span multiple messages
+# fragment bot-to-bot context — see the 2026-04-27 incident — so team-mode
+# bots take this path and stay strictly to one message per reply.
+SINGLE_MESSAGE_LIMIT = 3500
+OVERFLOW_TRUNCATION_MARKER = "\n\n[…truncated; full text in attached file]"
+
+
+def split_or_attach(
+    text: str, limit: int = SINGLE_MESSAGE_LIMIT,
+) -> tuple[str, str | None]:
+    """Return ``(head, overflow)``.
+
+    - ``len(text) <= limit``: returns ``(text, None)`` — single message, no attachment.
+    - ``len(text) > limit``: returns ``(truncated_head, original_text)``. The head
+      includes ``OVERFLOW_TRUNCATION_MARKER`` so the chat reader knows more is
+      attached, and the full original is in the overflow so the receiver can
+      reconstruct everything from the attachment alone.
+
+    Truncation prefers a newline boundary near the cut point to avoid cutting
+    mid-sentence (or worse, mid-HTML-tag, which would break Telegram rendering).
+    """
+    if len(text) <= limit:
+        return text, None
+    keep = limit - len(OVERFLOW_TRUNCATION_MARKER)
+    if keep <= 0:
+        return OVERFLOW_TRUNCATION_MARKER.lstrip(), text
+    head = text[:keep]
+    nl = head.rfind("\n", max(0, keep - 200), keep)
+    if nl > 0:
+        head = head[:nl]
+    return head + OVERFLOW_TRUNCATION_MARKER, text
+
+
 def _render_table(table_text: str) -> str:
     rows: list[list[str]] = []
     for line in table_text.strip().splitlines():

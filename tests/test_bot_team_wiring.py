@@ -286,6 +286,388 @@ async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeyp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Single-message-or-attach for team-mode replies
+#
+# Long bot replies in team mode used to chunk-split into multiple Telegram
+# messages. The relay coalesces fragile (3s window, requires same reply_to,
+# only first chunk has the @peer mention), so the 2026-04-27 incident showed
+# late/out-of-order parts being dropped — peer bot saw fragments. The fix is
+# source-side: in team mode, never produce more than one Telegram message
+# per agent reply. Anything past the limit goes into a file attachment that
+# the peer bot can read.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_team_mode_short_reply_sends_one_message_no_attachment(tmp_path):
+    """A short agent reply still uses the regular send_text path, no file."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+
+    chat = _group_chat(-100_111)
+    await bot._send_to_chat(chat, "@acme_dev_bot please implement P1-1")
+
+    assert len(bot._transport.sent_messages) == 1
+    assert len(bot._transport.sent_files) == 0
+    assert "@acme_dev_bot" in bot._transport.sent_messages[0].text
+
+
+@pytest.mark.asyncio
+async def test_team_mode_long_reply_sends_one_message_plus_file(tmp_path):
+    """A long agent reply must produce exactly ONE sent_text + ONE sent_file in
+    team mode — never multiple chunked send_texts. The file holds the full
+    original body so the peer bot can read it via incoming.files."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+
+    chat = _group_chat(-100_111)
+    long_body = "@acme_dev_bot here is a very long batch report.\n\n" + (
+        "- detail line that runs on and on with lots of context " * 200
+    )
+    await bot._send_to_chat(chat, long_body)
+
+    assert len(bot._transport.sent_messages) == 1, (
+        f"expected 1 message in team mode, got {len(bot._transport.sent_messages)}"
+    )
+    assert len(bot._transport.sent_files) == 1, (
+        f"expected 1 file attachment, got {len(bot._transport.sent_files)}"
+    )
+    # The visible message should reference the attachment.
+    head = bot._transport.sent_messages[0].text
+    assert "truncated" in head.lower() or "attached" in head.lower()
+    # The attached file must contain the FULL original body.
+    file_path = bot._transport.sent_files[0].path
+    file_content = file_path.read_text(encoding="utf-8")
+    assert long_body.strip() in file_content or "@acme_dev_bot" in file_content
+    assert len(file_content) >= len(long_body)
+
+
+@pytest.mark.asyncio
+async def test_solo_mode_long_reply_still_chunks_into_multiple_messages(tmp_path):
+    """Outside team mode, the existing chunked-split behavior is preserved
+    (a human reading the chat is fine with multiple consecutive messages)."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    assert bot.group_mode is False
+    _team_bot_with_fake_transport(bot)
+
+    chat = ChatRef(transport_id="telegram", native_id="42", kind=ChatKind.DM)
+    long_body = "x" * 8000  # well over Telegram's 4096
+    await bot._send_to_chat(chat, long_body)
+
+    # Solo mode: chunked into multiple messages, no attachment.
+    assert len(bot._transport.sent_messages) >= 2
+    assert len(bot._transport.sent_files) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session-aware persona/history injection gate (Step 2)
+#
+# Codex (and Claude) CLIs persist conversation memory server-side via session
+# resume. Re-prepending the persona + recent-history block to the user message
+# every turn causes the model to re-execute the persona's procedural directives
+# from scratch (e.g. the software_manager "Review protocol" preamble), which is
+# the root of the 2026-04-27 looping incident on the codex manager.
+#
+# Fix: in team mode, when the backend has a resumable session, skip the
+# persona + history prepend. The team_system_note (handled by the backend
+# itself) and the actual user message still go through. Outside team mode,
+# behavior is unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_fake_backend(session_id: str | None, supports_resume: bool = True):
+    """Stand-in backend exposing only what _team_session_active reads."""
+    class _Caps:
+        def __init__(self, supports_resume: bool):
+            self.supports_resume = supports_resume
+
+    class _FakeBackend:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.session_id = session_id
+            self.capabilities = _Caps(supports_resume)
+
+    return _FakeBackend()
+
+
+@pytest.mark.asyncio
+async def test_team_first_turn_relay_path_includes_persona_and_history(tmp_path):
+    """Fresh session (session_id=None): persona + history MUST be prepended so
+    the agent sees them at least once. They land in the backend's session
+    memory and don't need to be re-sent on later turns."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        active_persona="software_manager",
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id=None)
+
+    captured = []
+    bot.task_manager.submit_agent = lambda **kw: captured.append(kw)
+
+    # Seed history so the prepend block is non-empty.
+    bot.conversation_log.append(
+        ChatRef(transport_id="telegram", native_id="-100111", kind=ChatKind.ROOM),
+        "user", "earlier turn", backend="fake",
+    )
+
+    incoming = _group_incoming(
+        _group_chat(-100_111),
+        "@acme_manager dispatch P1-1",
+        sender_handle="acme_dev_bot", sender_is_bot=True, is_relayed=True,
+    )
+    await bot._submit_group_message_to_claude(incoming)
+
+    assert len(captured) == 1
+    prompt = captured[0]["prompt"]
+    assert "[PERSONA: software_manager]" in prompt
+    assert "[Recent conversation history" in prompt
+
+
+@pytest.mark.asyncio
+async def test_team_resumed_turn_relay_path_omits_persona_and_history(tmp_path):
+    """Active session (session_id set, supports_resume=True): persona + history
+    MUST NOT be re-prepended. The backend's session memory already has them.
+    Re-injection is what triggered the codex manager loop on 2026-04-27."""
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        active_persona="software_manager",
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="abc-123-def")
+
+    captured = []
+    bot.task_manager.submit_agent = lambda **kw: captured.append(kw)
+
+    bot.conversation_log.append(
+        ChatRef(transport_id="telegram", native_id="-100111", kind=ChatKind.ROOM),
+        "user", "earlier turn", backend="fake",
+    )
+
+    incoming = _group_incoming(
+        _group_chat(-100_111),
+        "@acme_manager dispatch P1-1",
+        sender_handle="acme_dev_bot", sender_is_bot=True, is_relayed=True,
+    )
+    await bot._submit_group_message_to_claude(incoming)
+
+    assert len(captured) == 1
+    prompt = captured[0]["prompt"]
+    assert "[PERSONA:" not in prompt, (
+        f"persona was re-injected on a resumed session (loop trigger): {prompt[:200]!r}"
+    )
+    assert "[Recent conversation history" not in prompt, (
+        f"history was re-injected on a resumed session: {prompt[:200]!r}"
+    )
+    # The actual peer message is still what gets submitted.
+    assert "dispatch P1-1" in prompt
+
+
+@pytest.mark.asyncio
+async def test_team_resumed_turn_human_path_omits_persona_and_history(tmp_path):
+    """Same gate must apply to human-in-group messages (_on_text path), since
+    they hit the same agent and the same loop risk."""
+    from link_project_to_chat.bot import ProjectBot
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        active_persona="software_manager",
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="zzz-999")
+    # Bypass auth + rate limit gates for this prompt-building test.
+    bot._auth_identity = MagicMock(return_value=True)
+    bot._rate_limited = MagicMock(return_value=False)
+
+    captured = []
+    bot.task_manager.submit_agent = lambda **kw: captured.append(kw)
+
+    bot.conversation_log.append(
+        ChatRef(transport_id="telegram", native_id="-100111", kind=ChatKind.ROOM),
+        "user", "earlier turn", backend="fake",
+    )
+
+    incoming = _group_incoming(_group_chat(-100_111), "@acme_manager status?")
+    await bot._on_text(incoming)
+
+    assert len(captured) == 1
+    prompt = captured[0]["prompt"]
+    assert "[PERSONA:" not in prompt
+    assert "[Recent conversation history" not in prompt
+    assert "status?" in prompt
+
+
+@pytest.mark.asyncio
+async def test_team_mode_persona_change_clears_backend_session(tmp_path):
+    """Step 2's gate hides persona+history when a session is active. So a
+    `/persona` swap mid-session would otherwise be invisible to the agent
+    until /reset. Clearing session_id on persona change forces the next
+    turn to be fresh, re-injecting the new persona."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport import CommandInvocation
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        active_persona="software_manager",
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="session-before-swap")
+    bot._auth_identity = MagicMock(return_value=True)
+
+    chat = _group_chat(-100_111)
+    ci = CommandInvocation(
+        chat=chat, sender=_sender_identity(uid=1, handle="rezo", is_bot=False),
+        name="persona", args=["software_dev"],
+        raw_text="/persona software_dev",
+        message=MessageRef(transport_id="telegram", native_id="100", chat=chat),
+    )
+    await bot._on_persona(ci)
+
+    assert bot._active_persona == "software_dev"
+    assert bot.task_manager.backend.session_id is None, (
+        "session_id must be cleared on persona change in team mode so the "
+        "Step-2 gate opens and the new persona injects on the next turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_team_mode_stop_persona_clears_backend_session(tmp_path):
+    """Same gate-driven reason for /stop_persona — without a fresh session,
+    the resumed agent keeps acting under the old persona until /reset."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport import CommandInvocation
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(
+        name="acme_manager", path=tmp_path, token="t",
+        team_name="acme", role="manager", group_chat_id=-100_111,
+        active_persona="software_manager",
+    )
+    bot.bot_username = "acme_manager"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="session-before-stop")
+    bot._auth_identity = MagicMock(return_value=True)
+
+    chat = _group_chat(-100_111)
+    ci = CommandInvocation(
+        chat=chat, sender=_sender_identity(uid=1, handle="rezo", is_bot=False),
+        name="stop_persona", args=[],
+        raw_text="/stop_persona",
+        message=MessageRef(transport_id="telegram", native_id="100", chat=chat),
+    )
+    await bot._on_stop_persona(ci)
+
+    assert bot._active_persona is None
+    assert bot.task_manager.backend.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_solo_mode_persona_change_preserves_backend_session(tmp_path):
+    """Outside team mode, the per-turn injection gate is OFF — personas
+    re-inject every turn anyway. Don't disrupt session continuity for
+    solo users who change persona mid-conversation."""
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.transport import CommandInvocation
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(
+        name="solo", path=tmp_path, token="t",
+        active_persona="software_manager",
+    )
+    assert bot.group_mode is False
+    bot.bot_username = "solo"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="solo-session-keep")
+    bot._auth_identity = MagicMock(return_value=True)
+
+    chat = ChatRef(transport_id="telegram", native_id="55", kind=ChatKind.DM)
+    ci = CommandInvocation(
+        chat=chat, sender=_sender_identity(uid=1, handle="rezo", is_bot=False),
+        name="persona", args=["software_dev"],
+        raw_text="/persona software_dev",
+        message=MessageRef(transport_id="telegram", native_id="100", chat=chat),
+    )
+    await bot._on_persona(ci)
+
+    assert bot._active_persona == "software_dev"
+    assert bot.task_manager.backend.session_id == "solo-session-keep", (
+        "solo mode must not alter backend session continuity on persona change"
+    )
+
+
+@pytest.mark.asyncio
+async def test_solo_mode_resumed_session_still_injects_persona_and_history(tmp_path):
+    """Outside team mode, leave existing behavior alone. Solo bots don't have
+    the relay-loop failure mode, and changing solo persona injection would
+    silently break /persona-mid-conversation flows users rely on today."""
+    from link_project_to_chat.bot import ProjectBot
+    from unittest.mock import MagicMock
+
+    bot = ProjectBot(
+        name="solo", path=tmp_path, token="t",
+        active_persona="software_dev",
+    )
+    assert bot.group_mode is False
+    bot.bot_username = "solo"
+    _team_bot_with_fake_transport(bot)
+    bot.task_manager._backend = _make_fake_backend(session_id="solo-session")
+    bot._auth_identity = MagicMock(return_value=True)
+    bot._rate_limited = MagicMock(return_value=False)
+
+    captured = []
+    bot.task_manager.submit_agent = lambda **kw: captured.append(kw)
+
+    chat = ChatRef(transport_id="telegram", native_id="55", kind=ChatKind.DM)
+    bot.conversation_log.append(chat, "user", "previous turn", backend="fake")
+
+    incoming = IncomingMessage(
+        chat=chat,
+        sender=_sender_identity(uid=1, handle="rezo", is_bot=False),
+        text="ship it",
+        files=[],
+        reply_to=None,
+        native=None,
+        message=MessageRef(transport_id="telegram", native_id="42", chat=chat),
+    )
+    await bot._on_text(incoming)
+
+    assert len(captured) == 1
+    prompt = captured[0]["prompt"]
+    # Solo mode preserves the legacy injection — persona + history both prepend.
+    assert "[PERSONA: software_dev]" in prompt
+    assert "[Recent conversation history" in prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # A2 — RoomBinding-aware comparison for non-Telegram transports
 #
 # The four `int(incoming.chat.native_id) != self.group_chat_id` call sites in

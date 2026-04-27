@@ -40,7 +40,7 @@ from .conversation_log import (
     default_db_path,
     format_history_block,
 )
-from .formatting import md_to_telegram, split_html, strip_html
+from .formatting import md_to_telegram, split_html, split_or_attach, strip_html
 from .backends.claude import (
     PERMISSION_MODES,
     ClaudeBackend,
@@ -482,8 +482,77 @@ class ProjectBot(AuthMixin):
     async def _send_to_chat(
         self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
     ) -> None:
+        if self.group_mode:
+            await self._send_to_chat_singleton(chat, text, reply_to=reply_to)
+            return
         html = md_to_telegram(text or "[No output]").replace("\x00", "")
         await self._send_html(chat, html, reply_to)
+
+    async def _send_to_chat_singleton(
+        self, chat: ChatRef, text: str, *, reply_to: MessageRef | None = None,
+    ) -> None:
+        """Team-mode send: exactly one Telegram message + optional file overflow.
+
+        Multi-message replies fragment bot-to-bot context: the relay's coalesce
+        is fragile (3s window, requires same reply_to, only the first chunk
+        carries the @peer mention), so late or out-of-order parts get silently
+        dropped. Singleton sends keep each reply self-contained — content past
+        the visible limit lives in the attachment, which the peer bot reads via
+        ``incoming.files`` per its normal upload-handling path.
+        """
+        assert self._transport is not None
+        body = text or "[No output]"
+        visible, overflow = split_or_attach(body)
+        html = md_to_telegram(visible).replace("\x00", "")
+        sent_html = False
+        try:
+            await self._transport.send_text(chat, html, html=True, reply_to=reply_to)
+            sent_html = True
+        except Exception as exc:
+            logger.warning(
+                "Team singleton HTML send failed; falling back to plain: %s",
+                exc, exc_info=True,
+            )
+        if not sent_html:
+            plain = strip_html(html).replace("\x00", "")
+            if plain.strip():
+                try:
+                    await self._transport.send_text(chat, plain, reply_to=reply_to)
+                except Exception:
+                    logger.error(
+                        "Team singleton plain fallback failed", exc_info=True,
+                    )
+                    return
+        if overflow is not None:
+            await self._send_overflow_attachment(chat, overflow)
+
+    async def _send_overflow_attachment(
+        self, chat: ChatRef, overflow: str,
+    ) -> None:
+        """Persist `overflow` to a per-bot temp file and send it via the transport.
+
+        The file is left on disk after upload — the peer bot's standard upload
+        handler downloads its own copy from the platform, so cleanup of this
+        local copy isn't on the response path. Files are tiny (text only) and
+        live in the per-bot overflow dir, which can be cleaned by external
+        rotation if it ever grows.
+        """
+        assert self._transport is not None
+        overflow_dir = (
+            Path(tempfile.gettempdir())
+            / "link-project-to-chat"
+            / self.name
+            / "overflow"
+        )
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+        path = overflow_dir / f"reply-{uuid.uuid4().hex}.txt"
+        path.write_text(overflow, encoding="utf-8")
+        try:
+            await self._transport.send_file(
+                chat, path, caption="full reply text (truncated in chat above)",
+            )
+        except Exception:
+            logger.exception("Team singleton overflow attachment failed")
 
     async def _send_raw(
         self, chat: ChatRef, text: str, reply_to: MessageRef | None = None,
@@ -837,21 +906,58 @@ class ProjectBot(AuthMixin):
         the legacy _on_text shim — not through this method.
         """
         assert self._transport is not None
-        prompt = incoming.text
-        if self._active_persona:
-            from .skills import load_persona, format_persona_prompt
-            persona = load_persona(self._active_persona, self.path)
-            if persona:
-                prompt = format_persona_prompt(persona, prompt)
-        # Build history BEFORE logging this turn so the current message
-        # doesn't appear in its own prepend.
-        prompt = self._history_block(incoming.chat) + prompt
+        prompt = self._build_user_prompt(incoming.chat, incoming.text)
         self._log_user_turn(incoming.chat, incoming.text)
         self.task_manager.submit_agent(
             chat=incoming.chat,
             message=incoming.message,
             prompt=prompt,
         )
+
+    def _team_session_active(self) -> bool:
+        """True when team mode + the active backend has a resumable session.
+
+        While true, the agent's own session memory carries the persona and
+        prior turns; re-prepending them to the user message every turn causes
+        the agent to re-execute the persona's procedural directives from
+        scratch (this is what produced the codex manager loop on 2026-04-27).
+        Outside team mode, this gate is off and existing solo behavior holds.
+        """
+        if not self.group_mode:
+            return False
+        backend = self.task_manager.backend
+        capabilities = getattr(backend, "capabilities", None)
+        return bool(
+            getattr(backend, "session_id", None)
+            and getattr(capabilities, "supports_resume", False)
+        )
+
+    def _build_user_prompt(
+        self,
+        chat: ChatRef,
+        raw_text: str,
+        *,
+        reply_to_text: str | None = None,
+    ) -> str:
+        """Compose the prompt sent to the agent for a user/peer message.
+
+        Always carries the actual user message and any "[Replying to: ...]"
+        prefix. The persona block and recent-history block are prepended only
+        when ``_team_session_active()`` is False — i.e. on a fresh team
+        session, or in solo mode. See ``_team_session_active`` for rationale.
+        """
+        prompt = raw_text
+        if reply_to_text:
+            prompt = f"[Replying to: {reply_to_text}]\n\n{prompt}"
+        if self._team_session_active():
+            return prompt
+        if self._active_persona:
+            from .skills import load_persona, format_persona_prompt
+            persona = load_persona(self._active_persona, self.path)
+            if persona:
+                prompt = format_persona_prompt(persona, prompt)
+        prompt = self._history_block(chat) + prompt
+        return prompt
 
     async def _on_text(self, incoming) -> None:
         """Handle a plain-text message: auth, rate-limit, pending skill/persona
@@ -934,18 +1040,14 @@ class ProjectBot(AuthMixin):
             if typing:
                 typing.cancel()
 
-        prompt = incoming.text
-        if incoming.reply_to_text:
-            prompt = f"[Replying to: {incoming.reply_to_text}]\n\n{prompt}"
-        if self._active_persona:
-            from .skills import load_persona, format_persona_prompt
-            persona = load_persona(self._active_persona, self.path)
-            if persona:
-                prompt = format_persona_prompt(persona, prompt)
-        # Build history BEFORE logging this turn so the current message
-        # doesn't appear in its own prepend. Logging the user entry happens
-        # last so the next turn's prepend will include it.
-        prompt = self._history_block(incoming.chat) + prompt
+        prompt = self._build_user_prompt(
+            incoming.chat,
+            incoming.text,
+            reply_to_text=incoming.reply_to_text,
+        )
+        # Log the user entry AFTER building the prompt so the current message
+        # does not appear in its own prepend block (only relevant when the
+        # gate is open and history actually gets injected).
         self._log_user_turn(incoming.chat, incoming.text)
         self.task_manager.submit_agent(
             chat=incoming.chat,
@@ -1578,6 +1680,33 @@ class ProjectBot(AuthMixin):
         """Persist this bot's active_persona."""
         self._patch_config({"active_persona": name}, config_path)
 
+    def _on_persona_change(self) -> None:
+        """Clear the backend session so the new persona takes effect next turn.
+
+        In team mode, ``_team_session_active`` gates persona/history injection
+        on the backend NOT having a resumable session. Without this clearing
+        step, a ``/persona`` swap mid-conversation would be invisible to the
+        agent — it would keep acting under the persona that was injected on
+        the original first turn until ``/reset``. Forcing session_id=None makes
+        the next turn a fresh first-turn, where the new persona is injected
+        and lands in the new session's memory.
+
+        Solo mode skips this: the per-turn injection gate is off there, the
+        new persona shows up on the very next turn anyway, and disturbing
+        session continuity would needlessly drop the agent's working context.
+        """
+        if not self.group_mode:
+            return
+        backend = self.task_manager.backend
+        if getattr(backend, "session_id", None) is None:
+            return
+        backend.session_id = None
+        logger.info(
+            "Cleared backend session_id on persona change (team=%s role=%s) "
+            "so the new persona injects on the next turn",
+            self.team_name, self.role,
+        )
+
     async def _on_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
@@ -1605,6 +1734,7 @@ class ProjectBot(AuthMixin):
             await self._transport.send_text(ci.chat, f"Persona '{name}' not found.")
             return
         self._active_persona = name
+        self._on_persona_change()
         self._persist_active_persona(name)
         await self._transport.send_text(
             ci.chat, f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate."
@@ -1619,6 +1749,7 @@ class ProjectBot(AuthMixin):
             return
         old = self._active_persona
         self._active_persona = None
+        self._on_persona_change()
         self._persist_active_persona(None)
         await self._transport.send_text(ci.chat, f"Persona '{old}' deactivated.")
 
@@ -1913,6 +2044,7 @@ class ProjectBot(AuthMixin):
             _delete_persona(name, self.path, scope=scope)
             if self._active_persona == name:
                 self._active_persona = None
+                self._on_persona_change()
             await self._transport.edit_text(msg_ref, f"Persona '{name}' deleted.")
         elif value == "persona_delete_cancel":
             await self._transport.edit_text(msg_ref, "Cancelled.")
@@ -1930,6 +2062,7 @@ class ProjectBot(AuthMixin):
                 await self._transport.edit_text(msg_ref, f"Persona '{name}' not found.")
                 return
             self._active_persona = name
+            self._on_persona_change()
             self._persist_active_persona(name)
             await self._transport.edit_text(
                 msg_ref, f"💬 Persona '{name}' activated.\nUse /stop_persona to deactivate."

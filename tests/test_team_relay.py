@@ -420,19 +420,111 @@ async def test_relay_still_forwards_substantive_messages():
     assert relay._rounds == 1
 
 
-def test_default_max_consecutive_bot_relays_is_10():
-    """Raised from 5 alongside the time-window guard — real delegations were
-    hitting the old cap mid-work. With the rolling window, 10 rounds within
-    120s still catches machine-gun loops but permits legitimate long-running
-    back-and-forth (each round spaced by tool calls of 10s+).
+def test_default_loop_guard_constants():
+    """Tightened from 10/120s to 6/180s after the 2026-04-27 quota incident
+    showed sustained loops at 5-7 forwards per 120s — under the old cap. The
+    wider window plus lower count catches slower loops without stopping
+    legitimate multi-round delegations (where tool calls space rounds 10s+
+    apart).
     """
     from link_project_to_chat.transport._telegram_relay import (
         _MAX_CONSECUTIVE_BOT_RELAYS,
         _ROUND_WINDOW_SECONDS,
     )
 
-    assert _MAX_CONSECUTIVE_BOT_RELAYS == 10
-    assert _ROUND_WINDOW_SECONDS == 120.0
+    assert _MAX_CONSECUTIVE_BOT_RELAYS == 6
+    assert _ROUND_WINDOW_SECONDS == 180.0
+
+
+def test_default_same_author_streak_cap():
+    """Same-author streak guard: 3 consecutive forwards from the same sender
+    halt regardless of the time-window count. Catches the 'manager re-issues
+    same dispatch 3x without dev replying' shape from the 2026-04-27 incident,
+    which never tripped the count/window cap because legitimate dev tool-call
+    pauses kept the rate low."""
+    from link_project_to_chat.transport._telegram_relay import (
+        _MAX_SAME_AUTHOR_STREAK,
+    )
+
+    assert _MAX_SAME_AUTHOR_STREAK == 3
+
+
+@pytest.mark.asyncio
+async def test_relay_halts_on_same_author_streak():
+    """Three forwards in a row from the same sender halt the relay even if
+    the count/window cap hasn't tripped. This is the loop shape the
+    2026-04-27 lptc team incident showed: manager re-dispatched the same
+    batch 3+ times before dev's relay-visible response landed."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(
+        client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"},
+        # Use a high count cap so the streak guard is the only thing that can halt.
+        max_consecutive_bot_relays=999,
+    )
+    for i in range(3):
+        ev = await _mk_event(
+            f"@acme_dev_bot dispatch {i}",
+            sender_username="acme_mgr_bot", sender_is_bot=True, msg_id=2000 + i,
+        )
+        await _dispatch(relay, ev)
+    assert relay._halted is True
+    notices = [c for c in client.send_message.await_args_list if "paused" in c.args[1].lower()]
+    assert len(notices) == 1
+
+
+@pytest.mark.asyncio
+async def test_relay_alternating_senders_does_not_trigger_streak_halt():
+    """Legitimate alternating delegation (mgr→dev→mgr→dev→...) must not halt
+    on the streak guard, no matter how many rounds happen — this is what real
+    work looks like."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(
+        client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=999,
+    )
+    senders = ["acme_mgr_bot", "acme_dev_bot"] * 5  # 10 alternating rounds
+    for i, sender in enumerate(senders):
+        peer = "acme_dev_bot" if sender == "acme_mgr_bot" else "acme_mgr_bot"
+        ev = await _mk_event(
+            f"@{peer} round {i}",
+            sender_username=sender, sender_is_bot=True, msg_id=3000 + i,
+        )
+        await _dispatch(relay, ev)
+    assert relay._halted is False
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
+    assert len(forwards) == 10
+
+
+@pytest.mark.asyncio
+async def test_relay_streak_resets_when_other_author_forwards():
+    """Two same-author forwards followed by the peer is NOT a streak — the
+    streak counter must reset on author change, not just on user activity."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(
+        client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=999,
+    )
+    # mgr → mgr → dev → mgr → mgr — at no point does any author hit a streak of 3
+    plan = [
+        ("acme_mgr_bot", "acme_dev_bot"),
+        ("acme_mgr_bot", "acme_dev_bot"),
+        ("acme_dev_bot", "acme_mgr_bot"),
+        ("acme_mgr_bot", "acme_dev_bot"),
+        ("acme_mgr_bot", "acme_dev_bot"),
+    ]
+    for i, (sender, peer) in enumerate(plan):
+        ev = await _mk_event(
+            f"@{peer} step {i}",
+            sender_username=sender, sender_is_bot=True, msg_id=4000 + i,
+        )
+        await _dispatch(relay, ev)
+    assert relay._halted is False
 
 
 @pytest.mark.asyncio
@@ -531,6 +623,47 @@ async def test_relay_coalesces_split_bot_message_into_one_forward():
     # Both input msg_ids must be recorded as relayed so late edits don't re-fire.
     assert 10_001 in relay._relayed_ids
     assert 10_002 in relay._relayed_ids
+
+
+@pytest.mark.asyncio
+async def test_relay_coalesces_split_when_reply_to_differs():
+    """Streaming-edit splits and middleware can land sibling parts of the SAME
+    logical bot reply with different reply_to values (some None, some pointing
+    to the original prompt, some to an intermediate placeholder). The old
+    (sender, reply_to) coalesce key dropped these into separate buckets and
+    only the first part ever forwarded — see the 2026-04-27 incident where
+    continuations like 'd.py (3 cases)' arrived after the @-mention head and
+    were never forwarded to the peer.
+
+    Sender-only keying means same-sender parts within the coalesce window
+    combine into a single forward regardless of their reply_to."""
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids()
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+
+    ev1 = await _mk_event(
+        "@acme_dev_bot Batch 1 dispatch — files A, B, C",
+        sender_username="acme_mgr_bot", sender_is_bot=True,
+        msg_id=20_001, reply_to=42,
+    )
+    await relay._on_new_message(ev1)  # don't drain — second part is in flight
+    ev2 = await _mk_event(
+        "...continued: also touch test_xyz.py and update CHANGELOG.",
+        sender_username="acme_mgr_bot", sender_is_bot=True,
+        msg_id=20_002, reply_to=None,  # different from ev1's reply_to=42
+    )
+    await _dispatch(relay, ev2)
+
+    forwards = [c for c in client.send_message.await_args_list if c.args[1].startswith("@")]
+    assert len(forwards) == 1, (
+        f"split parts with different reply_to should coalesce; got {len(forwards)} forwards"
+    )
+    assert "Batch 1 dispatch" in forwards[0].args[1]
+    assert "test_xyz.py" in forwards[0].args[1]
+    # Both input msg_ids must be marked relayed so late edits don't re-fire.
+    assert 20_001 in relay._relayed_ids
+    assert 20_002 in relay._relayed_ids
 
 
 @pytest.mark.asyncio

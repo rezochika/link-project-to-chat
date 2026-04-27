@@ -178,8 +178,14 @@ class CodexBackend(BaseBackend):
                     usage = parsed.usage
                 if parsed.turn_completed:
                     self._last_error = None
+                    # Codex emits one item.completed agent_message per logical
+                    # paragraph (planning preamble, mid-action update, final
+                    # answer). Joining with "" produced run-on bubbles like
+                    # "I'll review... I'm running... Done." in the 2026-04-27
+                    # manager logs. \n\n between non-empty parts renders them
+                    # as visibly distinct paragraphs in the chat.
                     yield Result(
-                        text="".join(collected_text) or "[No response]",
+                        text="\n\n".join(t for t in collected_text if t) or "[No response]",
                         session_id=self.session_id,
                         model=self.model_display,
                     )
