@@ -143,6 +143,9 @@ def _unlock_file(lock_handle) -> None:
 @contextmanager
 def _config_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Predictable by design: the lock sits beside config.json so every process
+    # coordinating on the same config path contends on the same file. The
+    # config directory is chmod 0700 on POSIX before writes.
     lock = path.with_suffix(".lock")
     with open(lock, "a+b") as lf:
         _lock_file(lf)
@@ -484,6 +487,17 @@ def _team_is_configured(raw: dict, team_name: str) -> bool:
     )
 
 
+def _make_room_binding(raw: dict | None) -> RoomBinding | None:
+    """Build a structured room binding from raw config, ignoring malformed rows."""
+    if not raw:
+        return None
+    transport_id = raw.get("transport_id")
+    native_id = raw.get("native_id")
+    if not transport_id or not native_id:
+        return None
+    return RoomBinding(transport_id=str(transport_id), native_id=str(native_id))
+
+
 def _make_team_bot_config(b: dict) -> TeamBotConfig:
     """Build a TeamBotConfig from a raw dict, folding legacy fields into backend_state."""
     bot_model = b.get("model")
@@ -620,6 +634,7 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             team_cfg = TeamConfig(
                 path=team["path"],
                 group_chat_id=team["group_chat_id"],
+                room=_make_room_binding(team.get("room")),
                 bots={
                     role: _make_team_bot_config(b)
                     for role, b in team.get("bots", {}).items()
@@ -817,6 +832,13 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         entry = existing_teams.get(name, {})
         entry["path"] = team.path
         entry["group_chat_id"] = team.group_chat_id
+        if team.room is not None:
+            entry["room"] = {
+                "transport_id": team.room.transport_id,
+                "native_id": team.room.native_id,
+            }
+        else:
+            entry.pop("room", None)
         entry["bots"] = {
             role: _serialize_team_bot(b)
             for role, b in team.bots.items()
@@ -990,6 +1012,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                 name: TeamConfig(
                     path=team["path"],
                     group_chat_id=team["group_chat_id"],
+                    room=_make_room_binding(team.get("room")),
                     bots={
                         role: _make_team_bot_config(b)
                         for role, b in team.get("bots", {}).items()

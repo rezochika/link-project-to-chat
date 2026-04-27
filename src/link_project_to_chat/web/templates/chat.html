@@ -21,6 +21,7 @@
     <input type="text" name="username" id="username-field"
            placeholder="username" autocomplete="username"
            value="" required>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="text" name="text" placeholder="Message…" autocomplete="off" autofocus>
     <input type="file" name="file" accept="audio/*,application/pdf,text/*,image/*">
     <button type="submit">Send</button>

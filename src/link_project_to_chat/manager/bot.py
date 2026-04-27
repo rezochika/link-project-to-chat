@@ -613,15 +613,20 @@ class ManagerBot(AuthMixin):
         ctx.user_data["new_project"]["path"] = path
         await self._transport.send_text(
             incoming.chat,
-            "Enter the Telegram bot token (or /skip):",
+            "Enter the Telegram bot token:",
         )
         return self.ADD_TOKEN
 
     async def _add_token(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         incoming = self._incoming_from_update(update)
         text = incoming.text.strip()
-        if text != "/skip":
-            ctx.user_data["new_project"]["telegram_bot_token"] = text
+        if text == "/skip" or not text:
+            await self._transport.send_text(
+                incoming.chat,
+                "Telegram bot token is required. Enter the token:",
+            )
+            return self.ADD_TOKEN
+        ctx.user_data["new_project"]["telegram_bot_token"] = text
         await self._transport.send_text(
             incoming.chat,
             "Enter the allowed username (or /skip):",

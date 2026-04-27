@@ -67,6 +67,10 @@ The verdict moved from `NOT READY` to `READY` under the rollout-review rule, the
 
 Phase 4 is complete for the current Claude + Codex scope. Remaining ideas require fresh evidence: a Codex rate-limit pattern, new CLI support for thinking/compact/allowed-tools, or a user need for manager-level `/default_backend`.
 
+## Post-completion hardening note
+
+The 2026-04-26 post-completion audit follow-ups tracked in `docs/TODO.md` were handled after the Phase 4 feature scope shipped. Those fixes are quality and safety hardening around the shipped design: conversation-log correctness and async I/O, backend process/session races, typed command arguments, status formatting, Codex permission validation, and docs/test drift.
+
 ## Next action
 
 No immediate Phase 4 follow-up is planned. Next work should come from the broader backlog (new transports, maintenance fixes, or sandboxing) unless new backend evidence appears.

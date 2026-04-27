@@ -1,6 +1,6 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
+_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, and root-level planning docs. Reflects status as of branch `feat/transport-abstraction` HEAD after the TODO hardening batch. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
 
@@ -81,64 +81,64 @@ Severity legend: 🔴 Critical · 🟠 Important · 🟡 Minor · 📚 Doc / Tes
 
 | ID | File:line | Item | Status |
 |---|---|---|---|
-| P4-C1 | [bot.py:649-660](../src/link_project_to_chat/bot.py) | `_log_assistant_turn(task.chat, task.result)` runs BEFORE `_finalize_claude_task`, capturing only the LAST text block. Buffer with full narration is in `live_text.buffer` and only popped inside `_finalize_claude_task`. Conversation history replayed to the next turn is missing the narration the user actually saw. Fix: log AFTER finalize, sourcing text from the buffer. | ⏳ pending |
-| P4-C2 | [backends/codex.py:214-218](../src/link_project_to_chat/backends/codex.py) | `chat_stream`'s `finally` clears `self._proc` but does NOT terminate `proc`. If the consumer closes the generator early (CancelledError, exception, early return) before `turn.completed`, the codex subprocess is orphaned. `close_interactive()` then sees `_proc is None` and can't reap. Fix: reorder finally to `proc.kill()` + `await proc.wait()` before clearing `_proc`. Add regression test: close generator mid-stream and assert proc terminates. | ⏳ pending |
-| P4-C3 | [tests/conftest.py:25-29](../tests/conftest.py) | `_isolate_home` sets `HOME` only — `Path.home()` ignores `HOME` on Windows (uses `USERPROFILE` / `HOMEDRIVE`+`HOMEPATH`). Tests on win32 silently write to the developer's real `~/.link-project-to-chat/`. Verified empirically. Fix: also set `USERPROFILE`/`HOMEDRIVE`/`HOMEPATH` under `sys.platform == "win32"`. | ⏳ pending |
-| P4-C4 | [conversation_log.py](../src/link_project_to_chat/conversation_log.py) callers in [bot.py:264-293](../src/link_project_to_chat/bot.py) | Synchronous `sqlite3` open+insert+commit runs directly on the asyncio event loop in `_log_user_turn` / `_log_assistant_turn` / `_history_block`. Class docstring claims this is OK; latency spikes (slow disks, AV, network home dirs) will stall streaming/typing/rate-limit coroutines. Fix: wrap calls in `asyncio.to_thread` OR add async wrappers on `ConversationLog`. | ⏳ pending |
+| P4-C1 | [bot.py:649-660](../src/link_project_to_chat/bot.py) | `_log_assistant_turn(task.chat, task.result)` ran BEFORE `_finalize_claude_task`, capturing only the LAST text block. Buffer with full narration is in `live_text.buffer` and only popped inside `_finalize_claude_task`. Conversation history replayed to the next turn was missing the narration the user actually saw. | ✅ closed — logs after finalize from the full live buffer |
+| P4-C2 | [backends/codex.py:214-218](../src/link_project_to_chat/backends/codex.py) | `chat_stream`'s early-close path could orphan the codex subprocess before `turn.completed`. | ✅ closed — early generator close terminates/reaps proc with regression coverage |
+| P4-C3 | [tests/conftest.py:25-29](../tests/conftest.py) | `_isolate_home` set `HOME` only, which does not isolate `Path.home()` on Windows. | ✅ closed — fixture sets `HOME`, `USERPROFILE`, `HOMEDRIVE`, and `HOMEPATH` with sentinel coverage |
+| P4-C4 | [conversation_log.py](../src/link_project_to_chat/conversation_log.py) callers in [bot.py:264-293](../src/link_project_to_chat/bot.py) | Synchronous `sqlite3` open+insert+commit ran directly on the asyncio event loop in conversation-history paths. | ✅ closed — async wrappers use `asyncio.to_thread` |
 
 #### Important — UX, races, contract gaps
 
 | ID | File:line | Item | Status |
 |---|---|---|---|
-| P4-I1 | [conversation_log.py:157-176](../src/link_project_to_chat/conversation_log.py) | `format_history_block` truncates per-turn (`HISTORY_TURN_CHAR_CAP = 4000`) but has no total-block cap. With `/context 50`, worst-case ~200KB prepended to every prompt — context-window foot-gun and silent cost balloon. Fix: add `HISTORY_BLOCK_CHAR_CAP` (e.g. 20_000), drop oldest turns when exceeded. | ⏳ pending |
-| P4-I2 | [bot.py:1042-1053](../src/link_project_to_chat/bot.py), [bot.py:1065-1076](../src/link_project_to_chat/bot.py) | `/model` and `/effort` silently drop typed args (always render picker). Inconsistent with `/thinking`, `/context`, `/permissions`, `/backend` which honor typed args. The static help text (`COMMANDS`, dynamic Telegram preamble) implies typed-args work. Fix: parse and apply args before falling back to picker. | ⏳ pending |
-| P4-I3 | [bot.py:61](../src/link_project_to_chat/bot.py) | `COMMANDS["effort"]` description hardcoded `"low/medium/high/max"` — Codex effort tops at `xhigh`, no `max`. Wrong help text after `/backend codex`. Fix: backend-agnostic phrasing or rebuild `COMMANDS` per-backend. | ⏳ pending |
-| P4-I4 | [bot.py:1805-1814](../src/link_project_to_chat/bot.py) | `thinking_set_*` button branch is NOT gated on `supports_thinking` (compare `permissions_set_*` and `effort_set_*` which are). A stale picker after `/backend codex` would silently mutate `show_thinking`. Fix: add the same `if not capabilities.supports_thinking` guard the other branches use. | ⏳ pending |
-| P4-I5 | [bot.py:1238-1276](../src/link_project_to_chat/bot.py) | `_switch_backend` is non-atomic: between `has_live_agent_tasks()` check and `task_manager._backend = new_backend`, a concurrent `_on_text` can submit on the about-to-be-discarded backend. Fix: per-bot `asyncio.Lock` around the swap, OR atomic `task_manager.swap_backend(new)` API. | ⏳ pending |
-| P4-I6 | [bot.py:638-650](../src/link_project_to_chat/bot.py) | `_on_task_complete` reads `task_manager.backend.session_id` AFTER any concurrent swap, so a Claude task completing post-swap writes its UUID under Codex's `backend_state` slot — Codex then tries `codex exec resume <claude-uuid>` next turn. Fix: capture backend reference at task submit-time. | ⏳ pending |
-| P4-I7 | [backends/codex.py:106-116, 271-272](../src/link_project_to_chat/backends/codex.py) | `set_permission` accepts arbitrary strings; `_permission_args` raises `ValueError` mid-`_build_cmd` on the next turn — surfaces as task FAILED, not a clean rejection. Triggered by hand-edited config or future cross-backend mode names. Fix: validate in `set_permission` against the accepted-mode set. | ⏳ pending |
-| P4-I8 | [backends/codex.py:64, 184](../src/link_project_to_chat/backends/codex.py) | `model_display` initialized to `None` and never reassigned — Codex `Result(model=...)` is always `None`, so `_current_model()` falls back to `backend.model or "default"`. When the user hasn't manually `/model`'d, `/status` shows `Model: default` instead of the real Codex model. Fix: parser updates `model_display` from `turn.completed`, or seed from `MODEL_OPTIONS[0][1]` when `model is None`. | ⏳ pending |
-| P4-I9 | [bot.py:2025-2092](../src/link_project_to_chat/bot.py) | `_compose_status` mixes `st['running']` (would `KeyError` for a backend missing the key) and `st.get(...)` access on adjacent lines. `FakeBackend` happens to provide `running`, but no contract enforces it. Fix: define `BackendStatus` TypedDict in `backends/base.py`, use `.get` consistently, add contract test in `tests/backends/test_contract.py`. | ⏳ pending |
+| P4-I1 | [conversation_log.py:157-176](../src/link_project_to_chat/conversation_log.py) | `format_history_block` had per-turn truncation but no total-block cap. | ✅ closed — bounded by `HISTORY_BLOCK_CHAR_CAP`, oldest turns dropped first |
+| P4-I2 | [bot.py:1042-1053](../src/link_project_to_chat/bot.py), [bot.py:1065-1076](../src/link_project_to_chat/bot.py) | `/model` and `/effort` silently dropped typed args. | ✅ closed — typed args apply or return usage text |
+| P4-I3 | [bot.py:61](../src/link_project_to_chat/bot.py) | `COMMANDS["effort"]` hardcoded Claude/Codex-specific levels. | ✅ closed — backend-agnostic help text |
+| P4-I4 | [bot.py:1805-1814](../src/link_project_to_chat/bot.py) | `thinking_set_*` button branch was not gated on `supports_thinking`. | ✅ closed — stale thinking buttons are rejected under unsupported backends |
+| P4-I5 | [bot.py:1238-1276](../src/link_project_to_chat/bot.py) | `_switch_backend` was non-atomic against concurrent submissions. | ✅ closed — per-bot backend-switch lock covers switch and submit paths |
+| P4-I6 | [bot.py:638-650](../src/link_project_to_chat/bot.py) | `_on_task_complete` could persist a session under the wrong backend after a concurrent swap. | ✅ closed — task captures backend at submit time and completion persists to that backend slot |
+| P4-I7 | [backends/codex.py:106-116, 271-272](../src/link_project_to_chat/backends/codex.py) | `set_permission` accepted arbitrary strings until command build time. | ✅ closed — Codex validates permission modes immediately |
+| P4-I8 | [backends/codex.py:64, 184](../src/link_project_to_chat/backends/codex.py) | Codex default model displayed as `default`. | ✅ closed — default seeded from Codex model options and startup no longer leaks Claude defaults |
+| P4-I9 | [bot.py:2025-2092](../src/link_project_to_chat/bot.py) | `_compose_status` mixed required and optional status-key access. | ✅ closed — status uses safe `.get` access and `BackendStatus` documents optional keys |
 
 #### Minor — hardening, polish, drift
 
 | ID | File:line | Item | Status |
 |---|---|---|---|
-| P4-M1 | [conversation_log.py:36-37](../src/link_project_to_chat/conversation_log.py) | `…[truncated]` marker can collide with literal user text ending in the same string. Use a less-likely sentinel (e.g. `[__history_truncated__]`). | ⏳ pending |
-| P4-M2 | [conversation_log.py:50-51](../src/link_project_to_chat/conversation_log.py) | `_connect()` opens without `check_same_thread=False`. Today it's safe (one connection per call inside `to_thread`); future pooling would break. Add the flag or document the constraint. | ⏳ pending |
-| P4-M3 | [conversation_log.py:46-49, 65-71](../src/link_project_to_chat/conversation_log.py) | `chmod 0o700` / `0o600` failures swallowed silently — on filesystems that don't support chmod, the conversation log can be world-readable with no warning. Add `logger.warning` in the except branch. | ⏳ pending |
-| P4-M4 | [bot.py:1128-1132](../src/link_project_to_chat/bot.py) | `_persist_context_settings` docstring claims the team-bot save path doesn't honor `None` — but `_patch_config` (line 1565-1570) does `entry.pop(k, None)` for the active role. Fix the docstring; the code is correct. | ⏳ pending |
-| P4-M5 | [backends/codex.py:25, 48-54](../src/link_project_to_chat/backends/codex.py) | `CODEX_MODELS` (capability tuple) and `MODEL_OPTIONS` (picker rows) duplicate the model list. Hand-aligned; will drift. Derive one from the other: `CODEX_MODELS = tuple(opt[0] for opt in MODEL_OPTIONS)`. | ⏳ pending |
-| P4-M6 | [bot.py:2087-2092](../src/link_project_to_chat/bot.py) | `_short_status_value` collapses ALL whitespace (incl. newlines) — multi-line Codex stderr in `/status` becomes unreadable. Truncate without normalizing, or only normalize when over the limit. | ⏳ pending |
-| P4-M7 | [bot.py:2094-2098](../src/link_project_to_chat/bot.py) | `_on_status_t` calls `transport.send_text` directly — verbose Claude+team setups can exceed Telegram's 4096-char limit. Use the bot's chunking helper. | ⏳ pending |
-| P4-M8 | [backends/claude.py:81-82](../src/link_project_to_chat/backends/claude.py) | `MODELS = (...)` and `EFFORT_LEVELS = (...)` constants still exported; phase 4 introduced `MODEL_OPTIONS` + capability `effort_levels` as new sources of truth. Derive the constants from `MODEL_OPTIONS` so a model added in one place doesn't get forgotten. (`DEFAULT_MODEL = "sonnet"` is still wired up, NOT dead.) | ⏳ pending |
-| P4-M9 | [bot.py:248-262](../src/link_project_to_chat/bot.py) | `_history_block`'s `getattr(self, "context_enabled", False)` / `getattr(self, "conversation_log", None)` defensiveness only protects bots constructed via `__new__` — no current test does that. Either remove or comment which test relies on it. | ⏳ pending |
-| P4-M10 | [backends/codex.py:25, 48-54](../src/link_project_to_chat/backends/codex.py) | Comment claims `MODEL_OPTIONS` order "mirrors the priority field in `~/.codex/models_cache.json`" — there's no mechanism to keep them in sync. Either drop the claim or read the cache at startup with a hardcoded fallback. | ⏳ pending |
-| P4-M11 | [conversation_log.py:157-176](../src/link_project_to_chat/conversation_log.py) | `/context off` does NOT stop `_log_user_turn` / `_log_assistant_turn` from writing to disk — only `_history_block` checks `context_enabled`. Probably intended (re-enabling sees coherent log) but undocumented. Add a one-line comment. | ⏳ pending |
+| P4-M1 | [conversation_log.py:36-37](../src/link_project_to_chat/conversation_log.py) | `…[truncated]` marker could collide with literal user text. | ✅ closed — sentinel is `[__history_truncated__]` |
+| P4-M2 | [conversation_log.py:50-51](../src/link_project_to_chat/conversation_log.py) | `_connect()` opened without `check_same_thread=False`. | ✅ closed |
+| P4-M3 | [conversation_log.py:46-49, 65-71](../src/link_project_to_chat/conversation_log.py) | Conversation-log chmod failures were swallowed silently. | ✅ closed — warnings include exception context |
+| P4-M4 | [bot.py:1128-1132](../src/link_project_to_chat/bot.py) | `_persist_context_settings` docstring was stale. | ✅ closed |
+| P4-M5 | [backends/codex.py:25, 48-54](../src/link_project_to_chat/backends/codex.py) | `CODEX_MODELS` and `MODEL_OPTIONS` duplicated model lists. | ✅ closed — derived from one source |
+| P4-M6 | [bot.py:2087-2092](../src/link_project_to_chat/bot.py) | `_short_status_value` collapsed newlines. | ✅ closed — preserves whitespace while truncating |
+| P4-M7 | [bot.py:2094-2098](../src/link_project_to_chat/bot.py) | `_on_status_t` bypassed chunking. | ✅ closed — uses `_send_to_chat` |
+| P4-M8 | [backends/claude.py:81-82](../src/link_project_to_chat/backends/claude.py) | Claude model constants could drift from `MODEL_OPTIONS`. | ✅ closed — derived from one source |
+| P4-M9 | [bot.py:248-262](../src/link_project_to_chat/bot.py) | `_history_block` defensive `getattr` lacked coverage/comment. | ✅ closed — async-wrapper tests exercise the defensive path |
+| P4-M10 | [backends/codex.py:25, 48-54](../src/link_project_to_chat/backends/codex.py) | Codex model-order comment overclaimed cache sync. | ✅ closed — stale claim removed |
+| P4-M11 | [conversation_log.py:157-176](../src/link_project_to_chat/conversation_log.py) | `/context off` logging behavior was undocumented. | ✅ closed — inline comment documents re-enable continuity |
 
 #### Test gaps
 
 | ID | Item | Status |
 |---|---|---|
-| P4-T1 | [tests/test_conversation_log.py:108-113](../tests/test_conversation_log.py) — uses `try/except` rather than `pytest.raises(ValueError)`; can mask unrelated `ValueError`s. | ⏳ pending |
-| P4-T2 | [tests/test_context_command.py:1199-1232](../tests/test_context_command.py) — `asyncio.gather(..., return_exceptions=True)` silently eats backend errors. Set `return_exceptions=False`. | ⏳ pending |
-| P4-T3 | [tests/test_backend_command.py](../tests/test_backend_command.py) — `test_status_includes_codex_last_usage_tokens` reads `_last_usage` (private) instead of `backend.status` (public). | ⏳ pending |
-| P4-T4 | No regression test for `CodexBackend.chat_stream` early-cancellation (P4-C2). Add `test_chat_stream_kills_proc_on_generator_close`. | ⏳ pending |
-| P4-T5 | No test for `_switch_backend` race window (P4-I5/P4-I6). | ⏳ pending |
-| P4-T6 | [tests/backends/test_contract.py](../tests/backends/test_contract.py) — no contract test for `set_permission`/`current_permission` round-trip across registered backends. | ⏳ pending |
+| P4-T1 | [tests/test_conversation_log.py:108-113](../tests/test_conversation_log.py) — uses `try/except` rather than `pytest.raises(ValueError)`; can mask unrelated `ValueError`s. | ✅ closed |
+| P4-T2 | [tests/test_context_command.py:1199-1232](../tests/test_context_command.py) — `asyncio.gather(..., return_exceptions=True)` silently eats backend errors. | ✅ closed |
+| P4-T3 | [tests/test_backend_command.py](../tests/test_backend_command.py) — status test depended on `_last_usage` instead of the public status surface. | ✅ closed |
+| P4-T4 | No regression test for `CodexBackend.chat_stream` early-cancellation (P4-C2). | ✅ closed |
+| P4-T5 | No test for `_switch_backend` race window (P4-I5/P4-I6). | ✅ closed |
+| P4-T6 | [tests/backends/test_contract.py](../tests/backends/test_contract.py) — no contract test for `set_permission`/`current_permission` round-trip across registered backends. | ✅ closed |
 
 #### Doc drift
 
 | ID | File | Item | Status |
 |---|---|---|---|
-| P4-D1 | [docs/CHANGELOG.md](CHANGELOG.md) | Phase 4 entry doesn't cite the commit range (Phase 3 entry does). | ⏳ pending |
-| P4-D2 | [README.md](../README.md) | `/thinking` doc still says "Stream Claude's internal reasoning live to chat" — capability-gated under phase 4, wording should say "active backend". | ⏳ pending |
-| P4-D3 | [docs/superpowers/specs/2026-04-23-backend-phase-4-rollout-review.md](superpowers/specs/2026-04-23-backend-phase-4-rollout-review.md) | Declares phase 4 `COMPLETE`; should add a follow-up note linking here. | ⏳ pending |
-| P4-D4 | [tests/conftest.py:9-12](../tests/conftest.py) | Caveat about `Path.home()` module-load constants is documented but not enforced. Add an `assert DEFAULT_CONFIG.is_relative_to(tmp_path)`-style sentinel test. | ⏳ pending |
+| P4-D1 | [docs/CHANGELOG.md](CHANGELOG.md) | Phase 4 entry didn't cite the commit range. | ✅ closed |
+| P4-D2 | [README.md](../README.md) | `/thinking` doc named Claude instead of capability-gated active backend support. | ✅ closed |
+| P4-D3 | [docs/superpowers/specs/2026-04-23-backend-phase-4-rollout-review.md](superpowers/specs/2026-04-23-backend-phase-4-rollout-review.md) | Rollout review needed a follow-up note after post-completion audit work. | ✅ closed |
+| P4-D4 | [tests/conftest.py:9-12](../tests/conftest.py) | Caveat about `Path.home()` module-load constants was documented but not enforced. | ✅ closed — fresh-import sentinel test added |
 
 #### Reproduction notes
 
-- Full suite at HEAD: 885 passed, 30 skipped, 2 failed (`tests/test_cli_transport.py` — `/tmp/x` hardcoded path; pre-existing, see §7).
+- Historical full-suite note from audit HEAD: 885 passed, 30 skipped, 2 failed (`tests/test_cli_transport.py` hardcoded `/tmp/x`). Superseded by the TODO hardening batch, which closes that blocker.
 - Targeted phase 4 suites: `pytest tests/backends/{test_env_policy,test_capability_declaration,test_codex_backend,test_contract,test_claude_backend}.py` → **41 passed, 1 skipped**; `pytest tests/test_{backend_command,capability_gating,bot_streaming,context_command,conversation_log}.py` → **90 passed**; `pytest tests/test_{bot_backend_lockout,bot_team_wiring}.py` → **49 passed**.
 
 PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
@@ -180,15 +180,15 @@ Audit: [issues-2026-04-22.md](issues-2026-04-22.md) — 29 issues + 3 post-audit
 
 | ID | File | Item | Status |
 |---|---|---|---|
-| M1 | `bot.py` | Atomic `find_by_message` + cancel under lock / `asyncio.shield` | ⏳ pending |
+| M1 | `bot.py` | Atomic `find_by_message` + cancel under lock / `asyncio.shield` | ✅ shipped — cancel happens synchronously before live-message await; backend switch uses lock |
 | M2 | `backends/claude.py` | `chat()` raises typed exception instead of `"Error:..."` strings (`ClaudeStreamError`) | ✅ shipped (PR #6 commit `04619cf`) |
-| M4 | `config.py` | Document predictable lock path | ⏳ doc-only |
+| M4 | `config.py` | Document predictable lock path | ✅ closed |
 | M5 | `config.py` | Replace O(n) loop with dict-keyed update (`_merge_project_entry`) | ✅ shipped (commit `84ef5f0`) |
 | M6 | `task_manager.py:518–522` | `heapq.nlargest` instead of full sort in `list_tasks` | ✅ shipped (commit `84ef5f0`) |
-| M8 | `bot.py` | `tempfile.gettempdir()` instead of hardcoded `/tmp/...` | ⏳ pending |
-| M10 | `tests/` | Auth tests: concurrent attempts, 30 msg/min boundary, multi-user precedence | ⏳ pending |
-| M11 | `tests/` | Config I/O: malformed JSON, perm errors, concurrent access | ⏳ pending |
-| M12 | `tests/` | `LiveMessage._rotate_once` boundary tests (now in `transport/streaming.py`) | ⏳ pending |
+| M8 | `bot.py` | `tempfile.gettempdir()` instead of hardcoded `/tmp/...` | ✅ shipped |
+| M10 | `tests/` | Auth tests: concurrent attempts, 30 msg/min boundary, multi-user precedence | ✅ shipped (`tests/test_auth_m10.py`) |
+| M11 | `tests/` | Config I/O: malformed JSON, perm errors, concurrent access | ✅ shipped (`tests/test_config_m11.py`) |
+| M12 | `tests/` | `LiveMessage._rotate_once` boundary tests (now in `transport/streaming.py`) | ✅ closed (`tests/transport/test_streaming.py`) |
 | M13 | `_auth.py` + `docs/` | Document `_auth()` + `docs/auth-migration.md` | ✅ shipped (commit `84ef5f0`) |
 
 Retired: M3, M7, M9 (re-verified 2026-04-23).
@@ -211,7 +211,7 @@ Retired: M3, M7, M9 (re-verified 2026-04-23).
 |---|---|---|
 | F1 | `tests/test_task_manager.py::test_cancelling_waiting_input_task_releases_next_claude_task` | 🟡 intermittent; passed in latest full run; async-race suspected |
 | F2 | `tests/transport/test_telegram_transport.py::test_enable_team_relay_lifecycle` | 🟡 intermittent; passed in latest full run |
-| F3 | `tests/test_cli_transport.py::test_start_accepts_transport_web_flag` + `::test_start_default_transport_is_telegram` | 🔴 current Windows full-suite failure; both pass hardcoded `/tmp/x` into Click `Path(exists=True)` and fail before the mocked runner. Replace with a `tmp_path` directory. |
+| F3 | `tests/test_cli_transport.py::test_start_accepts_transport_web_flag` + `::test_start_default_transport_is_telegram` | ✅ closed — uses `tmp_path` |
 | — | `tests/test_transport_lockout.py:37` — `Path(...).read_text()` encoding bug | ✅ closed (see F4 in §1.2) |
 
 ### 4.5 Post-audit operational fixes
@@ -230,10 +230,10 @@ Small-scope plans, ready to implement.
 
 | Plan | Scope | Status |
 |---|---|---|
-| [Fix CLI Telethon session permissions](superpowers/plans/2026-04-24-fix-cli-telethon-session-permissions.md) | Close perm race in `setup --phone`; mirror BotFatherClient pattern | ⏳ pending |
-| [Fix Windows config M11 collection](superpowers/plans/2026-04-24-fix-windows-config-m11-collection.md) | Make M11 tests collect on Windows; preserve Unix root-skip | ⏳ pending |
-| [Isolate OpenAI transcriber tests](superpowers/plans/2026-04-24-isolate-openai-transcriber-tests.md) | Tests pass without optional `openai` dep | ⏳ pending |
-| [Update team-relay lifecycle test](superpowers/plans/2026-04-24-update-team-relay-lifecycle-test.md) | Match current TeamRelay contract (new + edited handlers) | ⏳ pending |
+| [Fix CLI Telethon session permissions](superpowers/plans/2026-04-24-fix-cli-telethon-session-permissions.md) | Close perm race in `setup --phone`; mirror BotFatherClient pattern | ✅ shipped |
+| [Fix Windows config M11 collection](superpowers/plans/2026-04-24-fix-windows-config-m11-collection.md) | Make M11 tests collect on Windows; preserve Unix root-skip | ✅ shipped |
+| [Isolate OpenAI transcriber tests](superpowers/plans/2026-04-24-isolate-openai-transcriber-tests.md) | Tests pass without optional `openai` dep | ✅ shipped |
+| [Update team-relay lifecycle test](superpowers/plans/2026-04-24-update-team-relay-lifecycle-test.md) | Match current TeamRelay contract (new + edited handlers) | ✅ shipped |
 | Spec D′ — StringSession for team-bot relays | Manager exports `telethon.session` once and seeds subprocesses via `LP2C_TELETHON_SESSION_STRING`; eliminates the `database is locked` race on concurrent autostart (path-mode env var kept as fallback) | ✅ branch `fix/team-relay-string-session` |
 
 ---
@@ -256,17 +256,17 @@ Open questions:
 
 | Item | Location | Status |
 |---|---|---|
-| Browser username spoofing enables web command execution: client-controlled `username` + constant `browser_user` can satisfy allowlist auth and reach `/run` | `web/app.py:52-78`, `_auth.py:138-181`, `bot.py:955-968` | 🔴 P0 pending — add real web auth, CSRF/origin protection, and server-generated identity/session binding |
-| Streamed Web UI output is rendered as trusted HTML: `render_markdown()` passes model text through, then `messages.html` uses `|safe` | `web/transport.py:193-195`, `transport/streaming.py:218-226`, `web/templates/messages.html:4` | 🔴 P1 pending — sanitize/render markdown for web or store escaped text when `html=True` |
-| Web transport drops `Buttons`, making picker-only workflows unusable (`/backend`, `/model`, `/effort`, `/permissions`, `/reset`, task controls, AskUserQuestion) | `web/transport.py:135-154`, `web/templates/messages.html` | 🟠 P1 pending — persist/render button metadata and add a web button-submit path, or add typed fallbacks |
-| Non-Telegram team `room` bindings are written but not loaded/saved/passed on restart, allowing wrong-room recapture | `config.py:594-621`, `config.py:790-799`, `cli.py:426-456` | 🟡 P2 pending — load/save `RoomBinding` and pass `room=` into `ProjectBot` startup |
-| Codex subprocess can be orphaned if `chat_stream()` exits before `turn.completed` because `_proc` is cleared before termination/reap | `backends/codex.py:214-218` | 🟡 P2 pending — terminate/reap before clearing `_proc`, with an early-generator-close regression test |
-| `_proc` is single slot — concurrent Claude tasks could overwrite | `backends/claude.py:158` (was `claude_client.py`) | ⏳ pending |
-| Manager bot `/add_project` wizard allows skipping token (inconsistent with CLI) | `manager/bot.py` | ⏳ pending |
+| Browser username spoofing enables web command execution: client-controlled `username` + constant `browser_user` can satisfy allowlist auth and reach `/run` | `web/app.py:52-78`, `_auth.py:138-181`, `bot.py:955-968` | ✅ closed — server-issued session id, server-side handle binding, and CSRF |
+| Streamed Web UI output is rendered as trusted HTML: `render_markdown()` passes model text through, then `messages.html` uses `|safe` | `web/transport.py:193-195`, `transport/streaming.py:218-226`, `web/templates/messages.html:4` | ✅ closed — template escapes stored text |
+| Web transport drops `Buttons`, making picker-only workflows unusable (`/backend`, `/model`, `/effort`, `/permissions`, `/reset`, task controls, AskUserQuestion) | `web/transport.py:135-154`, `web/templates/messages.html` | ✅ closed — buttons persist, render, and dispatch through web route |
+| Non-Telegram team `room` bindings are written but not loaded/saved/passed on restart, allowing wrong-room recapture | `config.py:594-621`, `config.py:790-799`, `cli.py:426-456` | ✅ closed — `RoomBinding` load/save/load_teams/startup path covered |
+| Codex subprocess can be orphaned if `chat_stream()` exits before `turn.completed` because `_proc` is cleared before termination/reap | `backends/codex.py:214-218` | ✅ closed — terminate/reap before clearing `_proc`, with early-generator-close regression |
+| `_proc` is single slot — concurrent Claude tasks could overwrite | `backends/claude.py:158` (was `claude_client.py`) | ✅ closed — `TaskManager` serializes agent turns per backend slot |
+| Manager bot `/add_project` wizard allows skipping token (inconsistent with CLI) | `manager/bot.py` | ✅ closed |
 | ~~`livestream.LiveMessage` dead code~~ | ~~`livestream.py`~~ | ✅ removed (file no longer exists; project bot uses `transport/streaming.py`) |
-| `WebTransport.stop()` doesn't fully release uvicorn listener; tests hardcode ports → `[Errno 98]` flakes when running suite end-to-end | `web/transport.py:stop` | ⏳ swap task-cancellation for `uvicorn_server.shutdown()` (~10 lines) |
-| `tests/test_cli_transport.py` depends on `/tmp/x` existing (Click `Path(exists=True)` validation) | `tests/test_cli_transport.py:21,42` | 🔴 full-suite blocker on Windows; replace with `tmp_path` fixture (see F3 in §4.4) |
-| No end-to-end test wires `ProjectBot` + `WebTransport` + `_auth_identity` + handler in one flow | new test | ⏳ follow-up after spec #1 review-fix |
+| `WebTransport.stop()` doesn't fully release uvicorn listener; tests hardcode ports → `[Errno 98]` flakes when running suite end-to-end | `web/transport.py:stop` | ✅ closed |
+| `tests/test_cli_transport.py` depends on `/tmp/x` existing (Click `Path(exists=True)` validation) | `tests/test_cli_transport.py:21,42` | ✅ closed |
+| No end-to-end test wires `ProjectBot` + `WebTransport` + `_auth_identity` + handler in one flow | new test | ✅ closed (`tests/web/test_projectbot_web_e2e.py`) |
 
 ---
 
@@ -274,10 +274,10 @@ Open questions:
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + 7 batch-1 items + 4 batch-2 items (M2/M5/M6/M13) + 7 batch-3 items (L1–L7) + 3 post-audit + 5 follow-ups (F1/F2/F3 + livestream removal + A1) |
-| 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) + 1 active Windows full-suite test failure (F3 in §4.4) |
+| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path |
+| 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) |
 | 📋 Designed, not started | 3 transport specs (Discord #2, Slack #3, Google Chat #4), Backend Phase 5 (Gemini adapter), sandbox |
-| ⏳ Small pending fixes | 4 maintenance plans · 6 audit items (M1, M4, M8, M10, M11, M12) · known issues: `_proc` overwrite, manager token skip, WebTransport.stop() listener-release, CLI `/tmp/x` Windows failure, missing WebTransport e2e · 1 deferred follow-up (A3) · **34 phase 4 follow-ups (§2.1: 4 critical, 9 important, 11 minor, 6 test gaps, 4 doc drift)** |
+| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec) |
 
 ---
 

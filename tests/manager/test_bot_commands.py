@@ -122,7 +122,7 @@ def bot_env(tmp_path: Path):
     return bot, pm, proj_cfg
 
 
-async def _run_add_dialogue(bot, tmp_path, name="myproj", token="/skip", username="/skip", model="/skip"):
+async def _run_add_dialogue(bot, tmp_path, name="myproj", token="TOKEN", username="/skip", model="/skip"):
     proj_path = tmp_path / name
     proj_path.mkdir(exist_ok=True)
     fake = _swap_fake_transport(bot)
@@ -164,6 +164,21 @@ async def test_addproject_success(bot_env, tmp_path: Path):
     assert result == ConversationHandler.END
     assert "Added" in fake.sent_messages[-1].text
     assert "myproj" in json.loads(proj_cfg.read_text())["projects"]
+
+
+@pytest.mark.asyncio
+async def test_addproject_rejects_skipped_token(bot_env, tmp_path: Path):
+    bot, _pm, _proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
+    ctx = MagicMock()
+    ctx.user_data = {"new_project": {"name": "myproj", "path": str(tmp_path)}}
+
+    update, _ = _make_update(text="/skip")
+    result = await bot._add_token(update, ctx)
+
+    assert result == bot.ADD_TOKEN
+    assert "token is required" in fake.sent_messages[-1].text.lower()
+    assert "telegram_bot_token" not in ctx.user_data["new_project"]
 
 
 @pytest.mark.asyncio

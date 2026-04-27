@@ -270,6 +270,36 @@ async def test_finalize_with_live_text_sends_completion_notice():
 
 
 @pytest.mark.asyncio
+async def test_task_complete_logs_full_live_text_after_finalize():
+    """Conversation history must capture the full streamed text the user saw."""
+    bot = await _stub_bot()
+    bot._is_image = lambda p: False
+    bot._synthesizer = None
+    bot._effective_config_path = lambda: None
+    logged: list[tuple[str, str]] = []
+
+    class _Log:
+        async def append_async(self, chat, role, text, backend=None):
+            logged.append((role, text))
+
+    bot.conversation_log = _Log()
+    bot.task_manager = SimpleNamespace(
+        backend=SimpleNamespace(session_id=None, name="claude"),
+    )
+    task = _fake_task(task_id=13)
+    task.status = TaskStatus.DONE
+    task.started_at = 10.0
+    task.finished_at = 12.0
+    task.result = "final answer only"
+    await bot._on_stream_event(task, TextDelta(text="narration before tool use"))
+    await bot._on_stream_event(task, TextDelta(text=" — final answer"))
+
+    await bot._on_task_complete(task)
+
+    assert logged == [("assistant", "narration before tool use — final answer")]
+
+
+@pytest.mark.asyncio
 async def test_finalize_with_live_error_sends_failure_notice():
     bot = await _stub_bot()
     bot._is_image = lambda p: False
@@ -378,7 +408,7 @@ async def test_on_task_complete_still_finalizes_when_session_persist_fails(caplo
     task.status = TaskStatus.DONE
     bot.task_manager = SimpleNamespace(backend=SimpleNamespace(session_id="sess-123"))
     bot._patch_config = MagicMock(side_effect=RuntimeError("disk full"))
-    bot._finalize_claude_task = AsyncMock()
+    bot._finalize_claude_task = AsyncMock(return_value=None)
 
     with caplog.at_level("ERROR", logger="link_project_to_chat.bot"):
         await bot._on_task_complete(task)

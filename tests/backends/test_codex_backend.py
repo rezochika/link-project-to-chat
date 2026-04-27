@@ -1,4 +1,5 @@
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,13 @@ def test_codex_permission_state_defaults_and_updates(tmp_path):
     assert backend.current_permission() == "default"
 
 
+def test_codex_rejects_invalid_permission_immediately(tmp_path):
+    backend = CodexBackend(tmp_path, {})
+
+    with pytest.raises(ValueError, match="Unsupported Codex permissions mode"):
+        backend.set_permission("future-mode")
+
+
 def test_status_includes_permission_and_last_error(tmp_path):
     backend = CodexBackend(tmp_path, {"permissions": "plan"})
     backend._last_error = "codex failed"
@@ -159,7 +167,7 @@ async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
     assert events[-1] == Result(
         text="OK",
         session_id=ACTUAL_THREAD_ID,
-        model=None,
+        model="GPT-5.5 — Frontier coding (default)",
     )
     assert backend.session_id == ACTUAL_THREAD_ID
     assert backend.status["last_error"] is None
@@ -221,7 +229,11 @@ async def test_successful_stderr_warning_does_not_fail_turn(tmp_path, monkeypatc
     )
 
     events = [event async for event in backend.chat_stream("hello")]
-    assert events[-1] == Result(text="OK", session_id=ACTUAL_THREAD_ID, model=None)
+    assert events[-1] == Result(
+        text="OK",
+        session_id=ACTUAL_THREAD_ID,
+        model="GPT-5.5 — Frontier coding (default)",
+    )
 
 
 @pytest.mark.asyncio
@@ -263,6 +275,27 @@ async def test_chat_stream_drains_proc_after_turn_completed(tmp_path, monkeypatc
     assert isinstance(events[-1], Result)
     assert proc.wait_count == 1
     assert proc.stderr.tell() == len(proc.stderr.getvalue())  # stderr fully drained
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_kills_proc_on_generator_close(tmp_path, monkeypatch):
+    """Closing the async generator before turn.completed must not orphan Codex."""
+    line = json.dumps({"type": "item.completed", "item": {
+        "id": "i0", "type": "agent_message", "text": "partial",
+    }})
+    proc = _FakeProc([line], returncode=None)
+    backend = CodexBackend(tmp_path, {})
+    monkeypatch.setattr(backend, "_popen", lambda cmd: proc)
+
+    gen = backend.chat_stream("hello")
+    event = await gen.__anext__()
+    assert event == TextDelta(text="partial")
+
+    await gen.aclose()
+
+    assert proc.killed is True
+    assert proc.wait_count == 1
+    assert backend._proc is None
 
 
 @pytest.mark.asyncio

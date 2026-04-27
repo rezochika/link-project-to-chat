@@ -12,6 +12,7 @@ conversational turns.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -32,15 +33,16 @@ ASSISTANT_ROLE = "assistant"
 # block, not what we store on disk — so /reset (which clears the table) and
 # any future history-export feature still see the full text.
 HISTORY_TURN_CHAR_CAP = 4000
-_TRUNCATION_SUFFIX = "…[truncated]"
+HISTORY_BLOCK_CHAR_CAP = 20_000
+HISTORY_TRUNCATION_MARKER = "[__history_truncated__]"
 
 
 class ConversationLog:
     """Append-only SQLite log keyed by (transport_id, chat_native_id).
 
-    Synchronous on purpose: writes are tiny and infrequent compared to the
-    streaming traffic the bot is already juggling, and avoiding aiosqlite
-    keeps the dependency footprint identical to the existing codebase.
+    The core API is synchronous and dependency-free; async wrappers below
+    offload SQLite work with ``asyncio.to_thread`` so bot call sites do not
+    block the event loop.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -50,11 +52,15 @@ class ConversationLog:
             try:
                 self._db_path.parent.chmod(0o700)
             except OSError:
-                pass
+                logger.warning(
+                    "Could not chmod conversation log directory %s",
+                    self._db_path.parent,
+                    exc_info=True,
+                )
         self._migrate()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self._db_path)
+        return sqlite3.connect(self._db_path, check_same_thread=False)
 
     def _migrate(self) -> None:
         with self._connect() as db:
@@ -77,7 +83,11 @@ class ConversationLog:
             try:
                 os.chmod(self._db_path, 0o600)
             except OSError:
-                pass
+                logger.warning(
+                    "Could not chmod conversation log database %s",
+                    self._db_path,
+                    exc_info=True,
+                )
 
     def append(
         self,
@@ -105,6 +115,15 @@ class ConversationLog:
                 chat.transport_id, chat.native_id,
             )
 
+    async def append_async(
+        self,
+        chat: ChatRef,
+        role: str,
+        text: str,
+        backend: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(self.append, chat, role, text, backend)
+
     def recent(self, chat: ChatRef, limit: int = 10) -> list[tuple[str, str]]:
         """Return the last ``limit`` (role, text) pairs in chronological order."""
         if limit <= 0:
@@ -126,6 +145,9 @@ class ConversationLog:
             return []
         return [(role, text) for role, text in reversed(rows)]
 
+    async def recent_async(self, chat: ChatRef, limit: int = 10) -> list[tuple[str, str]]:
+        return await asyncio.to_thread(self.recent, chat, limit)
+
     def clear(self, chat: ChatRef) -> int:
         """Delete every row for the chat. Returns the number of deleted rows."""
         try:
@@ -142,6 +164,9 @@ class ConversationLog:
                 chat.transport_id, chat.native_id,
             )
             return 0
+
+    async def clear_async(self, chat: ChatRef) -> int:
+        return await asyncio.to_thread(self.clear, chat)
 
 
 def default_db_path(project_name: str) -> Path:
@@ -164,12 +189,30 @@ def format_history_block(turns: list[tuple[str, str]]) -> str:
     """
     if not turns:
         return ""
-    lines = [f"[Recent conversation history — last {len(turns)} turns in this chat]"]
+    rendered_turns: list[str] = []
     for role, text in turns:
         if len(text) > HISTORY_TURN_CHAR_CAP:
-            keep = HISTORY_TURN_CHAR_CAP - len(_TRUNCATION_SUFFIX)
-            text = text[:keep] + _TRUNCATION_SUFFIX
-        lines.append(f"{role}: {text}")
+            keep = HISTORY_TURN_CHAR_CAP - len(HISTORY_TRUNCATION_MARKER)
+            text = text[:keep] + HISTORY_TRUNCATION_MARKER
+        rendered_turns.append(f"{role}: {text}")
+
+    def _render(body: list[str]) -> str:
+        lines = [
+            f"[Recent conversation history — last {len(body)} turns in this chat]",
+            *body,
+            "",
+            "[Current message]",
+            "",
+        ]
+        return "\n".join(lines)
+
+    while rendered_turns and len(_render(rendered_turns)) > HISTORY_BLOCK_CHAR_CAP:
+        rendered_turns.pop(0)
+
+    lines = [
+        f"[Recent conversation history — last {len(rendered_turns)} turns in this chat]",
+        *rendered_turns,
+    ]
     lines.append("")
     lines.append("[Current message]")
     lines.append("")

@@ -1,6 +1,22 @@
 {% for msg in messages %}
 <div class="message {{ 'bot' if msg.sender_is_bot else 'user' }}">
   <span class="sender">{{ msg.sender_display_name }}</span>
-  <div class="text">{% if msg.html %}{{ msg.text | safe }}{% else %}{{ msg.text }}{% endif %}</div>
+  <div class="text">{{ msg.text }}</div>
+  {% if msg.buttons %}
+  <div class="buttons">
+    {% for row in msg.buttons %}
+      <div class="button-row">
+      {% for button in row %}
+        <form hx-post="/chat/{{ msg.chat_id }}/button" hx-swap="none" method="post">
+          <input type="hidden" name="message_id" value="{{ msg.id }}">
+          <input type="hidden" name="value" value="{{ button.value }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="button {{ button.style }}">{{ button.label }}</button>
+        </form>
+      {% endfor %}
+      </div>
+    {% endfor %}
+  </div>
+  {% endif %}
 </div>
 {% endfor %}

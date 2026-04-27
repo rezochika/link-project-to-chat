@@ -53,3 +53,23 @@ def test_backend_contract_declares_name_and_capabilities(tmp_path):
     backend = FakeBackend(tmp_path)
     assert isinstance(backend.name, str)
     assert backend.capabilities is not None
+
+
+@pytest.mark.parametrize(
+    "backend_factory, expected",
+    [
+        (lambda tmp_path: FakeBackend(tmp_path), "plan"),
+        (lambda tmp_path: ClaudeBackend(tmp_path), "plan"),
+        (lambda tmp_path: CodexBackend(tmp_path, {}), "plan"),
+    ],
+)
+def test_backend_contract_permission_round_trip(tmp_path, backend_factory, expected):
+    backend = backend_factory(tmp_path)
+    if not backend.capabilities.supports_permissions:
+        assert backend.current_permission() == "default"
+        return
+
+    backend.set_permission(expected)
+
+    assert backend.current_permission() == expected
+    assert backend.status["permission"] == expected

@@ -98,7 +98,7 @@ You: /tasks
 | `/backend [claude\|codex]` | Show or switch the active backend |
 | `/model [name]` | Set backend model |
 | `/effort low/medium/high/xhigh/max` | Set backend reasoning depth |
-| `/thinking on/off` | Stream Claude's internal reasoning live to chat |
+| `/thinking on/off` | Stream live reasoning when the active backend supports it |
 | `/context [on\|off\|N]` | Show or set per-chat conversation history depth |
 | `/permissions <mode>` | Set backend permission / sandbox mode |
 | `/skills` | List available skills |

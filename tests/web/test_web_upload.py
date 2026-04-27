@@ -4,12 +4,19 @@ pytest.importorskip("fastapi")
 
 import asyncio
 import io
+import re
 from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
 
 from link_project_to_chat.web.app import create_app
 from link_project_to_chat.web.store import WebStore
+
+
+def _csrf_token(html: str) -> str:
+    match = re.search(r'name="csrf_token" value="([^"]+)"', html)
+    assert match
+    return match.group(1)
 
 
 @pytest.fixture
@@ -26,8 +33,10 @@ async def app_client(tmp_path: Path):
 
 async def test_post_message_with_file_attaches(app_client):
     client, inbound_queue, _ = app_client
+    page = await client.get("/chat/default")
+    token = _csrf_token(page.text)
     files = {"file": ("hello.txt", io.BytesIO(b"hi there"), "text/plain")}
-    data = {"text": "see attached", "username": "alice"}
+    data = {"text": "see attached", "username": "alice", "csrf_token": token}
     resp = await client.post("/chat/default/message", data=data, files=files)
     assert resp.status_code in (200, 204)
     event = inbound_queue.get_nowait()

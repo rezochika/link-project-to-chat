@@ -401,6 +401,35 @@ def test_start_team_and_role_invokes_run_bot_with_team_primitives(tmp_path, monk
     assert kwargs.get("role") == "manager"
 
 
+def test_start_team_passes_structured_room_binding(tmp_path, monkeypatch):
+    import link_project_to_chat.cli as cli
+    from link_project_to_chat.config import Config, RoomBinding, TeamBotConfig, TeamConfig, save_config
+
+    cfg_path = tmp_path / "config.json"
+    room = RoomBinding(transport_id="google_chat", native_id="spaces/AAAA1234")
+    config = Config(
+        teams={
+            "acme": TeamConfig(
+                path=str(tmp_path),
+                room=room,
+                bots={"manager": TeamBotConfig(telegram_bot_token="t1")},
+            )
+        }
+    )
+    save_config(config, cfg_path)
+
+    calls = []
+    monkeypatch.setattr("link_project_to_chat.bot.run_bot", lambda *a, **k: calls.append((a, k)))
+
+    result = CliRunner().invoke(
+        cli.main,
+        ["--config", str(cfg_path), "start", "--team", "acme", "--role", "manager"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][1]["room"] == room
+
+
 def test_start_team_applies_default_model(tmp_path, monkeypatch):
     """When no --model is given, team bots should fall back to config.default_model."""
     import link_project_to_chat.cli as cli

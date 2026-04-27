@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 from ..events import Error, Result, StreamEvent
-from .base import BackendCapabilities, BaseBackend, HealthStatus
+from .base import BackendCapabilities, BackendStatus, BaseBackend, HealthStatus
 from .claude_parser import parse_stream_line
 from .factory import register
 
@@ -78,10 +78,17 @@ class ClaudeUsageCapError(Exception):
     """
 
 
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-MODELS = ("haiku", "sonnet", "opus", "opus[1m]", "sonnet[1m]")
 PERMISSION_MODES = ("default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 DEFAULT_MODEL = "sonnet"
+CLAUDE_MODEL_OPTIONS = [
+    ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context", ("claude-opus-4-7[1m]",)),
+    ("opus", "Opus 4.7", "Most capable", ("claude-opus-4-7",)),
+    ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context", ("claude-sonnet-4-6[1m]",)),
+    ("sonnet", "Sonnet 4.6", "Best for everyday tasks", ("claude-sonnet-4-6",)),
+    ("haiku", "Haiku 4.5", "Fastest for quick answers", ("claude-haiku-4-5",)),
+]
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+MODELS = tuple(opt[0] for opt in CLAUDE_MODEL_OPTIONS)
 
 # Appended when interactive mode is used so Claude handles dismissed AskUserQuestion gracefully.
 _ASK_DISMISSED_HINT = (
@@ -186,13 +193,7 @@ class ClaudeBackend(BaseBackend):
     # Order matters: more-specific variants (the [1m] forms) come first
     # so prefix-matching picks the right row when one prefix is a prefix
     # of another (e.g. `claude-opus-4-7` vs `claude-opus-4-7[1m]`).
-    MODEL_OPTIONS = [
-        ("opus[1m]", "Opus 4.7 1M", "Most capable, 1M context", ("claude-opus-4-7[1m]",)),
-        ("opus", "Opus 4.7", "Most capable", ("claude-opus-4-7",)),
-        ("sonnet[1m]", "Sonnet 4.6 1M", "Everyday tasks, 1M context", ("claude-sonnet-4-6[1m]",)),
-        ("sonnet", "Sonnet 4.6", "Best for everyday tasks", ("claude-sonnet-4-6",)),
-        ("haiku", "Haiku 4.5", "Fastest for quick answers", ("claude-haiku-4-5",)),
-    ]
+    MODEL_OPTIONS = CLAUDE_MODEL_OPTIONS
     _env_keep_patterns = ()
     _env_scrub_patterns = (
         "*_TOKEN", "*_KEY", "*_SECRET",
@@ -463,7 +464,7 @@ class ClaudeBackend(BaseBackend):
     # ------------------------------------------------------------------
 
     @property
-    def status(self) -> dict:
+    def status(self) -> BackendStatus:
         running = self._proc is not None and self._proc.poll() is None
         info = {
             "running": running,

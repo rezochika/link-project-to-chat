@@ -100,6 +100,7 @@ class Task:
     finished_at: float | None = None
     pending_questions: list[Question] = field(default_factory=list)
     _compact: bool = field(default=False, repr=False)
+    _backend: AgentBackend | None = field(default=None, repr=False)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
     _asyncio_task: asyncio.Task | None = field(default=None, repr=False)
     _log: collections.deque = field(
@@ -269,13 +270,14 @@ class TaskManager:
         try:
             await self._acquire_backend_slot(task.id)
             claimed_slot = True
+            task._backend = self._backend
             task.status = TaskStatus.RUNNING
             task.started_at = time.monotonic()
             await self._safe_callback(self._on_task_started, task)
             if task._compact:
                 task.result = await self._do_compact()
             else:
-                await self._run_agent_turn(task)
+                await self._run_agent_turn(task, task._backend)
 
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT
@@ -306,12 +308,13 @@ class TaskManager:
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.WAITING_INPUT):
             await self._safe_callback(self._on_complete, task)
 
-    async def _run_agent_turn(self, task: Task) -> None:
+    async def _run_agent_turn(self, task: Task, backend: AgentBackend | None = None) -> None:
         """Run one turn of agent conversation, collecting events."""
         collected_text: list[str] = []
         task.pending_questions = []
+        active_backend = backend or task._backend or self._backend
 
-        async for event in self._backend.chat_stream(
+        async for event in active_backend.chat_stream(
             task.input,
             on_proc=lambda p: setattr(task, "_proc", p),
         ):
@@ -342,11 +345,13 @@ class TaskManager:
 
         if self._backend_owner_task_id != task.id:
             await self._acquire_backend_slot(task.id)
+        if task._backend is None:
+            task._backend = self._backend
         task.status = TaskStatus.RUNNING
         task.input = answer  # set input for _run_agent_turn
 
         try:
-            await self._run_agent_turn(task)
+            await self._run_agent_turn(task, task._backend)
 
             if task.pending_questions:
                 task.status = TaskStatus.WAITING_INPUT

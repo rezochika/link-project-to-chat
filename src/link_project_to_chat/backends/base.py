@@ -6,7 +6,7 @@ import subprocess
 from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypedDict
 
 from ..events import StreamEvent
 
@@ -29,6 +29,22 @@ class HealthStatus:
     ok: bool
     usage_capped: bool
     error_message: str | None = None
+
+
+class BackendStatus(TypedDict, total=False):
+    running: bool
+    pid: int | None
+    session_id: str | None
+    total_requests: int
+    last_duration: float | None
+    last_message: str | None
+    effort: str | None
+    permission: str | None
+    allowed_tools: list[str]
+    disallowed_tools: list[str]
+    usage_capped: bool
+    last_error: str | None
+    last_usage: dict[str, int] | None
 
 
 class BaseBackend:
@@ -103,5 +119,5 @@ class AgentBackend(Protocol):
         pass
 
     @property
-    def status(self) -> dict:
+    def status(self) -> BackendStatus:
         pass

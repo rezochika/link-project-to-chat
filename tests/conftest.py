@@ -1,10 +1,10 @@
 """Shared pytest fixtures.
 
-Redirect ``$HOME`` (and ``Path.home()`` via the ``HOME`` env var) to a
+Redirect ``$HOME`` / Windows home variables (and ``Path.home()``) to a
 per-test tmp directory so test artefacts — config.json, conversation log
 SQLite DBs, persona files, etc. — never leak into the developer's real
-home directory. ``Path.home()`` honours ``$HOME`` on POSIX, which is what
-the bot uses for default storage paths.
+home directory. ``Path.home()`` honors ``$HOME`` on POSIX and
+``USERPROFILE`` / ``HOMEDRIVE`` + ``HOMEPATH`` on Windows.
 
 Caveat: protects only DYNAMIC `Path.home()` evaluations. Module-load
 constants like ``config.DEFAULT_CONFIG`` resolve before this fixture
@@ -19,6 +19,8 @@ properly-configured machine.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -26,4 +28,9 @@ import pytest
 def _isolate_home(request, tmp_path, monkeypatch):
     if request.node.get_closest_marker("codex_live"):
         return
-    monkeypatch.setenv("HOME", str(tmp_path))
+    home = str(tmp_path)
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("USERPROFILE", home)
+    drive, tail = os.path.splitdrive(home)
+    monkeypatch.setenv("HOMEDRIVE", drive)
+    monkeypatch.setenv("HOMEPATH", tail or home)

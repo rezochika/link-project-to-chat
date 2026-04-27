@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
 from ..events import Error, Result, StreamEvent, TextDelta
-from .base import BackendCapabilities, BaseBackend, HealthStatus
+from .base import BackendCapabilities, BackendStatus, BaseBackend, HealthStatus
 from .codex_parser import parse_codex_line
 from .factory import register
 
@@ -19,10 +19,28 @@ class CodexStreamError(Exception):
     """Raised by CodexBackend.chat() when the stream returns an Error event."""
 
 
+CODEX_MODEL_OPTIONS = [
+    ("gpt-5.5", "GPT-5.5", "Frontier coding (default)", ()),
+    ("gpt-5.4", "GPT-5.4", "", ()),
+    ("gpt-5.4-mini", "GPT-5.4-Mini", "Fast, lighter reasoning", ()),
+    ("gpt-5.3-codex", "GPT-5.3-Codex", "", ()),
+    ("gpt-5.2", "GPT-5.2", "", ()),
+]
+
 # Reasoning-effort levels accepted by `codex exec -c model_reasoning_effort=...`.
 # Codex tops out at ``xhigh`` (Claude also exposes ``max``, but Codex doesn't).
 CODEX_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
-CODEX_MODELS = ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2")
+CODEX_MODELS = tuple(opt[0] for opt in CODEX_MODEL_OPTIONS)
+CODEX_PERMISSION_MODES = {
+    None,
+    "default",
+    "plan",
+    "acceptEdits",
+    "dontAsk",
+    "auto",
+    "bypassPermissions",
+    "dangerously-skip-permissions",
+}
 
 CODEX_CAPABILITIES = BackendCapabilities(
     models=CODEX_MODELS,
@@ -40,18 +58,11 @@ CODEX_CAPABILITIES = BackendCapabilities(
 class CodexBackend(BaseBackend):
     name = "codex"
     capabilities = CODEX_CAPABILITIES
-    # `/model` button picker entries — order mirrors the priority field in
-    # ~/.codex/models_cache.json so the default frontier model surfaces first.
+    # `/model` button picker entries. Keep the default frontier model first.
     # Codex slugs ARE the wire identifiers — no aliases needed (passed
     # straight through `--model <slug>`). Empty alias tuples keep the
     # 4-tuple shape consistent with Claude's MODEL_OPTIONS.
-    MODEL_OPTIONS = [
-        ("gpt-5.5", "GPT-5.5", "Frontier coding (default)", ()),
-        ("gpt-5.4", "GPT-5.4", "", ()),
-        ("gpt-5.4-mini", "GPT-5.4-Mini", "Fast, lighter reasoning", ()),
-        ("gpt-5.3-codex", "GPT-5.3-Codex", "", ()),
-        ("gpt-5.2", "GPT-5.2", "", ()),
-    ]
+    MODEL_OPTIONS = CODEX_MODEL_OPTIONS
     _env_keep_patterns = ("OPENAI_*", "CODEX_*")
     _env_scrub_patterns = (
         "*_TOKEN", "*_KEY", "*_SECRET",
@@ -61,7 +72,7 @@ class CodexBackend(BaseBackend):
     def __init__(self, project_path: Path, state: dict):
         self.project_path = project_path
         self.model: str | None = state.get("model")
-        self.model_display: str | None = None
+        self.model_display: str | None = self._display_for_model(self.model)
         self.session_id: str | None = state.get("session_id")
         self.effort: str | None = state.get("effort")
         self.permissions: str | None = state.get("permissions")
@@ -72,6 +83,14 @@ class CodexBackend(BaseBackend):
         self._last_usage: dict | None = None
         self._last_error: str | None = None
         self._total_requests: int = 0
+
+    @classmethod
+    def _display_for_model(cls, model: str | None) -> str:
+        target = model or cls.MODEL_OPTIONS[0][0]
+        for model_id, label, desc, *_ in cls.MODEL_OPTIONS:
+            if model_id == target:
+                return f"{label} — {desc}" if desc else label
+        return model or cls.MODEL_OPTIONS[0][1]
 
     # ------------------------------------------------------------------
     # Command building
@@ -159,6 +178,7 @@ class CodexBackend(BaseBackend):
 
         collected_text: list[str] = []
         usage: dict | None = None
+        completed = False
         try:
             while True:
                 raw_line = await asyncio.to_thread(proc.stdout.readline)
@@ -177,6 +197,7 @@ class CodexBackend(BaseBackend):
                 if parsed.usage is not None:
                     usage = parsed.usage
                 if parsed.turn_completed:
+                    completed = True
                     self._last_error = None
                     # Codex emits one item.completed agent_message per logical
                     # paragraph (planning preamble, mid-action update, final
@@ -218,6 +239,9 @@ class CodexBackend(BaseBackend):
                 yield Error(message=self._last_error)
                 raise CodexStreamError(self._last_error)
         finally:
+            if not completed and proc.poll() is None:
+                proc.kill()
+                await asyncio.to_thread(proc.wait)
             if self._proc is proc:
                 self._proc = None
                 self._started_at = None
@@ -275,10 +299,12 @@ class CodexBackend(BaseBackend):
         return self.permissions or "default"
 
     def set_permission(self, mode: str | None) -> None:
+        if mode not in CODEX_PERMISSION_MODES:
+            raise ValueError(f"Unsupported Codex permissions mode: {mode}")
         self.permissions = None if mode in (None, "default") else mode
 
     @property
-    def status(self) -> dict:
+    def status(self) -> BackendStatus:
         running = self._proc is not None and self._proc.poll() is None
         return {
             "running": running,

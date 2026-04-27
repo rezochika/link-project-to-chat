@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -273,7 +274,7 @@ async def test_codex_status_does_not_require_model_display(tmp_path):
     sent = bot._transport.sent_messages
     assert len(sent) == 1
     assert "Backend: codex" in sent[0].text
-    assert "Model: default" in sent[0].text
+    assert "Model: GPT-5.5 — Frontier coding (default)" in sent[0].text
 
 
 async def test_status_includes_effort_when_backend_supports_it(tmp_path):
@@ -343,12 +344,14 @@ async def test_status_surfaces_codex_last_usage_tokens(tmp_path):
     intentionally omitted to keep the line scannable."""
     bot = _make_bot(tmp_path)
     await _switch_to_codex(bot)
-    bot.task_manager._backend._last_usage = {
+    backend = bot.task_manager.backend
+    backend._last_usage = {
         "input_tokens": 24298,
         "cached_input_tokens": 3456,
         "output_tokens": 36,
         "reasoning_output_tokens": 10,
     }
+    assert backend.status["last_usage"]["input_tokens"] == 24298
 
     await bot._on_status_t(_ci([]))
 
@@ -410,6 +413,41 @@ async def test_status_surfaces_last_backend_error(tmp_path):
 
     text = bot._transport.sent_messages[-1].text
     assert "Last error: codex failed loudly" in text
+
+
+async def test_status_preserves_newlines_in_short_last_error(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+    bot.task_manager._backend._last_error = "first line\nsecond line"
+
+    await bot._on_status_t(_ci([]))
+
+    text = bot._transport.sent_messages[-1].text
+    assert "Last error: first line\nsecond line" in text
+
+
+async def test_status_uses_safe_status_defaults(tmp_path):
+    class SparseBackend(FakeBackend):
+        @property
+        def status(self) -> dict:
+            return {}
+
+    bot = _make_bot(tmp_path)
+    bot.task_manager._backend = SparseBackend(tmp_path)
+
+    await bot._on_status_t(_ci([]))
+
+    assert "Agent: idle" in bot._transport.sent_messages[-1].text
+
+
+async def test_status_uses_chunking_helper_for_long_output(tmp_path):
+    bot = _make_bot(tmp_path)
+    bot._transport.max_text_length = 120
+    bot.task_manager._backend._last_error = "x" * 500
+
+    await bot._on_status_t(_ci([]))
+
+    assert len(bot._transport.sent_messages) > 1
 
 
 async def test_status_resolves_friendly_label_from_wire_identifier(tmp_path):
@@ -493,6 +531,26 @@ async def test_codex_effort_command_shows_picker_for_codex(tmp_path):
     ]
 
 
+async def test_effort_command_accepts_typed_argument(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_effort(_ci(["xhigh"]))
+
+    assert bot.task_manager.backend.effort == "xhigh"
+    assert "Effort: xhigh" in bot._transport.sent_messages[-1].text
+
+
+async def test_effort_command_rejects_invalid_typed_argument(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_effort(_ci(["max"]))
+
+    assert bot.task_manager.backend.effort is None
+    assert "Usage: /effort low|medium|high|xhigh" in bot._transport.sent_messages[-1].text
+
+
 async def test_codex_model_command_shows_picker_for_codex(tmp_path):
     """/model on Codex returns the GPT-5 family picker. Mirrors Claude's
     behaviour now that MODEL_OPTIONS lives on the backend class."""
@@ -511,6 +569,38 @@ async def test_codex_model_command_shows_picker_for_codex(tmp_path):
         "model_set_gpt-5.3-codex",
         "model_set_gpt-5.2",
     ]
+
+
+async def test_model_command_accepts_typed_argument(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_model(_ci(["gpt-5.4-mini"]))
+
+    assert bot.task_manager.backend.model == "gpt-5.4-mini"
+    assert "Model: GPT-5.4-Mini — Fast, lighter reasoning" in bot._transport.sent_messages[-1].text
+
+
+async def test_model_command_rejects_invalid_typed_argument(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_model(_ci(["opus"]))
+
+    assert bot.task_manager.backend.model is None
+    assert "Usage: /model gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex|gpt-5.2" in (
+        bot._transport.sent_messages[-1].text
+    )
+
+
+async def test_stale_thinking_button_is_gated_when_backend_lacks_thinking(tmp_path):
+    bot = _make_bot(tmp_path)
+    await _switch_to_codex(bot)
+
+    await bot._on_button(_backend_button_click("thinking_set_on"))
+
+    assert bot.show_thinking is False
+    assert "doesn't support /thinking" in bot._transport.edited_messages[-1].text
 
 
 async def test_codex_skill_activation_is_rejected_without_assertion(tmp_path):
@@ -584,3 +674,87 @@ async def test_backend_command_switch_persists_for_team_bot(tmp_path):
     data = json.loads(cfg_path.read_text(encoding="utf-8"))
     assert data["teams"]["alpha"]["bots"]["developer"]["backend"] == "fake"
     assert "projects" not in data or "alpha_developer" not in data.get("projects", {})
+
+
+async def test_task_completion_persists_session_under_task_backend_after_switch(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "projects": {
+                    "proj": {
+                        "path": str(tmp_path),
+                        "telegram_bot_token": "tok",
+                        "backend": "codex",
+                        "backend_state": {
+                            "claude": {},
+                            "codex": {"session_id": "codex-existing"},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    bot = ProjectBot(
+        name="proj",
+        path=tmp_path,
+        token="tok",
+        allowed_username="alice",
+        config_path=cfg_path,
+    )
+    bot._transport = FakeTransport()
+    original_backend = _make_fake(tmp_path, "claude")
+    original_backend.session_id = "claude-new"
+    bot.task_manager._backend = _make_fake(tmp_path, "codex")
+    bot.task_manager._backend.session_id = "codex-existing"
+
+    task = Task(
+        id=1,
+        chat=_chat(),
+        message=MessageRef(transport_id="fake", native_id="9", chat=_chat()),
+        type=TaskType.AGENT,
+        input="prompt",
+        name="prompt",
+        status=TaskStatus.DONE,
+    )
+    task.result = "done"
+    task._backend = original_backend
+
+    async def _finalize(_task):
+        return _task.result
+
+    bot._finalize_claude_task = _finalize  # type: ignore[assignment]
+
+    await bot._on_task_complete(task)
+
+    raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    state = raw["projects"]["proj"]["backend_state"]
+    assert state["claude"]["session_id"] == "claude-new"
+    assert state["codex"]["session_id"] == "codex-existing"
+
+
+async def test_text_submission_waits_for_backend_switch_lock(tmp_path):
+    from link_project_to_chat.transport import IncomingMessage
+
+    bot = _make_bot(tmp_path)
+    lock = asyncio.Lock()
+    bot._backend_switch_lock = lock
+    await lock.acquire()
+    chat = _chat()
+    incoming = IncomingMessage(
+        chat=chat,
+        sender=_sender(),
+        text="hello",
+        files=[],
+        reply_to=None,
+        message=MessageRef(transport_id="fake", native_id="msg-1", chat=chat),
+    )
+
+    pending = asyncio.create_task(bot._on_text(incoming))
+    await asyncio.sleep(0.05)
+
+    assert bot.task_manager._tasks == {}
+    lock.release()
+    await pending
+    assert bot.task_manager._tasks

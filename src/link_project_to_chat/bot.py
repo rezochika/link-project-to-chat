@@ -59,7 +59,7 @@ COMMANDS = [
     ("tasks", "List all tasks"),
     ("backend", "Show or switch backend"),
     ("model", "Set backend model"),
-    ("effort", "Set thinking depth (low/medium/high/max)"),
+    ("effort", "Set backend reasoning effort"),
     ("thinking", "Toggle live thinking display (on/off)"),
     ("context", "Toggle per-chat conversation history (on/off/N)"),
     ("permissions", "Set permission mode"),
@@ -182,6 +182,7 @@ class ProjectBot(AuthMixin):
         self._backend_name = backend_name
         self._backend_state = dict(backend_state or {})
         self._backend_state[backend_name] = persisted_state
+        self._backend_switch_lock = asyncio.Lock()
         self.task_manager = TaskManager(
             project_path=self.path,
             backend=_backend,
@@ -246,7 +247,14 @@ class ProjectBot(AuthMixin):
     def _backend_supports_prompt_customization(self) -> bool:
         return isinstance(self.task_manager.backend, ClaudeBackend)
 
-    def _history_block(self, chat: ChatRef) -> str:
+    def _backend_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_backend_switch_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._backend_switch_lock = lock
+        return lock
+
+    async def _history_block(self, chat: ChatRef) -> str:
         """Render the recent-history prepend for a turn in ``chat``.
 
         Returns an empty string when context history is disabled OR the log
@@ -259,10 +267,12 @@ class ProjectBot(AuthMixin):
         log = getattr(self, "conversation_log", None)
         if log is None:
             return ""
-        turns = log.recent(chat, limit=getattr(self, "context_history_limit", 10))
+        turns = await log.recent_async(
+            chat, limit=getattr(self, "context_history_limit", 10)
+        )
         return format_history_block(turns)
 
-    def _log_user_turn(self, chat: ChatRef, text: str) -> None:
+    async def _log_user_turn(self, chat: ChatRef, text: str) -> None:
         """Capture a conversational user turn for cross-backend continuity.
 
         Only conversational text — slash commands, button clicks, file
@@ -273,20 +283,22 @@ class ProjectBot(AuthMixin):
         log = getattr(self, "conversation_log", None)
         if log is None:
             return
-        log.append(
+        # Writes continue while /context is off so re-enabling context has a
+        # coherent recent-history window available.
+        await log.append_async(
             chat,
             USER_ROLE,
             text,
             backend=self.task_manager.backend.name,
         )
 
-    def _log_assistant_turn(self, chat: ChatRef, text: str) -> None:
+    async def _log_assistant_turn(self, chat: ChatRef, text: str) -> None:
         if not text or not text.strip():
             return
         log = getattr(self, "conversation_log", None)
         if log is None:
             return
-        log.append(
+        await log.append_async(
             chat,
             ASSISTANT_ROLE,
             text,
@@ -451,7 +463,7 @@ class ProjectBot(AuthMixin):
     ) -> MessageRef | None:
         """Send HTML message(s), attaching buttons to the last chunk. Returns the last sent ref."""
         assert self._transport is not None
-        chunks = split_html(html)
+        chunks = split_html(html, limit=self._transport.max_text_length)
         last_ref: MessageRef | None = None
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
@@ -577,7 +589,7 @@ class ProjectBot(AuthMixin):
             except Exception:
                 logger.warning("Failed to cancel live thinking for task %d", task_id, exc_info=True)
 
-    async def _finalize_claude_task(self, task: Task) -> None:
+    async def _finalize_claude_task(self, task: Task) -> str | None:
         live_text = self._live_text.pop(task.id, None)
         live_thinking = self._live_thinking.pop(task.id, None)
         self._live_text_failed.discard(task.id)
@@ -594,9 +606,10 @@ class ProjectBot(AuthMixin):
             if live_thinking is not None:
                 await live_thinking.cancel("(compacted)")
             await self._send_to_chat(task.chat, text, reply_to=task.message)
-            return
+            return None
 
         if task.status == TaskStatus.DONE:
+            assistant_text: str | None = None
             if live_text is not None:
                 # Don't pass task.result — it contains only the LAST assistant text block.
                 # The StreamingMessage buffer already holds every streamed text delta (narration
@@ -614,9 +627,11 @@ class ProjectBot(AuthMixin):
                     )
                 else:
                     fallback = task.result if not has_buffer else None
+                    assistant_text = live_text.buffer if has_buffer else task.result
                     await live_text.finalize(fallback, render=True)
                 await self._send_completion_notice(task)
             else:
+                assistant_text = task.result
                 await self._send_to_chat(task.chat, task.result, reply_to=task.message)
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
@@ -624,6 +639,7 @@ class ProjectBot(AuthMixin):
                 self._thinking_store[task.id] = thinking
             if is_voice and self._synthesizer and task.result:
                 await self._send_voice_response(task.chat, task.result, reply_to=task.message)
+            return assistant_text
         else:
             error_text = f"Error: {task.error}"
             if is_usage_cap_error(task.error) and self.group_mode:
@@ -638,7 +654,7 @@ class ProjectBot(AuthMixin):
                     reply_to=task.message,
                 )
                 self._schedule_cap_probe(task.chat)
-                return
+                return None
             if live_text is not None:
                 await live_text.finalize(error_text, render=False)
                 await self._send_completion_notice(task, failed=True)
@@ -646,6 +662,7 @@ class ProjectBot(AuthMixin):
                 await self._send_to_chat(task.chat, error_text, reply_to=task.message)
             if live_thinking is not None:
                 await live_thinking.finalize(render=False)
+            return None
 
     async def _send_completion_notice(self, task: Task, *, failed: bool = False) -> None:
         """Send a fresh completion ping after a live-edited agent response.
@@ -722,15 +739,24 @@ class ProjectBot(AuthMixin):
             typing.cancel()
 
         if task.type == TaskType.AGENT:
-            if self.task_manager.backend.session_id:
+            task_backend = getattr(task, "_backend", None) or self.task_manager.backend
+            if task_backend.session_id:
                 try:
-                    save_session(
-                        self.name,
-                        self.task_manager.backend.session_id,
-                        self._effective_config_path(),
-                        team_name=self.team_name,
-                        role=self.role,
-                    )
+                    if self.team_name and self.role:
+                        patch_team_bot_backend_state(
+                            self.team_name,
+                            self.role,
+                            task_backend.name,
+                            {"session_id": task_backend.session_id},
+                            self._effective_config_path(),
+                        )
+                    else:
+                        patch_backend_state(
+                            self.name,
+                            task_backend.name,
+                            {"session_id": task_backend.session_id},
+                            self._effective_config_path(),
+                        )
                 except Exception:
                     logger.exception(
                         "Failed to persist session_id for task #%d", task.id
@@ -738,13 +764,9 @@ class ProjectBot(AuthMixin):
             # Capture the assistant's final reply text into the per-chat
             # conversation log. Skip /compact tasks (they don't represent a
             # conversational reply) and skip when the turn produced no text.
-            if (
-                not task._compact
-                and task.status == TaskStatus.DONE
-                and task.result
-            ):
-                self._log_assistant_turn(task.chat, task.result)
-            await self._finalize_claude_task(task)
+            assistant_text = await self._finalize_claude_task(task)
+            if not task._compact and task.status == TaskStatus.DONE and assistant_text:
+                await self._log_assistant_turn(task.chat, assistant_text)
         else:
             await self._finalize_command_task(task)
 
@@ -923,13 +945,14 @@ class ProjectBot(AuthMixin):
         the legacy _on_text shim — not through this method.
         """
         assert self._transport is not None
-        prompt = self._build_user_prompt(incoming.chat, incoming.text)
-        self._log_user_turn(incoming.chat, incoming.text)
-        self.task_manager.submit_agent(
-            chat=incoming.chat,
-            message=incoming.message,
-            prompt=prompt,
-        )
+        async with self._backend_lock():
+            prompt = await self._build_user_prompt(incoming.chat, incoming.text)
+            await self._log_user_turn(incoming.chat, incoming.text)
+            self.task_manager.submit_agent(
+                chat=incoming.chat,
+                message=incoming.message,
+                prompt=prompt,
+            )
 
     def _team_session_active(self) -> bool:
         """True when team mode + the active backend has a resumable session.
@@ -949,7 +972,7 @@ class ProjectBot(AuthMixin):
             and getattr(capabilities, "supports_resume", False)
         )
 
-    def _build_user_prompt(
+    async def _build_user_prompt(
         self,
         chat: ChatRef,
         raw_text: str,
@@ -973,7 +996,7 @@ class ProjectBot(AuthMixin):
             persona = load_persona(self._active_persona, self.path)
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
-        prompt = self._history_block(chat) + prompt
+        prompt = await self._history_block(chat) + prompt
         return prompt
 
     async def _on_text(self, incoming) -> None:
@@ -1057,20 +1080,21 @@ class ProjectBot(AuthMixin):
             if typing:
                 typing.cancel()
 
-        prompt = self._build_user_prompt(
-            incoming.chat,
-            incoming.text,
-            reply_to_text=incoming.reply_to_text,
-        )
-        # Log the user entry AFTER building the prompt so the current message
-        # does not appear in its own prepend block (only relevant when the
-        # gate is open and history actually gets injected).
-        self._log_user_turn(incoming.chat, incoming.text)
-        self.task_manager.submit_agent(
-            chat=incoming.chat,
-            message=message_ref,
-            prompt=prompt,
-        )
+        async with self._backend_lock():
+            prompt = await self._build_user_prompt(
+                incoming.chat,
+                incoming.text,
+                reply_to_text=incoming.reply_to_text,
+            )
+            # Log the user entry AFTER building the prompt so the current message
+            # does not appear in its own prepend block (only relevant when the
+            # gate is open and history actually gets injected).
+            await self._log_user_turn(incoming.chat, incoming.text)
+            self.task_manager.submit_agent(
+                chat=incoming.chat,
+                message=message_ref,
+                prompt=prompt,
+            )
 
     async def _on_run(self, ci) -> None:
         assert self._transport is not None
@@ -1163,8 +1187,21 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
-        if not self.task_manager.backend.capabilities.models:
+        backend = self.task_manager.backend
+        models = tuple(backend.capabilities.models)
+        if not models:
             await self._transport.send_text(ci.chat, "This backend doesn't support /model.")
+            return
+        args = ci.args or []
+        if args:
+            requested = args[0]
+            if requested in models:
+                backend.model = requested
+                backend.model_display = None
+                self._patch_backend_config({"model": requested})
+                await self._transport.send_text(ci.chat, f"Model: {self._current_model()}")
+                return
+            await self._transport.send_text(ci.chat, f"Usage: /model {'|'.join(models)}")
             return
         await self._transport.send_text(
             ci.chat,
@@ -1186,8 +1223,20 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
-        if not self.task_manager.backend.capabilities.supports_effort:
+        backend = self.task_manager.backend
+        levels = tuple(backend.capabilities.effort_levels)
+        if not backend.capabilities.supports_effort:
             await self._transport.send_text(ci.chat, "This backend doesn't support /effort.")
+            return
+        args = ci.args or []
+        if args:
+            requested = args[0]
+            if requested in levels:
+                backend.effort = requested
+                self._patch_backend_config({"effort": requested})
+                await self._transport.send_text(ci.chat, f"Effort: {self._current_effort()}")
+                return
+            await self._transport.send_text(ci.chat, f"Usage: /effort {'|'.join(levels)}")
             return
         await self._transport.send_text(
             ci.chat,
@@ -1246,10 +1295,8 @@ class ProjectBot(AuthMixin):
         ``_patch_config`` helper that updates active_persona / show_thinking.
 
         Skips writing values that match the dataclass defaults so the
-        on-disk JSON stays clean. The team-bot save path applies these
-        verbatim into the entry without re-checking defaults, so a
-        toggled-then-toggled-back sequence would otherwise leave stale
-        ``context_enabled: true`` lines in the team config.
+        on-disk JSON stays clean. ``None`` values are intentional remove-key
+        signals; the team-bot save path honors them through ``_patch_config``.
         """
         fields: dict = {}
         if enabled is not True:
@@ -1367,33 +1414,34 @@ class ProjectBot(AuthMixin):
         """
         from .backends.factory import available, create
 
-        available_backends = available()
-        current_name = self.task_manager.backend.name
+        async with self._backend_lock():
+            available_backends = available()
+            current_name = self.task_manager.backend.name
 
-        if requested == current_name:
-            return f"{requested} is already active."
-        if requested not in available_backends:
-            return (
-                f"Unknown backend '{requested}'. "
-                f"Available: {', '.join(available_backends)}"
-            )
-        if self.task_manager.has_live_agent_tasks():
-            return "Cancel running tasks before switching backend."
+            if requested == current_name:
+                return f"{requested} is already active."
+            if requested not in available_backends:
+                return (
+                    f"Unknown backend '{requested}'. "
+                    f"Available: {', '.join(available_backends)}"
+                )
+            if self.task_manager.has_live_agent_tasks():
+                return "Cancel running tasks before switching backend."
 
-        new_backend = create(requested, self.path, self._backend_state_for(requested))
-        self.task_manager.backend.close_interactive()
-        self.task_manager._backend = new_backend
-        self._backend_name = requested
-        self._backend_state.setdefault(requested, {})
-        self._refresh_team_system_note()
+            new_backend = create(requested, self.path, self._backend_state_for(requested))
+            self.task_manager.backend.close_interactive()
+            self.task_manager._backend = new_backend
+            self._backend_name = requested
+            self._backend_state.setdefault(requested, {})
+            self._refresh_team_system_note()
 
-        cfg = self._effective_config_path()
-        if self.team_name and self.role:
-            patch_team_bot_backend(self.team_name, self.role, requested, cfg)
-        else:
-            patch_project(self.name, {"backend": requested}, cfg)
+            cfg = self._effective_config_path()
+            if self.team_name and self.role:
+                patch_team_bot_backend(self.team_name, self.role, requested, cfg)
+            else:
+                patch_project(self.name, {"backend": requested}, cfg)
 
-        return f"Switched to {requested}."
+            return f"Switched to {requested}."
 
     async def _on_backend(self, ci) -> None:
         """Show or switch the active backend.
@@ -1952,6 +2000,9 @@ class ProjectBot(AuthMixin):
                 buttons=self._effort_buttons(),
             )
         elif value.startswith("thinking_set_"):
+            if not self.task_manager.backend.capabilities.supports_thinking:
+                await self._transport.edit_text(msg_ref, "This backend doesn't support /thinking.")
+                return
             val = value[len("thinking_set_"):]
             if val in ("on", "off"):
                 self.show_thinking = val == "on"
@@ -2013,7 +2064,7 @@ class ProjectBot(AuthMixin):
             # Drop the per-chat conversation log so the user gets a true fresh
             # start. Leaving prior turns would defeat the purpose of /reset
             # since the next prompt would still inject them.
-            self.conversation_log.clear(chat)
+            await self.conversation_log.clear_async(chat)
             await self._transport.edit_text(msg_ref, "Session reset.")
         elif value == "reset_cancel":
             await self._transport.edit_text(msg_ref, "Reset cancelled.")
@@ -2206,7 +2257,7 @@ class ProjectBot(AuthMixin):
         lines.extend([
             f"Uptime: {h}h {m}m {s}s",
             f"Session: {st.get('session_id') or 'none'}",
-            f"Agent: {'RUNNING' if st['running'] else 'idle'}",
+            f"Agent: {'RUNNING' if st.get('running') else 'idle'}",
             f"Running tasks: {self.task_manager.running_count}",
             f"Waiting: {self.task_manager.waiting_count}",
         ])
@@ -2237,7 +2288,6 @@ class ProjectBot(AuthMixin):
 
     @staticmethod
     def _short_status_value(value: str, limit: int = 240) -> str:
-        value = " ".join(value.split())
         if len(value) <= limit:
             return value
         return value[: limit - 3] + "..."
@@ -2246,7 +2296,7 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             return
         assert self._transport is not None
-        await self._transport.send_text(ci.chat, self._compose_status())
+        await self._send_to_chat(ci.chat, self._compose_status())
 
     async def _on_file_from_transport(self, incoming) -> None:
         """Transport-native file handler. Copies each incoming file from the
@@ -2357,24 +2407,19 @@ class ProjectBot(AuthMixin):
                 self.task_manager.submit_answer(waiting.id, text)
                 return
 
-            prompt = text
-            if incoming.reply_to_text:
-                prompt = f"[Replying to: {incoming.reply_to_text}]\n\n{prompt}"
+            async with self._backend_lock():
+                prompt = await self._build_user_prompt(
+                    incoming.chat,
+                    text,
+                    reply_to_text=incoming.reply_to_text,
+                )
+                await self._log_user_turn(incoming.chat, text)
 
-            if self._active_persona:
-                from .skills import load_persona, format_persona_prompt
-                persona = load_persona(self._active_persona, self.path)
-                if persona:
-                    prompt = format_persona_prompt(persona, prompt)
-
-            prompt = self._history_block(incoming.chat) + prompt
-            self._log_user_turn(incoming.chat, text)
-
-            task = self.task_manager.submit_agent(
-                chat=incoming.chat,
-                message=incoming.message,
-                prompt=prompt,
-            )
+                task = self.task_manager.submit_agent(
+                    chat=incoming.chat,
+                    message=incoming.message,
+                    prompt=prompt,
+                )
             if self._synthesizer:
                 self._voice_tasks.add(task.id)
 
@@ -2482,7 +2527,14 @@ class ProjectBot(AuthMixin):
             db_path = Path.home() / ".link-project-to-chat" / "web" / f"{self.name}.db"
             db_path.parent.mkdir(parents=True, exist_ok=True)
             self._transport = WebTransport(
-                db_path=db_path, bot_identity=bot_identity, port=self.web_port,
+                db_path=db_path,
+                bot_identity=bot_identity,
+                port=self.web_port,
+                authenticated_handle=(
+                    self._get_allowed_usernames()[0]
+                    if len(self._get_allowed_usernames()) == 1
+                    else None
+                ),
             )
             self._app = None  # WebTransport has no PTB Application
         else:

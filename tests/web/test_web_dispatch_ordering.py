@@ -3,12 +3,19 @@ import pytest
 pytest.importorskip("fastapi")
 
 import asyncio
+import re
 from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
 
 from link_project_to_chat.web.app import create_app
 from link_project_to_chat.web.store import WebStore
+
+
+def _csrf_token(html: str) -> str:
+    match = re.search(r'name="csrf_token" value="([^"]+)"', html)
+    assert match
+    return match.group(1)
 
 
 async def test_messages_partial_includes_post_after_sse(tmp_path: Path):
@@ -43,7 +50,12 @@ async def test_messages_partial_includes_post_after_sse(tmp_path: Path):
 
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            await client.post("/chat/default/message", data={"text": "hi", "username": "alice"})
+            page = await client.get("/chat/default")
+            token = _csrf_token(page.text)
+            await client.post(
+                "/chat/default/message",
+                data={"text": "hi", "username": "alice", "csrf_token": token},
+            )
             # Give the dispatch loop a moment.
             await asyncio.sleep(0.05)
             resp = await client.get("/chat/default/messages")

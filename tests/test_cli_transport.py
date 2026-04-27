@@ -3,7 +3,7 @@ from click.testing import CliRunner
 import pytest
 
 
-def test_start_accepts_transport_web_flag(monkeypatch):
+def test_start_accepts_transport_web_flag(monkeypatch, tmp_path):
     """`start --transport web --port 8080` must parse cleanly."""
     from link_project_to_chat.cli import main
 
@@ -18,7 +18,7 @@ def test_start_accepts_transport_web_flag(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(main, [
         "start",
-        "--path", "/tmp/x",
+        "--path", str(tmp_path),
         "--token", "fake_token",
         "--username", "alice",
         "--transport", "web",
@@ -29,7 +29,7 @@ def test_start_accepts_transport_web_flag(monkeypatch):
     assert captured.get("web_port") == 8080
 
 
-def test_start_default_transport_is_telegram(monkeypatch):
+def test_start_default_transport_is_telegram(monkeypatch, tmp_path):
     from link_project_to_chat.cli import main
 
     captured: dict = {}
@@ -39,7 +39,7 @@ def test_start_default_transport_is_telegram(monkeypatch):
     runner = CliRunner()
     result = runner.invoke(main, [
         "start",
-        "--path", "/tmp/x",
+        "--path", str(tmp_path),
         "--token", "fake_token",
         "--username", "alice",
     ])

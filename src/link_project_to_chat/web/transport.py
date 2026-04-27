@@ -57,11 +57,13 @@ class WebTransport:
         bot_identity: Identity,
         host: str = "127.0.0.1",
         port: int = 8080,
+        authenticated_handle: str | None = None,
     ) -> None:
         self._db_path = db_path
         self._bot_identity = bot_identity
         self._host = host
         self._port = port
+        self._authenticated_handle = authenticated_handle
 
         self._store: WebStore | None = None
         self._inbound_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -86,7 +88,12 @@ class WebTransport:
     async def start(self) -> None:
         self._store = WebStore(self._db_path)
         await self._store.open()
-        app = create_app(self._store, self._inbound_queue, self._sse_queues)
+        app = create_app(
+            self._store,
+            self._inbound_queue,
+            self._sse_queues,
+            authenticated_handle=self._authenticated_handle,
+        )
         config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(self._uvicorn_server.serve())
@@ -104,9 +111,14 @@ class WebTransport:
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         if self._server_task is not None:
-            self._server_task.cancel()
             try:
-                await self._server_task
+                await asyncio.wait_for(self._server_task, timeout=5)
+            except TimeoutError:
+                self._server_task.cancel()
+                try:
+                    await self._server_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             except (asyncio.CancelledError, Exception):
                 pass
         if self._store is not None:
@@ -149,6 +161,7 @@ class WebTransport:
             sender_is_bot=True,
             text=text,
             html=html,
+            buttons=self._serialize_buttons(buttons),
         )
         await _notify_sse(self._sse_queues, chat.native_id)
         return MessageRef(transport_id=self.TRANSPORT_ID, native_id=str(db_id), chat=chat)
@@ -162,7 +175,12 @@ class WebTransport:
         html: bool = False,
     ) -> None:
         assert self._store is not None
-        await self._store.update_message(int(msg.native_id), text, html)
+        await self._store.update_message(
+            int(msg.native_id),
+            text,
+            html,
+            buttons=self._serialize_buttons(buttons),
+        )
         await _notify_sse(self._sse_queues, msg.chat.native_id)
 
     async def send_file(
@@ -193,6 +211,22 @@ class WebTransport:
     def render_markdown(self, md: str) -> str:
         """Web UI renders markdown client-side; pass through unchanged."""
         return md
+
+    @staticmethod
+    def _serialize_buttons(buttons: Buttons | None) -> list[list[dict[str, str]]] | None:
+        if buttons is None:
+            return None
+        return [
+            [
+                {
+                    "label": button.label,
+                    "value": button.value,
+                    "style": button.style.value,
+                }
+                for button in row
+            ]
+            for row in buttons.rows
+        ]
 
     # -- Prompt support ---------------------------------------------------
     async def open_prompt(
@@ -264,7 +298,7 @@ class WebTransport:
             transport_id=self.TRANSPORT_ID,
             native_id=payload.get("sender_native_id", BROWSER_USER_ID),
             display_name=payload.get("sender_display_name", "You"),
-            handle=payload.get("sender_handle"),  # may be None for unauthenticated/anonymous
+            handle=self._authenticated_handle,
             is_bot=False,
         )
         # Authorizer gate: silently drop if rejected. Mirrors the C2 DoS-defense
@@ -272,6 +306,22 @@ class WebTransport:
         if self._authorizer is not None and not await self._authorizer(sender):
             return
         text: str = payload.get("text", "")
+
+        if event["event_type"] == "button_click":
+            msg_ref = MessageRef(
+                transport_id=self.TRANSPORT_ID,
+                native_id=str(payload.get("message_id", "")),
+                chat=chat,
+            )
+            click = ButtonClick(
+                chat=chat,
+                message=msg_ref,
+                sender=sender,
+                value=str(payload.get("value", "")),
+            )
+            for h in self._button_handlers:
+                await h(click)
+            return
 
         if event["event_type"] == "inbound_message":
             if text.startswith("/"):
@@ -353,7 +403,14 @@ class WebTransport:
         reply_to_sender: Identity | None = None,
         mentions: list[Identity] | None = None,
     ) -> None:
-        if self._authorizer is not None and not await self._authorizer(sender):
+        web_sender = Identity(
+            transport_id=sender.transport_id,
+            native_id=sender.native_id,
+            display_name=sender.display_name,
+            handle=self._authenticated_handle,
+            is_bot=sender.is_bot,
+        )
+        if self._authorizer is not None and not await self._authorizer(web_sender):
             return
         msg_ref = MessageRef(
             transport_id=self.TRANSPORT_ID,
@@ -364,7 +421,7 @@ class WebTransport:
         # platform-delivered media types we can't decode.
         msg = IncomingMessage(
             chat=chat,
-            sender=sender,
+            sender=web_sender,
             text=text,
             files=files or [],
             reply_to=reply_to,
@@ -386,7 +443,14 @@ class WebTransport:
         args: list[str],
         raw_text: str,
     ) -> None:
-        if self._authorizer is not None and not await self._authorizer(sender):
+        web_sender = Identity(
+            transport_id=sender.transport_id,
+            native_id=sender.native_id,
+            display_name=sender.display_name,
+            handle=self._authenticated_handle,
+            is_bot=sender.is_bot,
+        )
+        if self._authorizer is not None and not await self._authorizer(web_sender):
             return
         msg_ref = MessageRef(
             transport_id=self.TRANSPORT_ID,
@@ -394,7 +458,7 @@ class WebTransport:
             chat=chat,
         )
         ci = CommandInvocation(
-            chat=chat, sender=sender, name=name,
+            chat=chat, sender=web_sender, name=name,
             args=args, raw_text=raw_text, message=msg_ref,
         )
         handler = self._command_handlers.get(name)
@@ -404,9 +468,16 @@ class WebTransport:
     async def inject_button_click(
         self, message: MessageRef, sender: Identity, *, value: str
     ) -> None:
-        if self._authorizer is not None and not await self._authorizer(sender):
+        web_sender = Identity(
+            transport_id=sender.transport_id,
+            native_id=sender.native_id,
+            display_name=sender.display_name,
+            handle=self._authenticated_handle,
+            is_bot=sender.is_bot,
+        )
+        if self._authorizer is not None and not await self._authorizer(web_sender):
             return
-        click = ButtonClick(chat=message.chat, message=message, sender=sender, value=value)
+        click = ButtonClick(chat=message.chat, message=message, sender=web_sender, value=value)
         for h in self._button_handlers:
             await h(click)
 
@@ -418,10 +489,17 @@ class WebTransport:
         text: str | None = None,
         option: str | None = None,
     ) -> None:
-        if self._authorizer is not None and not await self._authorizer(sender):
+        web_sender = Identity(
+            transport_id=sender.transport_id,
+            native_id=sender.native_id,
+            display_name=sender.display_name,
+            handle=self._authenticated_handle,
+            is_bot=sender.is_bot,
+        )
+        if self._authorizer is not None and not await self._authorizer(web_sender):
             return
         submission = PromptSubmission(
-            chat=prompt.chat, sender=sender, prompt=prompt, text=text, option=option,
+            chat=prompt.chat, sender=web_sender, prompt=prompt, text=text, option=option,
         )
         for h in self._prompt_handlers:
             await h(submission)

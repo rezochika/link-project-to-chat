@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from link_project_to_chat.conversation_log import (
     ASSISTANT_ROLE,
     USER_ROLE,
@@ -120,11 +122,8 @@ def test_append_skips_blank_text(tmp_path):
 def test_append_invalid_role_raises(tmp_path):
     log = _log(tmp_path)
     chat = _chat()
-    try:
+    with pytest.raises(ValueError, match="role must be"):
         log.append(chat, "system", "ignored")
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for unknown role")
 
 
 def test_format_history_block_empty_returns_empty_string():
@@ -161,6 +160,33 @@ def test_format_history_block_truncates_oversized_turns():
     assert len(user_line) <= HISTORY_TURN_CHAR_CAP + len("user: ")
     # And carries a marker so the agent knows it was truncated.
     assert "truncated" in user_line
+
+
+def test_format_history_block_has_total_size_cap():
+    from link_project_to_chat.conversation_log import HISTORY_BLOCK_CHAR_CAP
+
+    turns = [(USER_ROLE, f"{i}-" + ("x" * 4000)) for i in range(50)]
+
+    block = format_history_block(turns)
+
+    assert len(block) <= HISTORY_BLOCK_CHAR_CAP
+    # Oldest turns are discarded first so the newest conversational context
+    # survives inside the bounded block.
+    assert "user: 49-" in block
+    assert "user: 0-" not in block
+
+
+def test_format_history_block_uses_unambiguous_truncation_marker():
+    from link_project_to_chat.conversation_log import (
+        HISTORY_TRUNCATION_MARKER,
+        HISTORY_TURN_CHAR_CAP,
+    )
+
+    huge = "x" * (HISTORY_TURN_CHAR_CAP + 10)
+    block = format_history_block([(USER_ROLE, huge)])
+
+    assert HISTORY_TRUNCATION_MARKER == "[__history_truncated__]"
+    assert HISTORY_TRUNCATION_MARKER in block
 
 
 def test_clear_on_empty_log_returns_zero(tmp_path):

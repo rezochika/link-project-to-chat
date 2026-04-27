@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 
-from link_project_to_chat.backends.base import BackendCapabilities, HealthStatus
+from link_project_to_chat.backends.base import BackendCapabilities, BackendStatus, HealthStatus
 from link_project_to_chat.events import Result, StreamEvent
 
 
@@ -73,5 +73,5 @@ class FakeBackend:
         self.permissions = None if mode in (None, "default") else mode
 
     @property
-    def status(self) -> dict:
+    def status(self) -> BackendStatus:
         return {"running": False, "session_id": self.session_id}

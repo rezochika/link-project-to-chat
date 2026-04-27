@@ -435,6 +435,7 @@ def start(
             synthesizer=synthesizer,
             team_name=team,
             group_chat_id=t.group_chat_id,
+            room=t.room,
             role=role,
             active_persona=bot_cfg.active_persona,
             model=resolve_start_model(

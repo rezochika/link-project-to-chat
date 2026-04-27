@@ -90,6 +90,22 @@ async def test_overflow_rotates_into_new_message():
     assert len(t.sent_messages) >= 2
 
 
+async def test_exact_limit_does_not_rotate_into_new_message():
+    t = FakeTransport()
+    sm = StreamingMessage(t, _chat(), throttle=0, max_chars=20)
+    await sm.start()
+    await sm.append("x" * 20)
+    await sm.finalize(render=False)
+
+    assert len(t.sent_messages) == 1
+    assert t.edited_messages[-1].text == "x" * 20
+
+
+def test_prefix_must_be_shorter_than_max_chars():
+    with pytest.raises(ValueError, match="prefix"):
+        StreamingMessage(FakeTransport(), _chat(), prefix="x" * 5, max_chars=5)
+
+
 async def test_retry_after_triggers_throttle_backoff():
     """If the Transport raises TransportRetryAfter, StreamingMessage retries after the hint."""
     t = FakeTransport()

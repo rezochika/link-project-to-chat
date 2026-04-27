@@ -7,6 +7,8 @@ pytest.importorskip("fastapi")
 pytest.importorskip("aiosqlite")
 
 from link_project_to_chat.transport import (
+    Button,
+    Buttons,
     ChatKind,
     ChatRef,
     Identity,
@@ -48,6 +50,22 @@ async def test_send_text_returns_message_ref(transport: WebTransport):
     assert ref.transport_id == "web"
 
 
+async def test_send_text_persists_buttons_for_web_rendering(transport: WebTransport):
+    chat = _chat()
+
+    await transport.send_text(
+        chat,
+        "Pick one",
+        buttons=Buttons(rows=[[Button(label="Codex", value="backend_set_codex")]]),
+    )
+
+    assert transport._store is not None
+    messages = await transport._store.get_messages(chat.native_id)
+    assert messages[-1]["buttons"] == [
+        [{"label": "Codex", "value": "backend_set_codex", "style": "default"}]
+    ]
+
+
 async def test_edit_text_does_not_raise(transport: WebTransport):
     chat = _chat()
     ref = await transport.send_text(chat, "first")
@@ -77,6 +95,30 @@ async def test_inbound_command_dispatched(transport: WebTransport):
     await transport.inject_command(_chat(), _browser_sender(), "help", args=[], raw_text="/help")
 
     assert seen == ["help"]
+
+
+async def test_inbound_button_click_dispatched(transport: WebTransport):
+    seen: list[str] = []
+
+    async def handler(click) -> None:
+        seen.append(click.value)
+
+    transport.on_button(handler)
+
+    await transport._inbound_queue.put({
+        "event_type": "button_click",
+        "chat_id": "default",
+        "payload": {
+            "message_id": "7",
+            "value": "backend_set_codex",
+            "sender_native_id": "web-session:abc",
+            "sender_display_name": "Web user",
+            "sender_handle": None,
+        },
+    })
+    await asyncio.sleep(0.05)
+
+    assert seen == ["backend_set_codex"]
 
 
 async def test_prompt_lifecycle(transport: WebTransport):

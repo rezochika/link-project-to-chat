@@ -253,6 +253,32 @@ async def test_history_block_not_prepended_when_disabled(tmp_path):
     assert "Recent conversation history" not in submitted
 
 
+async def test_conversation_log_access_uses_async_wrappers(tmp_path):
+    bot = _make_bot(tmp_path)
+
+    class AsyncOnlyLog:
+        async def recent_async(self, chat, limit=10):
+            return [(USER_ROLE, "prior question")]
+
+        async def append_async(self, chat, role, text, backend=None):
+            self.appended = (role, text, backend)
+
+        def recent(self, chat, limit=10):
+            raise AssertionError("bot must not call sync recent on the event loop")
+
+        def append(self, chat, role, text, backend=None):
+            raise AssertionError("bot must not call sync append on the event loop")
+
+    log = AsyncOnlyLog()
+    bot.conversation_log = log
+
+    await bot._on_text(_incoming("new question", chat=_chat()))
+
+    submitted = _last_submitted_prompt(bot)
+    assert "user: prior question" in submitted
+    assert log.appended[0:2] == (USER_ROLE, "new question")
+
+
 async def test_assistant_reply_logged_on_task_complete(tmp_path):
     bot = _make_bot(tmp_path)
     chat = _chat()
@@ -269,7 +295,7 @@ async def test_assistant_reply_logged_on_task_complete(tmp_path):
 
     # Stub out the finalize side effects — we only care about the log capture.
     async def _noop(_t):
-        pass
+        return _t.result
     bot._finalize_claude_task = _noop  # type: ignore[assignment]
 
     await bot._on_task_complete(task)
@@ -345,7 +371,7 @@ async def test_history_visible_to_new_backend_after_swap(tmp_path):
         if t._asyncio_task is not None and not t._asyncio_task.done()
     ]
     if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.gather(*pending)
     # Simulate the assistant reply landing in the log (FakeBackend doesn't
     # finalise via `_on_task_complete` because we never wired the callback
     # path here).
