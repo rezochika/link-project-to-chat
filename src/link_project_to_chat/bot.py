@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import tempfile
 import time
 import uuid
@@ -2535,6 +2536,7 @@ class ProjectBot(AuthMixin):
                     if len(self._get_allowed_usernames()) == 1
                     else None
                 ),
+                auth_token=secrets.token_urlsafe(32),
             )
             self._app = None  # WebTransport has no PTB Application
         else:

@@ -206,9 +206,15 @@ class TaskManager:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             self._backend.close_interactive()
+            self._release_backend_slot(task.id)
         else:
-            loop.create_task(self._close_backend_interactive())
-        self._release_backend_slot(task.id)
+            async def _close_then_release() -> None:
+                try:
+                    await self._close_backend_interactive()
+                finally:
+                    self._release_backend_slot(task.id)
+
+            loop.create_task(_close_then_release())
 
     def _command_popen_kwargs(self) -> dict[str, object]:
         return _command_popen_kwargs()

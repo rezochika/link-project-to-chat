@@ -39,6 +39,29 @@ async def test_messages_partial_returns_200(app_client):
     assert resp.status_code == 200
 
 
+async def test_chat_page_requires_web_auth_token_when_configured(tmp_path: Path):
+    store = WebStore(tmp_path / "auth.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(store, inbound_queue, sse_queues, auth_token="secret-token")
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            denied = await client.get("/chat/default")
+            assert denied.status_code == 401
+
+            allowed = await client.get("/chat/default?token=secret-token")
+            assert allowed.status_code == 200
+            assert 'name="csrf_token"' in allowed.text
+
+            followup = await client.get("/chat/default/messages")
+            assert followup.status_code == 200
+    finally:
+        await store.close()
+
+
 def _csrf_token(html: str) -> str:
     match = re.search(r'name="csrf_token" value="([^"]+)"', html)
     assert match is not None

@@ -24,6 +24,7 @@ _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
 _SESSION_COOKIE = "lp2c_web_session"
 _CSRF_COOKIE = "lp2c_web_csrf"
+_AUTH_COOKIE = "lp2c_web_auth"
 
 # CA-2: cap upload size to keep RAM/disk bounded. The previous
 # `await file.read()` read the entire body into memory unconditionally.
@@ -50,6 +51,26 @@ def _attach_session_cookies(response, session_id: str, csrf_token: str) -> None:
     response.set_cookie(_CSRF_COOKIE, csrf_token, httponly=True, samesite="lax")
 
 
+def _valid_web_auth(request: Request, auth_token: str | None) -> bool:
+    if auth_token is None:
+        return True
+    supplied = request.query_params.get("token") or request.cookies.get(_AUTH_COOKIE)
+    return bool(supplied) and secrets.compare_digest(supplied, auth_token)
+
+
+def _require_web_auth(request: Request, auth_token: str | None) -> None:
+    if not _valid_web_auth(request, auth_token):
+        raise HTTPException(status_code=401, detail="Web auth token required")
+
+
+def _attach_auth_cookie(response, request: Request, auth_token: str | None) -> None:
+    if auth_token is None:
+        return
+    supplied = request.query_params.get("token")
+    if supplied and secrets.compare_digest(supplied, auth_token):
+        response.set_cookie(_AUTH_COOKIE, auth_token, httponly=True, samesite="lax")
+
+
 def _verify_csrf(request: Request, csrf_token: str) -> tuple[str, str]:
     session_id = request.cookies.get(_SESSION_COOKIE)
     expected = request.cookies.get(_CSRF_COOKIE)
@@ -64,6 +85,7 @@ def create_app(
     sse_queues: dict[str, list[asyncio.Queue]],
     *,
     authenticated_handle: str | None = None,
+    auth_token: str | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -75,6 +97,8 @@ def create_app(
 
     @app.get("/chat/{chat_id}", response_class=HTMLResponse)
     async def chat_page(request: Request, chat_id: str):
+        if not _valid_web_auth(request, auth_token):
+            return HTMLResponse("Web auth token required", status_code=401)
         session_id, csrf_token = _session_values(request)
         messages = await store.get_messages(chat_id)
         response = templates.TemplateResponse(
@@ -82,11 +106,13 @@ def create_app(
             "chat.html",
             {"chat_id": chat_id, "messages": messages, "csrf_token": csrf_token},
         )
+        _attach_auth_cookie(response, request, auth_token)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
     @app.get("/chat/{chat_id}/messages", response_class=HTMLResponse)
     async def messages_partial(request: Request, chat_id: str):
+        _require_web_auth(request, auth_token)
         session_id, csrf_token = _session_values(request)
         messages = await store.get_messages(chat_id)
         response = templates.TemplateResponse(
@@ -94,6 +120,7 @@ def create_app(
             "messages.html",
             {"messages": messages, "csrf_token": csrf_token},
         )
+        _attach_auth_cookie(response, request, auth_token)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
@@ -106,6 +133,7 @@ def create_app(
         csrf_token: str = Form(""),
         file: UploadFile | None = File(None),
     ):
+        _require_web_auth(request, auth_token)
         session_id, _ = _verify_csrf(request, csrf_token)
         files: list[dict] = []
         if file is not None and file.filename:
@@ -164,6 +192,7 @@ def create_app(
         value: str = Form(...),
         csrf_token: str = Form(""),
     ):
+        _require_web_auth(request, auth_token)
         session_id, _ = _verify_csrf(request, csrf_token)
         await inbound_queue.put({
             "event_type": "button_click",
@@ -179,7 +208,8 @@ def create_app(
         return HTMLResponse("", status_code=204)
 
     @app.get("/chat/{chat_id}/sse")
-    async def chat_sse(chat_id: str):
+    async def chat_sse(request: Request, chat_id: str):
+        _require_web_auth(request, auth_token)
         queue: asyncio.Queue = asyncio.Queue()
         sse_queues.setdefault(chat_id, []).append(queue)
 

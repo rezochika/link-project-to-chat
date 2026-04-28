@@ -187,6 +187,34 @@ async def test_dispatch_loop_logs_handler_exceptions(transport: WebTransport, ca
     ), [r.message for r in caplog.records]
 
 
+async def test_rejected_message_cleans_payload_files(transport: WebTransport, tmp_path):
+    """CA-2: files written by the HTTP layer must be removed if the
+    transport authorizer rejects the queued event before message handlers run.
+    """
+    upload_dir = tmp_path / "lp2c-web-rejected"
+    upload_dir.mkdir()
+    upload = upload_dir / "upload.txt"
+    upload.write_text("payload")
+
+    async def reject(_identity):
+        return False
+
+    transport.set_authorizer(reject)
+
+    await transport._dispatch_event({
+        "event_type": "inbound_message",
+        "chat_id": "default",
+        "payload": {
+            "text": "hello",
+            "sender_native_id": "web-session:blocked",
+            "sender_display_name": "Blocked",
+            "files": [{"path": str(upload), "original_name": "upload.txt"}],
+        },
+    })
+
+    assert not upload_dir.exists()
+
+
 async def test_web_transport_warns_critically_on_non_loopback_bind(tmp_path, caplog):
     """CA-1: there is no in-app authentication gate. Binding to a
     non-loopback address without an external reverse proxy is a deploy

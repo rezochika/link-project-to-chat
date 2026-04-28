@@ -378,6 +378,18 @@ class _FakeClaude:
         self.closed += 1
 
 
+class _AsyncCloseFakeClaude(_FakeClaude):
+    def __init__(self, turns, close_started: asyncio.Event, release_close: asyncio.Event):
+        super().__init__(turns)
+        self.close_started = close_started
+        self.release_close = release_close
+
+    async def aclose_interactive(self):
+        self.closed += 1
+        self.close_started.set()
+        await self.release_close.wait()
+
+
 def _make_tm_with_fake(tmp_path, turns, on_complete=None, on_waiting_input=None):
     async def _noop(task):
         pass
@@ -607,6 +619,50 @@ async def test_cancelling_waiting_input_task_releases_next_claude_task(tmp_path)
     assert second.status == TaskStatus.DONE
     assert tm._backend.inputs == ["start", "next"]
     assert tm._backend.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_cancel_waiting_input_holds_slot_until_backend_close_finishes(tmp_path):
+    question = Question(
+        question="Pick one",
+        header="Choice",
+        options=[QuestionOption(label="Yes", description="")],
+    )
+    turns = [
+        [AskQuestion(questions=[question]), Result(text="", session_id="s1", model=None)],
+        [Result(text="next done", session_id="s1", model=None)],
+    ]
+
+    async def _noop(task):
+        pass
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    backend = _AsyncCloseFakeClaude(turns, close_started, release_close)
+    tm = TaskManager(
+        project_path=tmp_path,
+        backend=backend,
+        on_complete=_noop,
+        on_task_started=_noop,
+    )
+
+    first = tm.submit_agent(chat=_chat(), message=_msg(), prompt="start")
+    await asyncio.wait_for(first._asyncio_task, timeout=2)
+    assert first.status == TaskStatus.WAITING_INPUT
+
+    second = tm.submit_agent(chat=_chat(), message=_msg(mid=2), prompt="next")
+    await asyncio.sleep(0.1)
+    assert second.status == TaskStatus.WAITING
+
+    assert tm.cancel(first.id) is True
+    try:
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        await asyncio.sleep(0.1)
+        assert second.status == TaskStatus.WAITING
+    finally:
+        release_close.set()
+    await asyncio.wait_for(second._asyncio_task, timeout=2)
+    assert second.status == TaskStatus.DONE
 
 
 @pytest.mark.asyncio

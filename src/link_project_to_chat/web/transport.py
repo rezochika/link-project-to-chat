@@ -61,12 +61,14 @@ class WebTransport:
         host: str = "127.0.0.1",
         port: int = 8080,
         authenticated_handle: str | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self._db_path = db_path
         self._bot_identity = bot_identity
         self._host = host
         self._port = port
         self._authenticated_handle = authenticated_handle
+        self._auth_token = auth_token
 
         # CA-1: WebTransport currently has no in-app authentication. Every
         # browser session that can reach the HTTP listener is mapped to
@@ -83,6 +85,13 @@ class WebTransport:
                 "behind an authenticating reverse proxy or restrict the "
                 "network with a firewall.",
                 host,
+            )
+        if auth_token is not None:
+            logger.warning(
+                "Web UI auth token enabled. Open http://%s:%s/chat/default?token=%s",
+                host,
+                port,
+                auth_token,
             )
 
         self._store: WebStore | None = None
@@ -113,6 +122,7 @@ class WebTransport:
             self._inbound_queue,
             self._sse_queues,
             authenticated_handle=self._authenticated_handle,
+            auth_token=self._auth_token,
         )
         config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         self._uvicorn_server = uvicorn.Server(config)
@@ -317,6 +327,8 @@ class WebTransport:
         chat_id = event.get("chat_id", "default")
         chat = ChatRef(transport_id=self.TRANSPORT_ID, native_id=chat_id, kind=ChatKind.DM)
         payload = event.get("payload", {})
+        payload_files = payload.get("files", [])
+        files_handed_to_message = False
         sender = Identity(
             transport_id=self.TRANSPORT_ID,
             native_id=payload.get("sender_native_id", BROWSER_USER_ID),
@@ -326,44 +338,46 @@ class WebTransport:
         )
         # Authorizer gate: silently drop if rejected. Mirrors the C2 DoS-defense
         # contract enforced for every transport.
-        if self._authorizer is not None and not await self._authorizer(sender):
-            return
-        text: str = payload.get("text", "")
+        try:
+            if self._authorizer is not None and not await self._authorizer(sender):
+                return
+            text: str = payload.get("text", "")
 
-        if event["event_type"] == "button_click":
-            msg_ref = MessageRef(
-                transport_id=self.TRANSPORT_ID,
-                native_id=str(payload.get("message_id", "")),
-                chat=chat,
-            )
-            click = ButtonClick(
-                chat=chat,
-                message=msg_ref,
-                sender=sender,
-                value=str(payload.get("value", "")),
-            )
-            for h in self._button_handlers:
-                await h(click)
-            return
-
-        if event["event_type"] == "inbound_message":
-            if text.startswith("/"):
-                parts = text[1:].split()
-                name = parts[0] if parts else ""
-                args = parts[1:] if len(parts) > 1 else []
+            if event["event_type"] == "button_click":
                 msg_ref = MessageRef(
                     transport_id=self.TRANSPORT_ID,
-                    native_id=str(next(self._msg_counter)),
+                    native_id=str(payload.get("message_id", "")),
                     chat=chat,
                 )
-                ci = CommandInvocation(
-                    chat=chat, sender=sender, name=name,
-                    args=args, raw_text=text, message=msg_ref,
+                click = ButtonClick(
+                    chat=chat,
+                    message=msg_ref,
+                    sender=sender,
+                    value=str(payload.get("value", "")),
                 )
-                handler = self._command_handlers.get(name)
-                if handler:
-                    await handler(ci)
-            else:
+                for h in self._button_handlers:
+                    await h(click)
+                return
+
+            if event["event_type"] == "inbound_message":
+                if text.startswith("/"):
+                    parts = text[1:].split()
+                    name = parts[0] if parts else ""
+                    args = parts[1:] if len(parts) > 1 else []
+                    msg_ref = MessageRef(
+                        transport_id=self.TRANSPORT_ID,
+                        native_id=str(next(self._msg_counter)),
+                        chat=chat,
+                    )
+                    ci = CommandInvocation(
+                        chat=chat, sender=sender, name=name,
+                        args=args, raw_text=text, message=msg_ref,
+                    )
+                    handler = self._command_handlers.get(name)
+                    if handler:
+                        await handler(ci)
+                    return
+
                 assert self._store is not None
                 db_id = await self._store.save_message(
                     chat_id=chat_id,
@@ -385,13 +399,14 @@ class WebTransport:
                     chat=chat,
                 )
                 incoming_files: list[IncomingFile] = []
-                for f in payload.get("files", []):
+                for f in payload_files:
                     incoming_files.append(IncomingFile(
                         path=Path(f["path"]),
                         original_name=f.get("original_name", "upload"),
                         mime_type=f.get("mime_type", "application/octet-stream"),
                         size_bytes=f.get("size_bytes", 0),
                     ))
+                files_handed_to_message = True
                 # Web only handles text+files via the message form; no
                 # platform-delivered media types we can't decode.
                 msg = IncomingMessage(
@@ -412,6 +427,19 @@ class WebTransport:
                         parent = f.path.parent
                         if parent and parent.exists():
                             shutil.rmtree(parent, ignore_errors=True)
+        finally:
+            if payload_files and not files_handed_to_message:
+                self._cleanup_payload_files(payload_files)
+
+    @staticmethod
+    def _cleanup_payload_files(files: list[dict[str, Any]]) -> None:
+        for f in files:
+            path = f.get("path")
+            if not path:
+                continue
+            parent = Path(path).parent
+            if parent and parent.exists():
+                shutil.rmtree(parent, ignore_errors=True)
 
     # -- Test injection helpers -------------------------------------------
     async def inject_message(
