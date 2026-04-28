@@ -428,76 +428,95 @@ class TaskManager:
     # ------------------------------------------------------------------
 
     async def _exec_command(self, task: Task) -> None:
+        # CA-3: reserve a slot atomically BEFORE any await. The previous
+        # check-then-await-then-add pattern let several concurrent /run
+        # tasks all pass the cap check before any reached the .add() call,
+        # so the max-3 limit didn't actually bind under contention.
+        # We use a negative placeholder PID (task ids are positive) so the
+        # slot is held even before subprocess.Popen returns a real PID.
         if len(self._active_run_pids) >= _MAX_CONCURRENT_RUNS:
             task.status = TaskStatus.FAILED
             task.error = f"Too many concurrent /run commands (max {_MAX_CONCURRENT_RUNS}). Wait for one to finish."
             task.finished_at = time.monotonic()
             await self._safe_callback(self._on_complete, task)
             return
+        placeholder_pid = -task.id
+        self._active_run_pids.add(placeholder_pid)
 
-        await self._safe_callback(self._on_task_started, task)
+        proc: subprocess.Popen | None = None
         try:
-            proc = subprocess.Popen(
-                task.input,
-                shell=True,
-                cwd=str(self.project_path),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                **self._command_popen_kwargs(),
-            )
-        except Exception as e:
-            logger.exception("task #%d failed to start: %s", task.id, task.input)
-            task.status = TaskStatus.FAILED
-            task.error = str(e)
-            task.finished_at = time.monotonic()
-            await self._safe_callback(self._on_complete, task)
-            return
-        setattr(proc, "_kill_process_tree", True)
-        task._proc = proc
-        self._active_run_pids.add(proc.pid)
-        logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
+            await self._safe_callback(self._on_task_started, task)
+            try:
+                proc = subprocess.Popen(
+                    task.input,
+                    shell=True,
+                    cwd=str(self.project_path),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    **self._command_popen_kwargs(),
+                )
+            except Exception as e:
+                logger.exception("task #%d failed to start: %s", task.id, task.input)
+                task.status = TaskStatus.FAILED
+                task.error = str(e)
+                task.finished_at = time.monotonic()
+                await self._safe_callback(self._on_complete, task)
+                return
+            setattr(proc, "_kill_process_tree", True)
+            task._proc = proc
+            # Swap placeholder for the real PID atomically.
+            self._active_run_pids.discard(placeholder_pid)
+            placeholder_pid = None  # type: ignore[assignment]
+            self._active_run_pids.add(proc.pid)
+            logger.info("task #%d started pid=%d: %s", task.id, proc.pid, task.input)
 
-        all_lines: list[str] = []
+            all_lines: list[str] = []
 
-        def _read_output():
-            for raw_line in proc.stdout:
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
-                all_lines.append(line)
-                task._log.append(line)
+            def _read_output():
+                for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                    all_lines.append(line)
+                    task._log.append(line)
 
-        try:
-            await asyncio.to_thread(_read_output)
-            await asyncio.to_thread(proc.wait)
-        except asyncio.CancelledError:
-            if proc.poll() is None:
-                _terminate_process_tree(proc)
-            task.status = TaskStatus.CANCELLED
+            try:
+                await asyncio.to_thread(_read_output)
+                await asyncio.to_thread(proc.wait)
+            except asyncio.CancelledError:
+                if proc.poll() is None:
+                    _terminate_process_tree(proc)
+                task.status = TaskStatus.CANCELLED
+                task.finished_at = time.monotonic()
+                task._proc = None
+                return
+
             task.finished_at = time.monotonic()
             task._proc = None
-            self._active_run_pids.discard(proc.pid)
-            return
 
-        task.finished_at = time.monotonic()
-        task._proc = None
-        self._active_run_pids.discard(proc.pid)
+            if task.status == TaskStatus.CANCELLED:
+                return
 
-        if task.status == TaskStatus.CANCELLED:
-            return
+            task.result = "\n".join(all_lines)
+            task.error = None
+            task.exit_code = proc.returncode
+            task.status = TaskStatus.DONE if proc.returncode == 0 else TaskStatus.FAILED
+            logger.info(
+                "task #%d %s in %.1fs (exit %d)",
+                task.id,
+                task.status.value,
+                task.elapsed,
+                proc.returncode,
+            )
 
-        task.result = "\n".join(all_lines)
-        task.error = None
-        task.exit_code = proc.returncode
-        task.status = TaskStatus.DONE if proc.returncode == 0 else TaskStatus.FAILED
-        logger.info(
-            "task #%d %s in %.1fs (exit %d)",
-            task.id,
-            task.status.value,
-            task.elapsed,
-            proc.returncode,
-        )
-
-        await self._safe_callback(self._on_complete, task)
+            await self._safe_callback(self._on_complete, task)
+        finally:
+            # CA-3: always release the slot, on every exit path (cap-rejection
+            # was already returned above, so we won't reach this if the slot
+            # was never reserved).
+            if placeholder_pid is not None:
+                self._active_run_pids.discard(placeholder_pid)
+            if proc is not None:
+                self._active_run_pids.discard(proc.pid)
 
     # ------------------------------------------------------------------
     # Helpers

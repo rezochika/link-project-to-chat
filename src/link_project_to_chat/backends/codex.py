@@ -240,8 +240,15 @@ class CodexBackend(BaseBackend):
                 raise CodexStreamError(self._last_error)
         finally:
             if not completed and proc.poll() is None:
-                proc.kill()
-                await asyncio.to_thread(proc.wait)
+                # CA-4: _popen sets `start_new_session=True` so the codex
+                # subprocess is a process-group leader. A bare proc.kill()
+                # only signals the leader; helper children survive. Route
+                # through the shared tree-terminator (which also waits for
+                # the proc internally) so the whole group dies with the
+                # parent. Wrapped in to_thread because it blocks on
+                # signalling + wait().
+                from ..task_manager import _terminate_process_tree
+                await asyncio.to_thread(_terminate_process_tree, proc)
             if self._proc is proc:
                 self._proc = None
                 self._started_at = None

@@ -607,3 +607,109 @@ async def test_cancelling_waiting_input_task_releases_next_claude_task(tmp_path)
     assert second.status == TaskStatus.DONE
     assert tm._backend.inputs == ["start", "next"]
     assert tm._backend.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_run_concurrency_cap_is_atomic_under_race(tmp_path, monkeypatch):
+    """CA-3: spawning many /run commands concurrently must not exceed
+    _MAX_CONCURRENT_RUNS even when the schedulings interleave their await
+    points before any has reserved a slot. The previous check-then-await
+    pattern lets several callers all pass `len(_active_run_pids) >= MAX`
+    before any reaches the .add() call.
+    """
+    from link_project_to_chat.task_manager import _MAX_CONCURRENT_RUNS
+
+    class _BlockingProc:
+        """Holds a PID but never finishes — so once started, it occupies a
+        slot for the duration of the test."""
+        _next_pid = 9000
+        def __init__(self):
+            type(self)._next_pid += 1
+            self.pid = type(self)._next_pid
+            self._returncode = None
+            self.stdout = iter([])  # no output, but readable
+            self.terminated = False
+
+        def poll(self):
+            return self._returncode
+
+        def wait(self, timeout=None):
+            # Pretend to block forever (shorter than timeout to avoid hangs):
+            # the test will cancel the asyncio tasks before they actually
+            # exhaust this. asyncio.to_thread will yield while we wait.
+            if self._returncode is None:
+                # Make this a very short wait so the test doesn't hang.
+                # In practice the test cancels via asyncio_task.cancel()
+                # before this returns.
+                import time as _t
+                _t.sleep(0.5)
+                self._returncode = -9
+            return self._returncode
+
+        def kill(self):
+            self.terminated = True
+            self._returncode = -9
+
+    def fake_popen(*args, **kwargs):
+        return _BlockingProc()
+
+    monkeypatch.setattr(task_manager_module.subprocess, "Popen", fake_popen)
+
+    started: list[Task] = []
+
+    async def _on_started(task: Task) -> None:
+        # Insert an await so multiple /run tasks hit this point before any
+        # reaches the post-await `.add()` — exposes the race.
+        started.append(task)
+        await asyncio.sleep(0.02)
+
+    async def _on_complete(task: Task) -> None:
+        pass
+
+    tm = TaskManager(
+        project_path=tmp_path,
+        backend=FakeBackend(tmp_path),
+        on_complete=_on_complete,
+        on_task_started=_on_started,
+    )
+
+    # Schedule 2x the cap concurrently.
+    n = _MAX_CONCURRENT_RUNS * 2
+    tasks = [
+        tm.run_command(chat=_chat(), message=_msg(mid=i), command=f"sleep {i}")
+        for i in range(n)
+    ]
+
+    # Let the dispatcher process all of them.
+    await asyncio.sleep(0.2)
+
+    # Count how many actually reached the running slot — i.e. were allowed
+    # to spawn a process. Sum across `_active_run_pids` (live procs) PLUS
+    # tasks that have already moved past the slot acquisition this turn.
+    failed_with_cap = [
+        t for t in tasks
+        if t.status == TaskStatus.FAILED
+        and t.error
+        and "Too many concurrent" in t.error
+    ]
+    running = [t for t in tasks if t.status == TaskStatus.RUNNING]
+
+    # The atomic cap means: at MOST _MAX_CONCURRENT_RUNS are RUNNING at
+    # any one time, and the rest fail fast with the cap error.
+    assert len(running) <= _MAX_CONCURRENT_RUNS, (
+        f"Race violation: {len(running)} tasks RUNNING simultaneously "
+        f"(max should be {_MAX_CONCURRENT_RUNS}). Failed-with-cap: {len(failed_with_cap)}."
+    )
+    assert len(failed_with_cap) == n - _MAX_CONCURRENT_RUNS, (
+        f"Expected {n - _MAX_CONCURRENT_RUNS} tasks to fail with cap message, "
+        f"got {len(failed_with_cap)}. Running: {len(running)}."
+    )
+
+    # Cleanup: cancel the still-running tasks so the test exits.
+    for t in tasks:
+        if t._asyncio_task and not t._asyncio_task.done():
+            t._asyncio_task.cancel()
+    for t in tasks:
+        if t._asyncio_task:
+            with __import__("contextlib").suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(t._asyncio_task, timeout=2.0)

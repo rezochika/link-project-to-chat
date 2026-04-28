@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import shutil
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from typing import Any
 
 import uvicorn
@@ -64,6 +67,23 @@ class WebTransport:
         self._host = host
         self._port = port
         self._authenticated_handle = authenticated_handle
+
+        # CA-1: WebTransport currently has no in-app authentication. Every
+        # browser session that can reach the HTTP listener is mapped to
+        # `authenticated_handle` (typically the single allowed username) and
+        # passes the authorizer. The default bind is loopback, so the
+        # implicit trust boundary is "anyone on the host". Binding to a
+        # non-loopback address without an external auth proxy is a deploy
+        # misconfiguration; loud-log so operators can't miss it.
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            logger.critical(
+                "WebTransport is binding to a non-loopback host (%r) but has "
+                "NO in-app authentication. Anyone who can reach this listener "
+                "is treated as the configured allowed user. Put the bot "
+                "behind an authenticating reverse proxy or restrict the "
+                "network with a firewall.",
+                host,
+            )
 
         self._store: WebStore | None = None
         self._inbound_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -287,8 +307,11 @@ class WebTransport:
             try:
                 await self._dispatch_event(event)
             except Exception:
-                # Best-effort dispatch: don't let one bad event kill the loop.
-                pass
+                # Best-effort dispatch: don't let one bad event kill the
+                # loop, but DO surface the failure in logs so a broken
+                # command/button doesn't look like a silent no-op to the
+                # operator. (CA-5.)
+                logger.exception("Web dispatch failed: %r", event)
 
     async def _dispatch_event(self, event: dict[str, Any]) -> None:
         chat_id = event.get("chat_id", "default")

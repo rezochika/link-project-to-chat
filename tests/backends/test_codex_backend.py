@@ -299,6 +299,43 @@ async def test_chat_stream_kills_proc_on_generator_close(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_early_close_uses_process_tree_terminator(tmp_path, monkeypatch):
+    """CA-4: when chat_stream exits early (cancellation, exception, generator
+    close before turn.completed), the cleanup must use _terminate_process_tree
+    so the whole process group dies — Codex is launched in a new session
+    (`start_new_session=True`), so a bare proc.kill() would leak children.
+    """
+    from link_project_to_chat import task_manager as tm_mod
+
+    line = json.dumps({"type": "item.completed", "item": {
+        "id": "i0", "type": "agent_message", "text": "partial",
+    }})
+    proc = _FakeProc([line], returncode=None)
+    setattr(proc, "_kill_process_tree", True)  # mirrors _popen for grouped procs
+
+    backend = CodexBackend(tmp_path, {})
+    monkeypatch.setattr(backend, "_popen", lambda cmd: proc)
+
+    tree_kills: list = []
+    real_terminator = tm_mod._terminate_process_tree
+
+    def spy(p):
+        tree_kills.append(p)
+        real_terminator(p)
+
+    monkeypatch.setattr(tm_mod, "_terminate_process_tree", spy)
+
+    gen = backend.chat_stream("hello")
+    await gen.__anext__()
+    await gen.aclose()
+
+    assert tree_kills == [proc], (
+        "Early-close cleanup must call _terminate_process_tree, not bare proc.kill(); "
+        "otherwise Codex children in the same process group survive."
+    )
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_logs_post_turn_nonzero_exit(tmp_path, monkeypatch, caplog):
     """A non-zero exit that arrives after a syntactically complete turn must
     be surfaced (was silently swallowed by the early return)."""

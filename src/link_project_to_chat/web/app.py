@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,15 @@ _TEMPLATES_DIR = Path(__file__).parent / "templates"
 _STATIC_DIR = Path(__file__).parent / "static"
 _SESSION_COOKIE = "lp2c_web_session"
 _CSRF_COOKIE = "lp2c_web_csrf"
+
+# CA-2: cap upload size to keep RAM/disk bounded. The previous
+# `await file.read()` read the entire body into memory unconditionally.
+# 25 MB is chosen as a generous cap for screenshots and short audio clips
+# while rejecting accidental dumps and bulk-upload abuse. Operators can
+# override per-deployment by editing this constant; a future env-var
+# override is trivial if needed.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_UPLOAD_CHUNK = 64 * 1024
 
 
 def _new_token() -> str:
@@ -99,16 +109,37 @@ def create_app(
         session_id, _ = _verify_csrf(request, csrf_token)
         files: list[dict] = []
         if file is not None and file.filename:
+            # CA-2: stream to disk in chunks with a hard size cap so a
+            # multi-GB upload can't fill memory + disk before any auth
+            # check. Always clean the tempdir on failure paths.
             tmpdir = tempfile.mkdtemp(prefix="lp2c-web-")
-            # Sanitize filename: strip path separators
             safe_name = file.filename.replace("/", "_").replace("\\", "_") or "upload"
             dest = Path(tmpdir) / safe_name
-            dest.write_bytes(await file.read())
+            total = 0
+            try:
+                with dest.open("wb") as out:
+                    while True:
+                        chunk = await file.read(_UPLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_UPLOAD_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"Upload exceeds maximum size "
+                                    f"({MAX_UPLOAD_BYTES} bytes)."
+                                ),
+                            )
+                        out.write(chunk)
+            except BaseException:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
             files.append({
                 "path": str(dest),
                 "original_name": safe_name,
                 "mime_type": file.content_type or "application/octet-stream",
-                "size_bytes": dest.stat().st_size,
+                "size_bytes": total,
             })
         payload = {
             "text": text,
