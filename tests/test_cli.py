@@ -430,6 +430,43 @@ def test_start_team_passes_structured_room_binding(tmp_path, monkeypatch):
     assert calls[0][1]["room"] == room
 
 
+def test_run_bot_accepts_structured_room_binding(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import link_project_to_chat.bot as bot_mod
+    from link_project_to_chat.config import RoomBinding
+
+    room = RoomBinding(transport_id="telegram", native_id="-100123")
+    captured: dict[str, object] = {}
+
+    class FakeProjectBot:
+        def __init__(self, *args, **kwargs):
+            captured["kwargs"] = kwargs
+            self.task_manager = SimpleNamespace(
+                backend=SimpleNamespace(session_id=None, model=None, effort=None)
+            )
+
+        def build(self):
+            pass
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(bot_mod, "ProjectBot", FakeProjectBot)
+
+    bot_mod.run_bot(
+        "acme_dev",
+        tmp_path,
+        "token",
+        allowed_usernames=["alice"],
+        team_name="acme",
+        role="dev",
+        room=room,
+    )
+
+    assert captured["kwargs"]["room"] == room
+
+
 def test_start_team_applies_default_model(tmp_path, monkeypatch):
     """When no --model is given, team bots should fall back to config.default_model."""
     import link_project_to_chat.cli as cli
