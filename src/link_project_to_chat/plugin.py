@@ -95,11 +95,27 @@ class PluginContext:
         Accepts an int chat_id (legacy GitLab API) or a ChatRef (new style).
         Returns whatever the underlying send_text returned, or None when no
         send mechanism is wired.
+
+        The legacy `_send` path forwards all kwargs (plugins ported from the
+        GitLab fork may rely on Telegram-specific kwargs like parse_mode).
+        The Transport fallback filters to keys Transport.send_text accepts;
+        anything else is dropped with a WARNING so the call doesn't TypeError
+        against the modern API surface.
         """
         if self._send is not None:
             return await self._send(chat_id, text, **kwargs)
         if self.transport is None:
             return None
+        _SEND_TEXT_KEYS = {"buttons", "html", "reply_to"}
+        safe_kwargs = {k: v for k, v in kwargs.items() if k in _SEND_TEXT_KEYS}
+        dropped = set(kwargs) - _SEND_TEXT_KEYS
+        if dropped:
+            logger.warning(
+                "PluginContext.send_message dropped unsupported kwargs %r "
+                "(Transport.send_text accepts only %s); ported plugins should "
+                "either route through self._send or use Transport-native kwargs.",
+                sorted(dropped), sorted(_SEND_TEXT_KEYS),
+            )
         from .transport.base import ChatKind, ChatRef
         if isinstance(chat_id, ChatRef):
             chat = chat_id
@@ -109,7 +125,7 @@ class PluginContext:
                 native_id=str(chat_id),
                 kind=ChatKind.DM,
             )
-        return await self.transport.send_text(chat, text, **kwargs)
+        return await self.transport.send_text(chat, text, **safe_kwargs)
 
     def is_allowed(self, identity) -> bool:
         """Live check: is this identity currently in the bot's allow-list?

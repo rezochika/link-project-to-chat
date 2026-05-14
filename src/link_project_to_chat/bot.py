@@ -52,6 +52,7 @@ from .transport import Button, Buttons, ChatKind, ChatRef, Identity, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
+from .plugin import BotCommand, Plugin, PluginContext, load_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,41 @@ def _parse_task_id(data: str) -> int:
     return int(data.split("_")[-1])
 
 
+def _topo_sort(plugins: "list[Plugin]") -> "list[Plugin]":
+    """Order plugins so each comes after the plugins it depends_on.
+
+    Missing dependencies are logged but do not drop the plugin (best-effort).
+    """
+    by_name = {p.name: p for p in plugins}
+    visited: set[str] = set()
+    temp: set[str] = set()
+    out: list[Plugin] = []
+
+    def visit(p: Plugin) -> None:
+        if p.name in visited:
+            return
+        if p.name in temp:
+            logger.warning("plugin dependency cycle involving %s", p.name)
+            return
+        temp.add(p.name)
+        for dep in p.depends_on:
+            target = by_name.get(dep)
+            if target is None:
+                logger.warning(
+                    "plugin %s depends_on %s which is not installed; ignoring",
+                    p.name, dep,
+                )
+                continue
+            visit(target)
+        temp.discard(p.name)
+        visited.add(p.name)
+        out.append(p)
+
+    for p in plugins:
+        visit(p)
+    return out
+
+
 class ProjectBot(AuthMixin):
     def __init__(
         self,
@@ -123,6 +159,9 @@ class ProjectBot(AuthMixin):
         context_enabled: bool = True,
         context_history_limit: int = 10,
         conversation_log: ConversationLog | None = None,
+        plugins: list[dict] | None = None,
+        allowed_users: list | None = None,
+        auth_source: str = "project",
     ):
         self.name = name
         self.path = path.resolve()
@@ -233,6 +272,17 @@ class ProjectBot(AuthMixin):
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
         self._probe_tasks: set[asyncio.Task] = set()
+        # Plugin framework state. Populated in _after_ready after transport is ready.
+        self._plugin_configs: list[dict] = list(plugins or [])
+        self._plugins: list[Plugin] = []
+        self._plugin_command_handlers: dict[str, list] = {}
+        self._shared_ctx: PluginContext | None = None
+        # Sole auth + authority source. Empty list → fail-closed (no users authorized).
+        self._allowed_users: list = list(allowed_users or [])
+        # Track which scope this allow-list came from so _persist_auth_if_dirty
+        # writes back to the right place. "project" for per-project lists,
+        # "global" when run_bots used the Config.allowed_users fallback.
+        self._auth_source: str = auth_source if auth_source in ("project", "global") else "project"
 
     @property
     def _claude(self) -> ClaudeBackend:
@@ -454,6 +504,7 @@ class ProjectBot(AuthMixin):
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(task.chat, event.path, reply_to=task.message)
+            await self._dispatch_plugin_tool_use(event)
 
     async def _send_html(
         self,
@@ -770,6 +821,7 @@ class ProjectBot(AuthMixin):
                 await self._log_assistant_turn(task.chat, assistant_text)
         else:
             await self._finalize_command_task(task)
+        await self._dispatch_plugin_task_complete(task)
 
     def _question_buttons(self, task_id: int, q_idx: int, question: Question) -> Buttons:
         rows: list[list[Button]] = []
@@ -998,6 +1050,7 @@ class ProjectBot(AuthMixin):
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
         prompt = await self._history_block(chat) + prompt
+        prompt = self._plugin_context_prepend(prompt)
         return prompt
 
     async def _on_text(self, incoming) -> None:
@@ -1021,6 +1074,10 @@ class ProjectBot(AuthMixin):
             await self._transport.send_text(
                 incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
             )
+            return
+
+        consumed = await self._dispatch_plugin_on_message(incoming)
+        if consumed:
             return
 
         if incoming.has_unsupported_media:
@@ -1965,6 +2022,8 @@ class ProjectBot(AuthMixin):
         value = click.value
         msg_ref = click.message
         chat = click.chat
+        if await self._dispatch_plugin_button(click):
+            return
 
         if value.startswith("model_set_"):
             name = value[len("model_set_"):]
@@ -2482,6 +2541,236 @@ class ProjectBot(AuthMixin):
         except asyncio.CancelledError:
             pass
 
+    async def _dispatch_plugin_on_message(self, msg) -> bool:
+        """Fire on_message for each plugin. Return True if ANY plugin consumed.
+
+        Tolerates ``ProjectBot.__new__``-built stubs that skip plugin-state
+        initialization — they implicitly behave as "no plugins loaded".
+        """
+        consumed = False
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                if await plugin.on_message(msg):
+                    consumed = True
+            except Exception:
+                logger.warning("plugin %s on_message failed", plugin.name, exc_info=True)
+        return consumed
+
+    async def _dispatch_plugin_button(self, click) -> bool:
+        """Fire on_button for each plugin. Return True if ANY plugin consumed."""
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                if await plugin.on_button(click):
+                    return True
+            except Exception:
+                logger.warning("plugin %s on_button failed", plugin.name, exc_info=True)
+        return False
+
+    async def _dispatch_plugin_tool_use(self, event) -> None:
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                await plugin.on_tool_use(event.tool, event.path)
+            except Exception:
+                logger.warning("plugin %s on_tool_use failed", plugin.name, exc_info=True)
+
+    async def _dispatch_plugin_task_complete(self, task) -> None:
+        if task.status == TaskStatus.CANCELLED:
+            return
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                await plugin.on_task_complete(task)
+            except Exception:
+                logger.warning("plugin %s on_task_complete failed", plugin.name, exc_info=True)
+
+    def _plugin_context_prepend(self, prompt: str) -> str:
+        """Prepend get_context() outputs to a Claude prompt.
+
+        Only active when the current backend is Claude. Non-Claude backends
+        (Codex, future Gemini) don't accept arbitrary system-prompt prepends
+        the same way, so plugins that care should branch on ctx.backend_name.
+        """
+        if getattr(self, "_backend_name", None) != "claude":
+            return prompt
+        parts: list[str] = []
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                ctx = plugin.get_context()
+            except Exception:
+                logger.warning("plugin %s get_context failed", plugin.name, exc_info=True)
+                continue
+            if ctx:
+                parts.append(ctx)
+        if not parts:
+            return prompt
+        return "\n\n".join(parts) + "\n\n---\n\n" + prompt
+
+    def _wrap_plugin_command(self, plugin, bc):
+        """Wrap a plugin command handler with auth + role gating + persist.
+
+        Three guards:
+        1. **Active-plugin check.** If `plugin.start()` failed (we removed
+           the plugin from `self._plugins`), the registered command handler
+           silently no-ops. Without this, a failed plugin would still serve
+           half-initialized state via its commands.
+        2. **Auth + role gate.** `_auth_identity` then `_require_executor`
+           (unless `bc.viewer_ok=True`). Same pattern as `_guard_executor`,
+           inlined here because `_guard_executor` expects an `IncomingMessage`
+           or `CommandInvocation` shape that matches the core handler chain.
+        3. **try/finally persist.** Plugin commands can append a first-
+           contact identity (via `_auth_identity` → `_get_user_role`). The
+           `finally` block calls `_persist_auth_if_dirty` so that lock isn't
+           lost when the plugin handler exits — including the viewer-denied
+           and exception paths.
+        """
+        from functools import wraps
+        handler = bc.handler
+        viewer_ok = bc.viewer_ok
+        plugin_ref = plugin  # captured for the active-plugin check
+
+        @wraps(handler)
+        async def _wrapped(invocation):
+            try:
+                # 1. Active-plugin check — plugin may have been removed from
+                #    self._plugins after its start() failed.
+                if plugin_ref not in self._plugins:
+                    logger.debug(
+                        "Plugin %s command %r invoked after start failure; "
+                        "ignoring",
+                        plugin_ref.name, bc.command,
+                    )
+                    return
+                # 2a. Auth (defense-in-depth; transport's authorizer already gated).
+                if not self._auth_identity(invocation.sender):
+                    return
+                # 2b. Role gate (unless viewer_ok).
+                if not viewer_ok and not self._require_executor(invocation.sender):
+                    assert self._transport is not None
+                    await self._transport.send_text(
+                        invocation.chat,
+                        "Read-only access — your role is viewer.",
+                        reply_to=invocation.message,
+                    )
+                    return
+                await handler(invocation)
+            finally:
+                # 3. Always persist any first-contact lock the auth checks
+                #    above may have appended.
+                await self._persist_auth_if_dirty()
+
+        return _wrapped
+
+    async def _init_plugins(self) -> None:
+        """Instantiate, register, and start plugins. Called from _after_ready."""
+        if not self._plugin_configs or self._transport is None:
+            return
+        # PluginContext field provenance:
+        #   bot_name / project_path / bot_username / backend_name / transport
+        #     — sourced from ProjectBot state (set in __init__ / _after_ready).
+        #   data_dir — fixed convention `~/.link-project-to-chat/meta/<bot_name>`;
+        #     created with mkdir below.
+        #   _identity_resolver — live bound method (see comment inline).
+        #   web_port / public_url / register_in_app_web_handler — INTENTIONALLY
+        #     left at their None defaults in v1.0.0. They're API surface
+        #     reserved for the future external in-app-web-server plugin and
+        #     would be populated by a follow-up spec that wires bot.py to the
+        #     Web transport's port / public URL and registers an HTTP-route
+        #     callback. Plugins that need them must check for None and
+        #     degrade gracefully (documented in PluginContext's docstring).
+        self._shared_ctx = PluginContext(
+            bot_name=self.name,
+            project_path=self.path,
+            bot_username=self.bot_username,
+            data_dir=Path.home() / ".link-project-to-chat" / "meta" / self.name,
+            backend_name=self._backend_name,
+            transport=self._transport,
+            # LIVE identity resolver. Plugins call ctx.is_allowed(identity) /
+            # ctx.is_executor(identity); the helpers consult the bot's
+            # _allowed_users at call time, so locks added AFTER plugin init
+            # (e.g., a user first-contacting from a new transport later)
+            # are visible. The earlier draft snapshotted allowed_identities /
+            # executor_identities as flat lists here — that went stale.
+            _identity_resolver=self._get_user_role,
+        )
+        self._shared_ctx.data_dir.mkdir(parents=True, exist_ok=True)
+
+        for cfg in self._plugin_configs:
+            pname = cfg.get("name")
+            if not pname:
+                logger.warning("skipping plugin entry without 'name': %r", cfg)
+                continue
+            plugin = load_plugin(pname, self._shared_ctx, cfg)
+            if plugin:
+                self._plugins.append(plugin)
+
+        # Core command names plugins are NOT allowed to shadow. Sourced from
+        # `ported_commands` in bot.py:build()/setup; keep in sync if a new
+        # core command is added.
+        CORE_COMMAND_NAMES: set[str] = {
+            "help", "version", "status", "tasks", "backend", "model", "effort",
+            "thinking", "context", "permissions", "compact", "reset", "skills",
+            "stop_skill", "create_skill", "delete_skill", "persona",
+            "stop_persona", "create_persona", "delete_persona", "lang", "start",
+            "run", "voice", "halt", "resume",
+        }
+
+        # Track which plugin owns which command so we can detect duplicates
+        # across plugins (last-load-wins is silently wrong — plugins should
+        # not clobber each other).
+        registered_command_owner: dict[str, str] = {}
+
+        # Register each plugin's commands on the transport.
+        for plugin in self._plugins:
+            try:
+                cmds = plugin.commands()
+            except Exception:
+                logger.warning("plugin %s commands() failed; skipping plugin", plugin.name, exc_info=True)
+                continue
+            for bc in cmds:
+                name = bc.command
+                if name in CORE_COMMAND_NAMES:
+                    logger.warning(
+                        "Plugin %s tried to register reserved core command /%s; "
+                        "ignoring this command (other commands from this plugin "
+                        "remain registered)",
+                        plugin.name, name,
+                    )
+                    continue
+                prior_owner = registered_command_owner.get(name)
+                if prior_owner is not None:
+                    logger.warning(
+                        "Plugin %s tried to register /%s already claimed by "
+                        "plugin %s; ignoring",
+                        plugin.name, name, prior_owner,
+                    )
+                    continue
+                wrapped = self._wrap_plugin_command(plugin, bc)
+                self._transport.on_command(name, wrapped)
+                self._plugin_command_handlers.setdefault(plugin.name, []).append(name)
+                registered_command_owner[name] = plugin.name
+
+        # Start plugins in dependency order; on failure, "unregister" by
+        # removing from _plugins so further dispatch skips them. Transport
+        # doesn't expose remove-handler, so the registered command stays
+        # wired but its plugin is dead — log clearly so this is visible.
+        for plugin in _topo_sort(list(self._plugins)):
+            try:
+                await plugin.start()
+            except Exception:
+                logger.warning(
+                    "plugin %s start failed; removing from dispatch (commands %s remain inert)",
+                    plugin.name, self._plugin_command_handlers.get(plugin.name, []),
+                    exc_info=True,
+                )
+                if plugin in self._plugins:
+                    self._plugins.remove(plugin)
+
+    async def _shutdown_plugins(self) -> None:
+        for plugin in reversed(self._plugins):
+            try:
+                await plugin.stop()
+            except Exception:
+                logger.warning("plugin %s stop failed", plugin.name, exc_info=True)
+
     async def _after_ready(self, self_identity) -> None:
         """Called once after Transport.start() completes platform post-init.
 
@@ -2495,6 +2784,7 @@ class ProjectBot(AuthMixin):
         if self.team_name and self.role and self.bot_username:
             self._backfill_own_bot_username()
         self._refresh_team_system_note()
+        await self._init_plugins()
 
         # Startup ping to trusted users. Skipped for team bots: they live in
         # the team supergroup and have no DM with trusted users, so every send
@@ -2544,6 +2834,7 @@ class ProjectBot(AuthMixin):
             self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
             self._app = self._transport.app  # PTB Application
         self._transport.on_ready(self._after_ready)
+        self._transport.on_stop(self._shutdown_plugins)
 
         async def _pre_authorize(identity) -> bool:
             return self._auth_identity(identity)
@@ -2679,6 +2970,9 @@ def run_bot(
     backend_state: dict[str, dict] | None = None,
     context_enabled: bool = True,
     context_history_limit: int = 10,
+    plugins: list[dict] | None = None,
+    allowed_users: list | None = None,
+    auth_source: str = "project",
 ) -> None:
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not effective_usernames:
@@ -2719,6 +3013,9 @@ def run_bot(
         backend_state=backend_state,
         context_enabled=context_enabled,
         context_history_limit=context_history_limit,
+        plugins=plugins,
+        allowed_users=allowed_users,
+        auth_source=auth_source,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -2792,6 +3089,11 @@ def run_bots(
             backend_state=proj.backend_state,
             context_enabled=proj.context_enabled,
             context_history_limit=proj.context_history_limit,
+            plugins=getattr(proj, "plugins", None) or None,
+            allowed_users=getattr(proj, "allowed_users", None) or None,
+            # auth_source defaults to "project" for now; Task 4 Step 6 replaces this
+            # block with the resolve_project_allowed_users helper that returns
+            # (users, source).
         )
     else:
         names = ", ".join(config.projects.keys())
