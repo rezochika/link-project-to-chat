@@ -232,15 +232,16 @@ class PluginContext:
     backend_name: str = "claude"
     transport: "Transport | None" = field(default=None, repr=False)
 
-    # Identity strings: "transport_id:native_id" (e.g. "telegram:12345",
-    # "discord:abc-snowflake", "web:web-session:abc-def"). Transport-portable
-    # — replaces the GitLab `allowed_user_ids: list[int]` design.
-    # These are FLATTENED from every AllowedUser's locked_identities list, so a
-    # multi-transport user contributes multiple entries (one per transport
-    # they've contacted from). Plugins that gate themselves iterate these
-    # lists; matching any entry counts.
-    allowed_identities: list[str] = field(default_factory=list)
-    executor_identities: list[str] = field(default_factory=list)
+    # LIVE helpers that consult the bot's current _allowed_users on each call.
+    # Plugins call ctx.is_allowed(identity) / ctx.is_executor(identity) to gate
+    # themselves; the helpers see freshly-appended locked_identities (e.g., a
+    # user who first-contacted from a new transport AFTER bot startup).
+    # The earlier draft snapshotted these as `allowed_identities: list[str]` /
+    # `executor_identities: list[str]` at plugin init — that went stale after
+    # the first first-contact lock and gave plugins an incorrect view.
+    _identity_resolver: "Callable[[Any], str | None] | None" = field(default=None, repr=False)
+    # ProjectBot wires _identity_resolver to a bound method that looks up
+    # the role for an Identity from self._allowed_users at call time.
 
     web_port: int | None = None
     public_url: str | None = None
@@ -271,6 +272,23 @@ class PluginContext:
                 kind=ChatKind.DM,
             )
         return await self.transport.send_text(chat, text, **kwargs)
+
+    def is_allowed(self, identity) -> bool:
+        """Live check: is this identity currently in the bot's allow-list?
+
+        Reads the bot's _allowed_users at call time (not a snapshot), so
+        plugins see users who first-contacted from a new transport after
+        startup.
+        """
+        if self._identity_resolver is None:
+            return False
+        return self._identity_resolver(identity) is not None
+
+    def is_executor(self, identity) -> bool:
+        """Live check: does this identity currently have the executor role?"""
+        if self._identity_resolver is None:
+            return False
+        return self._identity_resolver(identity) == "executor"
 
 
 class Plugin:
@@ -307,9 +325,9 @@ class Plugin:
         """Called for every authorized incoming text message.
 
         Viewer policy: fires for executor AND viewer users. Plugins gate themselves
-        if they care about role — check `_identity_key(msg.sender)` against
-        `self._ctx.executor_identities`. Return True to consume (skip backend);
-        False to let the primary path proceed.
+        if they care about role — call `self._ctx.is_executor(msg.sender)` (live
+        helper that consults the bot's current allow-list). Return True to consume
+        (skip backend); False to let the primary path proceed.
         """
         return False
 
@@ -1094,27 +1112,58 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
             return prompt
         return "\n\n".join(parts) + "\n\n---\n\n" + prompt
 
-    def _wrap_plugin_command(self, bc):
-        """Wrap a plugin command handler with auth + role gating."""
+    def _wrap_plugin_command(self, plugin, bc):
+        """Wrap a plugin command handler with auth + role gating + persist.
+
+        Three guards:
+        1. **Active-plugin check.** If `plugin.start()` failed (we removed
+           the plugin from `self._plugins`), the registered command handler
+           silently no-ops. Without this, a failed plugin would still serve
+           half-initialized state via its commands.
+        2. **Auth + role gate.** `_auth_identity` then `_require_executor`
+           (unless `bc.viewer_ok=True`). Same pattern as `_guard_executor`,
+           inlined here because `_guard_executor` expects an `IncomingMessage`
+           or `CommandInvocation` shape that matches the core handler chain.
+        3. **try/finally persist.** Plugin commands can append a first-
+           contact identity (via `_auth_identity` → `_get_user_role`). The
+           `finally` block calls `_persist_auth_if_dirty` so that lock isn't
+           lost when the plugin handler exits — including the viewer-denied
+           and exception paths.
+        """
         from functools import wraps
         handler = bc.handler
         viewer_ok = bc.viewer_ok
+        plugin_ref = plugin  # captured for the active-plugin check
 
         @wraps(handler)
         async def _wrapped(invocation):
-            # Defense-in-depth: transport's set_authorizer already gated, but
-            # cheap and avoids drift if a plugin re-registers from elsewhere.
-            if not self._auth_identity(invocation.sender):
-                return
-            if not viewer_ok and not self._require_executor(invocation.sender):
-                assert self._transport is not None
-                await self._transport.send_text(
-                    invocation.chat,
-                    "Read-only access — your role is viewer.",
-                    reply_to=invocation.message,
-                )
-                return
-            await handler(invocation)
+            try:
+                # 1. Active-plugin check — plugin may have been removed from
+                #    self._plugins after its start() failed.
+                if plugin_ref not in self._plugins:
+                    logger.debug(
+                        "Plugin %s command %r invoked after start failure; "
+                        "ignoring",
+                        plugin_ref.name, bc.command,
+                    )
+                    return
+                # 2a. Auth (defense-in-depth; transport's authorizer already gated).
+                if not self._auth_identity(invocation.sender):
+                    return
+                # 2b. Role gate (unless viewer_ok).
+                if not viewer_ok and not self._require_executor(invocation.sender):
+                    assert self._transport is not None
+                    await self._transport.send_text(
+                        invocation.chat,
+                        "Read-only access — your role is viewer.",
+                        reply_to=invocation.message,
+                    )
+                    return
+                await handler(invocation)
+            finally:
+                # 3. Always persist any first-contact lock the auth checks
+                #    above may have appended.
+                await self._persist_auth_if_dirty()
 
         return _wrapped
 
@@ -1129,18 +1178,13 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
             data_dir=Path.home() / ".link-project-to-chat" / "meta" / self.name,
             backend_name=self._backend_name,
             transport=self._transport,
-            # Build identity-string lists from _allowed_users by FLATTENING
-            # each AllowedUser.locked_identities list. Transport-portable: works
-            # for telegram:, web:, future discord:/slack: prefixes alike. A
-            # multi-transport user contributes one entry per transport.
-            allowed_identities=[
-                ident for u in self._allowed_users for ident in u.locked_identities
-            ],
-            executor_identities=[
-                ident for u in self._allowed_users
-                if u.role == "executor"
-                for ident in u.locked_identities
-            ],
+            # LIVE identity resolver. Plugins call ctx.is_allowed(identity) /
+            # ctx.is_executor(identity); the helpers consult the bot's
+            # _allowed_users at call time, so locks added AFTER plugin init
+            # (e.g., a user first-contacting from a new transport later)
+            # are visible. The earlier draft snapshotted allowed_identities /
+            # executor_identities as flat lists here — that went stale.
+            _identity_resolver=self._get_user_role,
         )
         self._shared_ctx.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1153,6 +1197,22 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
             if plugin:
                 self._plugins.append(plugin)
 
+        # Core command names plugins are NOT allowed to shadow. Sourced from
+        # `ported_commands` in bot.py:build()/setup; keep in sync if a new
+        # core command is added.
+        CORE_COMMAND_NAMES: set[str] = {
+            "help", "version", "status", "tasks", "backend", "model", "effort",
+            "thinking", "context", "permissions", "compact", "reset", "skills",
+            "stop_skill", "create_skill", "delete_skill", "persona",
+            "stop_persona", "create_persona", "delete_persona", "lang", "start",
+            "run", "voice", "halt", "resume",
+        }
+
+        # Track which plugin owns which command so we can detect duplicates
+        # across plugins (last-load-wins is silently wrong — plugins should
+        # not clobber each other).
+        registered_command_owner: dict[str, str] = {}
+
         # Register each plugin's commands on the transport.
         for plugin in self._plugins:
             try:
@@ -1161,9 +1221,27 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
                 logger.warning("plugin %s commands() failed; skipping plugin", plugin.name, exc_info=True)
                 continue
             for bc in cmds:
-                wrapped = self._wrap_plugin_command(bc)
-                self._transport.on_command(bc.command, wrapped)
-                self._plugin_command_handlers.setdefault(plugin.name, []).append(bc.command)
+                name = bc.command
+                if name in CORE_COMMAND_NAMES:
+                    logger.warning(
+                        "Plugin %s tried to register reserved core command /%s; "
+                        "ignoring this command (other commands from this plugin "
+                        "remain registered)",
+                        plugin.name, name,
+                    )
+                    continue
+                prior_owner = registered_command_owner.get(name)
+                if prior_owner is not None:
+                    logger.warning(
+                        "Plugin %s tried to register /%s already claimed by "
+                        "plugin %s; ignoring",
+                        plugin.name, name, prior_owner,
+                    )
+                    continue
+                wrapped = self._wrap_plugin_command(plugin, bc)
+                self._transport.on_command(name, wrapped)
+                self._plugin_command_handlers.setdefault(plugin.name, []).append(name)
+                registered_command_owner[name] = plugin.name
 
         # Start plugins in dependency order; on failure, "unregister" by
         # removing from _plugins so further dispatch skips them. Transport
@@ -2407,6 +2485,61 @@ def test_configure_add_user_persists(tmp_path):
     ]
 
 
+def test_configure_reset_user_identity_per_transport(tmp_path):
+    """`configure --reset-user-identity alice:web` clears web entries only,
+    leaving other transports' locks intact. Regression test for the bug
+    where the whole string was normalized before the colon-split."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice:web"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    assert alice["locked_identities"] == ["telegram:12345"]
+
+
+def test_configure_reset_user_identity_clears_all(tmp_path):
+    """`configure --reset-user-identity alice` (no :transport) clears all."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    # Empty list serializes as the absent key.
+    assert alice.get("locked_identities", []) == []
+
+
 def test_configure_legacy_username_flag_warns(tmp_path):
     """Legacy `--username` flag works but emits a deprecation warning."""
     import json
@@ -2604,24 +2737,30 @@ def configure(ctx, username, remove_username, add_user, remove_user, reset_user_
         click.echo(f"Removed {norm}.")
 
     if reset_user_identity:
-        norm = reset_user_identity.lstrip("@").lower()
+        # Parse `USERNAME[:TRANSPORT]` FIRST. The previous draft normalized
+        # the entire string (including `:web`) and then tried to look up
+        # `alice:web` — which never matches a username. Split first, then
+        # normalize each piece.
+        if ":" in reset_user_identity:
+            uname_part, transport = reset_user_identity.split(":", 1)
+        else:
+            uname_part, transport = reset_user_identity, None
+        norm = uname_part.lstrip("@").lower()
         u = _find(norm)
         if not u:
             raise SystemExit(f"User {norm!r} not in allow-list.")
-        # Optional :transport suffix lets the operator clear just one
-        # transport's lock (e.g., --reset-user-identity alice:web).
-        if ":" in reset_user_identity:
-            uname_part, transport = reset_user_identity.split(":", 1)
-            target = _find(uname_part.lstrip("@").lower())
-            if target:
-                target.locked_identities = [
-                    ident for ident in target.locked_identities
-                    if not ident.startswith(f"{transport}:")
-                ]
-        else:
+        if transport is None:
             u.locked_identities = []
+        else:
+            u.locked_identities = [
+                ident for ident in u.locked_identities
+                if not ident.startswith(f"{transport}:")
+            ]
         save_config(config, cfg_path)
-        click.echo(f"Cleared locked identities for {norm}.")
+        if transport is None:
+            click.echo(f"Cleared all locked identities for {norm}.")
+        else:
+            click.echo(f"Cleared {transport!r} identities for {norm}.")
 ```
 
 (Read the existing `configure` body and merge the new option handling in. The rest of `configure`'s body — `--manager-token` etc. — is unchanged.)
@@ -3455,9 +3594,9 @@ async def test_persist_writes_to_global_when_auth_source_is_global(tmp_path):
 
     bot._auth_identity(_identity("admin", native_id="99"))
     assert bot._auth_dirty is True
-    # Simulate the persist call.
-    import asyncio
-    asyncio.run(ProjectBot._persist_auth_if_dirty(bot))
+    # Test is async — await directly. Calling asyncio.run() inside an
+    # already-running event loop raises RuntimeError.
+    await ProjectBot._persist_auth_if_dirty(bot)
 
     # Re-read disk. The GLOBAL allow-list must show the locked identity;
     # the project's allowed_users must remain empty (not promoted to a copy).
@@ -3496,7 +3635,8 @@ async def test_persist_merges_per_user_not_replace(tmp_path):
     bot._auth_source = "global"
     bot._effective_config_path = lambda: cfg_path
     bot._auth_identity(_identity("alice", native_id="100"))
-    asyncio.run(ProjectBot._persist_auth_if_dirty(bot))
+    # Async test — await directly.
+    await ProjectBot._persist_auth_if_dirty(bot)
 
     disk = json.loads(cfg_path.read_text())
     by_user = {u["username"]: u for u in disk["allowed_users"]}
@@ -3985,6 +4125,17 @@ Find the manager bot's button-click dispatch (mirrors `_on_button` on the projec
                 )
 
         elif click.value.startswith("proj_ptog_"):
+            # Plugin toggle changes config state — gate to executor role.
+            # Without this, a viewer with manager-bot access could enable
+            # arbitrary plugin code on any project.
+            if not self._require_executor(click.sender):
+                assert self._transport is not None
+                await self._transport.send_text(
+                    click.chat,
+                    "Read-only access — only executors can toggle plugins.",
+                    reply_to=click.message,
+                )
+                return
             suffix = click.value[len("proj_ptog_"):]
             if "|" not in suffix:
                 return
@@ -4006,6 +4157,51 @@ Find the manager bot's button-click dispatch (mirrors `_on_button` on the projec
                 f"Plugins for '{name}':\n✓ = active, + = available\n\nRestart required after changes.",
                 buttons=self._plugins_buttons(name),
             )
+```
+
+Add a test for the gate in `tests/manager/test_bot_plugins.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_viewer_cannot_toggle_plugin(monkeypatch, tmp_path):
+    """A viewer clicking the plugin toggle gets a Read-only reply; the
+    project's plugins list is NOT modified."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.transport.base import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
+
+    cfg_path = tmp_path / "config.json"
+    cfg = Config()
+    cfg.allowed_users = [
+        AllowedUser(username="viewer-admin", role="viewer", locked_identities=["telegram:9"]),
+    ]
+    save_config(cfg, cfg_path)
+
+    bot = ManagerBot.__new__(ManagerBot)
+    bot._project_config_path = cfg_path
+    bot._allowed_users = list(cfg.allowed_users)
+    bot._init_auth()
+    bot._transport = MagicMock()
+    bot._transport.send_text = AsyncMock()
+    bot._transport.edit_text = AsyncMock()
+
+    sender = Identity(transport_id="telegram", native_id="9", display_name="V", handle="viewer-admin", is_bot=False)
+    chat = ChatRef(transport_id="telegram", native_id="42", kind=ChatKind.DM)
+    msg = MessageRef(transport_id="telegram", native_id="100", chat=chat)
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="proj_ptog_demo|myp")
+
+    monkeypatch.setattr(bot, "_load_projects", lambda: {"myp": {"plugins": []}})
+    save_called = []
+    monkeypatch.setattr(bot, "_save_projects", lambda p: save_called.append(p))
+
+    await bot._on_callback(MagicMock(callback_query=MagicMock(data=click.value, from_user=sender)))
+    # … or whichever entry point your manager bot uses for ButtonClick dispatch.
+
+    assert save_called == []
+    text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in text or "executor" in text
 ```
 
 - [ ] **Step 7: Write failing tests — `tests/manager/test_user_commands.py`**
@@ -4157,6 +4353,47 @@ async def test_viewer_can_list_users(tmp_path):
     text = bot._transport.send_text.await_args.args[1]
     assert "alice" in text
     assert "viewer-bob" in text
+
+
+@pytest.mark.asyncio
+async def test_promote_user_usage_message_says_promote_not_demote(tmp_path):
+    """Regression test: _set_role used to compare new_role == 'promote' but
+    callers pass the role string ('executor' / 'viewer'), so the usage
+    message always said /demote_user even for /promote_user."""
+    bot = _make_manager(tmp_path)
+    # No args → usage message.
+    await bot._on_promote_user(_invocation([]))
+    text = bot._transport.send_text.await_args.args[1]
+    assert "/promote_user" in text
+
+
+@pytest.mark.asyncio
+async def test_user_commands_work_without_explicit_config_path(monkeypatch, tmp_path):
+    """When ManagerBot was constructed without a custom config path,
+    `_load_config_for_users()` must fall back to DEFAULT_CONFIG instead of
+    passing None to load_config (which would TypeError)."""
+    from link_project_to_chat.config import DEFAULT_CONFIG
+
+    # Redirect DEFAULT_CONFIG to a tmp file so the test doesn't touch the
+    # user's home directory.
+    cfg_path = tmp_path / "default-config.json"
+    cfg_path.write_text(json.dumps({"allowed_users": []}))
+    monkeypatch.setattr("link_project_to_chat.config.DEFAULT_CONFIG", cfg_path)
+    monkeypatch.setattr("link_project_to_chat.manager.bot.DEFAULT_CONFIG", cfg_path)
+
+    bot = ManagerBot.__new__(ManagerBot)
+    bot._project_config_path = None       # ← this is the case the bug surfaced in
+    bot._allowed_users = [AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"])]
+    bot._init_auth()
+    bot._transport = MagicMock()
+    bot._transport.send_text = AsyncMock()
+
+    inv = _invocation(["bob"], sender_handle="admin", sender_id="1")
+    await bot._on_add_user(inv)
+    # If _load_config_for_users passed None, this would have TypeError'd before
+    # this line. Reaching here proves the fallback to DEFAULT_CONFIG worked.
+    written = json.loads(cfg_path.read_text())
+    assert any(u["username"] == "bob" for u in written.get("allowed_users", []))
 ```
 
 - [ ] **Step 8: Run tests — expect failure**
@@ -4186,14 +4423,24 @@ self._transport.on_command("reset_user_identity", self._on_reset_user_identity)
 Add the handler methods on `ManagerBot`:
 
 ```python
+    def _users_config_path(self):
+        """Resolve the config path for user-management ops.
+
+        `self._project_config_path` may be None (manager bot constructed
+        without an explicit path → use the default). Passing None to
+        load_config / save_config would TypeError.
+        """
+        from ..config import DEFAULT_CONFIG
+        return self._project_config_path or DEFAULT_CONFIG
+
     def _load_config_for_users(self):
-        """Helper: load the global config (cached path)."""
+        """Helper: load the global config."""
         from ..config import load_config
-        return load_config(self._project_config_path)
+        return load_config(self._users_config_path())
 
     def _save_config_for_users(self, cfg) -> None:
         from ..config import save_config
-        save_config(cfg, self._project_config_path)
+        save_config(cfg, self._users_config_path())
         # Refresh our own in-memory allow-list to match.
         self._allowed_users = list(cfg.allowed_users)
 
@@ -4262,12 +4509,22 @@ Add the handler methods on `ManagerBot`:
         await self._transport.send_text(ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message)
 
     async def _set_role(self, ci, new_role: str) -> None:
+        """Shared body for /promote_user and /demote_user.
+
+        `new_role` is the role to assign — "executor" or "viewer". The
+        command name for the usage hint is derived from new_role:
+            executor → "/promote_user"
+            viewer   → "/demote_user"
+        (The earlier draft compared `new_role == "promote"`, which always
+        fell through to the demote message because callers actually pass
+        the role string, not the command name.)
+        """
         if not await self._require_executor_or_reply(ci):
             return
+        cmd_name = "promote_user" if new_role == "executor" else "demote_user"
         if not ci.args:
             await self._transport.send_text(
-                ci.chat, f"Usage: /{new_role}_user <username>" if new_role == "promote" else "Usage: /demote_user <username>",
-                reply_to=ci.message,
+                ci.chat, f"Usage: /{cmd_name} <username>", reply_to=ci.message,
             )
             return
         username = ci.args[0].lstrip("@").lower()

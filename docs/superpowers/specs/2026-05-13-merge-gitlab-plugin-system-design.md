@@ -1,6 +1,6 @@
 # Porting the GitLab plugin system onto the Transport/Backend architecture
 
-**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup; rev. 2026-05-14b — `locked_identities: list[str]` for multi-transport users, scope-aware persistence in `_persist_auth_if_dirty`, stale `buttons()` references cleaned, test-snippet identity strings corrected; rev. 2026-05-14c — same-transport spoof guard in `_get_user_role`, Web-session migration prefix fix, atomic RMW via `locked_config_rmw`, persist on viewer-denied path, try/finally around top-level handlers, helper signature corrected to `tuple[list[AllowedUser], str]`, baseline counts de-hardcoded)
+**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup; rev. 2026-05-14b — `locked_identities: list[str]` for multi-transport users, scope-aware persistence in `_persist_auth_if_dirty`, stale `buttons()` references cleaned, test-snippet identity strings corrected; rev. 2026-05-14c — same-transport spoof guard in `_get_user_role`, Web-session migration prefix fix, atomic RMW via `locked_config_rmw`, persist on viewer-denied path, try/finally around top-level handlers, helper signature corrected to `tuple[list[AllowedUser], str]`, baseline counts de-hardcoded; rev. 2026-05-14d — plugin command collision policy + core-name blocklist, active-plugin check + persist in `_wrap_plugin_command`, live `ctx.is_executor` helper replacing snapshot lists, CLI reset-user-identity parses `USERNAME[:TRANSPORT]` correctly, async tests await directly, manager plugin-toggle gated to executor, `_load_config_for_users` falls back to DEFAULT_CONFIG, `_set_role` usage message bug fixed, spec baseline mentions also de-hardcoded)
 **Status:** Approved with revisions; implementation plan reflects this design.
 **Author:** Revaz Chikashua (drafted with Claude)
 
@@ -81,7 +81,7 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
     - `data_dir: Path | None`
     - `transport: Transport | None` (reference, not the telegram-specific bot token)
     - `backend_name: str` (so plugins can detect Claude vs Codex)
-    - `allowed_identities: list[str]`, `executor_identities: list[str]` — `transport_id:native_id` strings for plugins that gate themselves (replaces the GitLab `allowed_user_ids: list[int]` since this is now transport-portable).
+    - `is_allowed(identity)`, `is_executor(identity)` — **live helpers** that consult the bot's current `_allowed_users` at call time. Plugins use these to gate themselves; the helpers see locks added after plugin init (e.g., a user first-contacting from a new transport later), unlike the snapshot-at-init `allowed_identities` / `executor_identities` lists in the earlier draft, which went stale.
     - `web_port: int | None`, `public_url: str | None` (web-server plugin compatibility)
     - `register_in_app_web_handler: Callable | None`
     - `_send: Callable[..., Awaitable[Any]] | None` (back-compat shim; delegates to `transport.send_text`)
@@ -91,7 +91,7 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
     - Hooks: `on_message(msg: IncomingMessage) -> bool`, `on_button(click: ButtonClick) -> bool`, `on_task_complete(task)`, `on_tool_use(tool: str, path: str | None)`
     - Claude integration: `get_context() -> str | None`, `tools() -> list[dict]`, `call_tool(name, args) -> str`
     - Registration: `commands() -> list[BotCommand]` (no `buttons()` method — buttons flow through `on_button` like messages flow through `on_message`)
-  - **Viewer policy:** `on_message` and `on_button` fire for every authorized user (executor + viewer). Plugin code is responsible for any role-based gating — it has access to `self._ctx.executor_identities` and helpers like `self._is_executor(click.sender)` to decide. Keeps the framework simple and uniform with command-level `viewer_ok`.
+  - **Viewer policy:** `on_message` and `on_button` fire for every authorized user (executor + viewer). Plugin code is responsible for any role-based gating — call `self._ctx.is_executor(click.sender)` / `self._ctx.is_allowed(msg.sender)`. These are live helpers, not snapshot lists. Keeps the framework simple and uniform with command-level `viewer_ok`.
   - `load_plugin(name, context, config) -> Plugin | None` via entry points.
 - **`scripts/restart.sh`**, **`scripts/stop.sh`** — copied verbatim from GitLab.
 
@@ -106,7 +106,8 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
 - `_init_plugins(transport)` called from `_after_ready` (after `bot_username` is populated):
   - Build `PluginContext(transport=self._transport, backend_name=self._backend_name, ...)`.
   - Instantiate plugins via `load_plugin`, skip missing.
-  - For each plugin's `commands()`: wrap handler with auth + role gate (see `_wrap_plugin_command`), then `self._transport.on_command(bc.command, wrapped)`. **The `TelegramTransport.on_command` method is updated in Task 1 to dynamically register a PTB `CommandHandler` when called after `attach_telegram_routing` — without this, plugin commands fail silently on Telegram.**
+  - For each plugin's `commands()`: wrap handler with auth + role gate + first-contact persist (see `_wrap_plugin_command`), then `self._transport.on_command(bc.command, wrapped)`. **The `TelegramTransport.on_command` method is updated in Task 1 to dynamically register a PTB `CommandHandler` when called after `attach_telegram_routing` — without this, plugin commands fail silently on Telegram.**
+  - **Command collision policy**: plugin commands are rejected when they shadow a core command name (`/help`, `/run`, `/model`, `/backend`, `/status`, `/tasks`, etc.) or another plugin's already-registered command. The rejection is per-command — other commands from the same plugin still register. Logged at WARNING.
   - Buttons: `plugin.on_button(click)` is invoked from `_dispatch_plugin_button` (called from `_on_button` before primary's branch chain); no separate registration step.
   - Call `start()` in topo-sorted order; on failure, unregister that plugin's commands (improvement over GitLab default).
 - `_dispatch_plugin_on_message(msg)`, `_dispatch_plugin_tool_use(event)`, `_dispatch_plugin_task_complete(task)`, `_dispatch_plugin_button(click)` — all try/except per plugin, all preserve "one plugin doesn't kill the others" semantics.
@@ -394,7 +395,7 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
   6. Deliver a second message: no new save (idempotent).
 
 ### Regression coverage
-Existing tests that referenced `allowed_usernames` / `trusted_users` / `trusted_user_ids` need updating (estimate: ~30 tests across `tests/test_auth*.py`, `tests/test_config*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py`). After those updates, the rest of the suite (1003 → ~970) must continue to pass without modification. Net test count rises with the new migration + role coverage.
+Existing tests that referenced `allowed_usernames` / `trusted_users` / `trusted_user_ids` need updating (estimate: ~30 tests across `tests/test_auth*.py`, `tests/test_config*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py`). After those updates, the rest of the suite must continue to pass without modification, and the net count grows with the new migration + role + plugin coverage. The actual passing-count baseline is recorded in **Plan Task 0** at execution time — hardcoded numbers in earlier drafts (e.g., `1003 → ~970`) are illustrative and drift across environments.
 
 ### Manual smoke
 - Pre-upgrade config (`allowed_usernames: [alice]`, `trusted_users: {alice: 12345}`) → load, then save → on disk: `allowed_users: [{username: alice, role: executor, locked_identities: ["telegram:12345"]}]`. Legacy keys absent.
@@ -416,7 +417,7 @@ Branch: `feat/plugin-system` off `main`. Each step a single commit. Tasks 3, 5, 
 6. **Manager UI + user-management commands** — plugin toggle (Transport-ported); `/users` (viewer-allowed listing), `/add_user`, `/remove_user`, `/promote_user`, `/demote_user`, `/reset_user_identity` (all write commands require executor) against `Config.allowed_users` (global allow-list).
 7. **Docs + version bump** — README plugin section, README auth-migration section, CHANGELOG entry with **BREAKING CHANGES** call-out, **v1.0.0** bump in both `pyproject.toml` AND `src/link_project_to_chat/__init__.py`.
 
-Verification gate after each step: `pytest -q` (must stay at 1003 passing + new tests for that step).
+Verification gate after each step: `pytest -q` must stay at or above the baseline recorded in **Plan Task 0** (whatever count the engineer measured after a fresh `pip install -e ".[all]"`), plus the new tests added in that step.
 
 ## Risks
 
