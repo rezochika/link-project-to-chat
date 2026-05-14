@@ -2894,6 +2894,244 @@ grep -n "auth_source=" src/link_project_to_chat/cli.py
 
 Both greps should return the same number of `run_bot(...)` invocations, and every one should have a matching `auth_source=` line in its kwargs.
 
+- [ ] **Step 6b: Migrate `start-manager` + update `ManagerBot.__init__` for `allowed_users`**
+
+The spec's eager-migration decision (Resolved question #3) promises BOTH `start` and `start-manager` honor `migration_pending` and write the new shape before serving traffic. Step 6 covers `start`; this step does the parallel work for `start-manager` plus the prerequisite constructor change.
+
+After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today's `start-manager` would `AttributeError` on `main_config.allowed_usernames` at [cli.py:753](src/link_project_to_chat/cli.py:753) and would pass nonexistent fields into `ManagerBot` at [cli.py:761](src/link_project_to_chat/cli.py:761). And `ManagerBot.__init__` at [manager/bot.py:248](src/link_project_to_chat/manager/bot.py:248) doesn't yet accept `allowed_users=`, so even an updated CLI would TypeError. Both surfaces need to land in the same commit so the suite stays green.
+
+**1. Update `ManagerBot.__init__` (additive — legacy kwargs stay until Task 5 Step 12 strips them).** In [manager/bot.py](src/link_project_to_chat/manager/bot.py):
+
+```python
+    def __init__(
+        self,
+        token: str,
+        process_manager: ProcessManager,
+        allowed_username: str = "",
+        allowed_usernames: list[str] | None = None,
+        trusted_users: dict[str, int] | None = None,
+        trusted_user_id: int | None = None,
+        trusted_user_ids: list[int] | None = None,
+        allowed_users: list["AllowedUser"] | None = None,  # NEW
+        project_config_path: Path | None = None,
+    ):
+        self._token = token
+        self._pm = process_manager
+        # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 12
+        # once every caller passes allowed_users= instead.
+        if allowed_usernames is not None:
+            self._allowed_usernames = allowed_usernames
+        else:
+            self._allowed_username = allowed_username
+        if trusted_users is not None:
+            self._trusted_users = dict(trusted_users)
+        if trusted_user_ids is not None:
+            self._trusted_user_ids = trusted_user_ids
+        else:
+            self._trusted_user_id = trusted_user_id
+        # NEW: AllowedUser allow-list. _init_auth + AuthMixin._allowed_users
+        # is the post-Task-5 source of truth; setting it here makes the
+        # transition transparent to manager auth code that lands in Task 5.
+        self._allowed_users = list(allowed_users or [])
+        self._started_at = time.monotonic()
+        self._app = None
+        self._project_config_path = project_config_path
+        self._telethon_client = None
+        self._init_auth()
+```
+
+Add the import at the top of [manager/bot.py](src/link_project_to_chat/manager/bot.py) (in the existing `from ..config import ...` block):
+
+```python
+from ..config import AllowedUser
+```
+
+(or inline-import inside `__init__` if circular-import noise — the spec's preferred shape is module-level so type hints work without `from __future__`).
+
+**2. Update `start_manager` in [cli.py](src/link_project_to_chat/cli.py).** Replace the body of the `start_manager` command:
+
+```python
+@main.command("start-manager")
+@click.pass_context
+def start_manager(ctx):
+    """Start the manager bot."""
+    from .manager.bot import ManagerBot
+    from .manager.process import ProcessManager
+    from .config import save_config
+
+    cfg_path = ctx.obj["config_path"]
+    main_config = load_config(cfg_path)
+
+    if main_config.migration_pending:
+        click.echo("Migrating config.json from legacy auth fields to allowed_users...", err=True)
+        save_config(main_config, cfg_path)
+        click.echo("Migration complete.", err=True)
+
+    token = main_config.manager_telegram_bot_token
+    if not token:
+        raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
+    # Post-migration the only auth source is allowed_users (global allow-list).
+    # Empty → fail-closed (every message rejected). The manager bot has no
+    # project-scoped fallback (unlike project bots via resolve_project_allowed_users).
+    if not main_config.allowed_users:
+        raise SystemExit(
+            "No users authorized for the manager bot. "
+            "Run `configure --add-user USER[:ROLE]` or edit `allowed_users` in config.json."
+        )
+
+    pm = ProcessManager(project_config_path=cfg_path)
+    restored = pm.start_autostart()
+    if restored:
+        click.echo(f"Autostarted {restored} project(s).")
+
+    bot = ManagerBot(
+        token, pm,
+        allowed_users=main_config.allowed_users,
+        project_config_path=cfg_path,
+    )
+    click.echo("Manager bot started.")
+    bot.build().run_polling()
+```
+
+Note: legacy `allowed_usernames=` / `trusted_users=` kwargs are NOT passed anymore. The constructor's legacy kwargs default to `None`, so any in-process state they used to populate is empty — but AuthMixin now reads exclusively from `_allowed_users` (after Task 5 Step 3), and `_allowed_users` IS populated. Old kwargs become dead defaults through Task 4 and Task 5 Step 1–11, then get stripped in Task 5 Step 12.
+
+**3. TDD verification.** Add to [tests/test_cli.py](tests/test_cli.py) (or a new `tests/test_start_manager.py` if the file is already large):
+
+```python
+def test_start_manager_requires_allowed_users(tmp_path, monkeypatch):
+    """start-manager must hard-fail when allowed_users is empty (fail-closed)."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Manager token set, but NO allowed_users.
+    save_config(
+        Config(telegram_bot_token="x", manager_telegram_bot_token="m", allowed_users=[]),
+        cfg_path,
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code != 0
+    assert "No users authorized" in (result.output + str(result.exception))
+
+
+def test_start_manager_passes_allowed_users_into_manager_bot(tmp_path, monkeypatch):
+    """start-manager must construct ManagerBot with allowed_users=, not the
+    legacy allowed_usernames=. Regression: pre-Task-4 start_manager passed
+    allowed_usernames= and trusted_users=, both of which Task 5 deletes."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            telegram_bot_token="x",
+            manager_telegram_bot_token="m",
+            allowed_users=[AllowedUser(username="alice", role="executor")],
+        ),
+        cfg_path,
+    )
+
+    captured_kwargs: dict = {}
+
+    class _FakeBot:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs["args"] = args
+            captured_kwargs["kwargs"] = kwargs
+
+        def build(self):
+            class _App:
+                def run_polling(self_inner): return None
+            return _App()
+
+    monkeypatch.setattr("link_project_to_chat.manager.bot.ManagerBot", _FakeBot)
+
+    class _FakePM:
+        def __init__(self, **kwargs): pass
+        def start_autostart(self): return 0
+
+    monkeypatch.setattr("link_project_to_chat.manager.process.ProcessManager", _FakePM)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+    # allowed_users= must be present; legacy kwargs must NOT be passed.
+    assert "allowed_users" in captured_kwargs["kwargs"]
+    assert captured_kwargs["kwargs"]["allowed_users"][0].username == "alice"
+    assert "allowed_usernames" not in captured_kwargs["kwargs"]
+    assert "trusted_users" not in captured_kwargs["kwargs"]
+
+
+def test_start_manager_runs_migration_on_pending(tmp_path, monkeypatch):
+    """start-manager must call save_config when load_config sets migration_pending,
+    mirroring start's behavior."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Write a legacy-shaped config that load_config will migrate.
+    import json
+    cfg_path.write_text(json.dumps({
+        "telegram_bot_token": "x",
+        "manager_telegram_bot_token": "m",
+        "allowed_usernames": ["alice"],  # legacy → will trigger migration
+    }))
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.bot.ManagerBot",
+        type("_FB", (), {"__init__": lambda *a, **k: None,
+                        "build": lambda self: type("_A", (), {"run_polling": lambda s: None})()}),
+    )
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.process.ProcessManager",
+        type("_FPM", (), {"__init__": lambda *a, **k: None,
+                          "start_autostart": lambda self: 0}),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+
+    # After migration, the on-disk file no longer has the legacy key and DOES
+    # have allowed_users with role=executor for alice.
+    reloaded = json.loads(cfg_path.read_text())
+    assert "allowed_usernames" not in reloaded
+    assert any(u["username"] == "alice" and u["role"] == "executor"
+               for u in reloaded.get("allowed_users", []))
+
+
+def test_manager_bot_accepts_allowed_users_kwarg():
+    """Constructor regression: ManagerBot must accept allowed_users= and set
+    self._allowed_users. Catches a future caller that drops this kwarg."""
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    pm = ProcessManager.__new__(ProcessManager)
+    bot = ManagerBot(
+        token="t",
+        process_manager=pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
+```
+
+Run:
+
+```bash
+pytest tests/test_cli.py::test_start_manager_requires_allowed_users \
+       tests/test_cli.py::test_start_manager_passes_allowed_users_into_manager_bot \
+       tests/test_cli.py::test_start_manager_runs_migration_on_pending \
+       tests/test_cli.py::test_manager_bot_accepts_allowed_users_kwarg -v
+```
+
+Expected (BEFORE this step's edits): FAIL — `start_manager` references `allowed_usernames` (raises `SystemExit("No username configured.")` rather than the new message) and passes `allowed_usernames=` to `ManagerBot`. The constructor regression fails because `ManagerBot.__init__` doesn't accept `allowed_users=`.
+
+Expected (AFTER): all PASS.
+
 - [ ] **Step 7: Run tests to verify they pass**
 
 ```bash
@@ -2910,7 +3148,9 @@ pytest -q
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/link_project_to_chat/cli.py tests/test_cli.py
+git add src/link_project_to_chat/cli.py \
+        src/link_project_to_chat/manager/bot.py \
+        tests/test_cli.py
 git commit -m "$(cat <<'EOF'
 feat(cli): plugin-call, migrate-config, AllowedUser configure flags
 
@@ -2924,10 +3164,17 @@ Adds three CLI surfaces:
   edits the global Config.allowed_users. Legacy `--username` /
   `--remove-username` aliased with deprecation warning for this release.
 
-`start` honors Config.migration_pending: forces a save before serving
-traffic so the on-disk migration is deterministic. Empty-allow-list
+Both `start` and `start-manager` honor Config.migration_pending: force
+a save before serving traffic so the on-disk migration is deterministic.
+`start-manager` additionally hard-fails on empty Config.allowed_users
+(fail-closed; manager has no per-project fallback). Empty-allow-list
 projects are aggregated into a single CRITICAL log line at startup
 (replaces per-load log spam).
+
+ManagerBot.__init__ gains an `allowed_users: list[AllowedUser] | None`
+kwarg additively. Legacy kwargs (allowed_usernames, trusted_users, …)
+stay through Task 5 for backward-compat, then get stripped in
+Task 5 Step 12 once no caller passes them.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -3328,11 +3575,68 @@ async def test_guard_uses_identity_key_for_rate_limit(monkeypatch):
 
     await bot._guard(_make_update(user_id=98765))
     assert seen_keys == ["telegram:98765"]
+
+
+async def test_edit_field_save_persists_and_uses_identity_key(monkeypatch):
+    """The other moved PTB-native call site. Same wiring as _guard, but on
+    PTB's MessageHandler path (pending-edit branch).
+
+    Rate-limit short-circuits before _apply_edit runs, so _persist_auth_if_dirty
+    must still fire via try/finally — and the rate-limit bucket must be
+    string-keyed on _identity_key(identity), matching _guard.
+    """
+    bot = _make_bot()
+    persisted: list[bool] = []
+
+    async def _track() -> None:
+        persisted.append(True)
+
+    seen_keys: list = []
+
+    def _capture(key):
+        seen_keys.append(key)
+        return True  # rate-limited → handler returns before pop / _apply_edit
+
+    monkeypatch.setattr(bot, "_persist_auth_if_dirty", _track)
+    monkeypatch.setattr(bot, "_auth_identity", lambda identity: True)
+    monkeypatch.setattr(bot, "_rate_limited", _capture)
+
+    update = _make_update(user_id=98765)
+    ctx = SimpleNamespace(user_data={"pending_edit": {"name": "x", "field": "path"}})
+
+    await bot._edit_field_save(update, ctx)
+    assert persisted == [True]
+    assert seen_keys == ["telegram:98765"]
+    # Rate-limited path exits before pop — pending_edit stays.
+    assert "pending_edit" in ctx.user_data
+
+
+async def test_edit_field_save_persists_on_auth_deny(monkeypatch):
+    """Auth-denied pending-edit path also fires _persist_auth_if_dirty. The
+    first-contact append happens INSIDE _auth_identity in Step 3 (lands later
+    in Task 5), so missing the persist tail here would lose the lock the
+    moment Step 3 starts appending.
+    """
+    bot = _make_bot()
+    persisted: list[bool] = []
+
+    async def _track() -> None:
+        persisted.append(True)
+
+    monkeypatch.setattr(bot, "_persist_auth_if_dirty", _track)
+    monkeypatch.setattr(bot, "_auth_identity", lambda identity: False)
+
+    update = _make_update()
+    ctx = SimpleNamespace(user_data={"pending_edit": {"name": "x", "field": "path"}})
+
+    await bot._edit_field_save(update, ctx)
+    assert persisted == [True]
+    assert "pending_edit" in ctx.user_data
 ```
 
 Run: `pytest tests/manager/test_guard_persistence.py -v`
-Expected (BEFORE this step's edits): FAIL — the unrewritten `_guard` calls `self._auth(user)` and passes raw `user.id` to `_rate_limited`, so neither `_persist_auth_if_dirty` nor the identity-key path get exercised.
-Expected (AFTER this step's edits): PASS — all three tests verify the rewrite directly.
+Expected (BEFORE this step's edits): FAIL — the unrewritten `_guard` / `_edit_field_save` call `self._auth(user)` and pass raw `user.id` to `_rate_limited`, so neither `_persist_auth_if_dirty` nor the identity-key path get exercised on either call site.
+Expected (AFTER this step's edits): PASS — all five tests verify the rewrite (3 for `_guard`, 2 for `_edit_field_save`).
 
 **5. Verify no legacy `_auth(user)` call sites remain:**
 
@@ -4366,6 +4670,7 @@ Every match outside `_migrate_legacy_auth` and the loader's compatibility shim m
 - Reads of `config.allowed_usernames` / `config.trusted_users` → `config.allowed_users`.
 - `_get_trusted_user_ids()` / `_get_trusted_user_bindings()` / `_effective_trusted_users` / `_trust_user` / `_revoke_user` / `_coerce_trust_value` — delete these helpers from `_auth.py` if they exist; their behavior is subsumed by `_get_user_role` and `_persist_auth_if_dirty`.
 - `add_trusted_user_id`, `add_project_trusted_user_id`, `bind_project_trusted_user` (in `config.py`) — rewrite to operate on `AllowedUser.locked_identities` (append the new identity to the list) or delete if `_persist_auth_if_dirty` covers them.
+- `ManagerBot.__init__` legacy kwargs (`allowed_username`, `allowed_usernames`, `trusted_users`, `trusted_user_id`, `trusted_user_ids`) — Task 4 Step 6b made them dead defaults (no caller passes them anymore). Strip them now along with the assignment block (`if allowed_usernames is not None: self._allowed_usernames = ...` etc.). The constructor's surviving signature is `(token, process_manager, allowed_users=None, project_config_path=None)`.
 
 After this step, **no source file outside `config.py`'s migration helper reads `allowed_usernames` / `trusted_users` / `trusted_user_ids`**. Verify by re-running the grep — only `_migrate_legacy_auth` and its tests should match.
 
