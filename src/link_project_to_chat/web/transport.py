@@ -102,6 +102,7 @@ class WebTransport:
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list[OnReadyCallback] = []
+        self._on_stop_callbacks: list = []
         self._prompt_handlers: list[PromptHandler] = []
         self._authorizer: "AuthorizerCallback | None" = None
 
@@ -132,6 +133,11 @@ class WebTransport:
             await cb(self._bot_identity)
 
     async def stop(self) -> None:
+        for cb in self._on_stop_callbacks:
+            try:
+                await cb()
+            except Exception:
+                logger.exception("on_stop callback failed")
         if self._dispatch_task is not None:
             self._dispatch_task.cancel()
             try:
@@ -300,6 +306,9 @@ class WebTransport:
 
     def on_ready(self, callback: OnReadyCallback) -> None:
         self._on_ready_callbacks.append(callback)
+
+    def on_stop(self, callback) -> None:
+        self._on_stop_callbacks.append(callback)
 
     def set_authorizer(self, authorizer: "AuthorizerCallback | None") -> None:
         """Pre-dispatch authorization gate. Consulted at the top of inbound
