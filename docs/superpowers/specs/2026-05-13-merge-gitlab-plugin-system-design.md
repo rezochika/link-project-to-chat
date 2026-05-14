@@ -1,6 +1,6 @@
 # Porting the GitLab plugin system onto the Transport/Backend architecture
 
-**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup; rev. 2026-05-14b — `locked_identities: list[str]` for multi-transport users, scope-aware persistence in `_persist_auth_if_dirty`, stale `buttons()` references cleaned, test-snippet identity strings corrected)
+**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup; rev. 2026-05-14b — `locked_identities: list[str]` for multi-transport users, scope-aware persistence in `_persist_auth_if_dirty`, stale `buttons()` references cleaned, test-snippet identity strings corrected; rev. 2026-05-14c — same-transport spoof guard in `_get_user_role`, Web-session migration prefix fix, atomic RMW via `locked_config_rmw`, persist on viewer-denied path, try/finally around top-level handlers, helper signature corrected to `tuple[list[AllowedUser], str]`, baseline counts de-hardcoded)
 **Status:** Approved with revisions; implementation plan reflects this design.
 **Author:** Revaz Chikashua (drafted with Claude)
 
@@ -146,14 +146,19 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
   - **Legacy fields remain on the dataclasses as read-only inputs** during the migration window. The save format writes only `allowed_users` (legacy keys stripped). All call sites read through `resolve_project_allowed_users(project, config)` (see below); after every caller migrates in Task 5, the legacy fields can be removed from the dataclasses in a final cleanup step. Keeping them around for the intermediate commits is what lets the suite stay green across tasks.
 - `TeamBotConfig`: **untouched.** Team bots inherit from `Config.allowed_users` (the global allow-list) — same pattern as today. No per-team-bot allow-list is added in this revision. (A future spec can layer per-team-bot allow-lists on top if needed.)
 - `_parse_allowed_users` / `_serialize_allowed_users` / `_parse_plugins` helpers.
-- New helper `resolve_project_allowed_users(project: ProjectConfig, config: Config) -> list[AllowedUser]`:
-  - Returns `project.allowed_users` if non-empty.
-  - Otherwise returns `config.allowed_users` (the global allow-list).
-  - This matches today's `resolve_project_auth_scope` precedence behavior (project overrides global, falls back to global). Without this fallback, projects with an empty per-project list would fail-closed even when the global list is populated — a regression.
+- New helper `resolve_project_allowed_users(project: ProjectConfig, config: Config) -> tuple[list[AllowedUser], str]`:
+  - Returns `(project.allowed_users, "project")` if non-empty.
+  - Otherwise returns `(config.allowed_users, "global")` (the global allow-list).
+  - The source string is consumed by `ProjectBot.__init__` to set `self._auth_source`, which `_persist_auth_if_dirty` reads to write back to the correct scope (project vs. global) — without this, a bot that inherited global users would silently promote them to project scope on first-contact lock persistence.
+  - Precedence matches today's `resolve_project_auth_scope` (project overrides global, falls back to global). Without this fallback, projects with an empty per-project list would fail-closed even when the global list is populated — a regression.
   - Empty list at both scopes → warning logged at load time and a single CRITICAL line at CLI startup phase (replaces per-load CRITICAL spam).
 - **One-shot migration on load**:
   - Legacy `allowed_usernames: list[str]` entries → `AllowedUser{username, role="executor", locked_identities=[]}`. Default role is `executor` because legacy users had full access; preserving that prevents silent privilege loss.
-  - Legacy `trusted_users` — **this field is a `dict[str, int | str]` on disk** (username → user_id mapping). For every key in this dict, build `f"telegram:{native_id}"` (legacy fields predate multi-transport, so every legacy ID belongs to Telegram) and APPEND it to the matching `AllowedUser.locked_identities` list. Non-numeric IDs (Discord/Slack scenarios entered manually) are passed through if they already contain `":"` (caller-prefixed); otherwise prefixed with `telegram:`. Confirm shape with `isinstance(raw_trusted, dict)`; older list-shape configs (pre-A1) align with `trusted_user_ids` by index against `allowed_usernames` and are still supported for one release.
+  - Legacy `trusted_users` — **this field is a `dict[str, int | str]` on disk** (username → user_id mapping). For every entry, the value is normalized into a `"transport_id:native_id"` string and appended to the matching `AllowedUser.locked_identities` list. Normalization rules:
+    - If the value already starts with a known transport prefix (`telegram:`, `web:`, `discord:`, `slack:`), pass through.
+    - If the value starts with `web-session:` (the pre-v1.0 Web bind format observed in `tests/web/test_projectbot_web_e2e.py`), prepend `web:` → `web:web-session:<id>`.
+    - Numeric or other bare strings → `telegram:<value>` (legacy default; legacy fields predate multi-transport).
+    Confirm shape with `isinstance(raw_trusted, dict)`; older list-shape configs (pre-A1) align with `trusted_user_ids` by index against `allowed_usernames` and are still supported for one release.
   - Legacy `trusted_user_ids: list[int]` is treated as a fallback only when `trusted_users` is missing or empty (matches the current loader semantics in `_effective_trusted_users`).
   - The loader sets a `migration_pending: bool` flag on the returned `Config` object when any legacy field was read. Callers (CLI `start`, manager bot startup) check this flag and call `save_config` once to materialize the new on-disk shape.
 - Unknown role on load → log warning, treat as `viewer` (least-privilege).
@@ -168,9 +173,9 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
 - `_get_user_role(identity) -> str | None`:
   - Reads `self._allowed_users` (populated by `ProjectBot.__init__`).
   - **First** checks whether `_identity_key(identity)` is in any `AllowedUser.locked_identities` list — platform-portable identity lock from first contact on that transport. This is the security-critical fast path and prevents username-change attacks. Works for every transport since the keys are `transport_id:native_id` strings.
-  - Falls back to a case- and `@`-insensitive username match when no identity from this transport is locked yet for that user. The match still wins even if the user has identities locked on OTHER transports — e.g., a user with `locked_identities=["telegram:12345"]` who messages from Web for the first time matches by username, then their Web identity gets appended.
-  - On first match by username, appends `_identity_key(identity)` to that `AllowedUser.locked_identities` (no replacement — just append if absent) and sets `self._auth_dirty = True` so the next message-handling tail persists. Subsequent requests from that transport validate by identity, not username.
-  - Returns `"executor"`, `"viewer"`, or `None` (not listed → denied).
+  - Falls back to a case- and `@`-insensitive username match when no identity from this transport is locked yet for that user. **Same-transport spoof guard**: if the matching `AllowedUser` already has at least one identity with the same `transport_id:` prefix as the incoming identity, the fallback is REFUSED (return None). This prevents an attacker who knows the username from binding their own native_id when the legitimate user has already locked. The fallback only succeeds for genuinely-new transports — e.g., a user with `locked_identities=["telegram:12345"]` first messaging from Web matches by username and appends `"web:web-session:abc"`.
+  - On a successful username match (no prior transport lock), appends `_identity_key(identity)` to that `AllowedUser.locked_identities` and sets `self._auth_dirty = True` so the next message-handling tail persists. Subsequent requests from that transport validate by identity, not username.
+  - Returns `"executor"`, `"viewer"`, or `None` (not listed, or spoof-guarded → denied).
 - `_auth_identity(identity) -> bool`:
   - True iff `_get_user_role(identity)` returns a role (any non-None).
   - Empty `allowed_users` → deny everyone. **Fail-closed** is the new default; the old laxity around missing-allowlists is gone.
@@ -304,10 +309,16 @@ Transport receives command → CommandInvocation
 ```
 Transport receives button click → ButtonClick
    └─ _on_button(click)
-          ├─ NEW: for handler in _plugin_button_handlers:
-          │       consumed = await handler(click)
+          ├─ NEW: for plugin in _plugins:
+          │       try: consumed = await plugin.on_button(click)
+          │       except: log and continue with next plugin
           │       if consumed: return
-          └─ existing primary button dispatch (ask_, proj_, model_, …)
+          ├─ NEW: state-changing branches in the primary chain
+          │       (model_set_*, effort_set_*, thinking_set_*,
+          │       permissions_set_*, backend_set_*, reset_*,
+          │       task_cancel_*, lang_set_*, ask_*) wrap with
+          │       `if not await self._guard_executor(click): return`
+          └─ existing primary button dispatch (proj_*, etc.)
 ```
 
 ### Tool use & task complete

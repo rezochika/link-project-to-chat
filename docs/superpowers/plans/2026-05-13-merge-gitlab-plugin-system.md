@@ -36,7 +36,9 @@ Expected: `On branch feat/plugin-system` with a clean working tree.
 .venv/bin/pytest -q
 ```
 
-Record the actual passing count (latest verified: **1003 passed, 5 skipped** as of `7fd934e` on `main`). Use this number as the regression gate for the rest of the plan — every commit must keep it green.
+**Record the actual passing count in this task's commit message** (e.g., `chore: pin test baseline at 1003 passed, 5 skipped`). Numbers in this plan are illustrative — they drift across reviewer environments and commits. The number recorded here in Task 0 is the regression gate for the rest of the plan.
+
+The author observed `1003 passed, 5 skipped` on `7fd934e`; a reviewer saw `976 collected` on an older state (likely a different SHA or a partial install). Re-run `pip install -e ".[all]" && pytest -q` to get YOUR baseline before writing it down.
 
 If the count differs, check the venv first: a stale editable install (e.g., from a deleted worktree) shows as 64 collection errors and `0 passed`, which is misleading. Re-running `pip install -e .` fixes it.
 
@@ -641,7 +643,7 @@ chmod +x scripts/restart.sh scripts/stop.sh
 ```bash
 pytest -q
 ```
-Expected: All tests PASS (1003 + new ones).
+Expected: All tests PASS. Count must be ≥ the baseline recorded in Task 0 plus the new tests added in this task; if anything dropped, investigate before continuing.
 
 - [ ] **Step 11: Commit**
 
@@ -1281,11 +1283,11 @@ In the body, find the `bot = ProjectBot(...)` call (line 2696). Add to its kwarg
 Mirror in `run_bots` (line 2740). Add to its `run_bot(...)` call (line 2766):
 
 ```python
-            plugins=proj.plugins or None,
-            allowed_users=proj.allowed_users or None,
+            plugins=getattr(proj, "plugins", None) or None,
+            allowed_users=getattr(proj, "allowed_users", None) or None,
 ```
 
-(`ProjectConfig.plugins` and `ProjectConfig.allowed_users` are added in Task 3 — this line will be live once Task 3 lands.)
+`getattr` with a default keeps Task 2 green at commit time — `ProjectConfig.plugins` and `ProjectConfig.allowed_users` don't exist until Task 3 lands. Once Task 3 adds the fields, these reads return the real lists. Task 4 Step 6 replaces the line with the `resolve_project_allowed_users` call that returns `(users, source)`, so the `getattr` shape is transient.
 
 - [ ] **Step 15: Run tests to verify they pass**
 
@@ -1299,7 +1301,7 @@ Expected: All tests PASS.
 ```bash
 pytest -q
 ```
-Expected: Pre-existing 1003 + new test count all PASS. If anything else breaks, the most likely cause is a hook placement issue. Re-read the surrounding code.
+Expected: Pre-existing baseline (recorded in Task 0) plus this task's new tests, all PASS. If anything else breaks, the most likely cause is a hook placement issue. Re-read the surrounding code.
 
 - [ ] **Step 17: Commit**
 
@@ -1344,7 +1346,7 @@ EOF
 
 We add `plugins` and `allowed_users` to `ProjectConfig` and to `Config` (global). **`TeamBotConfig` is not touched** — team bots inherit auth from `Config.allowed_users`, matching existing behavior. The legacy `allowed_usernames` / `trusted_users` / `trusted_user_ids` fields **stay on the dataclasses** through this task as read-only inputs — the loader populates them so existing callers in `bot.py` / `cli.py` / `manager/bot.py` keep working until Task 5 migrates every call site. The **save format already writes only `allowed_users`** — legacy keys are stripped from disk on first save after upgrade. Legacy fields get removed from the dataclasses in Task 5's final step once nothing reads them.
 
-We add a one-way migration on load that sets `Config.migration_pending` for the CLI to act on, plus a new helper `resolve_project_allowed_users(project, config) -> list[AllowedUser]` that callers use instead of touching the legacy fields directly.
+We add a one-way migration on load that sets `Config.migration_pending` for the CLI to act on, plus a new helper `resolve_project_allowed_users(project, config) -> tuple[list[AllowedUser], str]` (returns `(users, "project"|"global")` so the caller knows which scope to persist back to). Callers use this helper instead of touching the legacy fields directly.
 
 **Migration contract:** legacy keys are read on load (synthesized into `allowed_users` with `role="executor"`), then **stripped** from the save format. The first save after upgrade rewrites `config.json` without them. There is no path back to the legacy shape.
 
@@ -1682,6 +1684,49 @@ def test_migration_f_orphan_trust(tmp_path: Path):
     assert by_user["bob"].locked_identities == ["telegram:67890"]
 
 
+def test_migration_g_web_session_id_normalized(tmp_path: Path):
+    """Pre-v1.0 Web stored trusted_users["alice"] = "web-session:abc-def".
+    The legacy value contains ":" but lacks the "web:" transport prefix
+    that the new identity-keyed auth comparison requires. Migration must
+    normalize "web-session:abc" → "web:web-session:abc" so the locked
+    identity matches _identity_key(web_identity) at runtime."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": "web-session:abc-def"},
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["web:web-session:abc-def"]
+
+
+def test_migration_h_unknown_prefix_falls_back_to_telegram(tmp_path: Path):
+    """Bare strings that don't match a known transport prefix migrate as
+    telegram (the legacy default — pre-multi-transport configs)."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": "12345"},  # bare numeric string
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+
+
 def test_legacy_list_length_mismatch_drops_ids(tmp_path, caplog):
     """Mismatched legacy list shapes drop the IDs and log WARNING."""
     cfg_file = tmp_path / "config.json"
@@ -1882,6 +1927,30 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
     # with the new `locked_identities` field.
     identities_for: dict[str, list[str]] = {}
     legacy_trusted_names: list[str] = []
+    # Only values that already start with a KNOWN transport prefix are passed
+    # through; everything else is assumed Telegram (legacy default). This is
+    # the fix for the Web case: pre-v1.0 Web bound trusted_users["alice"] =
+    # "web-session:abc" — contains ":" but does NOT have the "web:" transport
+    # prefix that auth comparisons need. We detect this by matching a known
+    # transport whitelist; anything else falls back to telegram or to bare
+    # passthrough only if a known prefix is present.
+    _KNOWN_TRANSPORT_PREFIXES = ("telegram:", "web:", "discord:", "slack:")
+
+    def _normalize_legacy_trust_id(uid_str: str) -> str:
+        """Turn a legacy trusted_users value into a 'transport_id:native_id' string."""
+        # Already correctly prefixed?
+        for prefix in _KNOWN_TRANSPORT_PREFIXES:
+            if uid_str.startswith(prefix):
+                return uid_str
+        # The Web case: bare "web-session:abc" → "web:web-session:abc".
+        if uid_str.startswith("web-session:"):
+            return f"web:{uid_str}"
+        # Plain numeric or arbitrary string → telegram (legacy default).
+        try:
+            return f"telegram:{int(uid_str)}"
+        except (TypeError, ValueError):
+            return f"telegram:{uid_str}"
+
     if isinstance(raw_trusted, dict):
         # Current on-disk shape: username → user_id (int or str).
         for uname, uid in raw_trusted.items():
@@ -1889,16 +1958,7 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
             legacy_trusted_names.append(norm)
             if uid is None:
                 continue
-            uid_str = str(uid)
-            if ":" in uid_str:
-                # Caller-prefixed (any transport). Pass through.
-                identities_for.setdefault(norm, []).append(uid_str)
-            else:
-                # Plain ID — assume telegram (legacy fields predate multi-transport).
-                try:
-                    identities_for.setdefault(norm, []).append(f"telegram:{int(uid_str)}")
-                except (TypeError, ValueError):
-                    identities_for.setdefault(norm, []).append(f"telegram:{uid_str}")
+            identities_for.setdefault(norm, []).append(_normalize_legacy_trust_id(str(uid)))
     elif isinstance(raw_trusted, list):
         # Pre-A1 shape: list of usernames aligned with trusted_user_ids by index.
         legacy_trusted_names = [_norm(n) for n in raw_trusted]
@@ -2061,6 +2121,82 @@ Mirror in the **global** serialization block (where `raw["allowed_usernames"] = 
 **Do NOT touch the team-bot serialization block.** It never carried these fields.
 
 After saving, clear the in-memory flag: `config.migration_pending = False`. (Optional, but lets callers re-read state without re-saving.)
+
+- [ ] **Step 7b: Add atomic-RMW helpers (`locked_config_rmw` + `save_config_within_lock`)**
+
+Task 5's `_persist_auth_if_dirty` needs an atomic load-modify-save cycle: two concurrent first-contact saves would each read the pre-write state and clobber each other under the current "lock-only-on-save" model. Add a context manager that holds `_config_lock` across the WHOLE cycle.
+
+Refactor the existing `load_config` and `save_config` into wrapper + inner pairs:
+
+```python
+# Existing _config_lock context manager is already in config.py
+# (around line 143). Keep it. Refactor load/save to expose unlocked
+# inner helpers so the RMW manager can hold the lock for both.
+
+def _load_config_unlocked(path: Path) -> Config:
+    """Load Config without acquiring _config_lock. Caller must hold the lock."""
+    # Move the body of the current load_config here, dropping the with statement.
+    ...
+
+def _save_config_unlocked(config: Config, path: Path) -> None:
+    """Save Config without acquiring _config_lock. Caller must hold the lock."""
+    # Move the body of the current save_config here, dropping the with statement.
+    ...
+
+def load_config(path: Path = DEFAULT_CONFIG) -> Config:
+    """Public API: acquires _config_lock for the read."""
+    with _config_lock(path):
+        return _load_config_unlocked(path)
+
+def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
+    """Public API: acquires _config_lock for the write."""
+    with _config_lock(path):
+        _save_config_unlocked(config, path)
+
+@contextmanager
+def locked_config_rmw(path: Path = DEFAULT_CONFIG):
+    """Hold _config_lock across a load-modify-save cycle.
+
+    Yields a freshly-loaded Config; caller mutates it; the context manager's
+    block writes it back. Use `save_config_within_lock` inside the block
+    (NOT save_config — that would deadlock by re-acquiring the same lock).
+
+    Used by ProjectBot._persist_auth_if_dirty so concurrent first-contact
+    locks serialize correctly. Without this, two processes could each
+    `load_config()` the same pre-write state, append different identities,
+    and `save_config()` — last writer wins.
+    """
+    with _config_lock(path):
+        config = _load_config_unlocked(path)
+        yield config
+
+def save_config_within_lock(config: Config, path: Path = DEFAULT_CONFIG) -> None:
+    """Save Config without re-acquiring _config_lock. For callers inside
+    locked_config_rmw who already hold the lock."""
+    _save_config_unlocked(config, path)
+```
+
+Add a small TDD test in `tests/test_config_allowed_users.py`:
+
+```python
+def test_locked_config_rmw_holds_lock_across_load_and_save(tmp_path: Path):
+    """The RMW context manager must hold _config_lock for both phases.
+    A second locked_config_rmw call while the first holds the lock should
+    block (we can only verify the API exists and the basic round-trip works
+    without spawning real processes — concurrency is exercised by the
+    test_persist_merges_per_user_not_replace integration test in Task 5)."""
+    from link_project_to_chat.config import locked_config_rmw, save_config_within_lock
+
+    cfg_file = tmp_path / "config.json"
+    save_config(Config(), cfg_file)
+
+    with locked_config_rmw(cfg_file) as cfg:
+        cfg.allowed_users = [AllowedUser(username="alice", role="executor")]
+        save_config_within_lock(cfg, cfg_file)
+
+    reloaded = load_config(cfg_file)
+    assert reloaded.allowed_users == [AllowedUser(username="alice", role="executor", locked_identities=[])]
+```
 
 - [ ] **Step 8: Audit `config.py` only — confirm new code paths are wired in**
 
@@ -2676,6 +2812,45 @@ def test_first_contact_locks_identity():
     assert au.locked_identities == ["telegram:98765"]
 
 
+def test_username_fallback_refuses_when_transport_already_locked():
+    """Same-transport spoof guard: if the user already has any identity from
+    this transport, refuse the username fallback. Otherwise an attacker who
+    knows the username could bind their own native_id."""
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["telegram:12345"],
+    )
+    bot = _BotWithRoles(allowed_users=[au])
+    # Spoof attempt: same transport, different native_id, same username.
+    attacker = _identity("alice", native_id="11111")  # transport_id="telegram"
+    assert bot._auth_identity(attacker) is False
+    # Alice's identity list was NOT mutated.
+    assert au.locked_identities == ["telegram:12345"]
+    assert bot._auth_dirty is False
+
+
+def test_username_fallback_succeeds_for_genuinely_new_transport():
+    """When the user has NO identity from the incoming transport, fallback
+    succeeds and appends. That's the multi-transport onboarding case."""
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["telegram:12345"],
+    )
+    bot = _BotWithRoles(allowed_users=[au])
+    # Different transport: web. transport_prefix "web:" not present in
+    # locked_identities, so the fallback applies and appends.
+    from link_project_to_chat.transport.base import Identity
+    web_ident = Identity(
+        transport_id="web", native_id="web-session:abc-def",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(web_ident) is True
+    assert "telegram:12345" in au.locked_identities
+    assert "web:web-session:abc-def" in au.locked_identities
+
+
 def test_locked_identity_takes_precedence_over_username():
     """After identity is locked, validation goes through identity, not username."""
     au = AllowedUser(
@@ -2771,25 +2946,39 @@ class AuthMixin:
         if not self._allowed_users:
             return None
         ident_key = self._identity_key(identity)
+        transport_prefix = f"{identity.transport_id}:"
         # 1. Identity-lock fast path.
         for au in self._allowed_users:
             if ident_key in au.locked_identities:
                 return au.role
-        # 2. Username fallback.
+        # 2. Username fallback — ONLY when no identity from THIS transport is
+        # already locked for that user. If the user has a different identity
+        # from the same transport locked (e.g., locked_identities=["fake:12345"]
+        # and the incoming is "fake:11111"), the fast path missed AND there's
+        # already a transport lock — this is a same-transport spoof attempt.
+        # Deny without appending.
         uname = self._normalize_username(getattr(identity, "handle", ""))
         if not uname:
             return None
         for au in self._allowed_users:
             if self._normalize_username(au.username) != uname:
                 continue
-            # Append-if-absent — same identity from concurrent messages stays idempotent.
-            if ident_key not in au.locked_identities:
-                au.locked_identities.append(ident_key)
-                self._auth_dirty = True
-                logger.info(
-                    "Locked identity %s for %s on first contact",
-                    ident_key, au.username,
+            # Same-transport spoof guard. We only username-fallback when the
+            # user has NO identity from this transport yet.
+            if any(x.startswith(transport_prefix) for x in au.locked_identities):
+                logger.warning(
+                    "Same-transport spoof rejected: %s already has a %s lock; "
+                    "ignoring incoming %s",
+                    au.username, identity.transport_id, ident_key,
                 )
+                return None
+            # First contact from this transport — append.
+            au.locked_identities.append(ident_key)
+            self._auth_dirty = True
+            logger.info(
+                "Locked identity %s for %s on first contact",
+                ident_key, au.username,
+            )
             return au.role
         return None
 
@@ -2888,59 +3077,95 @@ In `src/link_project_to_chat/bot.py`, immediately above `_guard_executor` (Step 
         Called from message-handling tails (_on_text, _on_run, etc.) after the
         message is processed. Cheap when nothing to do (single bool check).
 
-        Two correctness properties:
-        1. **Scope-aware.** Writes back to whichever scope the bot's
+        Three correctness properties:
+        1. **Atomic read-modify-write.** The load → merge → save sequence
+           holds the existing `_config_lock` (`fcntl.flock` POSIX,
+           `msvcrt.locking` Windows) for the WHOLE duration, not just the
+           write phase. Without this, two concurrent first-contacts would
+           each load the pre-write state, each merge in their own change,
+           each save — last writer wins and silently drops one lock.
+           The lock is provided by the new `locked_config_rmw(path)` context
+           manager in `config.py` (added in Task 3 Step 7b alongside the
+           save logic).
+        2. **Scope-aware.** Writes back to whichever scope the bot's
            _allowed_users came from. When the bot inherited the global
            allow-list via `resolve_project_allowed_users` fallback,
-           self._auth_source == "global" and we update Config.allowed_users
+           `self._auth_source == "global"` and we update `Config.allowed_users`
            on disk — NOT the project's empty list (which would silently
            promote the global list to a project-scoped copy).
-        2. **Per-user merge.** Reload the file, find the AllowedUser by
-           username, update its locked_identities, save. Does NOT replace the
-           full list. Concurrent edits to other users converge correctly under
-           the existing _config_lock (fcntl.flock / msvcrt.locking).
+        3. **Per-user merge.** Find the AllowedUser by username, union its
+           locked_identities with our in-memory copy, write. Does NOT replace
+           the full list. Concurrent edits to OTHER users on disk are
+           preserved.
         """
         if not self._auth_dirty:
             return
-        from .config import load_config, save_config
+        from .config import locked_config_rmw, save_config_within_lock
         cfg_path = self._effective_config_path()
         try:
-            disk = load_config(cfg_path)
+            with locked_config_rmw(cfg_path) as disk:
+                # disk is a freshly-loaded Config with the file lock held.
+                if self._auth_source == "project":
+                    if self.name not in disk.projects:
+                        logger.warning(
+                            "Auth persist skipped: project %r missing from disk", self.name,
+                        )
+                        return
+                    target = disk.projects[self.name].allowed_users
+                else:  # "global"
+                    target = disk.allowed_users
 
-            # Pick the target list based on the bot's auth source.
-            if self._auth_source == "project":
-                if self.name not in disk.projects:
-                    logger.warning(
-                        "Auth persist skipped: project %r missing from disk", self.name,
-                    )
-                    return
-                target = disk.projects[self.name].allowed_users
-            else:  # "global"
-                target = disk.allowed_users
+                # Per-user merge: union our in-memory locks with disk's.
+                in_memory_by_user = {u.username: u for u in self._allowed_users}
+                for au in target:
+                    mem = in_memory_by_user.get(au.username)
+                    if mem is None:
+                        continue
+                    merged = list(au.locked_identities)
+                    for ident in mem.locked_identities:
+                        if ident not in merged:
+                            merged.append(ident)
+                    au.locked_identities = merged
 
-            # Per-user merge: for each in-memory AllowedUser, find the disk
-            # entry by username and update its locked_identities. Skip users
-            # not present on disk (operator may have removed them while bot
-            # was running — don't resurrect them here).
-            in_memory_by_user = {u.username: u for u in self._allowed_users}
-            for au in target:
-                mem = in_memory_by_user.get(au.username)
-                if mem is None:
-                    continue
-                # Union: keep any locks the disk had that we haven't seen yet
-                # (another bot may have written) AND any locks we have that
-                # the disk doesn't (our first-contact).
-                merged = list(au.locked_identities)
-                for ident in mem.locked_identities:
-                    if ident not in merged:
-                        merged.append(ident)
-                au.locked_identities = merged
+                # Inside the context manager — save_config_within_lock writes
+                # without re-locking (the context manager already holds the lock).
+                save_config_within_lock(disk, cfg_path)
 
-            save_config(disk, cfg_path)
             self._auth_dirty = False
         except Exception:
             logger.exception("Failed to persist auth state; will retry on next message")
 ```
+
+This relies on two new symbols in `config.py` (add them as part of Task 3 Step 7b):
+
+```python
+# In src/link_project_to_chat/config.py, near the existing _config_lock helper:
+
+from contextlib import contextmanager
+
+@contextmanager
+def locked_config_rmw(path: Path):
+    """Hold _config_lock across a load-modify-save cycle.
+
+    Yields a freshly-loaded Config object; caller mutates it; the context
+    manager writes it back atomically when the block exits cleanly. Use
+    `save_config_within_lock` inside the block to write — `save_config`
+    re-acquires the lock and would deadlock.
+    """
+    with _config_lock(path):
+        config = _load_config_unlocked(path)
+        yield config
+
+def save_config_within_lock(config, path: Path) -> None:
+    """Write config to disk WITHOUT acquiring _config_lock.
+
+    Public callers should use save_config (which acquires the lock); this is
+    for callers that already hold the lock via locked_config_rmw.
+    """
+    _save_config_unlocked(config, path)
+```
+
+The existing `load_config` / `save_config` get refactored to: outer wrapper acquires `_config_lock`, inner `_load_config_unlocked` / `_save_config_unlocked` does the actual work. The atomic RMW path uses the inner helpers under one lock acquisition. **Add this refactor as Task 3 Step 7b** (a small follow-up to Step 7's save changes) so the helpers exist when Task 5 imports them.
 
 The `self._auth_source` attribute is set in `ProjectBot.__init__` from the caller. In `run_bot` / `run_bots`, change the call sites that compute `effective_allowed` to also capture the source:
 
@@ -2962,26 +3187,9 @@ In `_on_text` (line 1003), at the very end of the body (after `task_manager.subm
         await self._persist_auth_if_dirty()
 ```
 
-Mirror in `_on_run` (line 1100), `_on_file_from_transport` (line 2302), and the command-handler bodies after `_guard_executor` returns True. The simplest pattern: extend `_guard_executor` itself to call `_persist_auth_if_dirty` before returning True. That covers every state-changing handler in one place:
+The persistence wiring is centralized in `_guard_executor` (Step 6 below) and in a `try/finally` around top-level handlers (Step 6b). The Step 6 helper persists on BOTH the success AND the viewer-denied path — `_require_executor` may have appended a first-contact identity even when the role check fails. The Step 6b wrapper picks up read-only handler paths that don't run `_guard_executor` (like `/status`, `/tasks`, plugin-consumed messages).
 
-```python
-    async def _guard_executor(self, ci_or_msg) -> bool:
-        sender = getattr(ci_or_msg, "sender", None)
-        if sender is None:
-            return False
-        if self._require_executor(sender):
-            await self._persist_auth_if_dirty()  # NEW
-            return True
-        assert self._transport is not None
-        await self._transport.send_text(
-            ci_or_msg.chat,
-            "Read-only access — your role is viewer.",
-            reply_to=getattr(ci_or_msg, "message", None),
-        )
-        return False
-```
-
-Read-only commands that don't run `_guard_executor` (like `/status`, `/tasks`) also need to persist — add `await self._persist_auth_if_dirty()` at the end of `_on_text_from_transport` for the `auth_identity` branch that doesn't go through `_guard_executor`.
+See Step 6 below for the canonical `_guard_executor` implementation.
 
 (Read the existing `_auth.py` first; preserve the brute-force lockout and rate-limit code. The only change is replacing the legacy username/ID lookup with the new `_get_user_role` flow.)
 
@@ -3003,11 +3211,22 @@ Insert this method on `ProjectBot` immediately above `_on_text` (line 1003):
         Replies 'Read-only access' on the active transport when blocked.
         `ci_or_msg` accepts either a CommandInvocation or an IncomingMessage —
         both expose `.sender`, `.chat`, and `.message`.
+
+        IMPORTANT: persists `_auth_dirty` on BOTH the success AND the
+        viewer-denied path. `_require_executor` may have appended a
+        first-contact identity to the user's locked_identities even when the
+        role check ultimately fails (e.g., the user is a viewer logging in
+        from a new transport — they get authed, locked, then denied for the
+        state-changing action). Skipping the save on the deny path would
+        lose that lock.
         """
         sender = getattr(ci_or_msg, "sender", None)
         if sender is None:
             return False
-        if self._require_executor(sender):
+        allowed = self._require_executor(sender)
+        # Persist first-contact locks regardless of allow/deny outcome.
+        await self._persist_auth_if_dirty()
+        if allowed:
             return True
         assert self._transport is not None
         await self._transport.send_text(
@@ -3016,6 +3235,105 @@ Insert this method on `ProjectBot` immediately above `_on_text` (line 1003):
             reply_to=getattr(ci_or_msg, "message", None),
         )
         return False
+```
+
+**This is the canonical `_guard_executor` shape.** The earlier sketch in Step 4 (that only persisted on the True branch) is superseded — disregard that snippet and use this one.
+
+- [ ] **Step 6b: Wrap top-level handlers with a try/finally that always persists**
+
+`_guard_executor` covers the state-changing path, but several top-level handlers can complete WITHOUT calling it: plugin-consumed messages (where `plugin.on_message` returned True), plugin-consumed buttons, read-only commands (`/status`, `/tasks`), and exception paths. In every case, the transport's authorizer may have already triggered a first-contact identity append via `_get_user_role`. Without a final persist, that lock stays in-memory and is lost on bot restart.
+
+Add a small async helper:
+
+```python
+    async def _with_auth_persist(self, awaitable):
+        """Run an awaitable, guaranteeing _persist_auth_if_dirty fires after.
+
+        Use this in top-level handler bodies whose flow may exit through any
+        of: plugin consume, viewer-denied gate, exception, normal path.
+        Cheap when no first-contact happened (the persist is a single bool
+        check that no-ops).
+        """
+        try:
+            await awaitable
+        finally:
+            await self._persist_auth_if_dirty()
+```
+
+Then wrap the three top-level entry points the transport calls — `_on_text_from_transport`, the command-dispatch callbacks (`_on_X_t` family), and `_on_button` — so the persist fires regardless of which branch the handler took. Concretely, in each top-level handler add the `try/finally` directly:
+
+```python
+    async def _on_text_from_transport(self, incoming) -> None:
+        try:
+            # existing body unchanged
+            ...
+        finally:
+            await self._persist_auth_if_dirty()
+
+    async def _on_button(self, click) -> None:
+        try:
+            # existing body unchanged
+            ...
+        finally:
+            await self._persist_auth_if_dirty()
+```
+
+Same pattern for each `_on_<command>` handler. For command handlers, since they all get registered via `transport.on_command(name, handler)`, you can also wrap them centrally by writing the registration step as:
+
+```python
+        def _wrap_command(handler):
+            async def _wrapped(ci):
+                try:
+                    await handler(ci)
+                finally:
+                    await self._persist_auth_if_dirty()
+            return _wrapped
+
+        for name, handler in ported_commands:
+            self._transport.on_command(name, _wrap_command(handler))
+```
+
+This is cleaner than touching every individual `_on_X_t` body.
+
+Add a test in `tests/test_auth_roles.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_plugin_consumed_message_still_persists_first_contact_lock():
+    """A plugin that consumes the message (returns True from on_message)
+    short-circuits the role gate. The first-contact identity lock applied
+    by the transport authorizer must still get persisted via the try/finally
+    wrapping the top-level handler."""
+    persists: list[int] = []
+
+    class _BotWithPersistCount(AuthMixin):
+        def __init__(self, allowed_users):
+            self._allowed_users = list(allowed_users)
+            self._init_auth()
+
+        async def _persist_auth_if_dirty(self):
+            if self._auth_dirty:
+                persists.append(1)
+                self._auth_dirty = False
+
+        async def _with_auth_persist(self, awaitable):
+            try:
+                await awaitable
+            finally:
+                await self._persist_auth_if_dirty()
+
+    bot = _BotWithPersistCount(
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+
+    async def consuming_handler():
+        # Simulate auth + plugin consume.
+        bot._auth_identity(_identity("alice", native_id="98765"))
+        # Plugin returned True → handler returns early without role gate.
+        return
+
+    await bot._with_auth_persist(consuming_handler())
+    assert persists == [1]
 ```
 
 - [ ] **Step 7: Edit `bot.py` — gate state-changing command handlers**
@@ -4314,7 +4632,7 @@ EOF
 
 After every task:
 
-1. `pytest -q` green (`1003 passed, 5 skipped` baseline on `main` at `7fd934e`; tasks add new tests so the count grows monotonically).
+1. `pytest -q` green. Baseline is whatever Task 0 recorded after `pip install -e ".[all]" && pytest -q`; tasks add new tests so the count grows monotonically.
 2. New tests for the task pass.
 3. No source files deleted EXCEPT for the legacy-field removal in Task 5 Step 12 (where `allowed_usernames` / `trusted_users` / `trusted_user_ids` are removed from `ProjectConfig` and `Config`).
 4. If you observe a count below the baseline, first verify the venv: `.venv/bin/pip install -e ".[all]"` then re-run pytest. A stale editable install (e.g., leftover from a deleted worktree) shows as `0 passed` with 60+ collection errors — that's a venv problem, not a regression.
