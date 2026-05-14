@@ -2900,7 +2900,7 @@ The spec's eager-migration decision (Resolved question #3) promises BOTH `start`
 
 After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today's `start-manager` would `AttributeError` on `main_config.allowed_usernames` at [cli.py:753](src/link_project_to_chat/cli.py:753) and would pass nonexistent fields into `ManagerBot` at [cli.py:761](src/link_project_to_chat/cli.py:761). And `ManagerBot.__init__` at [manager/bot.py:248](src/link_project_to_chat/manager/bot.py:248) doesn't yet accept `allowed_users=`, so even an updated CLI would TypeError. Both surfaces need to land in the same commit so the suite stays green.
 
-**1. Update `ManagerBot.__init__` (additive — legacy kwargs stay until Task 5 Step 12 strips them).** In [manager/bot.py](src/link_project_to_chat/manager/bot.py):
+**1. Update `ManagerBot.__init__` (additive — legacy kwargs stay until Task 5 Step 11 strips them).** In [manager/bot.py](src/link_project_to_chat/manager/bot.py):
 
 ```python
     def __init__(
@@ -2917,7 +2917,7 @@ After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today'
     ):
         self._token = token
         self._pm = process_manager
-        # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 12
+        # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 11
         # once every caller passes allowed_users= instead.
         if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
@@ -2993,7 +2993,7 @@ def start_manager(ctx):
     bot.build().run_polling()
 ```
 
-Note: legacy `allowed_usernames=` / `trusted_users=` kwargs are NOT passed anymore. The constructor's legacy kwargs default to `None`, so any in-process state they used to populate is empty — but AuthMixin now reads exclusively from `_allowed_users` (after Task 5 Step 3), and `_allowed_users` IS populated. Old kwargs become dead defaults through Task 4 and Task 5 Step 1–11, then get stripped in Task 5 Step 12.
+Note: legacy `allowed_usernames=` / `trusted_users=` kwargs are NOT passed anymore. The constructor's legacy kwargs default to `None`, so any in-process state they used to populate is empty — but AuthMixin now reads exclusively from `_allowed_users` (after Task 5 Step 3), and `_allowed_users` IS populated. Old kwargs become dead defaults through Task 4 and Task 5 Step 1–10, then get stripped in Task 5 Step 11.
 
 **3. TDD verification.** Add to [tests/test_cli.py](tests/test_cli.py) (or a new `tests/test_start_manager.py` if the file is already large):
 
@@ -3005,9 +3005,11 @@ def test_start_manager_requires_allowed_users(tmp_path, monkeypatch):
     from click.testing import CliRunner
 
     cfg_path = tmp_path / "config.json"
-    # Manager token set, but NO allowed_users.
+    # Manager token set, but NO allowed_users. (Config has no top-level
+    # telegram_bot_token field — that's per-ProjectConfig. start-manager
+    # only needs manager_telegram_bot_token.)
     save_config(
-        Config(telegram_bot_token="x", manager_telegram_bot_token="m", allowed_users=[]),
+        Config(manager_telegram_bot_token="m", allowed_users=[]),
         cfg_path,
     )
     runner = CliRunner()
@@ -3027,7 +3029,6 @@ def test_start_manager_passes_allowed_users_into_manager_bot(tmp_path, monkeypat
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            telegram_bot_token="x",
             manager_telegram_bot_token="m",
             allowed_users=[AllowedUser(username="alice", role="executor")],
         ),
@@ -3174,7 +3175,7 @@ projects are aggregated into a single CRITICAL log line at startup
 ManagerBot.__init__ gains an `allowed_users: list[AllowedUser] | None`
 kwarg additively. Legacy kwargs (allowed_usernames, trusted_users, …)
 stay through Task 5 for backward-compat, then get stripped in
-Task 5 Step 12 once no caller passes them.
+Task 5 Step 11 once no caller passes them.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
