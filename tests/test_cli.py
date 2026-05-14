@@ -327,8 +327,9 @@ def test_configure_manager_token(runner, cfg):
     assert "OKEN" in result.output
     data = json.loads(p.read_text())
     assert data["manager_telegram_bot_token"] == "MGR_TOKEN"
-    # existing keys preserved (migrated from allowed_username to allowed_usernames)
-    assert data["allowed_usernames"] == ["alice"]
+    # existing auth carried forward via the new identity-keyed shape (Task 3
+    # strips legacy ``allowed_usernames`` from disk).
+    assert [u["username"] for u in data["allowed_users"]] == ["alice"]
     assert "projects" in data
 
 
@@ -348,8 +349,12 @@ def test_configure_remove_username_revokes_trusted_binding(runner, tmp_path):
 
     assert result.exit_code == 0
     data = json.loads(p.read_text())
-    assert data["allowed_usernames"] == []
+    # Task 3: legacy keys are stripped from disk; the new shape carries the
+    # data forward. After removing alice, neither legacy nor new shape
+    # contains an entry for her.
+    assert "allowed_usernames" not in data
     assert "trusted_users" not in data
+    assert data.get("allowed_users", []) == []
 
 
 def test_configure_no_args_fails(runner, cfg):

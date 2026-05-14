@@ -367,7 +367,9 @@ def test_save_config_multi_user_roundtrip(tmp_path: Path):
 
 
 def test_save_config_removes_old_singular_keys(tmp_path: Path):
-    """After save, old singular keys should not be in the JSON."""
+    """After save, legacy singular AND plural auth keys are stripped from disk;
+    the new identity-keyed ``allowed_users`` shape carries the data forward.
+    """
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps({
         "allowed_username": "alice",
@@ -379,8 +381,19 @@ def test_save_config_removes_old_singular_keys(tmp_path: Path):
     raw = json.loads(p.read_text())
     assert "allowed_username" not in raw
     assert "trusted_user_id" not in raw
-    assert raw["trusted_users"] == {"alice": 42}
+    # Legacy keys at global + project scope are stripped on save (Task 3);
+    # the new shape carries the data forward.
+    assert "allowed_usernames" not in raw
+    assert "trusted_users" not in raw
+    assert "trusted_user_ids" not in raw
+    assert raw["allowed_users"] == [
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:42"]},
+    ]
     assert "username" not in raw["projects"]["proj"]
+    assert "allowed_usernames" not in raw["projects"]["proj"]
+    assert raw["projects"]["proj"]["allowed_users"] == [
+        {"username": "bob", "role": "executor"},
+    ]
 
 
 def test_add_trusted_user_id(tmp_path: Path):

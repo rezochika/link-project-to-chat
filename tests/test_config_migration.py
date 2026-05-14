@@ -366,3 +366,283 @@ def test_save_session_for_unknown_team_is_noop(tmp_path: Path):
 
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert "acme" not in raw.get("teams", {})
+
+
+# ---------------------------------------------------------------------------
+# Auth-migration golden-file tests (Task 3)
+#
+# Six golden-file fixtures matching the spec's testing section:
+# (a) `allowed_usernames` only;
+# (b) dict-shape `trusted_users` (current on-disk format) covering a subset of
+#     `allowed_usernames`;
+# (c) dict-shape `trusted_users` covering all of `allowed_usernames`;
+# (d) legacy list-shape `trusted_users` aligned with `trusted_user_ids`;
+# (e) global `Config.allowed_usernames` migrating while a project's per-project
+#     list is empty;
+# (f) orphan trust - `trusted_users` contains a username not in
+#     `allowed_usernames`.
+# ---------------------------------------------------------------------------
+
+from link_project_to_chat.config import AllowedUser  # noqa: E402
+
+
+def _write(path: Path, raw: dict) -> None:
+    path.write_text(json.dumps(raw, indent=2))
+
+
+def test_migration_a_allowed_usernames_only(tmp_path: Path):
+    """Shape (a): only allowed_usernames; no trust info at all."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice", "bob"],
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    assert loaded.migration_pending is True
+    p = loaded.projects["p"]
+    assert p.allowed_users == [
+        AllowedUser(username="alice", role="executor"),
+        AllowedUser(username="bob", role="executor"),
+    ]
+    save_config(loaded, cfg_file)
+    written = json.loads(cfg_file.read_text())
+    assert "allowed_usernames" not in written["projects"]["p"]
+    assert "allowed_users" in written["projects"]["p"]
+
+
+def test_migration_b_trusted_users_dict_subset(tmp_path: Path):
+    """Shape (b): current on-disk format - trusted_users is dict, subset of allowed_usernames."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice", "bob", "carol"],
+                "trusted_users": {"alice": 12345},  # dict shape (post-A1)
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    assert loaded.migration_pending is True
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].role == "executor" and by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].role == "executor" and by_user["bob"].locked_identities == []
+    assert by_user["carol"].role == "executor" and by_user["carol"].locked_identities == []
+
+
+def test_migration_c_trusted_users_dict_full(tmp_path: Path):
+    """Shape (c): every allowed user is in the trusted dict."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice", "bob"],
+                "trusted_users": {"alice": 12345, "bob": 67890},
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
+
+
+def test_migration_d_legacy_list_with_ids_aligned(tmp_path: Path):
+    """Shape (d): pre-A1 - trusted_users is a list aligned with trusted_user_ids by index."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice", "bob"],
+                "trusted_users": ["alice", "bob"],
+                "trusted_user_ids": [12345, 67890],
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
+
+
+def test_migration_e_global_config_migration(tmp_path: Path):
+    """Shape (e): global Config.allowed_usernames migrates while per-project is empty."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "allowed_usernames": ["admin"],
+        "trusted_users": {"admin": 99999},
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                # No legacy fields at project scope.
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    assert loaded.migration_pending is True
+    # Global allow-list got migrated.
+    assert loaded.allowed_users == [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:99999"]),
+    ]
+    # Project has empty allowed_users (and that's fine - it'll fall back to
+    # Config.allowed_users in some paths, or warn at startup).
+    assert loaded.projects["p"].allowed_users == []
+    save_config(loaded, cfg_file)
+    written = json.loads(cfg_file.read_text())
+    assert "allowed_usernames" not in written
+    assert "trusted_users" not in written
+    assert written["allowed_users"] == [
+        {"username": "admin", "role": "executor", "locked_identities": ["telegram:99999"]},
+    ]
+
+
+def test_migration_f_orphan_trust(tmp_path: Path):
+    """Shape (f): trusted_users contains a username not in allowed_usernames.
+
+    Should still produce an AllowedUser entry - preserves access. No data loss.
+    """
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"bob": 67890},  # bob NOT in allowed_usernames
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert "alice" in by_user
+    assert "bob" in by_user
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
+
+
+def test_migration_g_web_session_id_normalized(tmp_path: Path):
+    """Pre-v1.0 Web stored trusted_users["alice"] = "web-session:abc-def".
+    The legacy value contains ":" but lacks the "web:" transport prefix
+    that the new identity-keyed auth comparison requires. Migration must
+    normalize "web-session:abc" -> "web:web-session:abc" so the locked
+    identity matches _identity_key(web_identity) at runtime."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": "web-session:abc-def"},
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["web:web-session:abc-def"]
+
+
+def test_migration_h_unknown_prefix_falls_back_to_telegram(tmp_path: Path):
+    """Bare strings that don't match a known transport prefix migrate as
+    telegram (the legacy default - pre-multi-transport configs)."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": "12345"},  # bare numeric string
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+
+
+def test_legacy_list_length_mismatch_drops_ids(tmp_path, caplog):
+    """Mismatched legacy list shapes drop the IDs and log WARNING."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": ["alice"],  # list shape
+                "trusted_user_ids": [],      # length mismatch
+            }
+        }
+    })
+    with caplog.at_level("WARNING"):
+        loaded = load_config(cfg_file)
+    assert "length mismatch" in caplog.text.lower()
+    p = loaded.projects["p"]
+    assert p.allowed_users == [AllowedUser(username="alice", role="executor", locked_identities=[])]
+
+
+def test_save_strips_legacy_keys(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    save_config(loaded, cfg_file)
+    written = json.loads(cfg_file.read_text())
+    p = written["projects"]["p"]
+    assert "allowed_usernames" not in p
+    assert "trusted_users" not in p
+    assert "trusted_user_ids" not in p
+    assert p["allowed_users"] == [
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
+    ]
+
+
+def test_load_save_load_is_stable(tmp_path: Path):
+    """Second load after save has migration_pending=False (idempotent)."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    })
+    once = load_config(cfg_file)
+    assert once.migration_pending is True
+    save_config(once, cfg_file)
+    twice = load_config(cfg_file)
+    assert twice.migration_pending is False
+    save_config(twice, cfg_file)
+    final = json.loads(cfg_file.read_text())
+    assert "allowed_usernames" not in final["projects"]["p"]
+    assert final["projects"]["p"]["allowed_users"] == [
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
+    ]

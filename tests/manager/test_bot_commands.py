@@ -808,8 +808,12 @@ async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
 
     assert fake.sent_messages[-1].text == "Removed @alice."
     raw = json.loads(proj_cfg.read_text())
-    assert raw["allowed_usernames"] == ["testuser"]
-    assert raw["trusted_users"] == {"testuser": 1}
+    # Task 3: legacy on-disk auth keys are stripped; the new
+    # ``allowed_users`` shape carries the surviving user (testuser) forward.
+    assert "allowed_usernames" not in raw
+    assert "trusted_users" not in raw
+    surviving = {u["username"] for u in raw.get("allowed_users", [])}
+    assert surviving == {"testuser"}
     revoked = Identity(
         transport_id="fake",
         native_id="42",
