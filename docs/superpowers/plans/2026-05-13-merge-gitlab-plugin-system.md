@@ -3583,7 +3583,7 @@ For `_on_skills`: read the handler body. If it has separate list-skills (read-on
 
 - [ ] **Step 7b: Gate state-changing button branches in `_on_button`**
 
-In [bot.py](src/link_project_to_chat/bot.py) `_on_button` (line 1960), the branch chain handles many state-changing button values. Each one needs a role gate. The known state-changing prefixes:
+In [bot.py](src/link_project_to_chat/bot.py) `_on_button` (line 1960), the branch chain handles many state-changing button values. Each one needs a role gate. The complete state-changing prefix list (verified against the current `_on_button` body):
 
 - `model_set_*` (line 1969) — changes the active model.
 - `effort_set_*` (line 1989) — changes effort level.
@@ -3591,9 +3591,16 @@ In [bot.py](src/link_project_to_chat/bot.py) `_on_button` (line 1960), the branc
 - `permissions_set_*` (around line 1360 generator + handler) — changes permission mode.
 - `backend_set_*` (line 1981) — switches the active backend.
 - `reset_confirm` / `reset_cancel` (line 1487-1488) — session reset confirmation.
-- `task_cancel_*` (find in `_tasks_buttons` or related) — cancels a running task.
-- `lang_set_*` (search) — switches voice-message language.
-- Any future `*_set_*` or destructive-action prefix should be added as it lands.
+- `task_cancel_*` (in `_tasks_buttons`) — cancels a running task.
+- `lang_set_*` — switches voice-message language.
+- `skill_scope_*` ([bot.py:2085](src/link_project_to_chat/bot.py:2085)) — `/create_skill` scope picker → next message writes a skill.
+- `pick_skill_*` ([bot.py:2091](src/link_project_to_chat/bot.py:2091)) — activates the picked skill on this project.
+- `skill_delete_confirm_*` ([bot.py:2073](src/link_project_to_chat/bot.py:2073)) — destructive delete confirmation.
+- `persona_scope_*` ([bot.py:2120](src/link_project_to_chat/bot.py:2120)) — `/create_persona` scope picker.
+- `pick_persona_*` (around `persona_scope_*`) — activates the picked persona.
+- `persona_delete_confirm_*` ([bot.py:2109](src/link_project_to_chat/bot.py:2109)) — destructive delete confirmation.
+- `ask_*` (answers to `AskUserQuestion`) — the answer drives a Claude turn forward. Viewers can't push a turn, so this gates too.
+- Any future `*_set_*` / `*_confirm_*` / destructive-action prefix should be added as it lands.
 
 For each state-changing branch, wrap the body with the guard. Example pattern:
 
@@ -3604,37 +3611,135 @@ For each state-changing branch, wrap the body with the guard. Example pattern:
             # ... existing branch body unchanged ...
 ```
 
-Read-only branches stay untouched:
-- `ask_*` (answers to AskUserQuestion; the answer itself is the user's reply — viewers shouldn't be able to push a Claude turn, so even `ask_*` should gate if the user role is viewer. Add the gate here too.)
-- `tasks_show_log_*` (display only).
-- Any plugin-registered buttons — those flow through `_dispatch_plugin_button` and the plugin is responsible for its own gating per the spec's viewer policy.
+Read-only branches stay untouched (no gate added):
+- `tasks_show_log_*` — display only.
+- Any other read-only display prefix surfaced by the audit.
+- Plugin-registered buttons (they flow through `_dispatch_plugin_button` and the plugin is responsible for its own gating per the spec's viewer policy).
 
-After the audit, list every gated branch in the commit message so reviewers can verify nothing was missed. The test in Step 8 below adds parametrized coverage.
+After the audit, list every gated branch in the commit message so reviewers can verify nothing was missed. The parametrized test in Step 7c below covers every prefix in the gated set.
 
-Add a test case to `tests/test_auth_roles.py`:
+- [ ] **Step 7c: Add a parametrized test for every gated button prefix**
+
+Add to `tests/test_auth_roles.py`:
 
 ```python
-@pytest.mark.asyncio
-async def test_state_changing_button_blocked_for_viewer():
-    """A viewer clicking a state-changing button (model_set_*) gets a Read-only reply."""
-    from link_project_to_chat.transport.base import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
+# All state-changing button-value examples — one per prefix from Step 7b.
+# Tests are parametrized over this list so a missed gate fails loudly with
+# a specific param name.
+STATE_CHANGING_BUTTON_VALUES = [
+    "model_set_haiku",
+    "effort_set_medium",
+    "thinking_set_on",
+    "permissions_set_default",
+    "backend_set_codex",
+    "reset_confirm",
+    "reset_cancel",
+    "task_cancel_42",
+    "lang_set_en",
+    "skill_scope_project_test-skill",
+    "pick_skill_test-skill",
+    "skill_delete_confirm_project_test-skill",
+    "persona_scope_project_test-persona",
+    "pick_persona_test-persona",
+    "persona_delete_confirm_project_test-persona",
+    "ask_42_0_0",  # AskUserQuestion answer — task 42, q 0, option 0
+]
+
+
+@pytest.fixture
+def _viewer_bot(tmp_path):
+    """Minimal ProjectBot wired enough to call _on_button(click).
+
+    Constructed via __new__ to skip the heavy real __init__ (which would
+    spin up backends and a TaskManager). We hand-set every attribute that
+    _on_button + _guard_executor reads.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from pathlib import Path
+    from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import AllowedUser
 
     bot = ProjectBot.__new__(ProjectBot)
-    bot._allowed_users = [AllowedUser(username="viewer-user", role="viewer", locked_identities=["telegram:42"])]
+    bot.name = "p"
+    bot.path = Path("/tmp/p")
+    bot._allowed_users = [
+        AllowedUser(username="viewer-user", role="viewer", locked_identities=["telegram:42"]),
+    ]
+    bot._auth_source = "project"
     bot._init_auth()
+    bot._plugins = []
+    bot._plugin_command_handlers = {}
+    bot._shared_ctx = None
     bot._transport = MagicMock()
     bot._transport.send_text = AsyncMock()
+    bot._transport.edit_text = AsyncMock()
+    bot._effective_config_path = lambda: tmp_path / "config.json"
+
+    # Stub task_manager so any task_cancel_* branch doesn't AttributeError
+    # before the gate fires. (Belt and suspenders — the gate should run
+    # first, but if it doesn't, the test fails loudly instead of erroring.)
+    bot.task_manager = MagicMock()
+    bot.task_manager.cancel = MagicMock()
+    bot.task_manager.find_by_id = MagicMock(return_value=None)
+    return bot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", STATE_CHANGING_BUTTON_VALUES)
+async def test_state_changing_button_blocked_for_viewer(_viewer_bot, value):
+    """Every state-changing button prefix from Step 7b must reply
+    'Read-only access' to a viewer and NOT call its mutation path.
+
+    A new state-changing button prefix added later but not gated will fail
+    this parametrized test with the missing-value param name in the report.
+    """
+    from link_project_to_chat.transport.base import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
 
     viewer = Identity(transport_id="telegram", native_id="42", display_name="V", handle="viewer-user", is_bot=False)
     chat = ChatRef(transport_id="telegram", native_id="42", kind=ChatKind.DM)
     msg = MessageRef(transport_id="telegram", native_id="100", chat=chat)
-    click = ButtonClick(chat=chat, message=msg, sender=viewer, value="model_set_haiku")
+    click = ButtonClick(chat=chat, message=msg, sender=viewer, value=value)
 
-    # Wire up just enough to call _on_button.
-    # ... call the real _on_button and assert the transport.send_text was awaited with "Read-only access"
+    await _viewer_bot._on_button(click)
+
+    # The gate fires → send_text was awaited with the Read-only reply.
+    assert _viewer_bot._transport.send_text.await_count >= 1, (
+        f"No Read-only reply for state-changing button {value!r}; gate missing?"
+    )
+    last_text = _viewer_bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in last_text, (
+        f"Reply for {value!r} was {last_text!r}, expected 'Read-only access' text"
+    )
+    # No mutation path ran.
+    _viewer_bot.task_manager.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_state_changing_button_passes_for_executor(_viewer_bot):
+    """Executors get past the gate — sanity check the gate isn't accidentally
+    rejecting authorized users."""
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.transport.base import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
+
+    # Swap the bot's role to executor for this test.
+    _viewer_bot._allowed_users = [
+        AllowedUser(username="exec-user", role="executor", locked_identities=["telegram:42"]),
+    ]
+    sender = Identity(transport_id="telegram", native_id="42", display_name="E", handle="exec-user", is_bot=False)
+    chat = ChatRef(transport_id="telegram", native_id="42", kind=ChatKind.DM)
+    msg = MessageRef(transport_id="telegram", native_id="100", chat=chat)
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="model_set_haiku")
+
+    await _viewer_bot._on_button(click)
+
+    # No Read-only reply was sent; the gate let the executor through.
+    sends = _viewer_bot._transport.send_text.await_args_list
+    for call in sends:
+        text = call.args[1].lower()
+        assert "read-only" not in text, f"Executor saw Read-only reply: {text!r}"
 ```
 
-(Implementation details: this test needs more wiring than the unit tests above; if it's too involved for a unit test, move it into `tests/test_auth_migration_e2e.py` as a real end-to-end click via FakeTransport.)
+If the test fixture above gets too involved (the real `_on_button` body touches many sibling attributes), move these into `tests/test_auth_migration_e2e.py` and drive the click through `FakeTransport` end-to-end instead. The contract — every state-changing prefix denies viewers — is what matters; the test shape can be whichever is cleanest given how `ProjectBot.__new__` interacts with the rest of the body.
 
 - [ ] **Step 8: Update existing auth tests for the field removal**
 
@@ -4546,7 +4651,7 @@ Concrete edits:
 
 2. **Remove** the `add_user` and `remove_user` lines from `command_handlers`. (Or replace them — see step 3.)
 
-3. **Add** all the new user-mgmt registrations through `_wrap_with_persist`:
+3. **Add** all the new user-mgmt registrations through `_wrap_with_persist` AND through `app.add_handler` so PTB actually dispatches them:
 
    ```python
    # Wrap every handler so a first-contact identity lock from the auth check
@@ -4562,13 +4667,24 @@ Concrete edits:
                await self._persist_auth_if_dirty()
        return _wrapped
 
-   # New user-management commands (replaces the legacy add_user / remove_user).
-   self._transport.on_command("users", _wrap_with_persist(self._on_users))
-   self._transport.on_command("add_user", _wrap_with_persist(self._on_add_user))
-   self._transport.on_command("remove_user", _wrap_with_persist(self._on_remove_user))
-   self._transport.on_command("promote_user", _wrap_with_persist(self._on_promote_user))
-   self._transport.on_command("demote_user", _wrap_with_persist(self._on_demote_user))
-   self._transport.on_command("reset_user_identity", _wrap_with_persist(self._on_reset_user_identity))
+   # IMPORTANT: the manager bot does NOT use attach_telegram_routing — that
+   # path is project-bot only. Each manager command needs BOTH calls:
+   #   - self._transport.on_command(name, handler) updates the dispatch dict
+   #   - app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))
+   #     registers a PTB handler that routes to the dispatch dict via _dispatch_command
+   # Without the second call, PTB drops the command at the filter level even
+   # though the dispatch dict knows about it.
+   _new_manager_commands = {
+       "users": self._on_users,
+       "add_user": self._on_add_user,
+       "remove_user": self._on_remove_user,
+       "promote_user": self._on_promote_user,
+       "demote_user": self._on_demote_user,
+       "reset_user_identity": self._on_reset_user_identity,
+   }
+   for _name, _handler in _new_manager_commands.items():
+       self._transport.on_command(_name, _wrap_with_persist(_handler))
+       app.add_handler(CommandHandler(_name, self._transport.bridge_command(_name)))
    ```
 
 4. **Wrap each existing handler** in the same registration block with `_wrap_with_persist` (replace `self._transport.on_command(name, handler)` with `self._transport.on_command(name, _wrap_with_persist(handler))` in the loop). Don't leave any unwrapped path: any manager command that calls `_auth_identity` and could lock a first-contact identity needs the persist tail.
@@ -4581,7 +4697,12 @@ Concrete edits:
 
    If the names still appear (e.g., in `_add_username` ConversationHandler), either delete the dead code or migrate it to the new `_on_add_user`. The legacy ConversationHandler wizard ([manager/bot.py:636](src/link_project_to_chat/manager/bot.py:636)) edits legacy `allowed_usernames` directly — wholesale-replace its terminal action with a call to `self._on_add_user` so it produces the new shape on disk.
 
-NOTE: these registrations work BECAUSE Task 1 fixed `TelegramTransport.on_command` to also register PTB `CommandHandler` when called post-routing.
+NOTE: Task 1's `TelegramTransport.on_command` post-routing fix applies to the **project bot** (which uses `attach_telegram_routing`). The **manager bot** has always used the explicit `app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))` pattern (visible at [manager/bot.py:2295](src/link_project_to_chat/manager/bot.py:2295)) — keep using it for the new commands too. Both calls are required:
+
+- `self._transport.on_command(name, handler)` → updates `_command_handlers` so `_dispatch_command(name, ...)` finds the right handler.
+- `app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))` → registers a PTB-level handler that routes the update into `_dispatch_command`.
+
+Missing either call leaves the command silently undispatchable.
 
 Also wrap the manager's button dispatch (`_on_button_from_transport`) with a try/finally that calls `_persist_auth_if_dirty`. The plugin-toggle viewer-denied path triggers the `_auth_identity` + `_require_executor` chain — both can append a first-contact lock. Edit the existing `_on_button_from_transport` to wrap its body:
 
