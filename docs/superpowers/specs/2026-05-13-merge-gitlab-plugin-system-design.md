@@ -1,7 +1,7 @@
 # Porting the GitLab plugin system onto the Transport/Backend architecture
 
-**Date:** 2026-05-13 (rev. 2026-05-13 after landing `feat/transport-abstraction`)
-**Status:** Approved, awaiting implementation plan
+**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them)
+**Status:** Approved with revisions; implementation plan needs to be re-issued.
 **Author:** Revaz Chikashua (drafted with Claude)
 
 ## Summary
@@ -11,6 +11,8 @@ Port the **design** of the GitLab fork's plugin system into the primary fork, fi
 This is **no longer a literal commit-level merge.** The GitLab plugin code was written directly against `python-telegram-bot`, but the primary fork's `bot.py` is now transport-agnostic (all I/O flows through the `Transport` Protocol). We rebuild the plugin framework natively on top of `Transport`, preserving the GitLab design's semantics (entry-point discovery, lifecycle hooks, command/callback registration, Claude-prompt prepend, viewer/executor role model).
 
 The deliverable is **transport-portable plugins**: a single plugin works unchanged against `TelegramTransport`, `WebTransport`, and any future Discord/Slack/Google Chat transport.
+
+This revision (2026-05-14) folds in a **breaking auth-model change**: `AllowedUser` is no longer an additive parallel field — it **replaces** `allowed_usernames`, `trusted_users`, and `trusted_user_ids`. Legacy configs migrate one-way on first load (legacy users → `executor` role, legacy IDs → `locked_user_id` on the matching `AllowedUser`), and the legacy keys are stripped from the on-disk format on next save. Operators upgrading need to run the migration during a quiet window and verify the resulting `allowed_users` list before exposing the bot to traffic.
 
 ## Background
 
@@ -35,13 +37,12 @@ Plugin implementations (`in-app-web-server`, `diff-reviewer`) live in an externa
 2. Plugin toggle UI in the manager bot.
 3. `plugin-call` CLI subcommand.
 4. `restart.sh`, `stop.sh` operational scripts.
-5. `AllowedUser` role model added **alongside** existing `allowed_usernames`/`trusted_users`/`trusted_user_ids` — legacy projects unaffected.
+5. `AllowedUser` role model **replaces** existing `allowed_usernames` / `trusted_users` / `trusted_user_ids` as the single source of auth + authority for project and team bots. Legacy configs migrate on first load and are saved back in the new shape; legacy fields are stripped from `config.json` thereafter.
 
 ## Non-goals
 
 - Wire-compatibility with GitLab plugin packages that expect telegram-PTB handler signatures. Plugin authors will rewrite handlers to the transport-agnostic signature; this is a one-time porting cost that buys multi-transport portability.
-- Migrating the primary fork's existing features (team_relay, livestream, personas, skills, voice) to the role model.
-- Replacing `allowed_usernames`/`trusted_users` on team bots.
+- Migrating the primary fork's existing features (team_relay, livestream, personas, skills, voice) to the role model. The role model gates entry, plain-text messages, and state-changing commands only; feature internals are untouched.
 - Backend-aware plugins (e.g., a plugin that reacts differently to Claude vs Codex). Plugins see backend output via `on_tool_use`/`on_task_complete` events but don't gate by backend.
 - Building any specific plugin (those live in the external package).
 
@@ -64,7 +65,7 @@ ProjectBot (transport-agnostic)
         └─ start()/stop() on bot lifecycle (after Transport ready)
 ```
 
-Roles (viewer/executor) layer as a **second, optional access check** on top of the existing flat allow-list. If a project's config has the new `allowed_users` field populated, role enforcement gates state-changing handlers and plugin commands. If absent, behavior is identical to today.
+Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, role, locked_user_id}` is the sole source of auth + authority for project and team bots. Legacy `allowed_usernames` / `trusted_users` / `trusted_user_ids` are migrated on load (one-way) and dropped from the on-disk format on next save. After migration, role is the only access decision; there is no second layer.
 
 ## Components
 
@@ -119,30 +120,51 @@ Roles (viewer/executor) layer as a **second, optional access check** on top of t
 - `_post_stop()` hook (already exists on the new architecture via `Transport.stop`) — calls `_shutdown_plugins()` to invoke `plugin.stop()` in reverse order.
 - `_wrap_plugin_command(bc)` — wraps the plugin's handler with `_auth_identity` (defense-in-depth; the transport's authorizer already gated, but cheap) + `_require_executor` gate (skipped when `bc.viewer_ok=True`).
 
-### `config.py` changes (additive, ~60 LOC)
+### `config.py` changes (~150 LOC: additive + legacy removal)
 
-- New dataclass `AllowedUser{username: str, role: str = "viewer"}` (roles: `"viewer"` | `"executor"`).
-- `ProjectConfig` gains:
-  - `plugins: list[dict] = field(default_factory=list)`
-  - `allowed_users: list[AllowedUser] = field(default_factory=list)`
+- New dataclass:
+  ```python
+  @dataclass
+  class AllowedUser:
+      username: str                  # normalized: lowercase, no leading "@"
+      role: str = "viewer"           # "viewer" | "executor"
+      locked_user_id: int | None = None   # populated on first contact; replaces trusted_user_ids
+  ```
+- `ProjectConfig`:
+  - Adds `plugins: list[dict] = field(default_factory=list)`.
+  - Adds `allowed_users: list[AllowedUser] = field(default_factory=list)`.
+  - **Removes** `allowed_usernames`, `trusted_users`, `trusted_user_ids` from the dataclass and from the save format.
+- `TeamBotConfig`: same removal + replacement (every team bot has its own `allowed_users` list).
 - `_parse_allowed_users` / `_serialize_allowed_users` / `_parse_plugins` helpers.
-- **Legacy migration on load (in-memory only)**: if `allowed_users` is empty but `allowed_usernames` has entries, synthesize equivalent `AllowedUser{username, role="executor"}` entries. Don't write back — preserve the on-disk form unless the user explicitly opts in.
-- Unknown role → log warning, treat as `viewer` (least-privilege).
+- **One-shot migration on load** (writes back the new shape on next save):
+  - Legacy `allowed_usernames` entries → `AllowedUser{username, role="executor", locked_user_id=None}`. Default role is `executor` because legacy users had full access; preserving that prevents silent privilege loss.
+  - Legacy `trusted_users` entries → also `executor` (deduped by username). The "trusted = gets startup DM ping" semantic collapses into the executor role; see §Risks.
+  - Legacy `trusted_user_ids` → match by index/order to corresponding `trusted_users` and populate `locked_user_id`. If the legacy structure can't be aligned cleanly, drop the ID and re-lock on next contact (small race window, see §Risks).
+  - First save after upgrade emits only `allowed_users`; legacy keys are stripped from `config.json`.
+- Unknown role on load → log warning, treat as `viewer` (least-privilege).
 - Malformed `plugins` entry → log, skip.
+- Malformed `allowed_users` entry → log, skip (auth fails closed for that entry; user is denied until corrected).
+- Empty `allowed_users` after migration → log a CRITICAL "no users authorized" warning; bot starts but everyone is denied. Operators can opt in via CLI / manager.
 
-### `_auth.py` changes (~25 LOC)
+### `_auth.py` changes (~80 LOC: rewrite, not addition)
 
-- Add `_get_user_role(identity) -> str | None`:
+`AuthMixin` is rewritten around `allowed_users` as the sole source of truth. Legacy code paths that referenced `allowed_usernames` / `trusted_users` / `trusted_user_ids` are deleted.
+
+- `_get_user_role(identity) -> str | None`:
   - Reads `self._allowed_users` (populated by `ProjectBot.__init__`).
-  - Matches `_normalize_username(identity.handle)` against `AllowedUser.username` (case- and `@`-insensitive).
-  - Returns `"executor"`, `"viewer"`, or `None` (not listed).
+  - **First** checks `locked_user_id` (numeric platform-native ID lock from first contact) — this is the security-critical fast path and prevents username-change attacks.
+  - Falls back to a case- and `@`-insensitive username match when no ID is locked yet for that user.
+  - On first match by username, atomically writes back `locked_user_id` on the `AllowedUser` and persists the config; subsequent requests are validated by ID, not username. This preserves the brute-force / username-spoof protection from the old `trusted_user_ids` design but applies it uniformly to every allowed user (not just the trusted subset).
+  - Returns `"executor"`, `"viewer"`, or `None` (not listed → denied).
+- `_auth_identity(identity) -> bool`:
+  - True iff `_get_user_role(identity)` returns a role (any non-None).
+  - Empty `allowed_users` → deny everyone. **Fail-closed** is the new default; the old laxity around missing-allowlists is gone.
 - `_require_executor(identity) -> bool`:
-  - Empty `allowed_users` → legacy path, allow (no behavior change).
-  - Role is `executor` → allow.
-  - Role is `viewer` or `None` → deny.
-- Authority order when `allowed_users` is set: `allowed_users` is authoritative; `allowed_usernames` / `trusted_users` are ignored for role-gated decisions (auth via `_auth_identity` still requires the user to be in `allowed_usernames` — this is layered, not replaced).
+  - True iff `_get_user_role(identity) == "executor"`.
 - Read-only command set (always allowed for viewers): `/tasks`, `/log`, `/status`, `/help`, `/version`, `/skills` (listing only), `/context` (display side).
-- State-changing command set (executor required when roles active): plain text messages routed to Claude/Codex, `/run`, `/use`, `/persona`, `/model`, `/effort`, `/thinking`, `/permissions`, `/compact`, `/reset`, `/backend`, `/stop_skill`, `/stop_persona`, `/create_skill`, `/delete_skill`, `/create_persona`, `/delete_persona`, `/voice`, `/lang`, `/halt`, `/resume`, file uploads, voice uploads.
+- State-changing command set (executor required): plain text messages routed to Claude/Codex, `/run`, `/use`, `/persona`, `/model`, `/effort`, `/thinking`, `/permissions`, `/compact`, `/reset`, `/backend`, `/stop_skill`, `/stop_persona`, `/create_skill`, `/delete_skill`, `/create_persona`, `/delete_persona`, `/voice`, `/lang`, `/halt`, `/resume`, file uploads, voice uploads.
+- Startup-ping recipients: `AllowedUser` with `role == "executor"` **and** a non-`None` `locked_user_id`. Viewers do not receive the startup ping. Executors without a locked ID yet are pinged on first contact instead.
+- Brute-force lockout and rate-limit keying (`transport_id:native_id`) unchanged.
 
 ### `manager/bot.py` changes (~80 LOC)
 
@@ -156,14 +178,30 @@ The manager bot is also transport-ported (via `TelegramTransport`). It uses `Com
   - `proj_ptog_{plugin_name}|{name}` — flip a plugin in/out of the project's `plugins` list and persist via `manager/config.py`.
 - "Restart required after changes" hint shown in the toggle message body.
 
-### `cli.py` changes (~30 LOC)
+**User-management commands (existing `/users`, `/add_user`, `/remove_user`) are updated** to operate on `AllowedUser`:
+- `/users` — list rows as `username (role) [ID locked]`.
+- `/add_user <username> [viewer|executor]` — default role `executor` (matches legacy `/add_user` semantics: previously all added users had full access).
+- `/remove_user <username>` — unchanged signature.
+- New: `/promote_user <username>` and `/demote_user <username>` toggle role.
+- New: `/reset_user_id <username>` clears `locked_user_id` (recovery path for users whose Telegram ID changed — rare but happens with account migration / re-registration).
 
-- New subcommand: `link-project-to-chat plugin-call <project> <plugin_name> <tool_name> <args_json>`
-  - Loads project's config to get path/data_dir.
-  - Builds a minimal `PluginContext` (no transport — standalone mode).
-  - Calls `plugin.call_tool(tool_name, args)`, prints result.
-  - Used by Claude via Bash inside a task.
-- `start` subcommand — `ProjectConfig.plugins` and `ProjectConfig.allowed_users` already flow through `run_bot`/`run_bots` once their signatures gain the new kwargs.
+### `cli.py` changes (~80 LOC)
+
+**New subcommand:** `link-project-to-chat plugin-call <project> <plugin_name> <tool_name> <args_json>`
+- Loads project's config to get path/data_dir.
+- Builds a minimal `PluginContext` (no transport — standalone mode).
+- Calls `plugin.call_tool(tool_name, args)`, prints result.
+- Used by Claude via Bash inside a task.
+
+**`configure` subcommand — user-management flags:**
+- `--add-user USERNAME[:ROLE]` — adds an `AllowedUser`. Default role `executor`. Examples: `--add-user alice`, `--add-user bob:viewer`.
+- `--remove-user USERNAME` — removes the entry.
+- `--reset-user-id USERNAME` — clears `locked_user_id` (recovery path).
+- Legacy flags `--username` and `--remove-username` are kept as aliases for one release with a deprecation warning, then removed.
+
+**`start` subcommand:**
+- `ProjectConfig.plugins` and `ProjectConfig.allowed_users` flow through `run_bot` / `run_bots` once their signatures gain the new kwargs.
+- The legacy `--username`/`--token` quick-start path implicitly creates one `AllowedUser{username, role="executor"}` entry (transient, in-memory; not persisted unless `projects add` is used).
 
 ### `pyproject.toml`
 
@@ -210,7 +248,7 @@ Transport receives platform-native event → builds IncomingMessage
           ├─ for plugin in _plugins:
           │      consumed = await plugin.on_message(msg)
           │      if any consumes: return
-          ├─ NEW role check (only if allowed_users set):
+          ├─ role check (always runs — fail-closed):
           │      if not _require_executor(msg.sender):
           │          reply "Read-only access" and return
           ├─ existing pending_skill / pending_persona handling
@@ -280,8 +318,9 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
   - `start()` failure unregisters that plugin's commands.
   - `stop()` called in reverse order on shutdown.
   - Plugin button handler consumes correctly.
-- `tests/test_config_allowed_users.py` — `AllowedUser` parse/serialize roundtrip, legacy `allowed_usernames` → `executor` migration, unknown role → `viewer`, malformed entries skipped.
-- `tests/test_auth_roles.py` — `Identity`-keyed: viewer denied state-changing commands, executor allowed, legacy projects unaffected, mixed list.
+- `tests/test_config_allowed_users.py` — `AllowedUser` parse/serialize roundtrip, unknown role → `viewer`, malformed entries skipped, empty-after-migration logs CRITICAL.
+- `tests/test_config_migration.py` — golden-file suite covering five legacy shapes: (a) `allowed_usernames` only, (b) `allowed_usernames` + `trusted_users` aligned with `trusted_user_ids`, (c) `trusted_users` ⊊ `allowed_usernames`, (d) `trusted_user_ids` length-mismatch with `trusted_users`, (e) team-bot legacy fields. Each test asserts: in-memory `AllowedUser` shape after load, saved JSON contains *only* `allowed_users` (no legacy keys), round-trip load-save-load is stable.
+- `tests/test_auth_roles.py` — `Identity`-keyed: viewer denied state-changing commands, executor allowed, no-entry denied (fail-closed), locked `locked_user_id` validates by ID, first-contact races lock the ID atomically.
 - `tests/manager/test_bot_plugins.py` — plugin toggle button callback_data, available plugins listed from entry points, toggle updates config.
 
 ### Cross-transport coverage
@@ -290,25 +329,27 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
 - A web-transport plugin test (using `WebTransport`) verifies the transport-portability claim.
 
 ### Regression coverage
-All 1003 existing tests must continue to pass without modification.
+Existing tests that referenced `allowed_usernames` / `trusted_users` / `trusted_user_ids` need updating (estimate: ~30 tests across `tests/test_auth*.py`, `tests/test_config*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py`). After those updates, the rest of the suite (1003 → ~970) must continue to pass without modification. Net test count rises with the new migration + role coverage.
 
 ### Manual smoke
-- Project with `plugins: []` and no `allowed_users` → identical behavior to today.
+- Pre-upgrade config (`allowed_usernames: [alice]`, `trusted_users: [alice]`, `trusted_user_ids: [12345]`) → load, then save → on disk: `allowed_users: [{username: alice, role: executor, locked_user_id: 12345}]`. Legacy keys absent.
+- Project with `plugins: []` and one `executor` user → identical behavior to today.
 - Project with one stub plugin → `start()` logged, command registered, hooks fire.
-- Project with `allowed_users: [{username, role: "viewer"}]` → `/run` denied, `/tasks` allowed.
+- Project with `allowed_users: [{username, role: "viewer"}]` → plain message replied "Read-only access", `/tasks` allowed.
+- Project with empty `allowed_users` → bot starts, CRITICAL log line, all incoming messages denied.
 - Same plugin + same config, start with `--transport web --port 8080` → plugin command works via the browser UI.
 
 ## Execution plan (high level)
 
-Branch: `feat/plugin-system` off `main`. Each step a single commit.
+Branch: `feat/plugin-system` off `main`. Each step a single commit. Steps 3 and 5 are the load-bearing ones for the auth rewrite; the rest stays close to the prior shape.
 
 1. **Plugin file + scripts** — `plugin.py` with transport-aware `PluginContext`, scripts.
 2. **bot.py plugin lifecycle** — `_init_plugins`, dispatch helpers, hook wiring in `_after_ready` / `_on_text_from_transport` / `_on_button` / `_on_stream_event` / `_on_task_complete` / `_post_stop`.
-3. **Config schema** — `plugins` field + `AllowedUser`.
-4. **CLI** — `plugin-call` subcommand; `start` passes `plugins` and `allowed_users` through `run_bot`/`run_bots`.
-5. **Role enforcement** — `_get_user_role` / `_require_executor` on `AuthMixin` (Identity-keyed); `_wrap_plugin_command`; gates on state-changing handlers.
-6. **Manager UI** — plugin toggle (Transport-ported, uses `CommandInvocation` / `ButtonClick`).
-7. **Docs + version bump** — README plugin section, CHANGELOG entry, optional `v0.17.0`.
+3. **Config schema + one-way migration** — `AllowedUser` dataclass, `plugins` field, migration on load, legacy-key removal on save, `TeamBotConfig` same treatment, `tests/test_config_migration.py` golden-file suite. **Required** verification gate: a saved-and-reloaded post-migration config must equal a hand-written equivalent, byte-for-byte.
+4. **CLI** — `plugin-call` subcommand; new `--add-user`/`--remove-user`/`--reset-user-id` flags on `configure`; legacy `--username`/`--remove-username` aliased with deprecation warning; `start` passes `plugins` + `allowed_users` through `run_bot`/`run_bots`.
+5. **Role enforcement (rewrite, not addition)** — `_get_user_role` / `_auth_identity` / `_require_executor` on `AuthMixin` rewritten around `allowed_users`; ID-locking moved from `trusted_user_ids` to `AllowedUser.locked_user_id`; existing auth tests updated; `_wrap_plugin_command`; gates on state-changing handlers; fail-closed on empty allowlist.
+6. **Manager UI** — plugin toggle (Transport-ported, uses `CommandInvocation` / `ButtonClick`); `/users` / `/add_user` / `/remove_user` / `/promote_user` / `/demote_user` / `/reset_user_id` updated.
+7. **Docs + version bump** — README plugin section, README auth-migration section, CHANGELOG entry, **major version bump** (`v0.17.0` minimum, consider `v1.0.0` given the breaking config change).
 
 Verification gate after each step: `pytest -q` (must stay at 1003 passing + new tests for that step).
 
@@ -319,7 +360,16 @@ Verification gate after each step: `pytest -q` (must stay at 1003 passing + new 
 - **Plugin button-handler ordering.** Multiple plugins all see each click; first one to return `True` consumes. Order is plugin-registration order (which matches plugin-config order). Documented in `plugin.py`.
 - **`PluginContext.send_message(chat_id)` with int — needs a `ChatRef` to call `transport.send_text`.** The proxy synthesizes `ChatRef(transport_id=transport.TRANSPORT_ID, native_id=str(chat_id), kind=ChatKind.DM)` as a best-effort default; plugins that need a specific kind should pass a `ChatRef` directly.
 - **Plugin authors writing telegram-PTB-style handlers will need to migrate.** This is the one-time cost of the transport port. The new signature is simpler (`async def(invocation: CommandInvocation)`) and works on every transport.
+- **Auth model is a breaking on-disk change.** First save after upgrade rewrites `config.json` without the legacy keys. Operators on an older binary reading that file afterward will see no users authorized. Mitigation: bump the major version of the package, document the migration in the changelog, and have the loader log a one-line "migrating auth model" line so the trail is visible.
+- **`trusted_users` ⊂ `allowed_usernames` distinction is lost.** Legacy deployments where the DM-ping recipient set was strictly smaller than the allow-list collapse into a single `executor` role; *every* executor now gets the startup ping. If anyone relied on the asymmetry, add a `notify: bool` flag on `AllowedUser` in a follow-up (see Open Questions).
+- **Locked-ID re-lock race window.** If migration cannot align legacy `trusted_user_ids` with `trusted_users` cleanly (different lengths, missing IDs), the affected entries start with `locked_user_id=None` and re-lock on the next valid request. A username-spoof attempt landing in that window could plant the wrong ID. Mitigation: migrate during quiet windows; or, ship the migration only after operators have run a `--reset-user-id` audit. Realistic risk for one-user deployments is near-zero.
+- **Empty-allowlist deployments hard-fail.** Previously, missing-or-empty allowlists may have failed open in obscure paths. New behavior is fail-closed everywhere. Pre-upgrade audit step: confirm every active project bot has at least one allowed user.
 
 ## Open questions
 
-None at design time. Implementation details defer to the implementation plan.
+1. **`notify: bool` on `AllowedUser`?** Current draft collapses "trusted-for-DM-ping" into `executor`. If any deployment ran with `trusted_users` ⊊ `allowed_usernames` and cared about the asymmetry, we need a separate `notify` flag (default `True` for migrated executors so behavior matches today). Lean: ship without it; add only if the gap matters in practice.
+2. **CLI flag shape:** `--add-user USER[:ROLE]` (single flag, current draft) vs. `--username USER --role ROLE` (two flags). Single flag is terser and unambiguous; two flags compose better with existing `--username` muscle memory. Lean: single flag, keep `--username` as a deprecated alias for one release.
+3. **Migration durability:** does the loader rewrite immediately at load time (next-save guaranteed) or only on the next *content-changing* save? Current draft says "first save after upgrade", which means a read-only run would leave the legacy fields in place — possibly surprising. Lean: rewrite eagerly at load, even when no other change is made, so the on-disk migration is deterministic.
+4. **Test coverage for migration:** how aggressively do we validate that round-tripping legacy → new → legacy isn't possible? The migration is one-way by design. A `tests/test_config_migration.py` golden-file suite covering 5–6 legacy configs (single-user, multi-user, trusted=allowed, trusted⊊allowed, with-IDs, without-IDs) is the minimum.
+5. **Team-bot migration semantics:** each `TeamBotConfig` carries its own `allowed_users`. Should team bots inherit from the parent project's `allowed_users` if their list is empty post-migration, or stay strictly independent? Lean: independent — copying the parent's list once at load could cause surprise drift. But empty-after-migration on a previously-working team bot is a footgun. Resolve before coding.
+6. **`role: "owner"` reserved?** Not in current draft, but plugin authors may want a third tier. Decide: enum it now (forward-compat) or treat as schema break later.
