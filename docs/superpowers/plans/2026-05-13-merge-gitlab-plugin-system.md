@@ -3137,19 +3137,24 @@ def test_manager_bot_accepts_allowed_users_kwarg():
     assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
 
 
-def test_manager_bot_legacy_auth_works_with_allowed_users_only():
+def test_manager_bot_legacy_auth_works_with_allowed_users_only(tmp_path):
     """TRANSITION SHIM regression — between Task 4 and Task 5, AuthMixin is
     still legacy: _auth(user) reads _allowed_usernames via
     _get_allowed_usernames. If start-manager passes only allowed_users= and
     the constructor leaves _allowed_usernames at its class-level [] default,
     every message gets denied until Task 5 Step 3 rewrites AuthMixin.
 
-    This test pins the synthesis behavior: constructing ManagerBot with
-    allowed_users= (and no legacy allowed_usernames=) must make legacy
-    _auth(user) return True for that username. The test stays useful even
-    after Task 5 lands — synthesis becomes dead code, but the assertion
-    that an authorized user authenticates remains a sensible invariant
-    that catches accidental regressions in the rewrite.
+    This test is intentionally transitional. Task 5 Step 3 deletes the
+    legacy _auth(user) method, after which calling bot._auth(...) here would
+    AttributeError — so Task 5 Step 11 strips both the shim and this test.
+    The post-rewrite equivalent (an authorized user authenticates via
+    _auth_identity) is already covered by tests/test_auth_roles.py.
+
+    Persistence side-effect note: legacy _auth on the allow path calls
+    _trust_user → _on_trust → bind_trusted_user, which writes to
+    self._project_config_path or DEFAULT_CONFIG. Without an explicit
+    project_config_path, that would mutate the real ~/.link-project-to-chat/
+    config.json on the test runner. The tmp_path fixture sandboxes it.
     """
     from types import SimpleNamespace
 
@@ -3162,6 +3167,7 @@ def test_manager_bot_legacy_auth_works_with_allowed_users_only():
         token="t",
         process_manager=pm,
         allowed_users=[AllowedUser(username="alice", role="executor")],
+        project_config_path=tmp_path / "config.json",
     )
     # Legacy _auth(user) takes a duck-typed user with .id / .username.
     user = SimpleNamespace(id=98765, username="alice")
