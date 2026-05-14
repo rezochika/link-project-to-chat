@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import DEFAULT_CONFIG, bind_trusted_user, patch_backend_state, unbind_trusted_user
+from ..config import AllowedUser, DEFAULT_CONFIG, bind_trusted_user, patch_backend_state, unbind_trusted_user
 from .._auth import AuthMixin
 from ..transport import Button, Buttons, ChatRef, MessageRef
 
@@ -254,12 +254,35 @@ class ManagerBot(AuthMixin):
         trusted_users: dict[str, int] | None = None,
         trusted_user_id: int | None = None,
         trusted_user_ids: list[int] | None = None,
+        allowed_users: list["AllowedUser"] | None = None,  # NEW
         project_config_path: Path | None = None,
     ):
         self._token = token
         self._pm = process_manager
+        # ORDER MATTERS: all _allowed_* / _trusted_* / _allowed_users
+        # assignments below MUST happen before the final _init_auth() call
+        # at the end of __init__. _init_auth doesn't read instance auth
+        # state today, but keeping the order explicit anchors the contract
+        # in case _init_auth ever grows per-user setup (rate-limit
+        # prepopulation, brute-force lockout warmup, etc.).
+        #
+        # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 11
+        # once every caller passes allowed_users= instead.
+        #
+        # TRANSITION SHIM (Tasks 4–5 window): synthesize the legacy
+        # _allowed_usernames from the AllowedUser entries. AuthMixin is
+        # still legacy at the end of Task 4 — _auth(user) reads via
+        # _get_allowed_usernames → self._allowed_usernames at _auth.py:34.
+        # Without this synthesis, the new start-manager (which passes only
+        # allowed_users=) would leave _allowed_usernames at the class-level
+        # default [] and the manager would deny everyone until Task 5 Step 3
+        # rewrites AuthMixin. The whole if/elif/else block (including this
+        # synthesis branch) is removed in Task 5 Step 11 once the rewrite
+        # makes _allowed_users the sole source of truth.
         if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
+        elif allowed_users is not None:
+            self._allowed_usernames = [u.username for u in allowed_users]
         else:
             self._allowed_username = allowed_username
         if trusted_users is not None:
@@ -268,6 +291,10 @@ class ManagerBot(AuthMixin):
             self._trusted_user_ids = trusted_user_ids
         else:
             self._trusted_user_id = trusted_user_id
+        # NEW: AllowedUser allow-list. _init_auth + AuthMixin._allowed_users
+        # is the post-Task-5 source of truth; setting it here makes the
+        # transition transparent to manager auth code that lands in Task 5.
+        self._allowed_users = list(allowed_users or [])
         self._started_at = time.monotonic()
         self._app = None
         self._project_config_path = project_config_path

@@ -29,6 +29,7 @@ from .config import (
     patch_team_bot_backend,
     patch_team_bot_backend_state,
     resolve_permissions,
+    resolve_project_allowed_users,
     resolve_project_auth_scope,
     resolve_start_model,
     save_session,
@@ -3053,6 +3054,7 @@ def run_bots(
             proj,
             config,
         )
+        effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
         on_trust = None
         if config_path:
             _name = name
@@ -3090,10 +3092,8 @@ def run_bots(
             context_enabled=proj.context_enabled,
             context_history_limit=proj.context_history_limit,
             plugins=getattr(proj, "plugins", None) or None,
-            allowed_users=getattr(proj, "allowed_users", None) or None,
-            # auth_source defaults to "project" for now; Task 4 Step 6 replaces this
-            # block with the resolve_project_allowed_users helper that returns
-            # (users, source).
+            allowed_users=effective_allowed_users or None,
+            auth_source=project_auth_source,
         )
     else:
         names = ", ".join(config.projects.keys())

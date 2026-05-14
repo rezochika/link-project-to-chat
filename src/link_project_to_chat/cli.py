@@ -227,35 +227,130 @@ def projects_edit(ctx, name: str, field: str, value: str):
 
 
 @main.command()
-@click.option("--username", default=None, help="Add an allowed Telegram username")
-@click.option("--remove-username", default=None, help="Remove an allowed Telegram username")
+@click.option("--username", default=None, help="(DEPRECATED — use --add-user) Allowed Telegram username.")
+@click.option("--remove-username", default=None, help="(DEPRECATED — use --remove-user) Remove an allowed username.")
+@click.option(
+    "--add-user", "add_user", default=None,
+    help="Add an AllowedUser. Format: 'username' or 'username:role' (role = viewer|executor; default executor).",
+)
+@click.option("--remove-user", "remove_user", default=None, help="Remove an AllowedUser by username.")
+@click.option(
+    "--reset-user-identity", "reset_user_identity", default=None,
+    help=(
+        "Clear the locked_identities for a user (re-locks on next contact). "
+        "Use 'username:transport' to clear only one transport."
+    ),
+)
 @click.option("--manager-token", default=None, help="Telegram bot token for the manager bot")
 @click.pass_context
-def configure(ctx, username: str | None, remove_username: str | None, manager_token: str | None):
-    """Configure username and/or manager bot token."""
-    if not username and not remove_username and not manager_token:
-        raise SystemExit("Provide at least one of --username, --remove-username, or --manager-token.")
+def configure(
+    ctx,
+    username: str | None,
+    remove_username: str | None,
+    add_user: str | None,
+    remove_user: str | None,
+    reset_user_identity: str | None,
+    manager_token: str | None,
+):
+    """Configure allowed users and/or manager bot token."""
+    from .config import AllowedUser
+
+    if not any([username, remove_username, add_user, remove_user, reset_user_identity, manager_token]):
+        raise SystemExit(
+            "Provide at least one of --add-user, --remove-user, --reset-user-identity, "
+            "--username, --remove-username, or --manager-token."
+        )
+
     cfg_path = ctx.obj["config_path"]
     config = load_config(cfg_path)
-    if username:
-        new_username = username.lower().lstrip("@")
-        if new_username not in config.allowed_usernames:
-            config.allowed_usernames.append(new_username)
-        click.echo(f"Added username: @{new_username}")
-    if remove_username:
-        rm = remove_username.lower().lstrip("@")
-        config.trusted_users.pop(rm, None)
-        config.trusted_user_ids = list(config.trusted_users.values())
-        if rm in config.allowed_usernames:
-            config.allowed_usernames.remove(rm)
-            click.echo(f"Removed username: @{rm}")
+
+    # Legacy alias handling: route deprecated flags to the new ones with a warning.
+    if username is not None:
+        click.echo("--username is deprecated; use --add-user instead.", err=True)
+        if add_user is None:
+            add_user = username
+    if remove_username is not None:
+        click.echo("--remove-username is deprecated; use --remove-user instead.", err=True)
+        if remove_user is None:
+            remove_user = remove_username
+
+    def _find(uname: str):
+        norm = uname.lstrip("@").lower()
+        for u in config.allowed_users:
+            if u.username == norm:
+                return u
+        return None
+
+    if add_user:
+        if ":" in add_user:
+            uname, role = add_user.split(":", 1)
         else:
-            click.echo(f"Username @{rm} not found.")
-        unbind_trusted_user(rm, cfg_path)
+            uname, role = add_user, "executor"
+        uname = uname.lstrip("@").lower()
+        if role not in ("viewer", "executor"):
+            raise SystemExit(f"Invalid role {role!r}; must be viewer or executor.")
+        existing = _find(uname)
+        if existing:
+            existing.role = role
+        else:
+            config.allowed_users.append(AllowedUser(username=uname, role=role))
+        # Mirror to legacy allowed_usernames so save_config's union view keeps
+        # this user across the legacy/new mirror through Task 4.
+        if uname not in config.allowed_usernames:
+            config.allowed_usernames.append(uname)
+        save_config(config, cfg_path)
+        click.echo(f"Added {uname} ({role}).")
+
+    if remove_user:
+        norm = remove_user.lstrip("@").lower()
+        config.allowed_users = [u for u in config.allowed_users if u.username != norm]
+        config.trusted_users.pop(norm, None)
+        config.trusted_user_ids = list(config.trusted_users.values())
+        if norm in config.allowed_usernames:
+            config.allowed_usernames.remove(norm)
+        save_config(config, cfg_path)
+        unbind_trusted_user(norm, cfg_path)
+        click.echo(f"Removed {norm}.")
+
+    if reset_user_identity:
+        # Parse `USERNAME[:TRANSPORT]` FIRST. Normalizing the entire string
+        # (including `:web`) before the split would corrupt the colon-
+        # separated form, so split, then normalize each piece.
+        if ":" in reset_user_identity:
+            uname_part, transport = reset_user_identity.split(":", 1)
+        else:
+            uname_part, transport = reset_user_identity, None
+        norm = uname_part.lstrip("@").lower()
+        u = _find(norm)
+        if not u:
+            raise SystemExit(f"User {norm!r} not in allow-list.")
+        if transport is None:
+            u.locked_identities = []
+            # Also clear the legacy mirror so save's UNION view doesn't
+            # resurrect telegram identities from `trusted_users`.
+            if norm in config.trusted_users:
+                config.trusted_users.pop(norm, None)
+                config.trusted_user_ids = list(config.trusted_users.values())
+        else:
+            u.locked_identities = [
+                ident for ident in u.locked_identities
+                if not ident.startswith(f"{transport}:")
+            ]
+            # The legacy mirror only stores telegram ids; clearing the
+            # telegram transport must also clear that mirror.
+            if transport == "telegram" and norm in config.trusted_users:
+                config.trusted_users.pop(norm, None)
+                config.trusted_user_ids = list(config.trusted_users.values())
+        save_config(config, cfg_path)
+        if transport is None:
+            click.echo(f"Cleared all locked identities for {norm}.")
+        else:
+            click.echo(f"Cleared {transport!r} identities for {norm}.")
+
     if manager_token:
         config.manager_telegram_bot_token = manager_token
         click.echo(f"Configured manager token: ***{manager_token[-4:]}")
-    save_config(config, cfg_path)
+        save_config(config, cfg_path)
 
 
 @main.command()
@@ -356,11 +451,18 @@ def start(
         # STT is unavailable on this path. Users who want voice should either
         # configure a project in the global config and use --project, or rely
         # on the default (no --path, no --token) startup flow.
+        from .config import AllowedUser
+        adhoc_uname = username.lower().lstrip("@") if username else None
+        adhoc_allowed_users = (
+            [AllowedUser(username=adhoc_uname, role="executor")] if adhoc_uname else None
+        )
         run_bot(
             name=p.name,
             path=p,
             token=token,
-            allowed_usernames=[username.lower().lstrip("@")] if username else [],
+            allowed_usernames=[adhoc_uname] if adhoc_uname else [],
+            allowed_users=adhoc_allowed_users,
+            auth_source="project",
             session_id=session_id,
             model=model,
             skip_permissions=skip_permissions,
@@ -373,6 +475,30 @@ def start(
         return
 
     config = load_config(cfg_path)
+
+    from .config import resolve_project_allowed_users
+
+    if config.migration_pending:
+        click.echo("Migrating config.json from legacy auth fields to allowed_users...", err=True)
+        save_config(config, cfg_path)
+        click.echo("Migration complete.", err=True)
+
+    # Aggregate projects where BOTH project AND global allow-lists are empty.
+    # resolve_project_allowed_users returns (users, source); when source is
+    # "global" and the global list is also empty, the project will fail-closed.
+    empty: list[str] = []
+    for name, proj in config.projects.items():
+        users, _source = resolve_project_allowed_users(proj, config)
+        if not users:
+            empty.append(name)
+    if empty:
+        import logging as _logging
+        _logging.getLogger(__name__).critical(
+            "Projects with no users authorized at either project or global scope "
+            "(will reject all messages): %s. "
+            "Add users via `configure --add-user` or the manager bot.",
+            ", ".join(empty),
+        )
 
     from .transcriber import create_transcriber, create_synthesizer
 
@@ -430,6 +556,8 @@ def start(
             bot_cfg.telegram_bot_token,
             allowed_usernames=effective_usernames,
             trusted_users=effective_trusted_users,
+            allowed_users=config.allowed_users or None,
+            auth_source="global",
             session_id=session_id or bot_state.get("session_id") or bot_cfg.session_id,
             transcriber=transcriber,
             synthesizer=synthesizer,
@@ -473,6 +601,7 @@ def start(
             config,
             username_override=username,
         )
+        effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
@@ -480,6 +609,8 @@ def start(
             Path(proj.path),
             proj.telegram_bot_token,
             allowed_usernames=effective_usernames,
+            allowed_users=effective_allowed_users or None,
+            auth_source=project_auth_source,
             session_id=session_id,
             model=resolve_start_model(
                 proj.backend,
@@ -747,11 +878,22 @@ def start_manager(ctx):
     cfg_path = ctx.obj["config_path"]
     main_config = load_config(cfg_path)
 
+    if main_config.migration_pending:
+        click.echo("Migrating config.json from legacy auth fields to allowed_users...", err=True)
+        save_config(main_config, cfg_path)
+        click.echo("Migration complete.", err=True)
+
     token = main_config.manager_telegram_bot_token
     if not token:
         raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
-    if not main_config.allowed_usernames:
-        raise SystemExit("No username configured. Run 'configure --username USER' first.")
+    # Post-migration the only auth source is allowed_users (global allow-list).
+    # Empty → fail-closed (every message rejected). The manager bot has no
+    # project-scoped fallback (unlike project bots via resolve_project_allowed_users).
+    if not main_config.allowed_users:
+        raise SystemExit(
+            "No users authorized for the manager bot. "
+            "Run `configure --add-user USER[:ROLE]` or edit `allowed_users` in config.json."
+        )
 
     pm = ProcessManager(project_config_path=cfg_path)
     restored = pm.start_autostart()
@@ -760,12 +902,112 @@ def start_manager(ctx):
 
     bot = ManagerBot(
         token, pm,
-        allowed_usernames=main_config.allowed_usernames,
-        trusted_users=main_config.trusted_users,
+        allowed_users=main_config.allowed_users,
         project_config_path=cfg_path,
     )
     click.echo("Manager bot started.")
     bot.build().run_polling()
+
+
+@main.command("plugin-call")
+@click.argument("project")
+@click.argument("plugin_name")
+@click.argument("tool_name")
+@click.argument("args_json")
+@click.pass_context
+def plugin_call(ctx, project: str, plugin_name: str, tool_name: str, args_json: str):
+    """Call a plugin tool from the command line (used by Claude via Bash)."""
+    import asyncio
+    import json as _json
+    from pathlib import Path
+
+    from .plugin import PluginContext, load_plugin
+
+    try:
+        args = _json.loads(args_json)
+    except _json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid args_json: {e}")
+
+    cfg_path = ctx.obj["config_path"]
+    config = load_config(cfg_path)
+    if project not in config.projects:
+        raise SystemExit(f"Project {project!r} not found in config.")
+    proj_path = Path(config.projects[project].path)
+    data_dir = Path.home() / ".link-project-to-chat" / "meta" / project
+
+    plugin_ctx = PluginContext(
+        bot_name=project,
+        project_path=proj_path,
+        data_dir=data_dir,
+    )
+    plugin = load_plugin(plugin_name, plugin_ctx, {})
+    if not plugin:
+        raise SystemExit(f"Plugin {plugin_name!r} not found.")
+
+    result = asyncio.run(plugin.call_tool(tool_name, args))
+    click.echo(result)
+
+
+@main.command("migrate-config")
+@click.option("--dry-run", is_flag=True, help="Print the migration without modifying config.json.")
+@click.option("--project", "project_filter", default=None, help="Limit project output to this name.")
+@click.pass_context
+def migrate_config(ctx, dry_run: bool, project_filter: str | None):
+    """Apply the legacy → AllowedUser migration on config.json.
+
+    Exit code 0 on success; non-zero when any project ends up with empty
+    `allowed_users` (operators must populate them before exposing the bot).
+    """
+    cfg_path = ctx.obj["config_path"]
+    config = load_config(cfg_path)
+
+    # Print the resulting state for the user to inspect.
+    click.echo(f"Global allow-list: {len(config.allowed_users)} users")
+    for u in config.allowed_users:
+        locked = f" [identities: {', '.join(u.locked_identities)}]" if u.locked_identities else ""
+        click.echo(f"  - {u.username} ({u.role}){locked}")
+
+    empty_projects: list[str] = []
+    for name, proj in config.projects.items():
+        if project_filter and name != project_filter:
+            continue
+        click.echo(f"\nProject {name!r}: {len(proj.allowed_users)} users")
+        for u in proj.allowed_users:
+            locked = f" [identities: {', '.join(u.locked_identities)}]" if u.locked_identities else ""
+            click.echo(f"  - {u.username} ({u.role}){locked}")
+        if not proj.allowed_users and not config.allowed_users:
+            empty_projects.append(name)
+
+    if not config.migration_pending:
+        click.echo("\nNo migration needed (config.json already in the new shape).")
+        # Still exit non-zero if there are empty allowlists — operator should know.
+        if empty_projects:
+            click.echo(
+                f"\nERROR: projects with no users authorized: {', '.join(empty_projects)}",
+                err=True,
+            )
+            raise SystemExit(2)
+        return
+
+    if dry_run:
+        click.echo("\n(dry-run) Migration NOT applied. Re-run without --dry-run to write.")
+        if empty_projects:
+            click.echo(
+                f"\nWARNING: after migration, projects with empty allow-lists: "
+                f"{', '.join(empty_projects)}", err=True,
+            )
+            raise SystemExit(2)
+        return
+
+    save_config(config, cfg_path)
+    click.echo("\nMigration applied. Legacy keys stripped; allowed_users written.")
+    if empty_projects:
+        click.echo(
+            f"\nERROR: projects with no users authorized: {', '.join(empty_projects)}.\n"
+            "Run `configure --add-user <username>` or edit the manager bot to fix.",
+            err=True,
+        )
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

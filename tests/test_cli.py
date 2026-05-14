@@ -986,3 +986,347 @@ def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkey
     assert kwargs["allowed_usernames"] == ["alice"]
     assert kwargs.get("on_trust") is None
     assert kwargs.get("trusted_users") is None
+
+
+def test_plugin_call_unknown_plugin_exits_nonzero(tmp_path):
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        '{"projects": {"p": {"path": "/tmp", "telegram_bot_token": "t"}}}'
+    )
+
+    result = runner.invoke(
+        main,
+        ["--config", str(cfg), "plugin-call", "p", "does-not-exist", "tool", "{}"],
+    )
+    assert result.exit_code != 0
+
+
+def test_migrate_config_dry_run_does_not_write(tmp_path):
+    """`migrate-config --dry-run` shows the migration without modifying the file."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {
+                "path": "/tmp",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    }))
+    before = cfg.read_text()
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config", "--dry-run"])
+    assert result.exit_code == 0
+    assert "alice" in result.output
+    assert "executor" in result.output
+    # File is unchanged.
+    assert cfg.read_text() == before
+
+
+def test_migrate_config_applies_migration(tmp_path):
+    """`migrate-config` (no --dry-run) writes the new shape to disk."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {
+                "path": "/tmp",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    }))
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config"])
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    assert "allowed_usernames" not in written["projects"]["p"]
+    assert written["projects"]["p"]["allowed_users"] == [
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
+    ]
+
+
+def test_migrate_config_nonzero_exit_on_empty_allowlist(tmp_path):
+    """Migration that leaves any project with empty allowed_users exits non-zero."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {"path": "/tmp", "telegram_bot_token": "t"}
+        }
+    }))
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config"])
+    assert result.exit_code != 0
+
+
+def test_configure_add_user_persists(tmp_path):
+    """`configure --add-user alice:executor` writes an AllowedUser to the global allow-list."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    result = runner.invoke(main, ["--config", str(cfg), "configure", "--add-user", "alice:executor"])
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    assert written["allowed_users"] == [
+        {"username": "alice", "role": "executor"},
+    ]
+
+
+def test_configure_reset_user_identity_per_transport(tmp_path):
+    """`configure --reset-user-identity alice:web` clears web entries only,
+    leaving other transports' locks intact. Regression test for the bug
+    where the whole string was normalized before the colon-split."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice:web"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    assert alice["locked_identities"] == ["telegram:12345"]
+
+
+def test_configure_reset_user_identity_clears_all(tmp_path):
+    """`configure --reset-user-identity alice` (no :transport) clears all."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    # Empty list serializes as the absent key.
+    assert alice.get("locked_identities", []) == []
+
+
+def test_configure_legacy_username_flag_warns(tmp_path):
+    """Legacy `--username` flag works but emits a deprecation warning."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    result = runner.invoke(main, ["--config", str(cfg), "configure", "--username", "bob"])
+    assert result.exit_code == 0
+    assert "deprecated" in result.output.lower() or "deprecated" in (result.stderr or "").lower()
+    written = json.loads(cfg.read_text())
+    assert any(u["username"] == "bob" for u in written.get("allowed_users", []))
+
+
+def test_start_manager_requires_allowed_users(tmp_path, monkeypatch):
+    """start-manager must hard-fail when allowed_users is empty (fail-closed)."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Manager token set, but NO allowed_users. (Config has no top-level
+    # telegram_bot_token field — that's per-ProjectConfig. start-manager
+    # only needs manager_telegram_bot_token.)
+    save_config(
+        Config(manager_telegram_bot_token="m", allowed_users=[]),
+        cfg_path,
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code != 0
+    assert "No users authorized" in (result.output + str(result.exception))
+
+
+def test_start_manager_passes_allowed_users_into_manager_bot(tmp_path, monkeypatch):
+    """start-manager must construct ManagerBot with allowed_users=, not the
+    legacy allowed_usernames=. Regression: pre-Task-4 start_manager passed
+    allowed_usernames= and trusted_users=, both of which Task 5 deletes."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            manager_telegram_bot_token="m",
+            allowed_users=[AllowedUser(username="alice", role="executor")],
+        ),
+        cfg_path,
+    )
+
+    captured_kwargs: dict = {}
+
+    class _FakeBot:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs["args"] = args
+            captured_kwargs["kwargs"] = kwargs
+
+        def build(self):
+            class _App:
+                def run_polling(self_inner): return None
+            return _App()
+
+    monkeypatch.setattr("link_project_to_chat.manager.bot.ManagerBot", _FakeBot)
+
+    class _FakePM:
+        def __init__(self, **kwargs): pass
+        def start_autostart(self): return 0
+
+    monkeypatch.setattr("link_project_to_chat.manager.process.ProcessManager", _FakePM)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+    # allowed_users= must be present; legacy kwargs must NOT be passed.
+    assert "allowed_users" in captured_kwargs["kwargs"]
+    assert captured_kwargs["kwargs"]["allowed_users"][0].username == "alice"
+    assert "allowed_usernames" not in captured_kwargs["kwargs"]
+    assert "trusted_users" not in captured_kwargs["kwargs"]
+
+
+def test_start_manager_runs_migration_on_pending(tmp_path, monkeypatch):
+    """start-manager must call save_config when load_config sets migration_pending,
+    mirroring start's behavior."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Write a legacy-shaped config that load_config will migrate.
+    import json
+    cfg_path.write_text(json.dumps({
+        "telegram_bot_token": "x",
+        "manager_telegram_bot_token": "m",
+        "allowed_usernames": ["alice"],  # legacy → will trigger migration
+    }))
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.bot.ManagerBot",
+        type("_FB", (), {"__init__": lambda *a, **k: None,
+                        "build": lambda self: type("_A", (), {"run_polling": lambda s: None})()}),
+    )
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.process.ProcessManager",
+        type("_FPM", (), {"__init__": lambda *a, **k: None,
+                          "start_autostart": lambda self: 0}),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+
+    # After migration, the on-disk file no longer has the legacy key and DOES
+    # have allowed_users with role=executor for alice.
+    reloaded = json.loads(cfg_path.read_text())
+    assert "allowed_usernames" not in reloaded
+    assert any(u["username"] == "alice" and u["role"] == "executor"
+               for u in reloaded.get("allowed_users", []))
+
+
+def test_manager_bot_accepts_allowed_users_kwarg():
+    """Constructor regression: ManagerBot must accept allowed_users= and set
+    self._allowed_users. Catches a future caller that drops this kwarg."""
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    pm = ProcessManager.__new__(ProcessManager)
+    bot = ManagerBot(
+        token="t",
+        process_manager=pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
+
+
+def test_manager_bot_legacy_auth_works_with_allowed_users_only(tmp_path):
+    """TRANSITION SHIM regression — between Task 4 and Task 5, AuthMixin is
+    still legacy: _auth(user) reads _allowed_usernames via
+    _get_allowed_usernames. If start-manager passes only allowed_users= and
+    the constructor leaves _allowed_usernames at its class-level [] default,
+    every message gets denied until Task 5 Step 3 rewrites AuthMixin.
+
+    This test is intentionally transitional. Task 5 Step 3 deletes the
+    legacy _auth(user) method, after which calling bot._auth(...) here would
+    AttributeError — so Task 5 Step 11 strips both the shim and this test.
+    The post-rewrite equivalent (an authorized user authenticates via
+    _auth_identity) is already covered by tests/test_auth_roles.py.
+
+    Persistence side-effect note: legacy _auth on the allow path calls
+    _trust_user → _on_trust → bind_trusted_user, which writes to
+    self._project_config_path or DEFAULT_CONFIG. Without an explicit
+    project_config_path, that would mutate the real ~/.link-project-to-chat/
+    config.json on the test runner. The tmp_path fixture sandboxes it.
+    """
+    from types import SimpleNamespace
+
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    pm = ProcessManager.__new__(ProcessManager)
+    bot = ManagerBot(
+        token="t",
+        process_manager=pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+        project_config_path=tmp_path / "config.json",
+    )
+    # Legacy _auth(user) takes a duck-typed user with .id / .username.
+    user = SimpleNamespace(id=98765, username="alice")
+    assert bot._auth(user) is True
+    # Sanity: an unknown username still denies.
+    intruder = SimpleNamespace(id=11111, username="mallory")
+    assert bot._auth(intruder) is False
