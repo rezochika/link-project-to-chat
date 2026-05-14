@@ -2257,12 +2257,14 @@ def save_config_within_lock(config: Config, path: Path = DEFAULT_CONFIG) -> None
 Add a small TDD test in `tests/test_config_allowed_users.py`:
 
 ```python
-def test_locked_config_rmw_holds_lock_across_load_and_save(tmp_path: Path):
-    """The RMW context manager must hold _config_lock for both phases.
-    A second locked_config_rmw call while the first holds the lock should
-    block (we can only verify the API exists and the basic round-trip works
-    without spawning real processes — concurrency is exercised by the
-    test_persist_merges_per_user_not_replace integration test in Task 5)."""
+def test_locked_config_rmw_round_trip_smoke(tmp_path: Path):
+    """Smoke test: API exists and a basic RMW cycle works.
+
+    This does NOT prove the lock is held across the load/save — it only
+    proves the context manager round-trips cleanly. The real concurrency
+    test (`test_locked_config_rmw_actually_serializes_writers` below) uses
+    multiprocessing to force contention.
+    """
     from link_project_to_chat.config import locked_config_rmw, save_config_within_lock
 
     cfg_file = tmp_path / "config.json"
@@ -2274,7 +2276,63 @@ def test_locked_config_rmw_holds_lock_across_load_and_save(tmp_path: Path):
 
     reloaded = load_config(cfg_file)
     assert reloaded.allowed_users == [AllowedUser(username="alice", role="executor", locked_identities=[])]
+
+
+def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
+    """Real contention test: two writers, each appending a different
+    identity to the same user, must converge to BOTH identities on disk.
+
+    If `locked_config_rmw` only locked the write phase (like the rejected
+    earlier design), one writer would load the pre-write state, the other
+    would also load it, both would compute different merged states, and the
+    last-to-save would clobber the first. With the lock held across the
+    whole load→modify→save cycle, the second writer sees the first writer's
+    result and unions on top.
+
+    Uses multiprocessing to force separate file-lock holders (a single
+    process can't really test fcntl.flock contention against itself).
+    """
+    import multiprocessing as mp
+    from link_project_to_chat.config import (
+        AllowedUser, Config, locked_config_rmw, load_config, save_config,
+        save_config_within_lock,
+    )
+
+    cfg_file = tmp_path / "config.json"
+    cfg = Config()
+    cfg.allowed_users = [AllowedUser(username="alice", role="executor")]
+    save_config(cfg, cfg_file)
+
+    def _worker(cfg_file_path: str, identity: str) -> None:
+        # Import inside the worker (each subprocess re-imports).
+        from link_project_to_chat.config import (
+            locked_config_rmw, save_config_within_lock,
+        )
+        import time
+        with locked_config_rmw(Path(cfg_file_path)) as disk:
+            # Tiny sleep widens the contention window — without the
+            # cross-phase lock, this all but guarantees one writer
+            # clobbers the other.
+            time.sleep(0.05)
+            for au in disk.allowed_users:
+                if au.username == "alice" and identity not in au.locked_identities:
+                    au.locked_identities = au.locked_identities + [identity]
+            save_config_within_lock(disk, Path(cfg_file_path))
+
+    p1 = mp.Process(target=_worker, args=(str(cfg_file), "telegram:1"))
+    p2 = mp.Process(target=_worker, args=(str(cfg_file), "web:web-session:abc"))
+    p1.start(); p2.start()
+    p1.join(); p2.join()
+    assert p1.exitcode == 0 and p2.exitcode == 0
+
+    final = load_config(cfg_file)
+    alice = next(u for u in final.allowed_users if u.username == "alice")
+    # Both writers' identities must be present — neither clobbered the other.
+    assert "telegram:1" in alice.locked_identities
+    assert "web:web-session:abc" in alice.locked_identities
 ```
+
+**On test stability**: the contention test uses a 50ms `time.sleep` to widen the race window. The flakiness shape would be a false PASS (lock not held but they happened to interleave benignly) — not a false FAIL. If `fcntl.flock` is not respected on the runner's filesystem (rare; some network-mounted /tmp setups), this test will fail consistently, which is the desired signal. Skip on Windows if the file-locking semantics are too platform-specific to mirror in CI; the integration test in Task 5 (`test_persist_merges_per_user_not_replace`) covers the higher-level behavior.
 
 - [ ] **Step 8: Audit `config.py` only — confirm new code paths are wired in**
 
@@ -2364,7 +2422,9 @@ EOF
 - Modify: `src/link_project_to_chat/cli.py`
 - Modify: `tests/test_cli.py` (append)
 
-`run_bot` / `run_bots` already accept `plugins` after Task 2; `proj.plugins` is read in `run_bots` via `proj.plugins or None`. Once Task 3 lands, the chain is live without further CLI changes. This task adds three CLI surfaces:
+`run_bot` / `run_bots` already accept `plugins` and `allowed_users` after Task 2 (via `getattr(proj, ...)` during the transitional window). Task 3 added the dataclass fields. **This task replaces Task 2's `getattr` plumbing with calls to `resolve_project_allowed_users(proj, config)`** so the bot inherits the global allow-list when the per-project list is empty AND knows which scope to persist back to via the returned `(users, source)` tuple (passed to `run_bot` as `auth_source`). Concrete edits are in Step 6.
+
+This task adds three CLI surfaces:
 
 1. **`plugin-call`** — standalone plugin invocation for Claude-via-Bash.
 2. **`migrate-config [--dry-run] [--project NAME]`** — preview / apply the legacy → AllowedUser migration. The `start` command also calls this implicitly when `Config.migration_pending` is set.
@@ -3560,9 +3620,17 @@ grep -rln "_allowed_usernames\|_trusted_user_ids\|allowed_usernames\|trusted_use
 
 Each match is a test referencing the legacy auth model. Rewrite to construct `AllowedUser` entries with `role="executor"` (the migration default — preserves equivalent legacy semantics). Don't delete tests; convert them. **Expected: tests pass with no behavioral change because executor-only allowed_users matches the legacy "everyone allowed has full access" behavior.**
 
-- [ ] **Step 9: Pipe `allowed_users` through `run_bots`**
+- [ ] **Step 9: Verify `run_bots` uses `resolve_project_allowed_users`**
 
-`run_bots` already passes `allowed_users=proj.allowed_users or None` (added in Task 2 Step 14). After Task 3 lands, `proj.allowed_users` exists — verify by running the suite.
+`run_bots` was updated in **Task 4 Step 6** to compute
+`effective_allowed, auth_source = resolve_project_allowed_users(proj, config)`
+and pass both into `run_bot`. Verify this is in place — if Task 4's edit hasn't landed yet (executing tasks out of order), apply the snippet from Task 4 Step 6 to `run_bots` now. The Task 2 transitional `getattr(proj, "plugins", None)` plumbing is **replaced**, not preserved.
+
+```bash
+grep -n "resolve_project_allowed_users\|auth_source=" src/link_project_to_chat/bot.py
+```
+
+Expected: matches inside the `run_bots` body. If only `getattr(proj, ...)` lingers, port the Task 4 Step 6 snippet now.
 
 - [ ] **Step 10a: Add scope-aware persistence test**
 
@@ -4127,7 +4195,10 @@ Find the manager bot's button-click dispatch (mirrors `_on_button` on the projec
         elif click.value.startswith("proj_ptog_"):
             # Plugin toggle changes config state — gate to executor role.
             # Without this, a viewer with manager-bot access could enable
-            # arbitrary plugin code on any project.
+            # arbitrary plugin code on any project. Also: _auth_identity
+            # earlier in the dispatch may have appended a first-contact lock
+            # for this user; the surrounding _on_button_from_transport
+            # try/finally (Step 6b mirror in manager) persists either way.
             if not self._require_executor(click.sender):
                 assert self._transport is not None
                 await self._transport.send_text(
@@ -4196,8 +4267,11 @@ async def test_viewer_cannot_toggle_plugin(monkeypatch, tmp_path):
     save_called = []
     monkeypatch.setattr(bot, "_save_projects", lambda p: save_called.append(p))
 
-    await bot._on_callback(MagicMock(callback_query=MagicMock(data=click.value, from_user=sender)))
-    # … or whichever entry point your manager bot uses for ButtonClick dispatch.
+    # The manager bot's transport-native button entry point is
+    # _on_button_from_transport (verified via grep on manager/bot.py — the
+    # one registered via self._transport.on_button(...)). Use it directly
+    # so the test exercises the real dispatch path.
+    await bot._on_button_from_transport(click)
 
     assert save_called == []
     text = bot._transport.send_text.await_args.args[1].lower()
@@ -4409,15 +4483,41 @@ In `src/link_project_to_chat/manager/bot.py`, add the handlers. Register them vi
 
 ```python
 # Register near the other transport.on_command calls in ManagerBot.build()
-# (or whatever the manager bot's setup method is named):
-self._transport.on_command("users", self._on_users)
-self._transport.on_command("add_user", self._on_add_user)
-self._transport.on_command("remove_user", self._on_remove_user)
-self._transport.on_command("promote_user", self._on_promote_user)
-self._transport.on_command("demote_user", self._on_demote_user)
-self._transport.on_command("reset_user_identity", self._on_reset_user_identity)
+# (or whatever the manager bot's setup method is named). Each handler is
+# wrapped with _wrap_with_persist so a first-contact identity lock from
+# the auth check inside the handler always gets saved, regardless of which
+# branch the handler exits through (auth-failed, viewer-denied, normal).
+def _wrap_with_persist(handler):
+    async def _wrapped(ci):
+        try:
+            await handler(ci)
+        finally:
+            await self._persist_auth_if_dirty()
+    return _wrapped
+
+self._transport.on_command("users", _wrap_with_persist(self._on_users))
+self._transport.on_command("add_user", _wrap_with_persist(self._on_add_user))
+self._transport.on_command("remove_user", _wrap_with_persist(self._on_remove_user))
+self._transport.on_command("promote_user", _wrap_with_persist(self._on_promote_user))
+self._transport.on_command("demote_user", _wrap_with_persist(self._on_demote_user))
+self._transport.on_command("reset_user_identity", _wrap_with_persist(self._on_reset_user_identity))
+# Same treatment for the existing manager commands that go through
+# _auth_identity (find them in the existing registration block and apply
+# _wrap_with_persist to each). Without this, any /projects-family command
+# from a first-contact user leaves the lock unsaved.
 # NOTE: these registrations work BECAUSE Task 1 fixed TelegramTransport.on_command
 # to also register PTB CommandHandler when called post-routing.
+```
+
+Also wrap the manager's button dispatch (`_on_button_from_transport`) with a try/finally that calls `_persist_auth_if_dirty`. The plugin-toggle viewer-denied path triggers the `_auth_identity` + `_require_executor` chain — both can append a first-contact lock. Edit the existing `_on_button_from_transport` to wrap its body:
+
+```python
+    async def _on_button_from_transport(self, click) -> None:
+        try:
+            # existing body unchanged
+            ...
+        finally:
+            await self._persist_auth_if_dirty()
 ```
 
 Add the handler methods on `ManagerBot`:
@@ -4454,24 +4554,68 @@ Add the handler methods on `ManagerBot`:
         return "\n".join(lines)
 
     async def _require_executor_or_reply(self, ci) -> bool:
-        """Common gate for write commands. Auth + executor role enforcement."""
-        if not self._auth_identity(ci.sender):
-            return False
-        if not self._require_executor(ci.sender):
-            await self._transport.send_text(
-                ci.chat,
-                "Read-only access — only executors can edit the allow-list.",
-                reply_to=ci.message,
-            )
-            return False
-        return True
+        """Common gate for write commands. Auth + executor role enforcement.
+
+        Calling `_auth_identity` may append a first-contact identity to a
+        user's locked_identities. The manager bot edits the global allow-list
+        on disk, so we need our own persist helper — `_persist_auth_if_dirty`
+        is defined below.
+        """
+        try:
+            if not self._auth_identity(ci.sender):
+                return False
+            if not self._require_executor(ci.sender):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Read-only access — only executors can edit the allow-list.",
+                    reply_to=ci.message,
+                )
+                return False
+            return True
+        finally:
+            # Always persist any first-contact lock from the _auth_identity
+            # call above. Covers both allow and deny branches.
+            await self._persist_auth_if_dirty()
+
+    async def _persist_auth_if_dirty(self) -> None:
+        """Persist _allowed_users to disk if a first-contact lock was added.
+
+        Manager bot's equivalent of ProjectBot._persist_auth_if_dirty. Always
+        writes to the GLOBAL Config.allowed_users (the manager bot has no
+        project-scoped state). Uses the atomic locked_config_rmw context
+        manager from config.py so concurrent first-contacts converge.
+        """
+        if not self._auth_dirty:
+            return
+        from ..config import locked_config_rmw, save_config_within_lock
+        cfg_path = self._users_config_path()
+        try:
+            with locked_config_rmw(cfg_path) as disk:
+                in_memory_by_user = {u.username: u for u in self._allowed_users}
+                for au in disk.allowed_users:
+                    mem = in_memory_by_user.get(au.username)
+                    if mem is None:
+                        continue
+                    merged = list(au.locked_identities)
+                    for ident in mem.locked_identities:
+                        if ident not in merged:
+                            merged.append(ident)
+                    au.locked_identities = merged
+                save_config_within_lock(disk, cfg_path)
+            self._auth_dirty = False
+        except Exception:
+            logger.exception("Failed to persist manager auth state; will retry on next message")
 
     async def _on_users(self, ci) -> None:
-        # /users LIST is viewer-allowed (read-only).
-        if not self._auth_identity(ci.sender):
-            return
-        cfg = self._load_config_for_users()
-        await self._transport.send_text(ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message)
+        # /users LIST is viewer-allowed (read-only). But _auth_identity may
+        # still append a first-contact lock; persist before returning.
+        try:
+            if not self._auth_identity(ci.sender):
+                return
+            cfg = self._load_config_for_users()
+            await self._transport.send_text(ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message)
+        finally:
+            await self._persist_auth_if_dirty()
 
     async def _on_add_user(self, ci) -> None:
         if not await self._require_executor_or_reply(ci):
