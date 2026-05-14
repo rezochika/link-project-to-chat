@@ -1463,13 +1463,13 @@ def test_project_config_has_allowed_users_default_empty():
     assert p.allowed_users == []
 
 
-def test_legacy_fields_are_not_dataclass_attributes():
-    p = ProjectConfig(path="/tmp", telegram_bot_token="x")
-    # The legacy fields are deleted from the dataclass. They must not
-    # be settable except via the migration path on load.
-    assert not hasattr(p, "allowed_usernames")
-    assert not hasattr(p, "trusted_users")
-    assert not hasattr(p, "trusted_user_ids")
+# NOTE: A `test_legacy_fields_are_not_dataclass_attributes` would belong
+# here in principle, but legacy fields STAY on ProjectConfig and Config
+# through Tasks 3–4 as transitional read-only inputs (existing callers in
+# bot.py / cli.py / manager/bot.py still read them until Task 5's audit
+# rewrites them). That test is added in **Task 5 Step 12** after the
+# dataclass field removal lands. Don't add it here — it would fail by
+# design at the end of Task 3.
 
 
 def test_save_load_roundtrip(tmp_path: Path):
@@ -2278,6 +2278,26 @@ def test_locked_config_rmw_round_trip_smoke(tmp_path: Path):
     assert reloaded.allowed_users == [AllowedUser(username="alice", role="executor", locked_identities=[])]
 
 
+# Module-scope worker — multiprocessing's default start method on macOS and
+# Windows is "spawn", which requires the target callable to be importable
+# (= pickled by qualified name). Nested functions inside a test body can't
+# be pickled under spawn. Keep this at module scope.
+def _rmw_contention_worker(cfg_file_path: str, identity: str) -> None:
+    from pathlib import Path as _Path
+    import time
+    from link_project_to_chat.config import (
+        locked_config_rmw, save_config_within_lock,
+    )
+    with locked_config_rmw(_Path(cfg_file_path)) as disk:
+        # Tiny sleep widens the contention window — without the cross-phase
+        # lock, this all but guarantees one writer clobbers the other.
+        time.sleep(0.05)
+        for au in disk.allowed_users:
+            if au.username == "alice" and identity not in au.locked_identities:
+                au.locked_identities = au.locked_identities + [identity]
+        save_config_within_lock(disk, _Path(cfg_file_path))
+
+
 def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
     """Real contention test: two writers, each appending a different
     identity to the same user, must converge to BOTH identities on disk.
@@ -2291,11 +2311,13 @@ def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
 
     Uses multiprocessing to force separate file-lock holders (a single
     process can't really test fcntl.flock contention against itself).
+    Forces the 'spawn' context explicitly so the test behaves the same on
+    Linux (default 'fork') and macOS/Windows (default 'spawn'); requires
+    the worker to be at module scope so it can be pickled.
     """
     import multiprocessing as mp
     from link_project_to_chat.config import (
-        AllowedUser, Config, locked_config_rmw, load_config, save_config,
-        save_config_within_lock,
+        AllowedUser, Config, load_config, save_config,
     )
 
     cfg_file = tmp_path / "config.json"
@@ -2303,24 +2325,9 @@ def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
     cfg.allowed_users = [AllowedUser(username="alice", role="executor")]
     save_config(cfg, cfg_file)
 
-    def _worker(cfg_file_path: str, identity: str) -> None:
-        # Import inside the worker (each subprocess re-imports).
-        from link_project_to_chat.config import (
-            locked_config_rmw, save_config_within_lock,
-        )
-        import time
-        with locked_config_rmw(Path(cfg_file_path)) as disk:
-            # Tiny sleep widens the contention window — without the
-            # cross-phase lock, this all but guarantees one writer
-            # clobbers the other.
-            time.sleep(0.05)
-            for au in disk.allowed_users:
-                if au.username == "alice" and identity not in au.locked_identities:
-                    au.locked_identities = au.locked_identities + [identity]
-            save_config_within_lock(disk, Path(cfg_file_path))
-
-    p1 = mp.Process(target=_worker, args=(str(cfg_file), "telegram:1"))
-    p2 = mp.Process(target=_worker, args=(str(cfg_file), "web:web-session:abc"))
+    ctx = mp.get_context("spawn")  # explicit; identical behavior across OSes
+    p1 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "telegram:1"))
+    p2 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "web:web-session:abc"))
     p1.start(); p2.start()
     p1.join(); p2.join()
     assert p1.exitcode == 0 and p2.exitcode == 0
@@ -2869,6 +2876,23 @@ The `run_bot` / `run_bots` plumbing (added in Task 2) currently passes `proj.plu
 ```
 
 For ad-hoc `--path`/`--token` runs (no config loaded), pass `auth_source="project"` — the bot has no shared global allow-list to fall back on. `run_bot` accepts a new `auth_source: str = "project"` kwarg.
+
+**Update ALL `run_bot` call sites in `cli.py`** (the single-project and team-bot branches each have their own direct call — not just `run_bots`):
+
+1. **Ad-hoc `--path`/`--token` branch** at [cli.py:359](src/link_project_to_chat/cli.py:359) — pass `auth_source="project"`. No global fallback applies because no config was loaded. Also accept the implicit one-user allow-list as `allowed_users=[AllowedUser(username=username, role="executor")]` synthesized from `--username` (the existing `allowed_usernames=` plumbing in this branch becomes the legacy-only path; the new code should build an `AllowedUser` list directly so the bot has a non-empty `_allowed_users` and fail-closed semantics work).
+
+2. **Team-bot branch** at [cli.py:427](src/link_project_to_chat/cli.py:427) — team bots inherit auth from `Config.allowed_users` (the spec says "no per-team-bot allow-list in this revision"). Pass `allowed_users=config.allowed_users, auth_source="global"`. The existing `effective_usernames` / `effective_trusted_users` plumbing becomes the legacy-only path and the new code goes through the global allow-list.
+
+3. **Single-project branch** at [cli.py:478](src/link_project_to_chat/cli.py:478) — use `resolve_project_allowed_users(proj, config)` and pass `(users, source)` as `allowed_users=` and `auth_source=`. This is the equivalent of the `run_bots` fix above but in the explicit `--project NAME` path.
+
+After this edit, **no `run_bot` call site in `cli.py` should be missing `auth_source=`**. Verify:
+
+```bash
+grep -n "run_bot(" src/link_project_to_chat/cli.py
+grep -n "auth_source=" src/link_project_to_chat/cli.py
+```
+
+Both greps should return the same number of `run_bot(...)` invocations, and every one should have a matching `auth_source=` line in its kwargs.
 
 - [ ] **Step 7: Run tests to verify they pass**
 
@@ -4000,6 +4024,27 @@ In [src/link_project_to_chat/config.py](src/link_project_to_chat/config.py), now
 
 Update tests that referenced the legacy fields on the dataclass (they'd been kept as no-ops during Task 3; now they need to construct `AllowedUser` entries directly).
 
+**Add the regression test that was deliberately deferred from Task 3** — append to `tests/test_config_allowed_users.py`:
+
+```python
+def test_legacy_fields_are_not_dataclass_attributes():
+    """After Task 5 Step 12, the legacy fields are GONE from the dataclass.
+    They can only be read by the loader's _migrate_legacy_auth, which sees
+    the raw JSON dict — never the typed ProjectConfig / Config.
+    Adding this test in Task 3 would fail by design, since legacy fields
+    stay on the dataclass through Tasks 3–4 as transitional read-only inputs.
+    """
+    p = ProjectConfig(path="/tmp", telegram_bot_token="x")
+    assert not hasattr(p, "allowed_usernames")
+    assert not hasattr(p, "trusted_users")
+    assert not hasattr(p, "trusted_user_ids")
+
+    c = Config()
+    assert not hasattr(c, "allowed_usernames")
+    assert not hasattr(c, "trusted_users")
+    assert not hasattr(c, "trusted_user_ids")
+```
+
 - [ ] **Step 13: Run tests**
 
 ```bash
@@ -4481,33 +4526,62 @@ Expected: FAIL — handlers don't exist yet.
 
 In `src/link_project_to_chat/manager/bot.py`, add the handlers. Register them via `transport.on_command(...)` in the existing command registration block (find where other manager commands like `/projects` are registered).
 
-```python
-# Register near the other transport.on_command calls in ManagerBot.build()
-# (or whatever the manager bot's setup method is named). Each handler is
-# wrapped with _wrap_with_persist so a first-contact identity lock from
-# the auth check inside the handler always gets saved, regardless of which
-# branch the handler exits through (auth-failed, viewer-denied, normal).
-def _wrap_with_persist(handler):
-    async def _wrapped(ci):
-        try:
-            await handler(ci)
-        finally:
-            await self._persist_auth_if_dirty()
-    return _wrapped
+**REPLACE, not just add.** `manager/bot.py` already maps `add_user` / `remove_user` to legacy handlers (`_on_add_user_from_transport` / `_on_remove_user_from_transport`) inside its existing registration block (around [manager/bot.py:2289](src/link_project_to_chat/manager/bot.py:2289)). Those legacy handlers use the pre-v1.0 single-username-per-call shape and edit `allowed_usernames` / `trusted_users`. Leaving them in place would mean two handlers compete for the same command name — the registration dict's last writer wins, but the legacy handlers might still be referenced from elsewhere (e.g., the in-class ConversationHandler wizard at `_add_username`).
 
-self._transport.on_command("users", _wrap_with_persist(self._on_users))
-self._transport.on_command("add_user", _wrap_with_persist(self._on_add_user))
-self._transport.on_command("remove_user", _wrap_with_persist(self._on_remove_user))
-self._transport.on_command("promote_user", _wrap_with_persist(self._on_promote_user))
-self._transport.on_command("demote_user", _wrap_with_persist(self._on_demote_user))
-self._transport.on_command("reset_user_identity", _wrap_with_persist(self._on_reset_user_identity))
-# Same treatment for the existing manager commands that go through
-# _auth_identity (find them in the existing registration block and apply
-# _wrap_with_persist to each). Without this, any /projects-family command
-# from a first-contact user leaves the lock unsaved.
-# NOTE: these registrations work BECAUSE Task 1 fixed TelegramTransport.on_command
-# to also register PTB CommandHandler when called post-routing.
-```
+Concrete edits:
+
+1. **Find** the existing registration block in `manager/bot.py` (~line 2280 onwards):
+
+   ```python
+   command_handlers = {
+       "projects": self._on_projects_from_transport,
+       ...
+       "add_user": self._on_add_user_from_transport,       # ← REMOVE
+       "remove_user": self._on_remove_user_from_transport, # ← REMOVE
+       ...
+   }
+   for name, handler in command_handlers.items():
+       self._transport.on_command(name, handler)
+   ```
+
+2. **Remove** the `add_user` and `remove_user` lines from `command_handlers`. (Or replace them — see step 3.)
+
+3. **Add** all the new user-mgmt registrations through `_wrap_with_persist`:
+
+   ```python
+   # Wrap every handler so a first-contact identity lock from the auth check
+   # inside the handler always gets saved, regardless of which branch the
+   # handler exits through (auth-failed, viewer-denied, normal). Apply this
+   # to BOTH the new user-mgmt commands AND the existing manager commands
+   # that go through _auth_identity (/projects, /add_project, etc.).
+   def _wrap_with_persist(handler):
+       async def _wrapped(ci):
+           try:
+               await handler(ci)
+           finally:
+               await self._persist_auth_if_dirty()
+       return _wrapped
+
+   # New user-management commands (replaces the legacy add_user / remove_user).
+   self._transport.on_command("users", _wrap_with_persist(self._on_users))
+   self._transport.on_command("add_user", _wrap_with_persist(self._on_add_user))
+   self._transport.on_command("remove_user", _wrap_with_persist(self._on_remove_user))
+   self._transport.on_command("promote_user", _wrap_with_persist(self._on_promote_user))
+   self._transport.on_command("demote_user", _wrap_with_persist(self._on_demote_user))
+   self._transport.on_command("reset_user_identity", _wrap_with_persist(self._on_reset_user_identity))
+   ```
+
+4. **Wrap each existing handler** in the same registration block with `_wrap_with_persist` (replace `self._transport.on_command(name, handler)` with `self._transport.on_command(name, _wrap_with_persist(handler))` in the loop). Don't leave any unwrapped path: any manager command that calls `_auth_identity` and could lock a first-contact identity needs the persist tail.
+
+5. **Verify nothing references the deleted legacy handlers**:
+
+   ```bash
+   grep -n "_on_add_user_from_transport\|_on_remove_user_from_transport" src/link_project_to_chat/manager/bot.py
+   ```
+
+   If the names still appear (e.g., in `_add_username` ConversationHandler), either delete the dead code or migrate it to the new `_on_add_user`. The legacy ConversationHandler wizard ([manager/bot.py:636](src/link_project_to_chat/manager/bot.py:636)) edits legacy `allowed_usernames` directly — wholesale-replace its terminal action with a call to `self._on_add_user` so it produces the new shape on disk.
+
+NOTE: these registrations work BECAUSE Task 1 fixed `TelegramTransport.on_command` to also register PTB `CommandHandler` when called post-routing.
 
 Also wrap the manager's button dispatch (`_on_button_from_transport`) with a try/finally that calls `_persist_auth_if_dirty`. The plugin-toggle viewer-denied path triggers the `_auth_identity` + `_require_executor` chain — both can append a first-contact lock. Edit the existing `_on_button_from_transport` to wrap its body:
 
