@@ -223,6 +223,14 @@ class PluginContext:
     `transport` is the active Transport — plugins should call `transport.send_text(chat_ref, ...)`
     for outbound messages when they have a `ChatRef`. The legacy `send_message(chat_id, text)`
     convenience proxy synthesizes a `ChatRef` for plain-int chat IDs.
+
+    `web_port` / `public_url` / `register_in_app_web_handler` are API surface
+    reserved for the future external in-app-web-server plugin. In v1.0.0
+    they're populated only when a follow-up spec wires them through from
+    the Web transport — until then plugins MUST check for None and degrade
+    gracefully. `data_dir` is the per-bot meta directory
+    (`~/.link-project-to-chat/meta/<bot_name>/`) wired by `ProjectBot._init_plugins`;
+    each `Plugin` builds its per-plugin subdirectory via the `data_dir` property.
     """
     bot_name: str
     project_path: Path
@@ -962,6 +970,117 @@ async def test_shutdown_continues_when_stop_raises():
     bot = _make_bot([p1, p2])
     await bot._shutdown_plugins()
     assert ("stop", None) in p2.events
+
+
+# --- Plugin command collision policy ---
+# Step 6's _init_plugins blocks two collision categories:
+#   1. Plugin command shadowing a CORE_COMMAND_NAMES entry (e.g., /help).
+#   2. Plugin command already claimed by an earlier plugin (last-load
+#      silently winning is wrong — both should keep their other commands
+#      but the duplicate gets dropped with a WARNING).
+# Without these tests, the collision logic regresses silently — it's
+# only observable via a WARNING log line today.
+
+
+class _RecordingCommandPlugin(_RecordingPlugin):
+    """Plugin variant that exposes a configurable commands() list.
+
+    `_commands_to_register` is a list[BotCommand]; commands() returns it.
+    """
+
+    def __init__(self, ctx, cfg):
+        super().__init__(ctx, cfg)
+        self._commands_to_register: list[BotCommand] = []
+
+    def commands(self):
+        return list(self._commands_to_register)
+
+
+def _bc(name: str) -> BotCommand:
+    async def _h(_ci):  # pragma: no cover — never invoked in these tests
+        return None
+    return BotCommand(command=name, description="", handler=_h)
+
+
+@pytest.mark.asyncio
+async def test_plugin_cannot_shadow_core_command(monkeypatch, caplog):
+    """A plugin registering /help (a CORE_COMMAND_NAMES entry) is dropped
+    for that command. Other commands from the same plugin still register."""
+    from link_project_to_chat.bot import ProjectBot
+
+    p = _RecordingCommandPlugin(_ctx(), {})
+    p.name = "rec"
+    p._commands_to_register = [_bc("help"), _bc("rec_open")]
+
+    registered: list[tuple[str, Any]] = []
+
+    class _FakeTransport:
+        TRANSPORT_ID = "fake"
+        def on_command(self, name, handler):
+            registered.append((name, handler))
+
+    bot = _make_bot([])
+    bot._transport = _FakeTransport()
+    bot._plugin_configs = [{"name": "rec"}]
+    bot._plugins = [p]  # bypass load_plugin; pre-seed the list.
+    # Stub load_plugin so _init_plugins doesn't try entry-point discovery.
+    import link_project_to_chat.bot as bot_mod
+    monkeypatch.setattr(bot_mod, "load_plugin", lambda *a, **kw: p)
+    # Stub _wrap_plugin_command (defined in Task 5) so this test passes
+    # before Task 5 lands — it returns the raw handler in Task 2's window.
+    bot._wrap_plugin_command = lambda plugin, bc: bc.handler
+
+    with caplog.at_level("WARNING"):
+        await bot._init_plugins()
+
+    names = [n for n, _ in registered]
+    assert "help" not in names, "core command must not be shadowed"
+    assert "rec_open" in names, "non-core command from same plugin should still register"
+    assert any("reserved core command" in r.message.lower() or "core command" in r.message.lower()
+               for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_collision_between_plugins(monkeypatch, caplog):
+    """Two plugins both claim /share_cmd. First-load wins; the second
+    plugin's /share_cmd is dropped, but its other commands still register."""
+    from link_project_to_chat.bot import ProjectBot
+
+    p1 = _RecordingCommandPlugin(_ctx(), {})
+    p1.name = "first"
+    p1._commands_to_register = [_bc("share_cmd")]
+
+    p2 = _RecordingCommandPlugin(_ctx(), {})
+    p2.name = "second"
+    p2._commands_to_register = [_bc("share_cmd"), _bc("only_second")]
+
+    registered: list[tuple[str, Any]] = []
+
+    class _FakeTransport:
+        TRANSPORT_ID = "fake"
+        def on_command(self, name, handler):
+            registered.append((name, handler))
+
+    bot = _make_bot([])
+    bot._transport = _FakeTransport()
+    bot._plugin_configs = [{"name": "first"}, {"name": "second"}]
+    bot._plugins = [p1, p2]
+    import link_project_to_chat.bot as bot_mod
+    plugin_by_name = {"first": p1, "second": p2}
+    monkeypatch.setattr(bot_mod, "load_plugin",
+                        lambda name, *a, **kw: plugin_by_name[name])
+    bot._wrap_plugin_command = lambda plugin, bc: bc.handler
+
+    with caplog.at_level("WARNING"):
+        await bot._init_plugins()
+
+    names = [n for n, _ in registered]
+    # share_cmd registered exactly once (by p1 — first wins).
+    assert names.count("share_cmd") == 1
+    # p2's other command still registers.
+    assert "only_second" in names
+    assert any("already claimed" in r.message.lower() or "duplicate" in r.message.lower()
+               for r in caplog.records)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1171,6 +1290,19 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
         """Instantiate, register, and start plugins. Called from _after_ready."""
         if not self._plugin_configs or self._transport is None:
             return
+        # PluginContext field provenance:
+        #   bot_name / project_path / bot_username / backend_name / transport
+        #     — sourced from ProjectBot state (set in __init__ / _after_ready).
+        #   data_dir — fixed convention `~/.link-project-to-chat/meta/<bot_name>`;
+        #     created with mkdir below.
+        #   _identity_resolver — live bound method (see comment inline).
+        #   web_port / public_url / register_in_app_web_handler — INTENTIONALLY
+        #     left at their None defaults in v1.0.0. They're API surface
+        #     reserved for the future external in-app-web-server plugin and
+        #     would be populated by a follow-up spec that wires bot.py to the
+        #     Web transport's port / public URL and registers an HTTP-route
+        #     callback. Plugins that need them must check for None and
+        #     degrade gracefully (documented in PluginContext's docstring).
         self._shared_ctx = PluginContext(
             bot_name=self.name,
             project_path=self.path,
@@ -2029,8 +2161,15 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
         except (TypeError, ValueError):
             return f"telegram:{uid_str}"
 
+    # SHAPE DISCRIMINATOR — isinstance() dispatches the three on-disk
+    # trusted_users shapes (see spec section "Migration semantics" and
+    # Step 2's golden-file tests (b)/(c) [dict shape] and (d) [list shape]).
+    # Without this branch, dict-shape configs would silently fall into the
+    # list branch and crash on `for name, uid in zip(...)` with a TypeError.
     if isinstance(raw_trusted, dict):
         # Current on-disk shape: username → user_id (int or str).
+        # Covered by tests (b) test_migration_b_trusted_users_dict_subset
+        # and (c) test_migration_c_trusted_users_dict_full.
         for uname, uid in raw_trusted.items():
             norm = _norm(uname)
             legacy_trusted_names.append(norm)
@@ -2039,6 +2178,7 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
             identities_for.setdefault(norm, []).append(_normalize_legacy_trust_id(str(uid)))
     elif isinstance(raw_trusted, list):
         # Pre-A1 shape: list of usernames aligned with trusted_user_ids by index.
+        # Covered by test (d) test_migration_d_legacy_list_with_ids_aligned.
         legacy_trusted_names = [_norm(n) for n in raw_trusted]
         if len(legacy_trusted_names) == len(legacy_ids):
             for name, uid in zip(legacy_trusted_names, legacy_ids):
@@ -2917,6 +3057,13 @@ After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today'
     ):
         self._token = token
         self._pm = process_manager
+        # ORDER MATTERS: all _allowed_* / _trusted_* / _allowed_users
+        # assignments below MUST happen before the final _init_auth() call
+        # at the end of __init__. _init_auth doesn't read instance auth
+        # state today, but keeping the order explicit anchors the contract
+        # in case _init_auth ever grows per-user setup (rate-limit
+        # prepopulation, brute-force lockout warmup, etc.).
+        #
         # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 11
         # once every caller passes allowed_users= instead.
         #
@@ -3345,10 +3492,22 @@ def test_first_contact_locks_identity():
     assert au.locked_identities == ["telegram:98765"]
 
 
-def test_username_fallback_refuses_when_transport_already_locked():
-    """Same-transport spoof guard: if the user already has any identity from
-    this transport, refuse the username fallback. Otherwise an attacker who
-    knows the username could bind their own native_id."""
+def test_same_transport_spoof_blocked():
+    """Same-transport spoof guard (security-critical).
+
+    If a user already has any locked identity from a transport, an attacker
+    who happens to know the username and lands on the same transport with
+    a different native_id must NOT be able to bind their own identity via
+    the username fallback. The fallback only runs when the user has zero
+    locked identities from the incoming transport — once an identity is
+    locked on telegram, every subsequent telegram contact has to match by
+    identity_key (transport_id:native_id), never by handle.
+
+    Without this guard, an attacker who renames themselves to "alice" on
+    Telegram could authenticate themselves and overwrite the real alice's
+    locked_identities. The earlier draft of _get_user_role had this hole;
+    this test pins the fix.
+    """
     au = AllowedUser(
         username="alice",
         role="executor",
