@@ -18,7 +18,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import AllowedUser, DEFAULT_CONFIG, bind_trusted_user, patch_backend_state, unbind_trusted_user
+from ..config import AllowedUser, DEFAULT_CONFIG, patch_backend_state
 from .._auth import AuthMixin
 from ..transport import Button, Buttons, ChatRef, MessageRef
 
@@ -249,52 +249,12 @@ class ManagerBot(AuthMixin):
         self,
         token: str,
         process_manager: ProcessManager,
-        allowed_username: str = "",
-        allowed_usernames: list[str] | None = None,
-        trusted_users: dict[str, int] | None = None,
-        trusted_user_id: int | None = None,
-        trusted_user_ids: list[int] | None = None,
-        allowed_users: list["AllowedUser"] | None = None,  # NEW
+        allowed_users: list["AllowedUser"] | None = None,
         project_config_path: Path | None = None,
     ):
         self._token = token
         self._pm = process_manager
-        # ORDER MATTERS: all _allowed_* / _trusted_* / _allowed_users
-        # assignments below MUST happen before the final _init_auth() call
-        # at the end of __init__. _init_auth doesn't read instance auth
-        # state today, but keeping the order explicit anchors the contract
-        # in case _init_auth ever grows per-user setup (rate-limit
-        # prepopulation, brute-force lockout warmup, etc.).
-        #
-        # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 11
-        # once every caller passes allowed_users= instead.
-        #
-        # TRANSITION SHIM (Tasks 4–5 window): synthesize the legacy
-        # _allowed_usernames from the AllowedUser entries. AuthMixin is
-        # still legacy at the end of Task 4 — _auth(user) reads via
-        # _get_allowed_usernames → self._allowed_usernames at _auth.py:34.
-        # Without this synthesis, the new start-manager (which passes only
-        # allowed_users=) would leave _allowed_usernames at the class-level
-        # default [] and the manager would deny everyone until Task 5 Step 3
-        # rewrites AuthMixin. The whole if/elif/else block (including this
-        # synthesis branch) is removed in Task 5 Step 11 once the rewrite
-        # makes _allowed_users the sole source of truth.
-        if allowed_usernames is not None:
-            self._allowed_usernames = allowed_usernames
-        elif allowed_users is not None:
-            self._allowed_usernames = [u.username for u in allowed_users]
-        else:
-            self._allowed_username = allowed_username
-        if trusted_users is not None:
-            self._trusted_users = dict(trusted_users)
-        if trusted_user_ids is not None:
-            self._trusted_user_ids = trusted_user_ids
-        else:
-            self._trusted_user_id = trusted_user_id
-        # NEW: AllowedUser allow-list. _init_auth + AuthMixin._allowed_users
-        # is the post-Task-5 source of truth; setting it here makes the
-        # transition transparent to manager auth code that lands in Task 5.
-        self._allowed_users = list(allowed_users or [])
+        self._allowed_users: list = list(allowed_users or [])
         self._started_at = time.monotonic()
         self._app = None
         self._project_config_path = project_config_path
@@ -302,10 +262,6 @@ class ManagerBot(AuthMixin):
         # deletion. Project bots own their own TeamRelay (see #0c).
         self._telethon_client = None
         self._init_auth()
-
-    def _on_trust(self, user_id: int, username: str) -> None:
-        path = self._project_config_path or DEFAULT_CONFIG
-        bind_trusted_user(username, user_id, path)
 
     def _load_projects(self) -> dict[str, dict]:
         path = self._project_config_path
@@ -367,6 +323,49 @@ class ManagerBot(AuthMixin):
 
         return notes, failures
 
+    def _users_config_path(self):
+        """Resolve the config path for manager auth ops.
+
+        ``self._project_config_path`` may be None (manager bot constructed
+        without an explicit path → use the default). Passing None to
+        ``load_config`` / ``save_config`` would TypeError.
+        """
+        from ..config import DEFAULT_CONFIG
+        return self._project_config_path or DEFAULT_CONFIG
+
+    async def _persist_auth_if_dirty(self) -> None:
+        """Persist ``_allowed_users`` to disk if a first-contact lock was added.
+
+        Manager bot's equivalent of ``ProjectBot._persist_auth_if_dirty``.
+        Always writes to the GLOBAL ``Config.allowed_users`` (the manager bot
+        has no project-scoped state). Uses the atomic ``locked_config_rmw``
+        context manager from config.py so concurrent first-contacts converge.
+
+        Pre-Step-3 (legacy ``AuthMixin``), ``_auth_dirty`` may not be set by
+        any code path — the helper is a no-op and safe to call. Post-Step-3,
+        it persists the append performed by ``_get_user_role``.
+        """
+        if not getattr(self, "_auth_dirty", False):
+            return
+        from ..config import locked_config_rmw, save_config_within_lock
+        cfg_path = self._users_config_path()
+        try:
+            with locked_config_rmw(cfg_path) as disk:
+                in_memory_by_user = {u.username: u for u in self._allowed_users}
+                for au in disk.allowed_users:
+                    mem = in_memory_by_user.get(au.username)
+                    if mem is None:
+                        continue
+                    merged = list(au.locked_identities)
+                    for ident in mem.locked_identities:
+                        if ident not in merged:
+                            merged.append(ident)
+                    au.locked_identities = merged
+                save_config_within_lock(disk, cfg_path)
+            self._auth_dirty = False
+        except Exception:
+            logger.exception("Failed to persist manager auth state; will retry on next message")
+
     async def _guard(self, update: Update) -> bool:
         """Returns True if the user is authorized and not rate-limited.
 
@@ -380,18 +379,32 @@ class ManagerBot(AuthMixin):
         latter unconditionally reads fields off ``effective_user`` and would
         raise on None (anonymous channel admins, service messages, etc.).
         """
-        from ..transport.telegram import chat_ref_from_telegram
+        from ..transport.telegram import (
+            chat_ref_from_telegram,
+            identity_from_telegram_user,
+        )
         user = update.effective_user
         chat = chat_ref_from_telegram(update.effective_chat) if update.effective_chat else None
-        if not user or not self._auth(user):
-            if chat is not None:
-                await self._transport.send_text(chat, "Unauthorized.")
-            return False
-        if self._rate_limited(user.id):
-            if chat is not None:
-                await self._transport.send_text(chat, "Rate limited. Try again shortly.")
-            return False
-        return True
+        try:
+            if not user:
+                if chat is not None:
+                    await self._transport.send_text(chat, "Unauthorized.")
+                return False
+            identity = identity_from_telegram_user(user)
+            if not self._auth_identity(identity):
+                if chat is not None:
+                    await self._transport.send_text(chat, "Unauthorized.")
+                return False
+            if self._rate_limited(self._identity_key(identity)):
+                if chat is not None:
+                    await self._transport.send_text(chat, "Rate limited. Try again shortly.")
+                return False
+            return True
+        finally:
+            # Step 3 makes _auth_identity → _get_user_role append a first-contact
+            # identity; persist before returning regardless of allow/deny branch.
+            # Pre-Step-3 this is a no-op (see _persist_auth_if_dirty docstring).
+            await self._persist_auth_if_dirty()
 
     async def _guard_invocation(self, invocation: "CommandInvocation") -> bool:
         """Transport-native counterpart of _guard.
@@ -702,11 +715,10 @@ class ManagerBot(AuthMixin):
         """Transport-native handler for /users."""
         if not await self._guard_invocation(invocation):
             return
-        usernames = self._get_allowed_usernames()
-        if not usernames:
+        if not self._allowed_users:
             await self._transport.send_text(invocation.chat, "No authorized users.")
             return
-        text = "Authorized users:\n" + "\n".join(f"  @{u}" for u in usernames)
+        text = "Authorized users:\n" + "\n".join(f"  @{u.username}" for u in self._allowed_users)
         await self._transport.send_text(invocation.chat, text)
 
     async def _on_add_user_from_transport(self, invocation: "CommandInvocation") -> None:
@@ -717,18 +729,15 @@ class ManagerBot(AuthMixin):
             await self._transport.send_text(invocation.chat, "Usage: /add_user <username>")
             return
         new_user = invocation.args[0].lower().lstrip("@")
-        usernames = self._get_allowed_usernames()
-        if new_user in usernames:
+        if any(u.username == new_user for u in self._allowed_users):
             await self._transport.send_text(invocation.chat, f"@{new_user} is already authorized.")
             return
-        if not self._allowed_usernames:
-            self._allowed_usernames = list(usernames)
-        self._allowed_usernames.append(new_user)
+        self._allowed_users.append(AllowedUser(username=new_user, role="executor"))
         from ..config import load_config, save_config
         path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(path)
-        if new_user not in config.allowed_usernames:
-            config.allowed_usernames.append(new_user)
+        if not any(u.username == new_user for u in config.allowed_users):
+            config.allowed_users.append(AllowedUser(username=new_user, role="executor"))
             save_config(config, path)
         await self._transport.send_text(invocation.chat, f"Added @{new_user}.")
 
@@ -740,22 +749,14 @@ class ManagerBot(AuthMixin):
             await self._transport.send_text(invocation.chat, "Usage: /remove_user <username>")
             return
         rm_user = invocation.args[0].lower().lstrip("@")
-        usernames = self._get_allowed_usernames()
-        if rm_user not in usernames:
+        if not any(u.username == rm_user for u in self._allowed_users):
             await self._transport.send_text(invocation.chat, f"@{rm_user} is not authorized.")
             return
-        if not self._allowed_usernames:
-            self._allowed_usernames = list(usernames)
-        self._allowed_usernames.remove(rm_user)
-        self._revoke_user(rm_user)
+        self._allowed_users = [u for u in self._allowed_users if u.username != rm_user]
         from ..config import load_config, save_config
         path = self._project_config_path or DEFAULT_CONFIG
         config = load_config(path)
-        if rm_user in config.allowed_usernames:
-            config.allowed_usernames.remove(rm_user)
-        config.trusted_users.pop(rm_user, None)
-        config.trusted_user_ids = list(config.trusted_users.values())
-        unbind_trusted_user(rm_user, path)
+        config.allowed_users = [u for u in config.allowed_users if u.username != rm_user]
         save_config(config, path)
         await self._transport.send_text(invocation.chat, f"Removed @{rm_user}.")
 
@@ -861,20 +862,35 @@ class ManagerBot(AuthMixin):
             )
 
     async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        # Handle setup text input
-        setup_awaiting = ctx.user_data.get("setup_awaiting")
-        if setup_awaiting:
-            await self._handle_setup_input(update, ctx, setup_awaiting)
-            return
-        # Existing edit logic (unchanged)
-        pending = ctx.user_data.get("pending_edit")
-        if not pending:
-            return
-        if not self._auth(update.effective_user):
-            return
-        ctx.user_data.pop("pending_edit")
-        incoming = self._incoming_from_update(update)
-        await self._apply_edit(incoming.chat, pending["name"], pending["field"], incoming.text.strip())
+        from ..transport.telegram import identity_from_telegram_user
+        try:
+            # Handle setup text input first (intentionally NOT rate-limited —
+            # users paste long tokens during onboarding and shouldn't get
+            # throttled mid-wizard). If the manager later wants to throttle
+            # setup text, gate it inside _handle_setup_input.
+            setup_awaiting = ctx.user_data.get("setup_awaiting")
+            if setup_awaiting:
+                await self._handle_setup_input(update, ctx, setup_awaiting)
+                return
+            # Existing edit logic
+            pending = ctx.user_data.get("pending_edit")
+            if not pending:
+                return
+            user = update.effective_user
+            if not user:
+                return
+            identity = identity_from_telegram_user(user)
+            if not self._auth_identity(identity):
+                return
+            if self._rate_limited(self._identity_key(identity)):
+                return
+            ctx.user_data.pop("pending_edit")
+            incoming = self._incoming_from_update(update)
+            await self._apply_edit(incoming.chat, pending["name"], pending["field"], incoming.text.strip())
+        finally:
+            # First-contact identity locks from _auth_identity must survive the
+            # wizard path the same way transport-native commands persist them.
+            await self._persist_auth_if_dirty()
 
     async def _handle_setup_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, awaiting: str) -> None:
         from ..config import load_config, save_config

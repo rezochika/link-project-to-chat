@@ -88,11 +88,13 @@ def bot_env(tmp_path: Path):
     proj_cfg = tmp_path / "projects.json"
     proj_cfg.write_text(json.dumps({"projects": {}}))
     pm = ProcessManager(project_config_path=proj_cfg)
+    from link_project_to_chat.config import AllowedUser
     bot = ManagerBot(
         "TOKEN",
         pm,
-        allowed_username="testuser",
-        trusted_user_id=1,
+        allowed_users=[
+            AllowedUser(username="testuser", role="executor", locked_identities=["telegram:1"]),
+        ],
         project_config_path=proj_cfg,
     )
     return bot, pm, proj_cfg

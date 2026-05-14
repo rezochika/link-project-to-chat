@@ -10,14 +10,16 @@ from link_project_to_chat.manager.process import ProcessManager
 
 
 def _make_bot(tmp_path: Path) -> ManagerBot:
+    from link_project_to_chat.config import AllowedUser
     cfg = tmp_path / "config.json"
     cfg.write_text('{"projects": {}}')
     pm = ProcessManager(project_config_path=cfg, command_builder=lambda n, c: ["echo", n])
     return ManagerBot(
         token="test-token",
         process_manager=pm,
-        allowed_usernames=["testuser"],
-        trusted_user_ids=[1],
+        allowed_users=[
+            AllowedUser(username="testuser", role="executor", locked_identities=["telegram:1"]),
+        ],
         project_config_path=cfg,
     )
 

@@ -643,6 +643,8 @@ async def test_ask_answer_annotation_preserves_question_html():
 
     bot = await _stub_bot()
     bot._auth_identity = lambda _sender: True
+    bot._require_executor = lambda _sender: True
+    bot._auth_dirty = False
 
     # Prepare a fake task with one pending question.
     task = _fake_task(task_id=77)

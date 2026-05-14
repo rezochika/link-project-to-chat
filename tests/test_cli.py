@@ -848,20 +848,19 @@ def test_start_team_wrong_role_errors(tmp_path, monkeypatch):
     assert "not in team" in (result.output or str(result.exception)) or "dev" in (result.output or str(result.exception))
 
 
-def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+def test_start_project_with_project_usernames_uses_project_allowed_users(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -881,25 +880,23 @@ def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["bob"]
+    assert kwargs["auth_source"] == "project"
 
 
-def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatch):
+def test_start_project_username_override_uses_one_user_allow_list(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
-                    trusted_user_ids=[202],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -919,24 +916,22 @@ def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["carol"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["carol"]
 
 
-def test_start_single_project_without_project_flag_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+def test_start_single_project_without_project_flag_uses_project_allowed_users(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -953,8 +948,7 @@ def test_start_single_project_without_project_flag_uses_project_trusted_ids_only
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["bob"]
 
 
 def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkeypatch):
@@ -983,9 +977,8 @@ def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkey
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["alice"]
+    assert [u.username for u in kwargs["allowed_users"]] == ["alice"]
     assert kwargs.get("on_trust") is None
-    assert kwargs.get("trusted_users") is None
 
 
 def test_plugin_call_unknown_plugin_exits_nonzero(tmp_path):
@@ -1292,41 +1285,7 @@ def test_manager_bot_accepts_allowed_users_kwarg():
     assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
 
 
-def test_manager_bot_legacy_auth_works_with_allowed_users_only(tmp_path):
-    """TRANSITION SHIM regression — between Task 4 and Task 5, AuthMixin is
-    still legacy: _auth(user) reads _allowed_usernames via
-    _get_allowed_usernames. If start-manager passes only allowed_users= and
-    the constructor leaves _allowed_usernames at its class-level [] default,
-    every message gets denied until Task 5 Step 3 rewrites AuthMixin.
-
-    This test is intentionally transitional. Task 5 Step 3 deletes the
-    legacy _auth(user) method, after which calling bot._auth(...) here would
-    AttributeError — so Task 5 Step 11 strips both the shim and this test.
-    The post-rewrite equivalent (an authorized user authenticates via
-    _auth_identity) is already covered by tests/test_auth_roles.py.
-
-    Persistence side-effect note: legacy _auth on the allow path calls
-    _trust_user → _on_trust → bind_trusted_user, which writes to
-    self._project_config_path or DEFAULT_CONFIG. Without an explicit
-    project_config_path, that would mutate the real ~/.link-project-to-chat/
-    config.json on the test runner. The tmp_path fixture sandboxes it.
-    """
-    from types import SimpleNamespace
-
-    from link_project_to_chat.config import AllowedUser
-    from link_project_to_chat.manager.bot import ManagerBot
-    from link_project_to_chat.manager.process import ProcessManager
-
-    pm = ProcessManager.__new__(ProcessManager)
-    bot = ManagerBot(
-        token="t",
-        process_manager=pm,
-        allowed_users=[AllowedUser(username="alice", role="executor")],
-        project_config_path=tmp_path / "config.json",
-    )
-    # Legacy _auth(user) takes a duck-typed user with .id / .username.
-    user = SimpleNamespace(id=98765, username="alice")
-    assert bot._auth(user) is True
-    # Sanity: an unknown username still denies.
-    intruder = SimpleNamespace(id=11111, username="mallory")
-    assert bot._auth(intruder) is False
+# Removed in Task 5 Step 11: ``test_manager_bot_legacy_auth_works_with_allowed_users_only``
+# called the deleted legacy ``_auth(user)`` method. The post-rewrite
+# equivalent (an authorized user authenticates via ``_auth_identity``) is
+# covered by ``tests/test_auth_roles.py``.

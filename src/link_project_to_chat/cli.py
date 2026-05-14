@@ -8,14 +8,11 @@ import click
 from .backends.claude import PERMISSION_MODES
 from .config import (
     DEFAULT_CONFIG,
-    bind_project_trusted_user,
     load_config,
     patch_backend_state,
-    resolve_project_auth_scope,
     resolve_permissions,
     resolve_start_model,
     save_config,
-    unbind_trusted_user,
 )
 
 
@@ -79,7 +76,8 @@ def projects_list(ctx):
     if not config.projects:
         return click.echo("No projects linked.")
     for name, proj in config.projects.items():
-        users = ", ".join(proj.allowed_usernames) if proj.allowed_usernames else "(global)"
+        usernames = [u.username for u in proj.allowed_users]
+        users = ", ".join(usernames) if usernames else "(global)"
         click.echo(f"  {name}: {proj.path}  [{users}]")
 
 
@@ -294,22 +292,13 @@ def configure(
             existing.role = role
         else:
             config.allowed_users.append(AllowedUser(username=uname, role=role))
-        # Mirror to legacy allowed_usernames so save_config's union view keeps
-        # this user across the legacy/new mirror through Task 4.
-        if uname not in config.allowed_usernames:
-            config.allowed_usernames.append(uname)
         save_config(config, cfg_path)
         click.echo(f"Added {uname} ({role}).")
 
     if remove_user:
         norm = remove_user.lstrip("@").lower()
         config.allowed_users = [u for u in config.allowed_users if u.username != norm]
-        config.trusted_users.pop(norm, None)
-        config.trusted_user_ids = list(config.trusted_users.values())
-        if norm in config.allowed_usernames:
-            config.allowed_usernames.remove(norm)
         save_config(config, cfg_path)
-        unbind_trusted_user(norm, cfg_path)
         click.echo(f"Removed {norm}.")
 
     if reset_user_identity:
@@ -326,21 +315,11 @@ def configure(
             raise SystemExit(f"User {norm!r} not in allow-list.")
         if transport is None:
             u.locked_identities = []
-            # Also clear the legacy mirror so save's UNION view doesn't
-            # resurrect telegram identities from `trusted_users`.
-            if norm in config.trusted_users:
-                config.trusted_users.pop(norm, None)
-                config.trusted_user_ids = list(config.trusted_users.values())
         else:
             u.locked_identities = [
                 ident for ident in u.locked_identities
                 if not ident.startswith(f"{transport}:")
             ]
-            # The legacy mirror only stores telegram ids; clearing the
-            # telegram transport must also clear that mirror.
-            if transport == "telegram" and norm in config.trusted_users:
-                config.trusted_users.pop(norm, None)
-                config.trusted_user_ids = list(config.trusted_users.values())
         save_config(config, cfg_path)
         if transport is None:
             click.echo(f"Cleared all locked identities for {norm}.")
@@ -535,8 +514,6 @@ def start(
         if role not in t.bots:
             raise SystemExit(f"Role '{role}' not in team '{team}'. Known roles: {list(t.bots)}")
         bot_cfg = t.bots[role]
-        effective_usernames = config.allowed_usernames
-        effective_trusted_users = config.trusted_users
         # Team bots run unattended in a group — a Claude tool-permission prompt
         # would block forever. Default to dangerously-skip-permissions unless
         # the team config explicitly overrides.
@@ -554,8 +531,6 @@ def start(
             f"{team}_{role}",
             Path(t.path),
             bot_cfg.telegram_bot_token,
-            allowed_usernames=effective_usernames,
-            trusted_users=effective_trusted_users,
             allowed_users=config.allowed_users or None,
             auth_source="global",
             session_id=session_id or bot_state.get("session_id") or bot_cfg.session_id,
@@ -596,19 +571,21 @@ def start(
         if project not in config.projects:
             raise SystemExit(f"Project '{project}' not found.")
         proj = config.projects[project]
-        effective_usernames, effective_trusted_users = resolve_project_auth_scope(
-            proj,
-            config,
-            username_override=username,
-        )
         effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
+        # ``--username`` CLI override: synthesize a one-user allow-list for
+        # this run that wins over the resolved scope. Matches the legacy
+        # ``username_override`` arm of the removed ``resolve_project_auth_scope``.
+        if username:
+            from .config import AllowedUser
+            uname_norm = username.lower().lstrip("@")
+            effective_allowed_users = [AllowedUser(username=uname_norm, role="executor")]
+            project_auth_source = "project"
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
             project,
             Path(proj.path),
             proj.telegram_bot_token,
-            allowed_usernames=effective_usernames,
             allowed_users=effective_allowed_users or None,
             auth_source=project_auth_source,
             session_id=session_id,
@@ -623,17 +600,10 @@ def start(
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
-            on_trust=lambda uid, trusted_username: bind_project_trusted_user(
-                project,
-                trusted_username,
-                uid,
-                cfg_path,
-            ),
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
             show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
-            trusted_users=effective_trusted_users,
             config_path=cfg_path,
             transport_kind=transport_kind,
             web_port=web_port,

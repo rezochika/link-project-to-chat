@@ -182,104 +182,32 @@ def test_locked_config_rmw_round_trip_smoke(tmp_path: Path):
 # (= pickled by qualified name). Nested functions inside a test body can't
 # be pickled under spawn. Keep this at module scope.
 def _rmw_contention_worker(cfg_file_path: str, new_username: str) -> None:
-    """Mutate via the legacy ``allowed_usernames`` field - the only supported
-    mutation surface through Tasks 3-4 (``_save_config_unlocked`` treats
-    legacy fields as authoritative on save until Task 5 rewrites callers to
-    use ``allowed_users`` directly). This test only cares that the RMW lock
-    serializes writers; the choice of mutated field is incidental.
+    """Append a new AllowedUser inside ``locked_config_rmw``.
+
+    This test only cares that the RMW lock serializes writers; without
+    cross-phase locking, one process would load before the other writes
+    and clobber it.
     """
     from pathlib import Path as _Path
     import time
     from link_project_to_chat.config import (
-        locked_config_rmw, save_config_within_lock,
+        AllowedUser as _AllowedUser,
+        locked_config_rmw,
+        save_config_within_lock,
     )
     with locked_config_rmw(_Path(cfg_file_path)) as disk:
         # Tiny sleep widens the contention window - without the cross-phase
         # lock, this all but guarantees one writer clobbers the other.
         time.sleep(0.05)
-        if new_username not in disk.allowed_usernames:
-            disk.allowed_usernames.append(new_username)
+        if not any(u.username == new_username for u in disk.allowed_users):
+            disk.allowed_users.append(_AllowedUser(username=new_username, role="executor"))
         save_config_within_lock(disk, _Path(cfg_file_path))
 
 
-def test_legacy_mutation_after_clean_load_is_preserved_on_save(tmp_path: Path):
-    """Regression: when a caller mutates legacy fields (e.g., CLI
-    ``configure --username``) on a clean (new-shape) config and saves, the
-    mutation must appear in the resulting on-disk allowed_users list.
-
-    Pre-fix, ``_save_config_unlocked`` preferred ``config.allowed_users``
-    when ``migration_pending=False``, which silently dropped legacy
-    mutations after the first migration save had run. Now legacy fields
-    are authoritative at save time through Tasks 3-4 (Task 5 rewrites
-    callers).
-    """
-    cfg_file = tmp_path / "config.json"
-    # Start from a clean new-shape config (migration_pending=False).
-    save_config(
-        Config(allowed_users=[AllowedUser(username="alice", role="executor")]),
-        cfg_file,
-    )
-    loaded = load_config(cfg_file)
-    assert loaded.migration_pending is False
-    # The load-time mirror populated allowed_usernames from allowed_users
-    # so existing legacy-aware callers can still mutate the list.
-    assert "alice" in loaded.allowed_usernames
-    # CLI-style legacy mutation: append a new username on the legacy field.
-    loaded.allowed_usernames.append("bob")
-    save_config(loaded, cfg_file)
-    # Reload — bob must survive.
-    reloaded = load_config(cfg_file)
-    by_name = {u.username for u in reloaded.allowed_users}
-    assert "alice" in by_name
-    assert "bob" in by_name
-
-
-def test_legacy_remove_username_on_clean_config_drops_user(tmp_path: Path):
-    """Regression mirror: when a caller removes a username from the legacy
-    list on a clean config, the removal must persist on save."""
-    cfg_file = tmp_path / "config.json"
-    save_config(
-        Config(allowed_users=[
-            AllowedUser(username="alice", role="executor"),
-            AllowedUser(username="bob", role="executor"),
-        ]),
-        cfg_file,
-    )
-    loaded = load_config(cfg_file)
-    # CLI-style remove: pop bob from the legacy list.
-    loaded.allowed_usernames.remove("bob")
-    save_config(loaded, cfg_file)
-    reloaded = load_config(cfg_file)
-    by_name = {u.username for u in reloaded.allowed_users}
-    assert by_name == {"alice"}
-
-
-def test_legacy_mutation_on_clean_project_config_persists(tmp_path: Path):
-    """Regression mirror at project scope: legacy mutation on a clean
-    project config must persist through save/reload.
-
-    The manager bot's /add_user / /remove_user handlers and CLI per-project
-    legacy paths mutate ``ProjectConfig.allowed_usernames`` directly. Same
-    bug shape as the global scope: pre-fix, ``_save_config_unlocked`` would
-    prefer the stale ``p.allowed_users`` when ``migration_pending=False``.
-    """
-    cfg_file = tmp_path / "config.json"
-    cfg = Config()
-    cfg.projects["myp"] = ProjectConfig(
-        path="/tmp/p",
-        telegram_bot_token="t",
-        allowed_users=[AllowedUser(username="alice", role="executor")],
-    )
-    save_config(cfg, cfg_file)
-    loaded = load_config(cfg_file)
-    assert loaded.migration_pending is False
-    p = loaded.projects["myp"]
-    assert "alice" in p.allowed_usernames
-    p.allowed_usernames.append("bob")
-    save_config(loaded, cfg_file)
-    reloaded = load_config(cfg_file)
-    by_name = {u.username for u in reloaded.projects["myp"].allowed_users}
-    assert by_name == {"alice", "bob"}
+# Removed in Task 5 Step 12: the three ``test_legacy_*`` tests exercised
+# the legacy ``allowed_usernames`` mutation path that no longer exists
+# (the dataclass field is gone). The new-shape path is covered by
+# ``test_save_load_preserves_*`` later in this file.
 
 
 def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
@@ -414,29 +342,29 @@ def test_save_load_preserves_locked_identity_addition_through_roundtrip(tmp_path
     }
 
 
-def test_project_cross_scope_synthesis_fallback_pins_behavior(tmp_path: Path):
-    """Regression for I5: a project with trusted_user_ids and no
-    allowed_usernames must inherit the GLOBAL allowed_usernames as the
-    legacy-synthesis basis, producing a per-project allowed_users entry
-    that mirrors the global username with the project's telegram ID
-    binding.
+# Removed in Task 5 Step 12:
+# ``test_project_cross_scope_synthesis_fallback_pins_behavior`` pinned the
+# behavior where a project with ``trusted_user_ids`` (legacy) and no
+# ``allowed_usernames`` of its own inherits the global allow-list as the
+# synthesis basis. With the legacy fields gone from the dataclass, the
+# scenario is unreachable from in-memory construction. The loader still
+# accepts legacy on-disk fields and migrates them into ``allowed_users``;
+# that path is covered by ``test_config.py::test_load_config_migrates_single_username``.
 
-    This matches the load-time precedence in `resolve_project_auth_scope`
-    (legacy: global usernames + project trusted IDs); we pin it at save
-    time so callers constructing `ProjectConfig(trusted_user_ids=[42])`
-    alongside a global `allowed_usernames=["alice"]` round-trip cleanly.
+
+def test_legacy_fields_are_not_dataclass_attributes():
+    """After Task 5 Step 12, the legacy fields are GONE from the dataclass.
+    They can only be read by the loader's _migrate_legacy_auth, which sees
+    the raw JSON dict — never the typed ProjectConfig / Config.
+    Adding this test in Task 3 would fail by design, since legacy fields
+    stay on the dataclass through Tasks 3–4 as transitional read-only inputs.
     """
-    cfg_file = tmp_path / "config.json"
-    cfg = Config(allowed_usernames=["alice"])
-    cfg.projects["myp"] = ProjectConfig(
-        path="/tmp/p",
-        telegram_bot_token="t",
-        trusted_user_ids=[42],
-    )
-    save_config(cfg, cfg_file)
-    reloaded = load_config(cfg_file)
+    p = ProjectConfig(path="/tmp", telegram_bot_token="x")
+    assert not hasattr(p, "allowed_usernames")
+    assert not hasattr(p, "trusted_users")
+    assert not hasattr(p, "trusted_user_ids")
 
-    proj_users = reloaded.projects["myp"].allowed_users
-    assert len(proj_users) == 1
-    assert proj_users[0].username == "alice"
-    assert proj_users[0].locked_identities == ["telegram:42"]
+    c = Config()
+    assert not hasattr(c, "allowed_usernames")
+    assert not hasattr(c, "trusted_users")
+    assert not hasattr(c, "trusted_user_ids")

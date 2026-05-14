@@ -13,11 +13,13 @@ from link_project_to_chat.web.transport import WebTransport
 
 
 async def test_projectbot_web_transport_auth_dispatches_command(tmp_path: Path):
+    from link_project_to_chat.config import AllowedUser
+
     bot = ProjectBot(
         name="demo",
         path=tmp_path,
         token="WEB",
-        allowed_usernames=["alice"],
+        allowed_users=[AllowedUser(username="alice", role="executor")],
         config_path=tmp_path / "config.json",
         transport_kind="web",
         web_port=0,
@@ -32,7 +34,7 @@ async def test_projectbot_web_transport_auth_dispatches_command(tmp_path: Path):
             transport_id="web",
             native_id="web-session:abc",
             display_name="Browser Alice",
-            handle="mallory",
+            handle="alice",
             is_bot=False,
         )
 
@@ -41,6 +43,8 @@ async def test_projectbot_web_transport_auth_dispatches_command(tmp_path: Path):
         assert transport._store is not None
         messages = await transport._store.get_messages("default")
         assert any("Project: demo" in message["text"] for message in messages)
-        assert bot._trusted_users["alice"] == "web-session:abc"
+        # First-contact lock recorded the web identity for alice.
+        alice = next(u for u in bot._allowed_users if u.username == "alice")
+        assert "web:web-session:abc" in alice.locked_identities
     finally:
         await transport.stop()

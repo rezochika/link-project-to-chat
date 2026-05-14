@@ -206,6 +206,7 @@ async def test_halt_command_sets_halted_in_registry(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
 
     chat = _group_chat(-100_111)
     await bot._on_halt(_halt_ci(chat))
@@ -220,6 +221,7 @@ async def test_resume_command_clears_halt(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
 
     chat = _group_chat(-100_111)
     bot._group_state.halt(chat)
@@ -240,6 +242,7 @@ async def test_halt_in_solo_mode_rejects(tmp_path):
     bot = ProjectBot(name="solo", path=tmp_path, token="t")  # no team_name → group_mode=False
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
     chat = _group_chat(-100_111)
 
     await bot._on_halt(_halt_ci(chat))
@@ -254,6 +257,7 @@ async def test_resume_in_solo_mode_rejects(tmp_path):
     bot = ProjectBot(name="solo", path=tmp_path, token="t")
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
     chat = _group_chat(-100_111)
 
     await bot._on_resume(_halt_ci(chat))
@@ -268,6 +272,7 @@ async def test_halt_from_wrong_group_silently_ignored(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
 
     wrong_chat = _group_chat(-100_222)
     await bot._on_halt(_halt_ci(wrong_chat))
@@ -283,6 +288,7 @@ async def test_resume_from_wrong_group_silently_ignored(tmp_path):
     bot = _mk_bot(tmp_path, max_rounds=20)  # bot.group_chat_id == -100_111
     _team_bot_with_fake_transport(bot)
     bot._auth_identity = lambda _s: True
+    bot._require_executor = lambda _s: True
     correct_chat = _group_chat(-100_111)
     bot._group_state.halt(correct_chat)
 

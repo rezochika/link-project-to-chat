@@ -15,10 +15,10 @@ if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
 from .config import (
+    AllowedUser,
     Config,
     DEFAULT_CONFIG,
     RoomBinding,
-    bind_project_trusted_user,
     clear_session,
     load_config,
     load_session,
@@ -30,7 +30,6 @@ from .config import (
     patch_team_bot_backend_state,
     resolve_permissions,
     resolve_project_allowed_users,
-    resolve_project_auth_scope,
     resolve_start_model,
     save_session,
 )
@@ -170,16 +169,10 @@ class ProjectBot(AuthMixin):
         self._config_path = config_path
         self.transport_kind = transport_kind
         self.web_port = web_port
-        if allowed_usernames is not None:
-            self._allowed_usernames = allowed_usernames
-        else:
-            self._allowed_username = allowed_username
-        if trusted_users is not None:
-            self._trusted_users = dict(trusted_users)
-        if trusted_user_ids is not None:
-            self._trusted_user_ids = trusted_user_ids
-        else:
-            self._trusted_user_id = trusted_user_id
+        # Legacy auth kwargs are still on the signature for callers that haven't
+        # migrated; they're consumed only by the synthesis block below to seed
+        # ``_allowed_users``. The legacy ``_allowed_usernames`` / ``_trusted_*``
+        # instance attributes from older AuthMixin are deleted in Task 5 Step 3.
         self._on_trust_fn = on_trust
         self._started_at = time.monotonic()
         self._app = None
@@ -279,7 +272,28 @@ class ProjectBot(AuthMixin):
         self._plugin_command_handlers: dict[str, list] = {}
         self._shared_ctx: PluginContext | None = None
         # Sole auth + authority source. Empty list → fail-closed (no users authorized).
-        self._allowed_users: list = list(allowed_users or [])
+        # TRANSITION SHIM (Task 5): when callers pass legacy
+        # ``allowed_username`` / ``allowed_usernames`` but not ``allowed_users``,
+        # synthesize a list of executor AllowedUser entries from the legacy
+        # kwargs. Lets the existing test suite (and a small handful of
+        # external callers) keep working through Tasks 5–6 while the new
+        # auth path becomes the only one. Step 11/12 strip the legacy kwargs.
+        if allowed_users is not None:
+            self._allowed_users: list = list(allowed_users)
+        elif allowed_usernames:
+            self._allowed_users = [
+                AllowedUser(username=str(u).lstrip("@").lower(), role="executor")
+                for u in allowed_usernames
+            ]
+        elif allowed_username:
+            self._allowed_users = [
+                AllowedUser(
+                    username=str(allowed_username).lstrip("@").lower(),
+                    role="executor",
+                ),
+            ]
+        else:
+            self._allowed_users = []
         # Track which scope this allow-list came from so _persist_auth_if_dirty
         # writes back to the right place. "project" for per-project lists,
         # "global" when run_bots used the Config.allowed_users fallback.
@@ -1054,6 +1068,117 @@ class ProjectBot(AuthMixin):
         prompt = self._plugin_context_prepend(prompt)
         return prompt
 
+    async def _persist_auth_if_dirty(self) -> None:
+        """Save config.json once if ``_auth_dirty`` was set by a first-contact lock.
+
+        Called from message-handling tails (``_on_text``, ``_on_run``, etc.)
+        after the message is processed. Cheap when nothing to do (single
+        bool check).
+
+        Three correctness properties:
+
+        1. **Atomic read-modify-write.** The load → merge → save sequence
+           holds the existing ``_config_lock`` (fcntl.flock POSIX,
+           msvcrt.locking Windows) for the WHOLE duration, not just the
+           write phase. Without this, two concurrent first-contacts would
+           each load the pre-write state, each merge in their own change,
+           each save — last writer wins and silently drops one lock. The
+           lock is provided by ``locked_config_rmw(path)`` in ``config.py``.
+        2. **Scope-aware.** Writes back to whichever scope the bot's
+           ``_allowed_users`` came from. When the bot inherited the global
+           allow-list via ``resolve_project_allowed_users`` fallback,
+           ``self._auth_source == "global"`` and we update
+           ``Config.allowed_users`` on disk — NOT the project's empty list
+           (which would silently promote the global list to a project-
+           scoped copy).
+        3. **Per-user merge.** Find the AllowedUser by username, union its
+           ``locked_identities`` with our in-memory copy, write. Does NOT
+           replace the full list. Concurrent edits to OTHER users on disk
+           are preserved.
+        """
+        if not self._auth_dirty:
+            return
+        from .config import locked_config_rmw, save_config_within_lock
+        cfg_path = self._effective_config_path()
+        try:
+            with locked_config_rmw(cfg_path) as disk:
+                # disk is a freshly-loaded Config with the file lock held.
+                if self._auth_source == "project":
+                    if self.name not in disk.projects:
+                        logger.warning(
+                            "Auth persist skipped: project %r missing from disk", self.name,
+                        )
+                        return
+                    target = disk.projects[self.name].allowed_users
+                else:  # "global"
+                    target = disk.allowed_users
+
+                # Per-user merge: union our in-memory locks with disk's.
+                in_memory_by_user = {u.username: u for u in self._allowed_users}
+                for au in target:
+                    mem = in_memory_by_user.get(au.username)
+                    if mem is None:
+                        continue
+                    merged = list(au.locked_identities)
+                    for ident in mem.locked_identities:
+                        if ident not in merged:
+                            merged.append(ident)
+                    au.locked_identities = merged
+
+                # Inside the context manager — save_config_within_lock writes
+                # without re-locking (the context manager already holds the
+                # lock).
+                save_config_within_lock(disk, cfg_path)
+
+            self._auth_dirty = False
+        except Exception:
+            logger.exception("Failed to persist auth state; will retry on next message")
+
+    async def _guard_executor(self, ci_or_msg) -> bool:
+        """Return True if the user may run state-changing actions.
+
+        Replies 'Read-only access' on the active transport when blocked.
+        ``ci_or_msg`` accepts either a ``CommandInvocation`` or an
+        ``IncomingMessage`` — both expose ``.sender``, ``.chat``, and
+        ``.message``.
+
+        IMPORTANT: persists ``_auth_dirty`` on BOTH the success AND the
+        viewer-denied path. ``_require_executor`` may have appended a
+        first-contact identity to the user's ``locked_identities`` even
+        when the role check ultimately fails (e.g., the user is a viewer
+        logging in from a new transport — they get authed, locked, then
+        denied for the state-changing action). Skipping the save on the
+        deny path would lose that lock.
+        """
+        sender = getattr(ci_or_msg, "sender", None)
+        if sender is None:
+            return False
+        allowed = self._require_executor(sender)
+        # Persist first-contact locks regardless of allow/deny outcome.
+        await self._persist_auth_if_dirty()
+        if allowed:
+            return True
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci_or_msg.chat,
+            "Read-only access — your role is viewer.",
+            reply_to=getattr(ci_or_msg, "message", None),
+        )
+        return False
+
+    async def _with_auth_persist(self, awaitable):
+        """Run an awaitable, guaranteeing ``_persist_auth_if_dirty`` fires after.
+
+        Use this in top-level handler bodies whose flow may exit through
+        any of: plugin consume, viewer-denied gate, exception, normal path.
+        Cheap when no first-contact happened (the persist is a single bool
+        check that no-ops).
+        """
+        try:
+            await awaitable
+        finally:
+            await self._persist_auth_if_dirty()
+
     async def _on_text(self, incoming) -> None:
         """Handle a plain-text message: auth, rate-limit, pending skill/persona
         capture, waiting-input routing, supersede, then Claude submission.
@@ -1079,6 +1204,12 @@ class ProjectBot(AuthMixin):
 
         consumed = await self._dispatch_plugin_on_message(incoming)
         if consumed:
+            return
+
+        # Role gate: only executors may submit prompts / answer questions /
+        # trigger backend turns. Read-only viewers should not be able to push
+        # the agent forward.
+        if not await self._guard_executor(incoming):
             return
 
         if incoming.has_unsupported_media:
@@ -1159,6 +1290,8 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
+        if not await self._guard_executor(ci):
             return
         if not ci.args:
             await self._transport.send_text(ci.chat, "Usage: /run <command>", reply_to=ci.message)
@@ -1245,6 +1378,8 @@ class ProjectBot(AuthMixin):
     async def _on_model(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         backend = self.task_manager.backend
         models = tuple(backend.capabilities.models)
@@ -1281,6 +1416,8 @@ class ProjectBot(AuthMixin):
     async def _on_effort(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         backend = self.task_manager.backend
         levels = tuple(backend.capabilities.effort_levels)
@@ -1314,6 +1451,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_thinking(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_thinking:
@@ -1374,7 +1513,11 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         args = ci.args or []
         if not args:
+            # Read-only — viewers may inspect the current state.
             await self._transport.send_text(ci.chat, self._context_status_text())
+            return
+        # Toggling / setting limit is state-changing — gate to executor.
+        if not await self._guard_executor(ci):
             return
         arg = args[0].lower()
         if arg in ("on", "off"):
@@ -1425,6 +1568,8 @@ class ProjectBot(AuthMixin):
     async def _on_permissions(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_permissions:
             await self._transport.send_text(ci.chat, "This backend doesn't support /permissions.")
@@ -1437,6 +1582,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_compact(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_compact:
@@ -1511,6 +1658,8 @@ class ProjectBot(AuthMixin):
         """
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
 
         if not ci.args:
@@ -1539,6 +1688,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_reset(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         buttons = Buttons(rows=[[
@@ -1571,6 +1722,9 @@ class ProjectBot(AuthMixin):
             )
             return
         if ci.args:
+            # Activation branch is state-changing — gate to executor.
+            if not await self._guard_executor(ci):
+                return
             name = ci.args[0].lower()
             from .skills import load_skill
             skill = load_skill(name, self.path)
@@ -1602,6 +1756,8 @@ class ProjectBot(AuthMixin):
     async def _on_stop_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self._backend_supports_prompt_customization():
             await self._transport.send_text(
@@ -1618,6 +1774,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_create_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1642,6 +1800,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_delete_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1851,6 +2011,9 @@ class ProjectBot(AuthMixin):
                 return
             await self._transport.send_text(ci.chat, "Pick a persona to activate:", buttons=buttons)
             return
+        # Activation branch is state-changing — gate to executor.
+        if not await self._guard_executor(ci):
+            return
         name = ci.args[0].lower()
         from .skills import load_persona
         persona = load_persona(name, self.path)
@@ -1866,6 +2029,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_stop_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self._active_persona:
@@ -1889,6 +2054,8 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
+        if not await self._guard_executor(ci):
+            return
         self._group_state.halt(ci.chat)
         await self._transport.send_text(
             ci.chat, "Halted. Use /resume to continue.", reply_to=ci.message,
@@ -1906,11 +2073,15 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
+        if not await self._guard_executor(ci):
+            return
         self._group_state.resume(ci.chat)
         await self._transport.send_text(ci.chat, "Resumed.", reply_to=ci.message)
 
     async def _on_create_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1934,6 +2105,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_delete_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1988,6 +2161,8 @@ class ProjectBot(AuthMixin):
     async def _on_lang(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self._transcriber:
             await self._transport.send_text(ci.chat, "Voice is not configured.")
@@ -2015,6 +2190,36 @@ class ProjectBot(AuthMixin):
             buttons=Buttons(rows=rows),
         )
 
+    # State-changing button prefixes / exact values — used by the role gate
+    # in _on_button. A button click matching any of these requires executor
+    # role. Plugin-registered buttons go through _dispatch_plugin_button BEFORE
+    # this check, so they are responsible for their own gating per the spec.
+    _STATE_CHANGING_BUTTON_PREFIXES = (
+        "model_set_",
+        "effort_set_",
+        "thinking_set_",
+        "permissions_set_",
+        "backend_set_",
+        "task_cancel_",
+        "lang_set_",
+        "ask_",
+        "skill_scope_",
+        "pick_skill_",
+        "skill_delete_confirm_",
+        "persona_scope_",
+        "pick_persona_",
+        "persona_delete_confirm_",
+    )
+    _STATE_CHANGING_BUTTON_EXACT = frozenset({
+        "reset_confirm",
+        "reset_cancel",
+    })
+
+    def _is_state_changing_button(self, value: str) -> bool:
+        if value in self._STATE_CHANGING_BUTTON_EXACT:
+            return True
+        return any(value.startswith(p) for p in self._STATE_CHANGING_BUTTON_PREFIXES)
+
     async def _on_button(self, click) -> None:
         """Transport-native button-click handler. Replaces legacy _on_callback."""
         if not self._auth_identity(click.sender):
@@ -2025,6 +2230,13 @@ class ProjectBot(AuthMixin):
         chat = click.chat
         if await self._dispatch_plugin_button(click):
             return
+
+        # Role gate for state-changing buttons. Read-only branches (task_info_*,
+        # task_log_*, tasks_back, show_thinking_*, skill_delete_cancel,
+        # persona_delete_cancel) fall through.
+        if self._is_state_changing_button(value):
+            if not await self._guard_executor(click):
+                return
 
         if value.startswith("model_set_"):
             name = value[len("model_set_"):]
@@ -2368,6 +2580,8 @@ class ProjectBot(AuthMixin):
 
         if not self._auth_identity(incoming.sender):
             return
+        if not await self._guard_executor(incoming):
+            return
         if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
@@ -2422,6 +2636,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_voice_from_transport(self, incoming) -> None:
         if not self._auth_identity(incoming.sender):
+            return
+        if not await self._guard_executor(incoming):
             return
         if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
@@ -2793,18 +3009,26 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         if self.team_name and self.role:
             return
-        for uid in self._get_trusted_user_ids():
-            chat = ChatRef(
-                transport_id=self._transport.TRANSPORT_ID,
-                native_id=str(uid),
-                kind=ChatKind.DM,
-            )
-            try:
-                await self._transport.send_text(
-                    chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+        # Each AllowedUser's locked_identities holds entries in the new
+        # "transport_id:native_id" shape (Task 3). For the startup ping we
+        # only want identities matching the bot's active transport.
+        active_prefix = f"{self._transport.TRANSPORT_ID}:"
+        for au in self._allowed_users:
+            for ident_key in au.locked_identities:
+                if not ident_key.startswith(active_prefix):
+                    continue
+                native_id = ident_key[len(active_prefix):]
+                chat = ChatRef(
+                    transport_id=self._transport.TRANSPORT_ID,
+                    native_id=native_id,
+                    kind=ChatKind.DM,
                 )
-            except Exception:
-                logger.error("Failed to send startup message to %d", uid, exc_info=True)
+                try:
+                    await self._transport.send_text(
+                        chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+                    )
+                except Exception:
+                    logger.error("Failed to send startup message to %s", native_id, exc_info=True)
 
     def build(self) -> None:
         if self.transport_kind == "web":
@@ -2823,8 +3047,8 @@ class ProjectBot(AuthMixin):
                 bot_identity=bot_identity,
                 port=self.web_port,
                 authenticated_handle=(
-                    self._get_allowed_usernames()[0]
-                    if len(self._get_allowed_usernames()) == 1
+                    self._allowed_users[0].username
+                    if len(self._allowed_users) == 1
                     else None
                 ),
                 auth_token=secrets.token_urlsafe(32),
@@ -2871,10 +3095,24 @@ class ProjectBot(AuthMixin):
             ("halt", self._on_halt),
             ("resume", self._on_resume),
         )
-        self._transport.on_message(self._on_text_from_transport)
-        self._transport.on_button(self._on_button)
+        # Wrap every top-level handler in a try/finally that fires
+        # _persist_auth_if_dirty on every exit path (success, deny, plugin
+        # consume, exception). Without this, first-contact identity locks
+        # added by the transport authorizer would be lost on bot restart
+        # whenever the path skipped _guard_executor (read-only commands,
+        # plugin-consumed messages, error paths).
+        def _wrap_with_persist(handler):
+            async def _wrapped(arg):
+                try:
+                    await handler(arg)
+                finally:
+                    await self._persist_auth_if_dirty()
+            return _wrapped
+
+        self._transport.on_message(_wrap_with_persist(self._on_text_from_transport))
+        self._transport.on_button(_wrap_with_persist(self._on_button))
         for _name, _handler in ported_commands:
-            self._transport.on_command(_name, _handler)
+            self._transport.on_command(_name, _wrap_with_persist(_handler))
 
         if self.transport_kind == "telegram":
             # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
@@ -2975,8 +3213,11 @@ def run_bot(
     allowed_users: list | None = None,
     auth_source: str = "project",
 ) -> None:
+    # Determine effective auth — prefer the modern allowed_users; fall back
+    # to synthesizing executor entries from the legacy usernames so the
+    # transition shim in ProjectBot.__init__ has something to consume.
     effective_usernames = allowed_usernames or ([username] if username else [])
-    if not effective_usernames:
+    if not allowed_users and not effective_usernames:
         raise SystemExit(
             "No allowed username configured. Use --username or run 'configure --username'."
         )
@@ -3050,16 +3291,7 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        effective_usernames, effective_trusted_users = resolve_project_auth_scope(
-            proj,
-            config,
-        )
         effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
-        on_trust = None
-        if config_path:
-            _name = name
-            _path = config_path
-            on_trust = lambda uid, username: bind_project_trusted_user(_name, username, uid, _path)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
@@ -3077,9 +3309,6 @@ def run_bots(
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
-            on_trust=on_trust,
-            allowed_usernames=effective_usernames,
-            trusted_users=effective_trusted_users,
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,

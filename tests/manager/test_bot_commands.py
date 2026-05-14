@@ -118,7 +118,14 @@ def bot_env(tmp_path: Path):
     proj_cfg = tmp_path / "projects.json"
     proj_cfg.write_text(json.dumps({"projects": {}}))
     pm = ProcessManager(project_config_path=proj_cfg)
-    bot = ManagerBot("TOKEN", pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
+    from link_project_to_chat.config import AllowedUser
+    bot = ManagerBot(
+        "TOKEN", pm,
+        allowed_users=[
+            AllowedUser(username="testuser", role="executor", locked_identities=["telegram:1"]),
+        ],
+        project_config_path=proj_cfg,
+    )
     return bot, pm, proj_cfg
 
 
@@ -789,18 +796,23 @@ async def test_guard_returns_false_when_effective_user_is_none(bot_env):
 
 @pytest.mark.asyncio
 async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
+    from link_project_to_chat.config import AllowedUser
     bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(
         json.dumps(
             {
-                "allowed_usernames": ["testuser", "alice"],
-                "trusted_users": {"alice": 42},
+                "allowed_users": [
+                    {"username": "testuser", "role": "executor"},
+                    {"username": "alice", "role": "executor", "locked_identities": ["telegram:42"]},
+                ],
                 "projects": {},
             }
         )
     )
-    bot._allowed_usernames = ["testuser", "alice"]
-    bot._trusted_users = {"alice": 42}
+    bot._allowed_users = [
+        AllowedUser(username="testuser", role="executor"),
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:42"]),
+    ]
     fake = _swap_fake_transport(bot)
 
     invocation = _make_invocation("remove_user", args=["alice"])
@@ -808,14 +820,14 @@ async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
 
     assert fake.sent_messages[-1].text == "Removed @alice."
     raw = json.loads(proj_cfg.read_text())
-    # Task 3: legacy on-disk auth keys are stripped; the new
-    # ``allowed_users`` shape carries the surviving user (testuser) forward.
+    # Legacy keys never appear post-Task-5.
     assert "allowed_usernames" not in raw
     assert "trusted_users" not in raw
     surviving = {u["username"] for u in raw.get("allowed_users", [])}
     assert surviving == {"testuser"}
+    # Alice's locked identity is gone — she can no longer auth.
     revoked = Identity(
-        transport_id="fake",
+        transport_id="telegram",
         native_id="42",
         display_name="alice",
         handle="alice",
