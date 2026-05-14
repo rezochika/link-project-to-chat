@@ -2919,8 +2919,21 @@ After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today'
         self._pm = process_manager
         # Legacy kwargs preserved through Task 5; stripped in Task 5 Step 11
         # once every caller passes allowed_users= instead.
+        #
+        # TRANSITION SHIM (Tasks 4–5 window): synthesize the legacy
+        # _allowed_usernames from the AllowedUser entries. AuthMixin is
+        # still legacy at the end of Task 4 — _auth(user) reads via
+        # _get_allowed_usernames → self._allowed_usernames at _auth.py:34.
+        # Without this synthesis, the new start-manager (which passes only
+        # allowed_users=) would leave _allowed_usernames at the class-level
+        # default [] and the manager would deny everyone until Task 5 Step 3
+        # rewrites AuthMixin. The whole if/elif/else block (including this
+        # synthesis branch) is removed in Task 5 Step 11 once the rewrite
+        # makes _allowed_users the sole source of truth.
         if allowed_usernames is not None:
             self._allowed_usernames = allowed_usernames
+        elif allowed_users is not None:
+            self._allowed_usernames = [u.username for u in allowed_users]
         else:
             self._allowed_username = allowed_username
         if trusted_users is not None:
@@ -2939,6 +2952,10 @@ After Task 5 deletes `Config.allowed_usernames` / `Config.trusted_users`, today'
         self._telethon_client = None
         self._init_auth()
 ```
+
+The synthesis shim deliberately covers ONLY `_allowed_usernames`, not `_trusted_users` / `_trusted_user_ids`. Reason: the legacy `_auth(user)` already falls through to the username-match branch and calls `_trust_user(user.id, username)` to populate `_trusted_users` in memory on first contact, so the trusted-id fast path becomes correct from message 2 onwards without any precomputation. The first-message overhead (one extra dict-lookup-miss) is acceptable for a transient one-task window.
+
+A small caveat during the window: `_trust_user` → `_on_trust` → `bind_trusted_user` will re-introduce a `trusted_users` dict into config.json. That's ugly but harmless — the post-Task-3 loader tolerates legacy keys (that's the whole point of `_migrate_legacy_auth`), and Task 5 Step 3 rewrites `_auth` so `_trust_user` is never reached anymore.
 
 Add the import at the top of [manager/bot.py](src/link_project_to_chat/manager/bot.py) (in the existing `from ..config import ...` block):
 
@@ -3118,6 +3135,40 @@ def test_manager_bot_accepts_allowed_users_kwarg():
         allowed_users=[AllowedUser(username="alice", role="executor")],
     )
     assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
+
+
+def test_manager_bot_legacy_auth_works_with_allowed_users_only():
+    """TRANSITION SHIM regression — between Task 4 and Task 5, AuthMixin is
+    still legacy: _auth(user) reads _allowed_usernames via
+    _get_allowed_usernames. If start-manager passes only allowed_users= and
+    the constructor leaves _allowed_usernames at its class-level [] default,
+    every message gets denied until Task 5 Step 3 rewrites AuthMixin.
+
+    This test pins the synthesis behavior: constructing ManagerBot with
+    allowed_users= (and no legacy allowed_usernames=) must make legacy
+    _auth(user) return True for that username. The test stays useful even
+    after Task 5 lands — synthesis becomes dead code, but the assertion
+    that an authorized user authenticates remains a sensible invariant
+    that catches accidental regressions in the rewrite.
+    """
+    from types import SimpleNamespace
+
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    pm = ProcessManager.__new__(ProcessManager)
+    bot = ManagerBot(
+        token="t",
+        process_manager=pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    # Legacy _auth(user) takes a duck-typed user with .id / .username.
+    user = SimpleNamespace(id=98765, username="alice")
+    assert bot._auth(user) is True
+    # Sanity: an unknown username still denies.
+    intruder = SimpleNamespace(id=11111, username="mallory")
+    assert bot._auth(intruder) is False
 ```
 
 Run:
@@ -3126,10 +3177,11 @@ Run:
 pytest tests/test_cli.py::test_start_manager_requires_allowed_users \
        tests/test_cli.py::test_start_manager_passes_allowed_users_into_manager_bot \
        tests/test_cli.py::test_start_manager_runs_migration_on_pending \
-       tests/test_cli.py::test_manager_bot_accepts_allowed_users_kwarg -v
+       tests/test_cli.py::test_manager_bot_accepts_allowed_users_kwarg \
+       tests/test_cli.py::test_manager_bot_legacy_auth_works_with_allowed_users_only -v
 ```
 
-Expected (BEFORE this step's edits): FAIL — `start_manager` references `allowed_usernames` (raises `SystemExit("No username configured.")` rather than the new message) and passes `allowed_usernames=` to `ManagerBot`. The constructor regression fails because `ManagerBot.__init__` doesn't accept `allowed_users=`.
+Expected (BEFORE this step's edits): FAIL — `start_manager` references `allowed_usernames` (raises `SystemExit("No username configured.")` rather than the new message) and passes `allowed_usernames=` to `ManagerBot`. The constructor regression fails because `ManagerBot.__init__` doesn't accept `allowed_users=`. The legacy-auth test fails because the un-shimmed constructor leaves `_allowed_usernames` at the class-level `[]`, so `_auth` fail-closes.
 
 Expected (AFTER): all PASS.
 
@@ -3173,9 +3225,13 @@ projects are aggregated into a single CRITICAL log line at startup
 (replaces per-load log spam).
 
 ManagerBot.__init__ gains an `allowed_users: list[AllowedUser] | None`
-kwarg additively. Legacy kwargs (allowed_usernames, trusted_users, …)
-stay through Task 5 for backward-compat, then get stripped in
-Task 5 Step 11 once no caller passes them.
+kwarg additively. When only `allowed_users=` is passed (the new path),
+a transition shim synthesizes the legacy `_allowed_usernames` from the
+AllowedUser entries so the still-legacy `AuthMixin._auth(user)` keeps
+working through the Task 4 → Task 5 window. Without this shim the
+manager would start but fail-closed on every message. Legacy kwargs
+plus the shim are stripped in Task 5 Step 11 once `_auth.py` rewrites
+`AuthMixin` to read `_allowed_users` exclusively.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -4671,7 +4727,8 @@ Every match outside `_migrate_legacy_auth` and the loader's compatibility shim m
 - Reads of `config.allowed_usernames` / `config.trusted_users` → `config.allowed_users`.
 - `_get_trusted_user_ids()` / `_get_trusted_user_bindings()` / `_effective_trusted_users` / `_trust_user` / `_revoke_user` / `_coerce_trust_value` — delete these helpers from `_auth.py` if they exist; their behavior is subsumed by `_get_user_role` and `_persist_auth_if_dirty`.
 - `add_trusted_user_id`, `add_project_trusted_user_id`, `bind_project_trusted_user` (in `config.py`) — rewrite to operate on `AllowedUser.locked_identities` (append the new identity to the list) or delete if `_persist_auth_if_dirty` covers them.
-- `ManagerBot.__init__` legacy kwargs (`allowed_username`, `allowed_usernames`, `trusted_users`, `trusted_user_id`, `trusted_user_ids`) — Task 4 Step 6b made them dead defaults (no caller passes them anymore). Strip them now along with the assignment block (`if allowed_usernames is not None: self._allowed_usernames = ...` etc.). The constructor's surviving signature is `(token, process_manager, allowed_users=None, project_config_path=None)`.
+- `ManagerBot.__init__` legacy kwargs (`allowed_username`, `allowed_usernames`, `trusted_users`, `trusted_user_id`, `trusted_user_ids`) — Task 4 Step 6b made them dead defaults (no caller passes them anymore). Strip them now along with the assignment block (`if allowed_usernames is not None: self._allowed_usernames = ...` etc.) **AND the transition synthesis branch** (`elif allowed_users is not None: self._allowed_usernames = [u.username for u in allowed_users]`) added in Step 6b. Step 3 above rewrote `AuthMixin` to read exclusively from `self._allowed_users`, so the legacy `_allowed_usernames` synthesis is now dead code. The constructor's surviving signature is `(token, process_manager, allowed_users=None, project_config_path=None)`.
+- The companion transition test `test_manager_bot_legacy_auth_works_with_allowed_users_only` (added in Task 4 Step 6b in [tests/test_cli.py](tests/test_cli.py)) — also strip. Step 3 deleted the legacy `_auth(user)` method, so the test would `AttributeError`. The post-rewrite equivalent ("authorized user authenticates via `_auth_identity`") is already covered by `tests/test_auth_roles.py` from Step 1; no replacement needed here.
 
 After this step, **no source file outside `config.py`'s migration helper reads `allowed_usernames` / `trusted_users` / `trusted_user_ids`**. Verify by re-running the grep — only `_migrate_legacy_auth` and its tests should match.
 
