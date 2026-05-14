@@ -1116,29 +1116,34 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     # New (Task 3): write identity-keyed auth and strip legacy keys.
     # Legacy fields stay on the dataclass through Task 4 as transitional
     # read-only inputs, but the on-disk format never sees them again.
-    # Save-time precedence:
-    #   - When ``config.migration_pending=True`` (config was loaded from a
-    #     disk file that had legacy auth keys), legacy fields are the source
-    #     of truth: existing callers (CLI ``--remove-username``, manager bot
-    #     /remove_user, etc.) mutate the legacy fields and Task 5 hasn't
-    #     rewritten them yet. Synthesize ``allowed_users`` from legacy.
-    #   - When ``migration_pending=False`` (caller constructed Config or
-    #     loaded a config already in the new shape), prefer
-    #     ``config.allowed_users``; fall back to legacy synthesis only when
-    #     the new field is empty (e.g. ``Config(allowed_usernames=[...])``
-    #     with no explicit ``allowed_users``).
+    # Save-time precedence: legacy fields are authoritative.
+    #
+    # Through Tasks 3-4, the ONLY producers of ``config.allowed_users`` are
+    # ``load_config`` (via migration / parse) and direct test construction.
+    # Every existing mutator (CLI ``configure --username`` /
+    # ``--remove-username`` at cli.py:240-258, manager bot
+    # ``_on_add_user_from_transport`` / ``_on_remove_user_from_transport``
+    # at manager/bot.py:685-733) writes to the legacy fields, so they must
+    # win at save time. Otherwise, after the first migration save clears
+    # ``migration_pending``, subsequent legacy-field mutations (especially
+    # *removals* that leave legacy lists empty) would be silently dropped
+    # in favour of the stale ``allowed_users`` snapshot.
+    #
+    # The ``or config.allowed_users`` tail is gated on
+    # ``migration_pending=False``: it covers the test-only direct-
+    # construction case (``Config(allowed_users=[...])`` with empty legacy),
+    # while ``migration_pending=True`` keeps legacy strictly authoritative
+    # so a "user removed everyone via legacy" command round-trips to an
+    # empty disk list on the first post-migration save.
+    legacy_synthesized = _synthesize_allowed_users_from_legacy(
+        config.allowed_usernames,
+        config.trusted_users,
+        config.trusted_user_ids,
+    )
     if config.migration_pending:
-        effective_global_users = _synthesize_allowed_users_from_legacy(
-            config.allowed_usernames,
-            config.trusted_users,
-            config.trusted_user_ids,
-        )
+        effective_global_users = legacy_synthesized
     else:
-        effective_global_users = config.allowed_users or _synthesize_allowed_users_from_legacy(
-            config.allowed_usernames,
-            config.trusted_users,
-            config.trusted_user_ids,
-        )
+        effective_global_users = legacy_synthesized or config.allowed_users
     if effective_global_users:
         raw["allowed_users"] = _serialize_allowed_users(effective_global_users)
     else:
@@ -1218,18 +1223,15 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         # caller constructing ``ProjectConfig(trusted_user_ids=[42])`` with
         # ``Config(allowed_usernames=["alice"])`` still gets alice -> 42.
         proj_synthesis_usernames = p.allowed_usernames or config.allowed_usernames
+        proj_legacy_synthesized = _synthesize_allowed_users_from_legacy(
+            proj_synthesis_usernames,
+            p.trusted_users,
+            p.trusted_user_ids,
+        )
         if config.migration_pending:
-            effective_proj_users = _synthesize_allowed_users_from_legacy(
-                proj_synthesis_usernames,
-                p.trusted_users,
-                p.trusted_user_ids,
-            )
+            effective_proj_users = proj_legacy_synthesized
         else:
-            effective_proj_users = p.allowed_users or _synthesize_allowed_users_from_legacy(
-                proj_synthesis_usernames,
-                p.trusted_users,
-                p.trusted_user_ids,
-            )
+            effective_proj_users = proj_legacy_synthesized or p.allowed_users
         if effective_proj_users:
             proj["allowed_users"] = _serialize_allowed_users(effective_proj_users)
         else:

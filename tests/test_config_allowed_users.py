@@ -181,7 +181,13 @@ def test_locked_config_rmw_round_trip_smoke(tmp_path: Path):
 # Windows is "spawn", which requires the target callable to be importable
 # (= pickled by qualified name). Nested functions inside a test body can't
 # be pickled under spawn. Keep this at module scope.
-def _rmw_contention_worker(cfg_file_path: str, identity: str) -> None:
+def _rmw_contention_worker(cfg_file_path: str, new_username: str) -> None:
+    """Mutate via the legacy ``allowed_usernames`` field - the only supported
+    mutation surface through Tasks 3-4 (``_save_config_unlocked`` treats
+    legacy fields as authoritative on save until Task 5 rewrites callers to
+    use ``allowed_users`` directly). This test only cares that the RMW lock
+    serializes writers; the choice of mutated field is incidental.
+    """
     from pathlib import Path as _Path
     import time
     from link_project_to_chat.config import (
@@ -191,15 +197,94 @@ def _rmw_contention_worker(cfg_file_path: str, identity: str) -> None:
         # Tiny sleep widens the contention window - without the cross-phase
         # lock, this all but guarantees one writer clobbers the other.
         time.sleep(0.05)
-        for au in disk.allowed_users:
-            if au.username == "alice" and identity not in au.locked_identities:
-                au.locked_identities = au.locked_identities + [identity]
+        if new_username not in disk.allowed_usernames:
+            disk.allowed_usernames.append(new_username)
         save_config_within_lock(disk, _Path(cfg_file_path))
+
+
+def test_legacy_mutation_after_clean_load_is_preserved_on_save(tmp_path: Path):
+    """Regression: when a caller mutates legacy fields (e.g., CLI
+    ``configure --username``) on a clean (new-shape) config and saves, the
+    mutation must appear in the resulting on-disk allowed_users list.
+
+    Pre-fix, ``_save_config_unlocked`` preferred ``config.allowed_users``
+    when ``migration_pending=False``, which silently dropped legacy
+    mutations after the first migration save had run. Now legacy fields
+    are authoritative at save time through Tasks 3-4 (Task 5 rewrites
+    callers).
+    """
+    cfg_file = tmp_path / "config.json"
+    # Start from a clean new-shape config (migration_pending=False).
+    save_config(
+        Config(allowed_users=[AllowedUser(username="alice", role="executor")]),
+        cfg_file,
+    )
+    loaded = load_config(cfg_file)
+    assert loaded.migration_pending is False
+    # The load-time mirror populated allowed_usernames from allowed_users
+    # so existing legacy-aware callers can still mutate the list.
+    assert "alice" in loaded.allowed_usernames
+    # CLI-style legacy mutation: append a new username on the legacy field.
+    loaded.allowed_usernames.append("bob")
+    save_config(loaded, cfg_file)
+    # Reload — bob must survive.
+    reloaded = load_config(cfg_file)
+    by_name = {u.username for u in reloaded.allowed_users}
+    assert "alice" in by_name
+    assert "bob" in by_name
+
+
+def test_legacy_remove_username_on_clean_config_drops_user(tmp_path: Path):
+    """Regression mirror: when a caller removes a username from the legacy
+    list on a clean config, the removal must persist on save."""
+    cfg_file = tmp_path / "config.json"
+    save_config(
+        Config(allowed_users=[
+            AllowedUser(username="alice", role="executor"),
+            AllowedUser(username="bob", role="executor"),
+        ]),
+        cfg_file,
+    )
+    loaded = load_config(cfg_file)
+    # CLI-style remove: pop bob from the legacy list.
+    loaded.allowed_usernames.remove("bob")
+    save_config(loaded, cfg_file)
+    reloaded = load_config(cfg_file)
+    by_name = {u.username for u in reloaded.allowed_users}
+    assert by_name == {"alice"}
+
+
+def test_legacy_mutation_on_clean_project_config_persists(tmp_path: Path):
+    """Regression mirror at project scope: legacy mutation on a clean
+    project config must persist through save/reload.
+
+    The manager bot's /add_user / /remove_user handlers and CLI per-project
+    legacy paths mutate ``ProjectConfig.allowed_usernames`` directly. Same
+    bug shape as the global scope: pre-fix, ``_save_config_unlocked`` would
+    prefer the stale ``p.allowed_users`` when ``migration_pending=False``.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg = Config()
+    cfg.projects["myp"] = ProjectConfig(
+        path="/tmp/p",
+        telegram_bot_token="t",
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    save_config(cfg, cfg_file)
+    loaded = load_config(cfg_file)
+    assert loaded.migration_pending is False
+    p = loaded.projects["myp"]
+    assert "alice" in p.allowed_usernames
+    p.allowed_usernames.append("bob")
+    save_config(loaded, cfg_file)
+    reloaded = load_config(cfg_file)
+    by_name = {u.username for u in reloaded.projects["myp"].allowed_users}
+    assert by_name == {"alice", "bob"}
 
 
 def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
     """Real contention test: two writers, each appending a different
-    identity to the same user, must converge to BOTH identities on disk.
+    username, must converge to BOTH usernames on disk.
 
     If `locked_config_rmw` only locked the write phase (like the rejected
     earlier design), one writer would load the pre-write state, the other
@@ -225,14 +310,13 @@ def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
     save_config(cfg, cfg_file)
 
     ctx = mp.get_context("spawn")  # explicit; identical behavior across OSes
-    p1 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "telegram:1"))
-    p2 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "web:web-session:abc"))
+    p1 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "bob"))
+    p2 = ctx.Process(target=_rmw_contention_worker, args=(str(cfg_file), "carol"))
     p1.start(); p2.start()
     p1.join(); p2.join()
     assert p1.exitcode == 0 and p2.exitcode == 0
 
     final = load_config(cfg_file)
-    alice = next(u for u in final.allowed_users if u.username == "alice")
-    # Both writers' identities must be present - neither clobbered the other.
-    assert "telegram:1" in alice.locked_identities
-    assert "web:web-session:abc" in alice.locked_identities
+    # Both writers' usernames must be present - neither clobbered the other.
+    by_name = {u.username for u in final.allowed_users}
+    assert by_name == {"alice", "bob", "carol"}
