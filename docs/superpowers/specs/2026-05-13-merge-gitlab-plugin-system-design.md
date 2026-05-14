@@ -1,6 +1,6 @@
 # Porting the GitLab plugin system onto the Transport/Backend architecture
 
-**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: `locked_identity` instead of `locked_user_id`, dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup)
+**Date:** 2026-05-13 (rev. 2026-05-14 — auth model flipped: `AllowedUser` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` rather than living alongside them; rev. 2026-05-14 — migration corrected for `trusted_users` dict shape, team-bot scope clarified, open questions resolved; rev. 2026-05-14 — review-fix pass: dynamic Telegram command dispatch, `resolve_project_allowed_users` helper, button-branch executor gating, manager user-mgmt requires executor, plugin button API uses `on_button(click) -> bool`, transitional legacy fields kept read-only until final cleanup; rev. 2026-05-14b — `locked_identities: list[str]` for multi-transport users, scope-aware persistence in `_persist_auth_if_dirty`, stale `buttons()` references cleaned, test-snippet identity strings corrected)
 **Status:** Approved with revisions; implementation plan reflects this design.
 **Author:** Revaz Chikashua (drafted with Claude)
 
@@ -12,7 +12,7 @@ This is **no longer a literal commit-level merge.** The GitLab plugin code was w
 
 The deliverable is **transport-portable plugins**: a single plugin works unchanged against `TelegramTransport`, `WebTransport`, and any future Discord/Slack/Google Chat transport.
 
-This revision (2026-05-14) folds in a **breaking auth-model change**: `AllowedUser` is no longer an additive parallel field — it **replaces** `allowed_usernames`, `trusted_users`, and `trusted_user_ids`. Legacy configs migrate one-way on first load (legacy users → `executor` role, legacy IDs → `locked_identity` on the matching `AllowedUser`, formatted as `"telegram:<id>"`), and the legacy keys are stripped from the on-disk format on next save. Operators upgrading need to run the migration during a quiet window and verify the resulting `allowed_users` list before exposing the bot to traffic.
+This revision (2026-05-14) folds in a **breaking auth-model change**: `AllowedUser` is no longer an additive parallel field — it **replaces** `allowed_usernames`, `trusted_users`, and `trusted_user_ids`. Legacy configs migrate one-way on first load (legacy users → `executor` role, legacy IDs → appended to `locked_identities` on the matching `AllowedUser`, formatted as `"telegram:<id>"`), and the legacy keys are stripped from the on-disk format on next save. `locked_identities` is a **list** of `"transport_id:native_id"` strings, so a user authed first on Telegram and later from Web ends up with both identities recorded and auth succeeds from either transport. Operators upgrading need to run the migration during a quiet window and verify the resulting `allowed_users` list before exposing the bot to traffic.
 
 ## Background
 
@@ -65,7 +65,7 @@ ProjectBot (transport-agnostic)
         └─ start()/stop() on bot lifecycle (after Transport ready)
 ```
 
-Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, role, locked_identity}` is the sole source of auth + authority. `locked_identity` is a `"transport_id:native_id"` string (e.g. `"telegram:12345"`) populated on first contact, so the lock works for every transport — not just numeric Telegram IDs. Legacy `allowed_usernames` / `trusted_users` / `trusted_user_ids` are migrated on load (one-way) and dropped from the on-disk format on next save; the loader keeps the legacy fields readable on the dataclasses through the migration window so existing callers don't break mid-task (see Plan Task 5 Step 12 for the final removal). After migration, role is the only access decision; there is no second layer.
+Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, role, locked_identities}` is the sole source of auth + authority. `locked_identities` is a **list** of `"transport_id:native_id"` strings (e.g. `["telegram:12345", "web:web-session:abc"]`); a user gets a new entry appended on first contact from each transport, and auth succeeds when any entry matches. Legacy `allowed_usernames` / `trusted_users` / `trusted_user_ids` are migrated on load (one-way) and dropped from the on-disk format on next save; the loader keeps the legacy fields readable on the dataclasses through the migration window so existing callers don't break mid-task (see Plan Task 5 Step 12 for the final removal). After migration, role is the only access decision; there is no second layer.
 
 ## Components
 
@@ -128,13 +128,17 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
   ```python
   @dataclass
   class AllowedUser:
-      username: str                  # normalized: lowercase, no leading "@"
-      role: str = "viewer"           # "viewer" | "executor"
-      locked_identity: str | None = None
-      # Platform-portable identity lock: "transport_id:native_id" string
-      # populated on first contact. Works for numeric IDs (Telegram: "telegram:12345")
-      # and non-numeric IDs (Discord: "discord:abc-snowflake", Web: "web:session-token").
-      # Replaces the int-only trusted_user_ids list from the legacy design.
+      username: str                                          # normalized: lowercase, no leading "@"
+      role: str = "viewer"                                   # "viewer" | "executor"
+      locked_identities: list[str] = field(default_factory=list)
+      # Platform-portable identity locks. Each entry is a "transport_id:native_id"
+      # string populated on first contact from THAT transport. A list (not a
+      # single value) because the same username may interact across multiple
+      # transports: a user authed on Telegram (locks "telegram:12345") may later
+      # message via Web (locks "web:web-session:abc-def") — both entries
+      # coexist and auth succeeds when any one matches.
+      # Examples after first contact: ["telegram:12345"], ["web:web-session:abc"],
+      # ["telegram:12345", "web:web-session:abc"] (same user, two transports).
   ```
 - `ProjectConfig` and `Config` (global):
   - Add `plugins: list[dict] = field(default_factory=list)` (ProjectConfig only — plugins are per-project).
@@ -148,8 +152,8 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
   - This matches today's `resolve_project_auth_scope` precedence behavior (project overrides global, falls back to global). Without this fallback, projects with an empty per-project list would fail-closed even when the global list is populated — a regression.
   - Empty list at both scopes → warning logged at load time and a single CRITICAL line at CLI startup phase (replaces per-load CRITICAL spam).
 - **One-shot migration on load**:
-  - Legacy `allowed_usernames: list[str]` entries → `AllowedUser{username, role="executor", locked_identity=None}`. Default role is `executor` because legacy users had full access; preserving that prevents silent privilege loss.
-  - Legacy `trusted_users` — **this field is a `dict[str, int | str]` on disk** (username → user_id mapping). For every key in this dict, populate `locked_identity` on the matching `AllowedUser` (created above if not already present). The identity string is built as `f"telegram:{native_id}"` for numeric Telegram IDs; non-numeric values get prefixed with the inferred transport scope (defaults to `telegram` for legacy migrations, since the legacy fields predate multi-transport support). Confirm shape with `isinstance(raw_trusted, dict)`; older list-shape configs (pre-A1) align with `trusted_user_ids` by index against `allowed_usernames` and are still supported for one release.
+  - Legacy `allowed_usernames: list[str]` entries → `AllowedUser{username, role="executor", locked_identities=[]}`. Default role is `executor` because legacy users had full access; preserving that prevents silent privilege loss.
+  - Legacy `trusted_users` — **this field is a `dict[str, int | str]` on disk** (username → user_id mapping). For every key in this dict, build `f"telegram:{native_id}"` (legacy fields predate multi-transport, so every legacy ID belongs to Telegram) and APPEND it to the matching `AllowedUser.locked_identities` list. Non-numeric IDs (Discord/Slack scenarios entered manually) are passed through if they already contain `":"` (caller-prefixed); otherwise prefixed with `telegram:`. Confirm shape with `isinstance(raw_trusted, dict)`; older list-shape configs (pre-A1) align with `trusted_user_ids` by index against `allowed_usernames` and are still supported for one release.
   - Legacy `trusted_user_ids: list[int]` is treated as a fallback only when `trusted_users` is missing or empty (matches the current loader semantics in `_effective_trusted_users`).
   - The loader sets a `migration_pending: bool` flag on the returned `Config` object when any legacy field was read. Callers (CLI `start`, manager bot startup) check this flag and call `save_config` once to materialize the new on-disk shape.
 - Unknown role on load → log warning, treat as `viewer` (least-privilege).
@@ -163,9 +167,9 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
 
 - `_get_user_role(identity) -> str | None`:
   - Reads `self._allowed_users` (populated by `ProjectBot.__init__`).
-  - **First** checks `locked_identity == _identity_key(identity)` — platform-portable identity lock from first contact. This is the security-critical fast path and prevents username-change attacks. Works for every transport since the key is `transport_id:native_id`.
-  - Falls back to a case- and `@`-insensitive username match when no identity is locked yet for that user.
-  - On first match by username, writes back `locked_identity = _identity_key(identity)` on the `AllowedUser` and sets `self._auth_dirty = True` so the next message-handling tail persists. Subsequent requests are validated by identity, not username. This preserves the brute-force / username-spoof protection from the old `trusted_user_ids` design but applies it uniformly to every allowed user (not just the trusted subset) and works across all transports.
+  - **First** checks whether `_identity_key(identity)` is in any `AllowedUser.locked_identities` list — platform-portable identity lock from first contact on that transport. This is the security-critical fast path and prevents username-change attacks. Works for every transport since the keys are `transport_id:native_id` strings.
+  - Falls back to a case- and `@`-insensitive username match when no identity from this transport is locked yet for that user. The match still wins even if the user has identities locked on OTHER transports — e.g., a user with `locked_identities=["telegram:12345"]` who messages from Web for the first time matches by username, then their Web identity gets appended.
+  - On first match by username, appends `_identity_key(identity)` to that `AllowedUser.locked_identities` (no replacement — just append if absent) and sets `self._auth_dirty = True` so the next message-handling tail persists. Subsequent requests from that transport validate by identity, not username.
   - Returns `"executor"`, `"viewer"`, or `None` (not listed → denied).
 - `_auth_identity(identity) -> bool`:
   - True iff `_get_user_role(identity)` returns a role (any non-None).
@@ -173,10 +177,10 @@ Roles (viewer/executor) **replace** the flat allow-list. `AllowedUser{username, 
 - `_require_executor(identity) -> bool`:
   - True iff `_get_user_role(identity) == "executor"`.
 - Brute-force lockout and rate-limit dictionaries are re-keyed on `_identity_key(identity)` (the `f"{transport_id}:{native_id}"` string). The current `_init_auth` already uses this key for `_rate_limits`; `_failed_auth_counts` is migrated to the same keying so Discord/Slack identities can't collide with Telegram ones.
-- First-contact write: when `_get_user_role` matches by username and populates `locked_identity`, it sets `self._auth_dirty = True` on the bot. `ProjectBot._on_text_from_transport` (and other message-handling tails) call `self._persist_auth_if_dirty()` which invokes `save_config` once and clears the flag. Concurrent first-contacts on different users are idempotent (each write sees the same in-memory state); save serialization is handled by the existing `_config_lock` (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows).
+- First-contact write: when `_get_user_role` matches by username and appends to `locked_identities`, it sets `self._auth_dirty = True` on the bot. `ProjectBot._on_text_from_transport` (and other message-handling tails) call `self._persist_auth_if_dirty()` which invokes `save_config` once and clears the flag. Persistence is **scope-aware** — the bot tracks whether its `_allowed_users` came from `ProjectConfig` (per-project) or `Config` (global, via `resolve_project_allowed_users` fallback) and writes back to the matching scope. The save also **merges per-user** rather than replacing the entire list, so concurrent edits to other users in the same config don't get clobbered. Concurrent first-contacts on different users converge correctly; save serialization is handled by the existing `_config_lock` (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows).
 - Read-only command set (always allowed for viewers): `/tasks`, `/log`, `/status`, `/help`, `/version`, `/skills` (listing only), `/context` (display side).
 - State-changing command set (executor required): plain text messages routed to Claude/Codex, `/run`, `/use`, `/persona`, `/model`, `/effort`, `/thinking`, `/permissions`, `/compact`, `/reset`, `/backend`, `/stop_skill`, `/stop_persona`, `/create_skill`, `/delete_skill`, `/create_persona`, `/delete_persona`, `/voice`, `/lang`, `/halt`, `/resume`, file uploads, voice uploads.
-- Startup-ping recipients: `AllowedUser` with `role == "executor"` **and** a non-`None` `locked_identity` (parsed from the `transport_id:native_id` string). Viewers do not receive the startup ping. Executors without a locked identity yet are pinged on first contact instead.
+- Startup-ping recipients: `AllowedUser` with `role == "executor"` **and** at least one `locked_identities` entry whose `transport_id:` prefix matches the active bot transport. Viewers do not receive the startup ping. Executors without a matching identity yet are pinged on first contact instead.
 - Brute-force lockout and rate-limit keying (`transport_id:native_id`) unchanged.
 
 ### `manager/bot.py` changes (~80 LOC)
@@ -193,11 +197,11 @@ The manager bot is also transport-ported (via `TelegramTransport`). It uses `Com
 
 **User-management commands** on the manager bot are updated to operate on `AllowedUser`. These changes are scoped to the manager-bot scope of the global `Config.allowed_users` list (the manager bot is the operator's surface for editing the global allow-list). Project-scoped allow-lists are edited via the per-project keyboard (planned for a follow-up; out of scope for this rev).
 
-- `/users` — list rows as `username (role) [identity locked: <transport:id> | not yet]`. Listing is read-only — viewer-allowed.
+- `/users` — list rows as `username (role) [identities: <transport:id>, <transport:id> | not yet]`. Listing is read-only — viewer-allowed.
 - `/add_user <username> [viewer|executor]` — default role `executor` (matches legacy `/add_user` semantics: previously all added users had full access).
 - `/remove_user <username>` — unchanged signature.
 - New: `/promote_user <username>` and `/demote_user <username>` toggle role.
-- New: `/reset_user_identity <username>` clears `locked_identity` (recovery path for users whose ID changed — Telegram account migration, Web session reset, etc.). Renamed from the earlier draft's `/reset_user_id` to reflect the locked-identity scheme.
+- New: `/reset_user_identity <username> [transport_id]` clears `locked_identities`. With no transport arg, clears the full list (recovery path for users whose IDs all changed — Telegram account migration + Web session reset). With a transport arg, clears only entries with that `transport_id:` prefix (e.g., `/reset_user_identity alice telegram` clears Telegram locks but leaves Web locks intact). Renamed from the earlier draft's `/reset_user_id` to reflect the locked-identities scheme.
 - **All write commands (everything except `/users`) require the **executor** role.** Viewers cannot edit the allow-list. Handlers check `_require_executor(ci.sender)` and reply "Read-only access" otherwise.
 - All write commands persist by calling `save_config` immediately and reply with the updated `/users` listing.
 
@@ -219,7 +223,7 @@ The manager bot is also transport-ported (via `TelegramTransport`). It uses `Com
 **`configure` subcommand — user-management flags** (operate on the **global** `Config.allowed_users`; project-scoped editing is via the manager bot):
 - `--add-user USERNAME[:ROLE]` — adds an `AllowedUser`. Default role `executor`. Examples: `--add-user alice`, `--add-user bob:viewer`.
 - `--remove-user USERNAME` — removes the entry.
-- `--reset-user-identity USERNAME` — clears `locked_identity` (recovery path).
+- `--reset-user-identity USERNAME[:TRANSPORT]` — clears `locked_identities`. With `:TRANSPORT` clears only entries from that transport (e.g., `--reset-user-identity alice:web`). Without `:TRANSPORT`, clears all locks for the user.
 - Legacy flags `--username` and `--remove-username` are kept as aliases for one release with a deprecation warning, then removed.
 
 **`start` subcommand:**
@@ -256,8 +260,8 @@ _after_ready(self_identity)
    │      │      for bc in plugin.commands():
    │      │          wrapped = _wrap_plugin_command(bc)
    │      │          _transport.on_command(bc.command, wrapped)
-   │      │      if (button_handler := plugin.buttons()):
-   │      │          _plugin_button_handlers.append(button_handler)
+   │      │      # No buttons() registration step — plugin.on_button(click) is
+   │      │      # invoked from _dispatch_plugin_button by iterating _plugins.
    │      └─ for plugin in _topo_sort(_plugins):
    │             try: await plugin.start()
    │             except: unregister this plugin's commands, log
@@ -321,10 +325,10 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
 ## Error handling
 
 - Every plugin hook wrapped in `try/except Exception`, logging `"plugin %s <hook> failed"` with `exc_info=True`. One bad plugin never blocks others or the bot.
-- `start()` failure → log, **unregister** that plugin's commands/buttons, continue.
+- `start()` failure → log, **unregister** that plugin's commands and skip its `on_button` hook in subsequent dispatches (remove from `_plugins`), continue.
 - `stop()` failure → log, continue.
 - `get_context()` raising → log, skip that plugin's contribution for the turn.
-- `commands()` / `buttons()` raising during registration → log, skip that plugin entirely.
+- `commands()` raising during registration → log, skip that plugin entirely. `on_button` failures during dispatch are caught per-call, not at registration time, since `on_button` is invoked per-click not registered as a separate handler.
 - `load_plugin` returns `None` (entry point absent) → log clear error, continue.
 - `plugin-call` CLI with missing plugin → non-zero exit with a clear message.
 - Unknown role string → treat as `viewer` (least-privilege).
@@ -352,7 +356,7 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
   (e) Global `Config.allowed_usernames` migrating into `Config.allowed_users` while a project's per-project allow-list is empty (verifies the global path).
   (f) `trusted_users` dict containing a username not in `allowed_usernames` (orphan trust) — must still be migrated into an executor entry; no `allowed_usernames` data loss.
   Each test asserts: in-memory `AllowedUser` shape after load, `migration_pending` flag set on the returned `Config`, saved JSON contains *only* `allowed_users` (no legacy keys), round-trip load-save-load is stable, second load has `migration_pending=False`.
-- `tests/test_auth_roles.py` — `Identity`-keyed: viewer denied state-changing commands, executor allowed, no-entry denied (fail-closed), locked `locked_identity` validates by transport-portable identity string, first-contact races lock the identity atomically.
+- `tests/test_auth_roles.py` — `Identity`-keyed: viewer denied state-changing commands, executor allowed, no-entry denied (fail-closed), entries in `locked_identities` validate by transport-portable identity strings, first-contact appends a new identity atomically, multi-transport users with `["telegram:X", "web:web-session:Y"]` auth from either transport.
 - `tests/manager/test_bot_plugins.py` — plugin toggle button callback_data, available plugins listed from entry points, toggle updates config.
 
 ### Cross-transport coverage
@@ -375,14 +379,14 @@ _post_stop hook (already exists via TelegramTransport's lifecycle)
   2. `load_config(...)` produces `Config` with `migration_pending=True` and synthesized `AllowedUser` entries.
   3. `save_config(...)` rewrites the file; reload confirms on-disk JSON has *only* `allowed_users`, legacy keys gone.
   4. Build `ProjectBot` with the loaded config and `FakeTransport`; deliver a message from a user who was in `allowed_usernames` but not in `trusted_users` (no locked ID yet).
-  5. Assert the auth-dirty flag fires; `_persist_auth_if_dirty()` runs once; on-disk file now shows the populated `locked_identity` (as a `"telegram:<id>"` string for the legacy migration case, or `"<transport_id>:<native_id>"` for first-contact locks from a new transport).
+  5. Assert the auth-dirty flag fires; `_persist_auth_if_dirty()` runs once; on-disk file now shows the populated `locked_identities` list with the new entry appended (`"<transport_id>:<native_id>"`). The save is per-user-merge — other AllowedUser entries are untouched.
   6. Deliver a second message: no new save (idempotent).
 
 ### Regression coverage
 Existing tests that referenced `allowed_usernames` / `trusted_users` / `trusted_user_ids` need updating (estimate: ~30 tests across `tests/test_auth*.py`, `tests/test_config*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py`). After those updates, the rest of the suite (1003 → ~970) must continue to pass without modification. Net test count rises with the new migration + role coverage.
 
 ### Manual smoke
-- Pre-upgrade config (`allowed_usernames: [alice]`, `trusted_users: {alice: 12345}`) → load, then save → on disk: `allowed_users: [{username: alice, role: executor, locked_identity: "telegram:12345"}]`. Legacy keys absent.
+- Pre-upgrade config (`allowed_usernames: [alice]`, `trusted_users: {alice: 12345}`) → load, then save → on disk: `allowed_users: [{username: alice, role: executor, locked_identities: ["telegram:12345"]}]`. Legacy keys absent.
 - Project with `plugins: []` and one `executor` user → identical behavior to today.
 - Project with one stub plugin → `start()` logged, command registered, hooks fire.
 - Project with `allowed_users: [{username, role: "viewer"}]` → plain message replied "Read-only access", `/tasks` allowed.
@@ -395,9 +399,9 @@ Branch: `feat/plugin-system` off `main`. Each step a single commit. Tasks 3, 5, 
 
 1. **Plugin file + scripts + `Transport.on_stop` + `TelegramTransport.on_command` dynamic dispatch fix** — `plugin.py` with transport-aware `PluginContext`, operational scripts, `on_stop` Protocol method implemented across all three transports, and the fix that makes `TelegramTransport.on_command` register a PTB `CommandHandler` immediately when `self._app` is already wired (without this, plugin commands silently fail on Telegram). New `tests/transport/test_dynamic_command_dispatch.py` covers the regression.
 2. **bot.py plugin lifecycle** — `_init_plugins`, dispatch helpers, hook wiring in `_after_ready` / `_on_text_from_transport` / `_on_button` / `_on_stream_event` / `_on_task_complete`; shutdown via `Transport.on_stop`. Buttons flow through `plugin.on_button(click)` (no separate registration).
-3. **Config schema + dict-shape-aware migration + eager save + transitional helper** — `AllowedUser` dataclass with `locked_identity: str | None`; `plugins` + `allowed_users` fields **added** to `ProjectConfig` and `Config` (global); legacy fields stay on the dataclass as read-only inputs; save format writes only `allowed_users`; `_migrate_legacy_auth` branches on `isinstance(trusted_users_raw, dict)`; loader sets `migration_pending`; `resolve_project_allowed_users(project, config)` helper introduced (project → global fallback, matches existing precedence); `tests/test_config_migration.py` 6-shape golden-file suite.
+3. **Config schema + dict-shape-aware migration + eager save + transitional helper** — `AllowedUser` dataclass with `locked_identities: list[str]`; `plugins` + `allowed_users` fields **added** to `ProjectConfig` and `Config` (global); legacy fields stay on the dataclass as read-only inputs; save format writes only `allowed_users`; `_migrate_legacy_auth` branches on `isinstance(trusted_users_raw, dict)`; loader sets `migration_pending`; `resolve_project_allowed_users(project, config)` helper introduced (project → global fallback, matches existing precedence) and returns `(users, source)` so the bot can persist back to the right scope; `tests/test_config_migration.py` 6-shape golden-file suite.
 4. **CLI** — `plugin-call` subcommand; new `migrate-config [--dry-run] [--project NAME]` subcommand; new `--add-user`/`--remove-user`/`--reset-user-identity` flags on `configure`; legacy `--username`/`--remove-username` aliased with deprecation warning; `start` invokes `save_config` when `migration_pending`, computes `allowed_users` via `resolve_project_allowed_users`, and logs single-line CRITICAL for projects empty at both scopes.
-5. **Role enforcement + legacy field removal** — `_get_user_role` / `_auth_identity` / `_require_executor` on `AuthMixin` rewritten around `allowed_users` and `_identity_key`-keyed comparisons; `_failed_auth_counts` re-keyed on `_identity_key`; identity-locking via `AllowedUser.locked_identity`; `_persist_auth_if_dirty` introduced with its own TDD step; `_wrap_plugin_command`; `_guard_executor` applied to state-changing command handlers **AND** state-changing button branches (`model_set_*`, `effort_set_*`, `thinking_set_*`, `permissions_set_*`, `backend_set_*`, `reset_confirm/cancel`, `task_cancel_*`, `lang_set_*`); all call sites of legacy fields rewritten to use `resolve_project_allowed_users`; **final step removes `allowed_usernames` / `trusted_users` / `trusted_user_ids` from the dataclasses now that no caller reads them**; `tests/test_auth_migration_e2e.py` integration test.
+5. **Role enforcement + legacy field removal** — `_get_user_role` / `_auth_identity` / `_require_executor` on `AuthMixin` rewritten around `allowed_users` and `_identity_key`-keyed comparisons; `_failed_auth_counts` re-keyed on `_identity_key`; identity-locking via `AllowedUser.locked_identities` (append on first contact); `_persist_auth_if_dirty` introduced with its own TDD step (scope-aware: writes back to global vs project based on `self._auth_source`, per-user merge); `_wrap_plugin_command`; `_guard_executor` applied to state-changing command handlers **AND** state-changing button branches (`model_set_*`, `effort_set_*`, `thinking_set_*`, `permissions_set_*`, `backend_set_*`, `reset_confirm/cancel`, `task_cancel_*`, `lang_set_*`); all call sites of legacy fields rewritten to use `resolve_project_allowed_users`; **final step removes `allowed_usernames` / `trusted_users` / `trusted_user_ids` from the dataclasses now that no caller reads them**; `tests/test_auth_migration_e2e.py` integration test (includes a multi-transport case asserting both `telegram:` and `web:web-session:` entries auth correctly).
 6. **Manager UI + user-management commands** — plugin toggle (Transport-ported); `/users` (viewer-allowed listing), `/add_user`, `/remove_user`, `/promote_user`, `/demote_user`, `/reset_user_identity` (all write commands require executor) against `Config.allowed_users` (global allow-list).
 7. **Docs + version bump** — README plugin section, README auth-migration section, CHANGELOG entry with **BREAKING CHANGES** call-out, **v1.0.0** bump in both `pyproject.toml` AND `src/link_project_to_chat/__init__.py`.
 
@@ -412,9 +416,9 @@ Verification gate after each step: `pytest -q` (must stay at 1003 passing + new 
 - **Plugin authors writing telegram-PTB-style handlers will need to migrate.** This is the one-time cost of the transport port. The new signature is simpler (`async def(invocation: CommandInvocation)`) and works on every transport.
 - **Auth model is a breaking on-disk change.** Eager migration on first start rewrites `config.json` without the legacy keys. Operators on an older binary reading that file afterward will see no users authorized. Mitigation: bump to v1.0.0, document the migration in the changelog, and have the loader log a one-line "migrating auth model" line. The new `migrate-config --dry-run` subcommand lets operators preview the migration before exposing the bot to traffic.
 - **`trusted_users` ⊂ `allowed_usernames` distinction is lost.** Legacy deployments where the DM-ping recipient set was strictly smaller than the allow-list collapse into a single `executor` role; *every* executor now gets the startup ping. If anyone relied on the asymmetry, add a `notify: bool` flag on `AllowedUser` in a follow-up. Realistic risk: low — most deployments had `trusted_users == allowed_usernames` in practice.
-- **Locked-identity re-lock race window.** Pre-A1 deployments with the list-shape `trusted_users` and a length-mismatched `trusted_user_ids` lose alignment; affected entries start with `locked_identity=None` and re-lock on next contact. A username-spoof attempt landing in that window could plant the wrong identity. Mitigation: migrate during quiet windows; the dict-shape `trusted_users` (current format since A1 closed) has explicit name→id mapping and is not affected.
+- **Locked-identity re-lock race window.** Pre-A1 deployments with the list-shape `trusted_users` and a length-mismatched `trusted_user_ids` lose alignment; affected entries start with `locked_identities=[]` and re-lock on next contact. A username-spoof attempt landing in that window could plant the wrong identity. Mitigation: migrate during quiet windows; the dict-shape `trusted_users` (current format since A1 closed) has explicit name→id mapping and is not affected.
 - **Empty-allowlist deployments fall back to global.** Project allow-lists with zero entries fall back to `Config.allowed_users` via `resolve_project_allowed_users`. When BOTH project AND global allow-lists are empty, the bot fails closed — CLI startup logs a single CRITICAL line listing affected projects so the issue is visible (replaces per-load log spam). Pre-upgrade audit step: confirm every active project bot has at least one allowed user at one of the two scopes, or run `migrate-config --dry-run` and inspect the output.
-- **First-contact persistence races.** When `_get_user_role` populates `locked_identity`, the bot sets `_auth_dirty=True` and the next message-handling tail calls `save_config`. Multiple bots writing to the same `config.json` concurrently are serialized by the existing `_config_lock` (`fcntl.flock` / `msvcrt.locking`). Concurrent first-contacts on different users converge correctly (each save reads the latest in-memory state). The one edge case — concurrent first-contacts on the *same* user with different `native_id` values — is impossible in practice (one user can't impersonate themselves) but the second writer would no-op (identity already locked).
+- **First-contact persistence races.** When `_get_user_role` appends to `locked_identities`, the bot sets `_auth_dirty=True` and the next message-handling tail calls `save_config`. The save is **scope-aware** (writes back to the project or global allow-list depending on where `self._allowed_users` came from) and **per-user-merge** (load disk, find the matching `AllowedUser` by username, update its `locked_identities`, save — does NOT replace the full list). Multiple bots writing to the same `config.json` concurrently are serialized by the existing `_config_lock` (`fcntl.flock` / `msvcrt.locking`). Concurrent first-contacts on different users converge correctly (each save reads the latest in-memory state, merges in only the changed user). The one edge case — concurrent first-contacts on the *same* user from the *same* transport with different `native_id` values — is impossible in practice (one user can't impersonate themselves) but the second writer would no-op (identity already in the list).
 - **Plugin commands silently failing on Telegram (FIXED in Task 1).** Before the fix, `TelegramTransport.on_command` only updated `_command_handlers`; PTB `CommandHandler` registration only ran in `attach_telegram_routing` with the static initial list. Plugin commands registered in `_after_ready` (which fires after routing) were dropped at PTB's filter level. The fix makes `on_command` register a PTB `CommandHandler` immediately when called post-routing. `tests/transport/test_dynamic_command_dispatch.py` is the regression guard.
 
 ## Resolved questions (decisions baked into this rev)

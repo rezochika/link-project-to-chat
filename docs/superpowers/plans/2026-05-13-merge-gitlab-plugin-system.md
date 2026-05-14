@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port the GitLab fork's plugin design onto the Transport+Backend architecture. Plugins become transport-portable (one plugin works on Telegram, Web, future Discord/Slack). Add an `AllowedUser{username, role, locked_identity}` model that **replaces** the existing `allowed_usernames` / `trusted_users` / `trusted_user_ids` flat fields as the single source of auth + authority. `locked_identity` is a `"transport_id:native_id"` string so the lock works for every transport, not just numeric Telegram IDs. Legacy configs migrate one-way on load; legacy keys are stripped on next save.
+**Goal:** Port the GitLab fork's plugin design onto the Transport+Backend architecture. Plugins become transport-portable (one plugin works on Telegram, Web, future Discord/Slack). Add an `AllowedUser{username, role, locked_identities}` model that **replaces** the existing `allowed_usernames` / `trusted_users` / `trusted_user_ids` flat fields as the single source of auth + authority. `locked_identities` is a **list** of `"transport_id:native_id"` strings — each transport a user contacts from gets appended, so the same username can authenticate from Telegram AND Web AND any future transport. Legacy configs migrate one-way on load; legacy keys are stripped on next save.
 
-**Architecture:** Plugins are external Python packages discovered via `lptc.plugins` entry points. `Plugin` base class with transport-agnostic handler signatures (`CommandInvocation`, `IncomingMessage`, `ButtonClick`). Lifecycle wired through `ProjectBot._after_ready` and an `on_stop` Transport callback. Auth + role enforcement is identity-keyed: `_auth_identity`, `_require_executor`, and `_get_user_role` read `_allowed_users` exclusively and compare `locked_identity` against `_identity_key(identity)`. Legacy fields stay on the dataclasses through Tasks 3–4 as read-only inputs; Task 5 rewrites every call site to use `resolve_project_allowed_users(project, config)` and then removes the legacy fields from the dataclasses. **This is a breaking on-disk config change.**
+**Architecture:** Plugins are external Python packages discovered via `lptc.plugins` entry points. `Plugin` base class with transport-agnostic handler signatures (`CommandInvocation`, `IncomingMessage`, `ButtonClick`). Lifecycle wired through `ProjectBot._after_ready` and an `on_stop` Transport callback. Auth + role enforcement is identity-keyed: `_auth_identity`, `_require_executor`, and `_get_user_role` read `_allowed_users` exclusively and check whether `_identity_key(identity)` is in any entry's `locked_identities`. Legacy fields stay on the dataclasses through Tasks 3–4 as read-only inputs; Task 5 rewrites every call site to use `resolve_project_allowed_users(project, config)` and then removes the legacy fields from the dataclasses. **This is a breaking on-disk config change.**
 
 **Tech Stack:** Python 3.11+, `python-telegram-bot>=22` (Telegram transport), `click>=8`, `pytest` with `asyncio_mode=auto`. Plugin discovery via `importlib.metadata.entry_points`.
 
@@ -231,8 +231,12 @@ class PluginContext:
     transport: "Transport | None" = field(default=None, repr=False)
 
     # Identity strings: "transport_id:native_id" (e.g. "telegram:12345",
-    # "discord:abc-snowflake", "web:session-token"). Transport-portable.
-    # Replaces the GitLab `allowed_user_ids: list[int]` design.
+    # "discord:abc-snowflake", "web:web-session:abc-def"). Transport-portable
+    # — replaces the GitLab `allowed_user_ids: list[int]` design.
+    # These are FLATTENED from every AllowedUser's locked_identities list, so a
+    # multi-transport user contributes multiple entries (one per transport
+    # they've contacted from). Plugins that gate themselves iterate these
+    # lists; matching any entry counts.
     allowed_identities: list[str] = field(default_factory=list)
     executor_identities: list[str] = field(default_factory=list)
 
@@ -1016,7 +1020,13 @@ In the body, find the final state initialization (the `self._probe_tasks: set[as
         self._shared_ctx: PluginContext | None = None
         # Sole auth + authority source. Empty list → fail-closed (no users authorized).
         self._allowed_users: list = list(allowed_users or [])
+        # Track which scope this allow-list came from so _persist_auth_if_dirty
+        # writes back to the right place. "project" for per-project lists,
+        # "global" when run_bots used the Config.allowed_users fallback.
+        self._auth_source: str = auth_source if auth_source in ("project", "global") else "project"
 ```
+
+And add `auth_source: str = "project"` to the `ProjectBot.__init__` signature alongside `allowed_users`.
 
 - [ ] **Step 6: Edit `bot.py` — add plugin dispatch helpers and `_init_plugins` / `_shutdown_plugins`**
 
@@ -1117,12 +1127,18 @@ Insert these methods on `ProjectBot`. Locate `async def _after_ready(self, self_
             data_dir=Path.home() / ".link-project-to-chat" / "meta" / self.name,
             backend_name=self._backend_name,
             transport=self._transport,
-            # Build identity-string lists from _allowed_users (locked_identity is
-            # populated on first contact). Transport-portable: works for telegram:
-            # web:, future discord:/slack: prefixes alike.
-            allowed_identities=[u.locked_identity for u in self._allowed_users if u.locked_identity is not None],
-            executor_identities=[u.locked_identity for u in self._allowed_users
-                                 if u.role == "executor" and u.locked_identity is not None],
+            # Build identity-string lists from _allowed_users by FLATTENING
+            # each AllowedUser.locked_identities list. Transport-portable: works
+            # for telegram:, web:, future discord:/slack: prefixes alike. A
+            # multi-transport user contributes one entry per transport.
+            allowed_identities=[
+                ident for u in self._allowed_users for ident in u.locked_identities
+            ],
+            executor_identities=[
+                ident for u in self._allowed_users
+                if u.role == "executor"
+                for ident in u.locked_identities
+            ],
         )
         self._shared_ctx.data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1307,7 +1323,7 @@ EOF
 
 ---
 
-## Task 3: Config schema — `plugins`, `AllowedUser` (with `locked_identity`), `resolve_project_allowed_users` helper, transitional legacy fields
+## Task 3: Config schema — `plugins`, `AllowedUser` (with `locked_identities`), `resolve_project_allowed_users` helper, transitional legacy fields
 
 **Files:**
 - Modify: `src/link_project_to_chat/config.py`
@@ -1354,7 +1370,7 @@ from link_project_to_chat.config import (
 def test_allowed_user_defaults_to_viewer():
     u = AllowedUser(username="alice")
     assert u.role == "viewer"
-    assert u.locked_identity is None
+    assert u.locked_identities == []
 
 
 def test_project_config_has_plugins_default_empty():
@@ -1383,7 +1399,7 @@ def test_save_load_roundtrip(tmp_path: Path):
         path="/tmp/p",
         telegram_bot_token="t",
         allowed_users=[
-            AllowedUser(username="alice", role="executor", locked_identity="telegram:12345"),
+            AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
             AllowedUser(username="bob", role="viewer"),
         ],
         plugins=[{"name": "in-app-web-server"}, {"name": "diff", "option": 1}],
@@ -1391,7 +1407,7 @@ def test_save_load_roundtrip(tmp_path: Path):
     save_config(cfg, cfg_file)
     loaded = load_config(cfg_file)
     p = loaded.projects["myp"]
-    assert {(u.username, u.role, u.locked_identity) for u in p.allowed_users} == {
+    assert {(u.username, u.role, tuple(u.locked_identities)) for u in p.allowed_users} == {
         ("alice", "executor", 12345),
         ("bob", "viewer", None),
     }
@@ -1412,7 +1428,7 @@ def test_unknown_role_falls_back_to_viewer(tmp_path: Path):
     cfg_file.write_text(json.dumps(raw))
     loaded = load_config(cfg_file)
     p = loaded.projects["p"]
-    assert p.allowed_users == [AllowedUser(username="x", role="viewer", locked_identity=None)]
+    assert p.allowed_users == [AllowedUser(username="x", role="viewer", locked_identities=[])]
 
 
 def test_malformed_plugin_entry_skipped(tmp_path: Path):
@@ -1450,7 +1466,7 @@ def test_malformed_allowed_user_entry_skipped_with_warning(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         loaded = load_config(cfg_file)
     assert loaded.projects["p"].allowed_users == [
-        AllowedUser(username="good", role="viewer", locked_identity=None),
+        AllowedUser(username="good", role="viewer", locked_identities=[]),
     ]
 
 
@@ -1564,9 +1580,9 @@ def test_migration_b_trusted_users_dict_subset(tmp_path: Path):
     assert loaded.migration_pending is True
     p = loaded.projects["p"]
     by_user = {u.username: u for u in p.allowed_users}
-    assert by_user["alice"].role == "executor" and by_user["alice"].locked_identity == "telegram:12345"
-    assert by_user["bob"].role == "executor" and by_user["bob"].locked_identity is None
-    assert by_user["carol"].role == "executor" and by_user["carol"].locked_identity is None
+    assert by_user["alice"].role == "executor" and by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].role == "executor" and by_user["bob"].locked_identities == []
+    assert by_user["carol"].role == "executor" and by_user["carol"].locked_identities == []
 
 
 def test_migration_c_trusted_users_dict_full(tmp_path: Path):
@@ -1585,8 +1601,8 @@ def test_migration_c_trusted_users_dict_full(tmp_path: Path):
     loaded = load_config(cfg_file)
     p = loaded.projects["p"]
     by_user = {u.username: u for u in p.allowed_users}
-    assert by_user["alice"].locked_identity == "telegram:12345"
-    assert by_user["bob"].locked_identity == "telegram:67890"
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
 
 
 def test_migration_d_legacy_list_with_ids_aligned(tmp_path: Path):
@@ -1606,8 +1622,8 @@ def test_migration_d_legacy_list_with_ids_aligned(tmp_path: Path):
     loaded = load_config(cfg_file)
     p = loaded.projects["p"]
     by_user = {u.username: u for u in p.allowed_users}
-    assert by_user["alice"].locked_identity == "telegram:12345"
-    assert by_user["bob"].locked_identity == "telegram:67890"
+    assert by_user["alice"].locked_identities == ["telegram:12345"]
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
 
 
 def test_migration_e_global_config_migration(tmp_path: Path):
@@ -1628,7 +1644,7 @@ def test_migration_e_global_config_migration(tmp_path: Path):
     assert loaded.migration_pending is True
     # Global allow-list got migrated.
     assert loaded.allowed_users == [
-        AllowedUser(username="admin", role="executor", locked_identity="telegram:99999"),
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:99999"]),
     ]
     # Project has empty allowed_users (and that's fine — it'll fall back to
     # Config.allowed_users in some paths, or warn at startup).
@@ -1638,7 +1654,7 @@ def test_migration_e_global_config_migration(tmp_path: Path):
     assert "allowed_usernames" not in written
     assert "trusted_users" not in written
     assert written["allowed_users"] == [
-        {"username": "admin", "role": "executor", "locked_identity": "telegram:99999"},
+        {"username": "admin", "role": "executor", "locked_identities": ["telegram:99999"]},
     ]
 
 
@@ -1663,7 +1679,7 @@ def test_migration_f_orphan_trust(tmp_path: Path):
     by_user = {u.username: u for u in p.allowed_users}
     assert "alice" in by_user
     assert "bob" in by_user
-    assert by_user["bob"].locked_identity == "telegram:67890"
+    assert by_user["bob"].locked_identities == ["telegram:67890"]
 
 
 def test_legacy_list_length_mismatch_drops_ids(tmp_path, caplog):
@@ -1684,7 +1700,7 @@ def test_legacy_list_length_mismatch_drops_ids(tmp_path, caplog):
         loaded = load_config(cfg_file)
     assert "length mismatch" in caplog.text.lower()
     p = loaded.projects["p"]
-    assert p.allowed_users == [AllowedUser(username="alice", role="executor", locked_identity=None)]
+    assert p.allowed_users == [AllowedUser(username="alice", role="executor", locked_identities=[])]
 
 
 def test_save_strips_legacy_keys(tmp_path: Path):
@@ -1707,7 +1723,7 @@ def test_save_strips_legacy_keys(tmp_path: Path):
     assert "trusted_users" not in p
     assert "trusted_user_ids" not in p
     assert p["allowed_users"] == [
-        {"username": "alice", "role": "executor", "locked_identity": "telegram:12345"},
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
     ]
 
 
@@ -1733,7 +1749,7 @@ def test_load_save_load_is_stable(tmp_path: Path):
     final = json.loads(cfg_file.read_text())
     assert "allowed_usernames" not in final["projects"]["p"]
     assert final["projects"]["p"]["allowed_users"] == [
-        {"username": "alice", "role": "executor", "locked_identity": "telegram:12345"},
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
     ]
 ```
 
@@ -1756,12 +1772,15 @@ _VALID_ROLES = ("viewer", "executor")
 class AllowedUser:
     username: str
     role: str = "viewer"
-    locked_identity: str | None = None
-    # Platform-portable identity lock: "transport_id:native_id" string
-    # populated on first contact. Works for numeric Telegram IDs
-    # ("telegram:12345"), Discord snowflakes ("discord:abc..."), and Web
-    # session tokens ("web:..."). Replaces the int-only ID locking from the
-    # legacy design — see spec Components > config.py.
+    locked_identities: list[str] = field(default_factory=list)
+    # Platform-portable identity locks: list of "transport_id:native_id" strings.
+    # Each transport a user contacts from gets a new entry appended on first
+    # contact (no replacement). Auth succeeds if any entry matches the
+    # current identity. Examples after first contact:
+    #   ["telegram:12345"]
+    #   ["web:web-session:abc-def"]
+    #   ["telegram:12345", "web:web-session:abc-def"]  (same user, two transports)
+    # Replaces the int-only ID locking from the legacy design.
 
 
 def _parse_allowed_users(raw_list) -> list[AllowedUser]:
@@ -1780,17 +1799,26 @@ def _parse_allowed_users(raw_list) -> list[AllowedUser]:
         if role not in _VALID_ROLES:
             logger.warning("unknown role %r for %s; defaulting to viewer", role, username)
             role = "viewer"
-        locked_identity = entry.get("locked_identity")
-        if locked_identity is not None and not isinstance(locked_identity, str):
+        # Accept the new list shape; tolerate the single-string shape used
+        # during the migration window (auto-wrap).
+        raw_locked = entry.get("locked_identities", [])
+        if isinstance(raw_locked, str):
+            raw_locked = [raw_locked]
+        if not isinstance(raw_locked, list):
             logger.warning(
-                "malformed locked_identity for %s (not a string): %r; dropping",
-                username, locked_identity,
+                "malformed locked_identities for %s (expected list of strings): %r; dropping",
+                username, raw_locked,
             )
-            locked_identity = None
+            raw_locked = []
+        locked_identities = [s for s in raw_locked if isinstance(s, str)]
+        if len(locked_identities) != len(raw_locked):
+            logger.warning(
+                "dropped non-string entries from locked_identities for %s", username,
+            )
         out.append(AllowedUser(
             username=str(username).lstrip("@").lower(),
             role=role,
-            locked_identity=locked_identity,
+            locked_identities=locked_identities,
         ))
     return out
 
@@ -1799,8 +1827,8 @@ def _serialize_allowed_users(users: list[AllowedUser]) -> list[dict]:
     out = []
     for u in users:
         entry: dict = {"username": u.username, "role": u.role}
-        if u.locked_identity is not None:
-            entry["locked_identity"] = u.locked_identity
+        if u.locked_identities:
+            entry["locked_identities"] = list(u.locked_identities)
         out.append(entry)
     return out
 
@@ -1846,11 +1874,13 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
     def _norm(name) -> str:
         return str(name).lstrip("@").lower()
 
-    # Build a username → locked_identity map ("telegram:<id>" strings).
+    # Build a username → locked_identities map ("telegram:<id>" strings).
     # Legacy fields predate multi-transport support, so every legacy ID belongs
-    # to Telegram; we prefix with "telegram:" so the locked_identity is
+    # to Telegram; we prefix with "telegram:" so each entry in locked_identities is
     # immediately usable by the new identity-keyed auth comparison.
-    identity_for: dict[str, str] = {}
+    # Returns lists (not single strings) so the migration is shape-compatible
+    # with the new `locked_identities` field.
+    identities_for: dict[str, list[str]] = {}
     legacy_trusted_names: list[str] = []
     if isinstance(raw_trusted, dict):
         # Current on-disk shape: username → user_id (int or str).
@@ -1859,26 +1889,22 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
             legacy_trusted_names.append(norm)
             if uid is None:
                 continue
-            # Preserve non-numeric IDs too (Discord/Slack scenarios that may
-            # have been entered manually). We assume telegram unless the ID
-            # already contains a ":" (caller-prefixed).
             uid_str = str(uid)
             if ":" in uid_str:
-                identity_for[norm] = uid_str
+                # Caller-prefixed (any transport). Pass through.
+                identities_for.setdefault(norm, []).append(uid_str)
             else:
+                # Plain ID — assume telegram (legacy fields predate multi-transport).
                 try:
-                    identity_for[norm] = f"telegram:{int(uid_str)}"
+                    identities_for.setdefault(norm, []).append(f"telegram:{int(uid_str)}")
                 except (TypeError, ValueError):
-                    # Non-numeric ID without prefix — assume telegram.
-                    identity_for[norm] = f"telegram:{uid_str}"
+                    identities_for.setdefault(norm, []).append(f"telegram:{uid_str}")
     elif isinstance(raw_trusted, list):
         # Pre-A1 shape: list of usernames aligned with trusted_user_ids by index.
         legacy_trusted_names = [_norm(n) for n in raw_trusted]
         if len(legacy_trusted_names) == len(legacy_ids):
-            identity_for = {
-                name: f"telegram:{int(uid)}"
-                for name, uid in zip(legacy_trusted_names, legacy_ids)
-            }
+            for name, uid in zip(legacy_trusted_names, legacy_ids):
+                identities_for.setdefault(name, []).append(f"telegram:{int(uid)}")
         elif legacy_ids:
             logger.warning(
                 "legacy trusted_users(list) / trusted_user_ids length mismatch "
@@ -1890,10 +1916,8 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
         # Oldest shape: trusted_user_ids aligned with allowed_usernames by index.
         norm_allowed = [_norm(n) for n in legacy_unames]
         if len(norm_allowed) == len(legacy_ids):
-            identity_for = {
-                name: f"telegram:{int(uid)}"
-                for name, uid in zip(norm_allowed, legacy_ids)
-            }
+            for name, uid in zip(norm_allowed, legacy_ids):
+                identities_for.setdefault(name, []).append(f"telegram:{int(uid)}")
         else:
             logger.warning(
                 "legacy allowed_usernames / trusted_user_ids length mismatch "
@@ -1912,30 +1936,35 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list[AllowedUser], bool]:
         out.append(AllowedUser(
             username=norm,
             role="executor",
-            locked_identity=identity_for.get(norm),
+            locked_identities=list(identities_for.get(norm, [])),
         ))
+    locked_count = sum(1 for u in out if u.locked_identities)
     logger.info(
         "migrated legacy auth fields → %d AllowedUser entries (%d with locked identities)",
-        len(out), sum(1 for u in out if u.locked_identity is not None),
+        len(out), locked_count,
     )
     return out, True
 
 
-def resolve_project_allowed_users(project, config) -> list[AllowedUser]:
-    """Project allow-list with global fallback.
+def resolve_project_allowed_users(project, config) -> tuple[list[AllowedUser], str]:
+    """Project allow-list with global fallback. Returns (users, source).
 
-    Returns the project's allowed_users if non-empty; otherwise returns the
-    global Config.allowed_users. Matches the precedence of the existing
-    `resolve_project_auth_scope` (project overrides global, falls back to
-    global) so deployments where the project list is empty don't suddenly
-    fail-closed when only the global list is populated.
+    Source is "project" when the project's own allow-list is non-empty,
+    "global" when falling back to Config.allowed_users. The bot uses the
+    source to write back to the matching scope when persisting first-contact
+    locks via `_persist_auth_if_dirty`.
+
+    Matches the precedence of the existing `resolve_project_auth_scope`
+    (project overrides global, falls back to global) so deployments where the
+    project list is empty don't suddenly fail-closed when only the global
+    list is populated.
 
     Callers in bot.py / cli.py / manager/bot.py use this helper instead of
     reading project.allowed_usernames / project.trusted_users directly.
     """
     if project.allowed_users:
-        return project.allowed_users
-    return config.allowed_users
+        return project.allowed_users, "project"
+    return config.allowed_users, "global"
 ```
 
 - [ ] **Step 5: Edit `config.py` — `ProjectConfig` and `Config` (NOT `TeamBotConfig`)**
@@ -2033,13 +2062,17 @@ Mirror in the **global** serialization block (where `raw["allowed_usernames"] = 
 
 After saving, clear the in-memory flag: `config.migration_pending = False`. (Optional, but lets callers re-read state without re-saving.)
 
-- [ ] **Step 8: Audit other call sites in `config.py`**
+- [ ] **Step 8: Audit `config.py` only — confirm new code paths are wired in**
 
 ```bash
-grep -n "allowed_usernames\|trusted_users\|trusted_user_ids" src/link_project_to_chat/config.py
+grep -n "allowed_users\|migration_pending\|resolve_project_allowed_users" src/link_project_to_chat/config.py
 ```
 
-Every remaining reference outside `_migrate_legacy_auth` is a bug — read the file and either delete the code path or rewrite to read `allowed_users`.
+Verify that the loader populates **both** the new `allowed_users` field and the legacy `allowed_usernames` / `trusted_users` / `trusted_user_ids` fields on `ProjectConfig` and `Config`, that `migration_pending` is set when legacy keys were read, and that `resolve_project_allowed_users` is defined and exported.
+
+**The legacy fields stay on the dataclasses through this task.** Existing callers in `bot.py` / `cli.py` / `manager/bot.py` still read them — that's expected. The repo-wide audit and call-site rewrites happen in **Task 5 Step 11**; the dataclass-level field removal happens in **Task 5 Step 12**.
+
+Spot-check that `save_config` already strips legacy keys from disk (Step 7) — `grep -n "pop.*allowed_usernames\|pop.*trusted_users" src/link_project_to_chat/config.py` should show the pops are in place.
 
 - [ ] **Step 9: Run target tests**
 
@@ -2048,13 +2081,11 @@ pytest tests/test_config_allowed_users.py tests/test_config_migration.py -v
 ```
 Expected: All PASS.
 
-- [ ] **Step 10: Update existing config tests for the field removal**
+- [ ] **Step 10: Verify existing config tests still pass**
 
-```bash
-grep -rln "allowed_usernames\|trusted_users\|trusted_user_ids" tests/
-```
+Existing tests in `tests/test_config.py`, `tests/test_auth*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py` read `proj.allowed_usernames` / `config.trusted_users` / etc. **These tests must KEEP passing as-is at the end of this task** — because we deliberately kept the legacy fields on the dataclasses. If any test breaks here, the loader is failing to populate the legacy fields and that's a bug to fix in Step 6.
 
-Each file gets read and rewritten to use `allowed_users` directly. **Many tests will fail until this is done.** Expected scope: `tests/test_config.py`, `tests/test_auth*.py`, `tests/manager/test_bot*.py`, `tests/test_bot_team_wiring.py`. Estimate ~30 tests touched.
+Repository-wide rewrites of the legacy-field test references happen in **Task 5 Step 11**, AFTER all source-code call sites have moved to `resolve_project_allowed_users`. Don't pre-emptively rewrite tests in this task.
 
 - [ ] **Step 11: Run the full suite**
 
@@ -2068,26 +2099,43 @@ Expected: green. If anything in `tests/manager/` or `tests/test_bot_*` reference
 ```bash
 git add src/link_project_to_chat/config.py \
         tests/test_config_allowed_users.py \
-        tests/test_config_migration.py \
-        tests/  # for the existing-test updates
+        tests/test_config_migration.py
+# NOTE: do NOT include broad tests/ updates here — legacy field test
+# references stay valid (loader still populates legacy fields). Repo-wide
+# test rewrites land in Task 5 Step 11 after source code migrates.
 git commit -m "$(cat <<'EOF'
-feat(config)!: AllowedUser replaces allowed_usernames/trusted_users/trusted_user_ids
+feat(config): add AllowedUser + allowed_users field (legacy fields read-only)
 
-ProjectConfig and Config (global) drop the three legacy auth fields.
-AllowedUser{username, role, locked_identity} becomes the sole on-disk
-shape (locked_identity is a "transport_id:native_id" string so the lock
-works for every transport, not only numeric Telegram IDs). Legacy `trusted_users` dict (current format) maps username → id;
-legacy list form aligned with trusted_user_ids by index is also
-supported. Loader sets Config.migration_pending = True when legacy
-fields were read; the CLI's start command saves once to materialize the
-new shape on disk. TeamBotConfig is unchanged — team bots continue to
-inherit from Config.allowed_users. Unknown roles fall back to viewer;
-malformed entries log warnings and are skipped; empty allowed_users
-after migration logs WARNING (CRITICAL aggregation happens in CLI start).
+ProjectConfig and Config (global) gain:
+- `plugins: list[dict]` (ProjectConfig only)
+- `allowed_users: list[AllowedUser{username, role, locked_identities}]`
+  where locked_identities is a list of "transport_id:native_id" strings
+  so the same username can authenticate from multiple transports
+  (Telegram + Web + future Discord/Slack all accumulate entries).
 
-BREAKING CHANGE: config.json schema. Operators upgrading need to verify
-the resulting allowed_users list and run the bot under supervision on
-first start.
+Legacy fields `allowed_usernames` / `trusted_users` / `trusted_user_ids`
+STAY on the dataclasses during this task as transitional read-only
+inputs. Save format writes ONLY `allowed_users` (legacy keys stripped
+from disk). Repo-wide rewrites of code that reads the legacy fields
+happen in Task 5 Step 11; field-level removal in Task 5 Step 12 — once
+no caller is left.
+
+Legacy `trusted_users` dict (current format) maps username → id; legacy
+list form aligned with trusted_user_ids by index is also supported.
+Loader sets Config.migration_pending = True when legacy fields were
+read; the CLI's start command saves once to materialize the new shape
+on disk.
+
+TeamBotConfig is unchanged — team bots continue to inherit from
+Config.allowed_users (matches existing behavior). Unknown roles fall
+back to viewer; malformed entries log warnings and are skipped; empty
+allowed_users after migration logs WARNING (CRITICAL aggregation
+happens in CLI start).
+
+BREAKING CHANGE: config.json on-disk schema. The dataclass-level
+legacy field removal lands in Task 5; this task only changes the
+written shape. Operators upgrading need to verify the resulting
+allowed_users list and run the bot under supervision on first start.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -2183,7 +2231,7 @@ def test_migrate_config_applies_migration(tmp_path):
     written = json.loads(cfg.read_text())
     assert "allowed_usernames" not in written["projects"]["p"]
     assert written["projects"]["p"]["allowed_users"] == [
-        {"username": "alice", "role": "executor", "locked_identity": "telegram:12345"},
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
     ]
 
 
@@ -2314,7 +2362,7 @@ def migrate_config(ctx, dry_run: bool, project_filter: str | None):
     # Print the resulting state for the user to inspect.
     click.echo(f"Global allow-list: {len(config.allowed_users)} users")
     for u in config.allowed_users:
-        locked = f" [locked_identity={u.locked_identity}]" if u.locked_identity is not None else ""
+        locked = f" [identities: {', '.join(u.locked_identities)}]" if u.locked_identities else ""
         click.echo(f"  - {u.username} ({u.role}){locked}")
 
     empty_projects: list[str] = []
@@ -2323,7 +2371,7 @@ def migrate_config(ctx, dry_run: bool, project_filter: str | None):
             continue
         click.echo(f"\nProject {name!r}: {len(proj.allowed_users)} users")
         for u in proj.allowed_users:
-            locked = f" [locked_identity={u.locked_identity}]" if u.locked_identity is not None else ""
+            locked = f" [identities: {', '.join(u.locked_identities)}]" if u.locked_identities else ""
             click.echo(f"  - {u.username} ({u.role}){locked}")
         if not proj.allowed_users and not config.allowed_users:
             empty_projects.append(name)
@@ -2373,7 +2421,7 @@ Find the existing `@main.command("configure")` and add three new options. Keep t
     help="Add an AllowedUser. Format: 'username' or 'username:role' (role = viewer|executor; default executor).",
 )
 @click.option("--remove-user", "remove_user", default=None, help="Remove an AllowedUser by username.")
-@click.option("--reset-user-identity", "reset_user_identity", default=None, help="Clear the locked_identity for a user (re-locks on next contact).")
+@click.option("--reset-user-identity", "reset_user_identity", default=None, help="Clear the locked_identities for a user (re-locks on next contact). Use 'username:transport' to clear only one transport.")
 # ... other existing options ...
 @click.pass_context
 def configure(ctx, username, remove_username, add_user, remove_user, reset_user_identity, ...):
@@ -2424,9 +2472,20 @@ def configure(ctx, username, remove_username, add_user, remove_user, reset_user_
         u = _find(norm)
         if not u:
             raise SystemExit(f"User {norm!r} not in allow-list.")
-        u.locked_identity = None
+        # Optional :transport suffix lets the operator clear just one
+        # transport's lock (e.g., --reset-user-identity alice:web).
+        if ":" in reset_user_identity:
+            uname_part, transport = reset_user_identity.split(":", 1)
+            target = _find(uname_part.lstrip("@").lower())
+            if target:
+                target.locked_identities = [
+                    ident for ident in target.locked_identities
+                    if not ident.startswith(f"{transport}:")
+                ]
+        else:
+            u.locked_identities = []
         save_config(config, cfg_path)
-        click.echo(f"Cleared locked_identity for {norm}.")
+        click.echo(f"Cleared locked identities for {norm}.")
 ```
 
 (Read the existing `configure` body and merge the new option handling in. The rest of `configure`'s body — `--manager-token` etc. — is unchanged.)
@@ -2444,11 +2503,12 @@ In the `start` command (find `@main.command()` with `def start(...)`), right aft
         click.echo("Migration complete.", err=True)
 
     # Aggregate projects where BOTH project AND global allow-lists are empty.
-    # resolve_project_allowed_users falls back to the global list, so a project
-    # with empty allowed_users is only a problem when the global is also empty.
+    # resolve_project_allowed_users returns (users, source); when source is
+    # "global" and the global list is also empty, the project will fail-closed.
     empty: list[str] = []
     for name, proj in config.projects.items():
-        if not resolve_project_allowed_users(proj, config):
+        users, _source = resolve_project_allowed_users(proj, config)
+        if not users:
             empty.append(name)
     if empty:
         import logging as _logging
@@ -2460,19 +2520,20 @@ In the `start` command (find `@main.command()` with `def start(...)`), right aft
         )
 ```
 
-The `run_bot` / `run_bots` plumbing (added in Task 2) currently passes `proj.plugins or None` and `proj.allowed_users or None` to `run_bot`. **Update both call sites to use the fallback helper** so the project picks up the global allow-list when its own is empty:
+The `run_bot` / `run_bots` plumbing (added in Task 2) currently passes `proj.plugins or None` and `proj.allowed_users or None` to `run_bot`. **Update both call sites to use the fallback helper** so the project picks up the global allow-list when its own is empty AND so the bot knows which scope to persist back to:
 
 ```python
 # In run_bots, before the existing run_bot call:
-        effective_allowed = resolve_project_allowed_users(proj, config)
+        effective_allowed, auth_source = resolve_project_allowed_users(proj, config)
         run_bot(
             ...,
             allowed_users=effective_allowed or None,
+            auth_source=auth_source,           # "project" or "global"
             plugins=proj.plugins or None,
         )
 ```
 
-Add the same wiring in any ad-hoc `--path`/`--token` `run_bot` call paths so they end up with the global list when no per-project override exists.
+For ad-hoc `--path`/`--token` runs (no config loaded), pass `auth_source="project"` — the bot has no shared global allow-list to fall back on. `run_bot` accepts a new `auth_source: str = "project"` kwarg.
 
 - [ ] **Step 7: Run tests to verify they pass**
 
@@ -2524,7 +2585,7 @@ EOF
 - Create: `tests/test_auth_roles.py`
 - Modify: `tests/test_auth.py` (and any other auth tests that reference legacy fields)
 
-`AuthMixin` is rewritten around `_allowed_users` as the sole source of truth. The legacy `_allowed_usernames` / `_trusted_user_ids` instance state is deleted. ID-locking moves from a separate `trusted_user_ids` list to `AllowedUser.locked_identity` (a `"transport_id:native_id"` string), populated on first contact via `_identity_key(identity)`.
+`AuthMixin` is rewritten around `_allowed_users` as the sole source of truth. The legacy `_allowed_usernames` / `_trusted_user_ids` instance state is deleted. ID-locking moves from a separate `trusted_user_ids` list to `AllowedUser.locked_identities` (a list of `"transport_id:native_id"` strings), appended on first contact via `_identity_key(identity)`. The list shape supports the same username across multiple transports.
 
 - [ ] **Step 1: Write the failing tests — `tests/test_auth_roles.py`**
 
@@ -2606,23 +2667,29 @@ def test_require_executor_case_and_at_insensitive():
     assert bot._require_executor(_identity("@ALICE")) is True
 
 
-def test_first_contact_locks_user_id():
-    """First contact by username writes back locked_identity atomically."""
+def test_first_contact_locks_identity():
+    """First contact by username appends an identity to locked_identities."""
     au = AllowedUser(username="alice", role="executor")
     bot = _BotWithRoles(allowed_users=[au])
     ident = _identity("alice", native_id="98765")
     bot._auth_identity(ident)  # First contact
-    assert au.locked_identity == "telegram:98765"
+    assert au.locked_identities == ["telegram:98765"]
 
 
 def test_locked_identity_takes_precedence_over_username():
     """After identity is locked, validation goes through identity, not username."""
-    au = AllowedUser(username="alice", role="executor", locked_identity="telegram:98765")
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["telegram:98765"],
+    )
     bot = _BotWithRoles(allowed_users=[au])
-    # Attacker renames themselves to "alice" but their native_id is different.
-    ident = _identity("alice", native_id="11111")
-    assert bot._auth_identity(ident) is False
-    # The real alice still works (her identity matches even with a renamed handle).
+    # Attacker renames themselves to "alice" but their native_id is different
+    # — same transport (telegram), different id, identity_key is "telegram:11111".
+    attacker = _identity("alice", native_id="11111")
+    assert bot._auth_identity(attacker) is False
+    # The real alice still works — her identity matches even with a renamed
+    # handle. (Her identity_key is "telegram:98765" regardless of handle.)
     ident_real = _identity("anything-else", native_id="98765")
     assert bot._auth_identity(ident_real) is True
 ```
@@ -2658,6 +2725,7 @@ class AuthMixin:
     """
 
     _allowed_users: list = []  # list[AllowedUser]; set by ProjectBot.__init__
+    _auth_source: str = "project"  # "project" | "global"; set by ProjectBot.__init__
     _MAX_MESSAGES_PER_MINUTE: int = 30
     _MAX_FAILED_AUTH: int = 5
 
@@ -2666,7 +2734,7 @@ class AuthMixin:
         # so Discord/Slack/Telegram identities never collide.
         self._rate_limits: dict[str, collections.deque] = {}
         self._failed_auth_counts: dict[str, int] = {}
-        # First-contact lock writes back locked_identity in-memory; this flag
+        # First-contact lock APPENDS to locked_identities in-memory; this flag
         # tells the bot's message-handling tail to call save_config once.
         self._auth_dirty: bool = False
 
@@ -2685,38 +2753,44 @@ class AuthMixin:
         """Return 'executor', 'viewer', or None.
 
         Order of checks:
-          1. Identity-lock fast path: a user with `locked_identity == _identity_key(identity)`.
-             Security-critical — prevents username-spoof attacks. Works for every
-             transport since the key is `transport_id:native_id`.
-          2. Username fallback: case- and @-insensitive match against an entry
-             with `locked_identity is None`. On match, write back
-             `locked_identity = _identity_key(identity)` and set
-             `self._auth_dirty = True` so the message-handling tail persists
-             via save_config.
+          1. Identity-lock fast path: `_identity_key(identity)` is in any
+             AllowedUser.locked_identities list. Security-critical — prevents
+             username-spoof attacks. Works for every transport since the
+             keys are `transport_id:native_id` strings.
+          2. Username fallback: case- and @-insensitive match against an
+             entry. Appends `_identity_key(identity)` to that AllowedUser's
+             locked_identities (no replacement, just append if absent) and
+             sets `self._auth_dirty = True` so the message-handling tail
+             persists via save_config. Multi-transport users naturally
+             accumulate identities here: a user authed first on Telegram
+             gets `["telegram:12345"]`, then later on Web appends
+             `"web:web-session:abc"` so the list becomes
+             `["telegram:12345", "web:web-session:abc"]` and both transports
+             authenticate them.
         """
         if not self._allowed_users:
             return None
         ident_key = self._identity_key(identity)
-        # 1. Identity-lock fast path. Works for every transport.
+        # 1. Identity-lock fast path.
         for au in self._allowed_users:
-            if au.locked_identity == ident_key:
+            if ident_key in au.locked_identities:
                 return au.role
-        # 2. Username fallback (only if no identity is locked for that user yet).
+        # 2. Username fallback.
         uname = self._normalize_username(getattr(identity, "handle", ""))
         if not uname:
             return None
         for au in self._allowed_users:
-            if au.locked_identity is not None:
-                # Locked to a different identity; username match doesn't help.
+            if self._normalize_username(au.username) != uname:
                 continue
-            if self._normalize_username(au.username) == uname:
-                au.locked_identity = ident_key
+            # Append-if-absent — same identity from concurrent messages stays idempotent.
+            if ident_key not in au.locked_identities:
+                au.locked_identities.append(ident_key)
                 self._auth_dirty = True
                 logger.info(
                     "Locked identity %s for %s on first contact",
                     ident_key, au.username,
                 )
-                return au.role
+            return au.role
         return None
 
     def _auth_identity(self, identity) -> bool:
@@ -2754,12 +2828,13 @@ Append to `tests/test_auth_roles.py`:
 
 ```python
 def test_auth_dirty_set_on_first_contact():
-    """First contact by username writes back locked_identity AND sets _auth_dirty."""
+    """First contact by username appends to locked_identities AND sets _auth_dirty."""
     au = AllowedUser(username="alice", role="executor")
     bot = _BotWithRoles(allowed_users=[au])
     assert bot._auth_dirty is False
     bot._auth_identity(_identity("alice", native_id="98765"))
-    assert au.locked_identity == 98765
+    # _identity helper uses transport_id="telegram"; the identity_key is "telegram:98765".
+    assert au.locked_identities == ["telegram:98765"]
     assert bot._auth_dirty is True
 
 
@@ -2793,8 +2868,8 @@ def test_auth_dirty_unset_after_persist_call():
 
 
 def test_locked_id_already_present_does_not_dirty():
-    """When locked_identity is already set, no first-contact write happens."""
-    au = AllowedUser(username="alice", role="executor", locked_identity="telegram:98765")
+    """When the current identity is already in locked_identities, no first-contact write happens."""
+    au = AllowedUser(username="alice", role="executor", locked_identities=["telegram:98765"])
     bot = _BotWithRoles(allowed_users=[au])
     bot._auth_identity(_identity("alice", native_id="98765"))
     assert bot._auth_dirty is False
@@ -2812,31 +2887,74 @@ In `src/link_project_to_chat/bot.py`, immediately above `_guard_executor` (Step 
 
         Called from message-handling tails (_on_text, _on_run, etc.) after the
         message is processed. Cheap when nothing to do (single bool check).
+
+        Two correctness properties:
+        1. **Scope-aware.** Writes back to whichever scope the bot's
+           _allowed_users came from. When the bot inherited the global
+           allow-list via `resolve_project_allowed_users` fallback,
+           self._auth_source == "global" and we update Config.allowed_users
+           on disk — NOT the project's empty list (which would silently
+           promote the global list to a project-scoped copy).
+        2. **Per-user merge.** Reload the file, find the AllowedUser by
+           username, update its locked_identities, save. Does NOT replace the
+           full list. Concurrent edits to other users converge correctly under
+           the existing _config_lock (fcntl.flock / msvcrt.locking).
         """
         if not self._auth_dirty:
             return
-        from .config import save_config
+        from .config import load_config, save_config
         cfg_path = self._effective_config_path()
         try:
-            # Reload-modify-save would race with other writers; instead we save
-            # the in-memory state and rely on the existing _config_lock for
-            # serialization. The in-memory state already reflects the lock
-            # write, so save_config's per-project merge will preserve it.
-            from .config import load_config
             disk = load_config(cfg_path)
-            # Merge our updated allowed_users back into the loaded shape so
-            # we don't clobber concurrent edits to other projects.
-            if self.team_name:
-                # Team bot: write to Config.allowed_users (global) which is
-                # what _allowed_users mirrors for team bots.
-                disk.allowed_users = list(self._allowed_users)
-            elif self.name in disk.projects:
-                disk.projects[self.name].allowed_users = list(self._allowed_users)
+
+            # Pick the target list based on the bot's auth source.
+            if self._auth_source == "project":
+                if self.name not in disk.projects:
+                    logger.warning(
+                        "Auth persist skipped: project %r missing from disk", self.name,
+                    )
+                    return
+                target = disk.projects[self.name].allowed_users
+            else:  # "global"
+                target = disk.allowed_users
+
+            # Per-user merge: for each in-memory AllowedUser, find the disk
+            # entry by username and update its locked_identities. Skip users
+            # not present on disk (operator may have removed them while bot
+            # was running — don't resurrect them here).
+            in_memory_by_user = {u.username: u for u in self._allowed_users}
+            for au in target:
+                mem = in_memory_by_user.get(au.username)
+                if mem is None:
+                    continue
+                # Union: keep any locks the disk had that we haven't seen yet
+                # (another bot may have written) AND any locks we have that
+                # the disk doesn't (our first-contact).
+                merged = list(au.locked_identities)
+                for ident in mem.locked_identities:
+                    if ident not in merged:
+                        merged.append(ident)
+                au.locked_identities = merged
+
             save_config(disk, cfg_path)
             self._auth_dirty = False
         except Exception:
             logger.exception("Failed to persist auth state; will retry on next message")
 ```
+
+The `self._auth_source` attribute is set in `ProjectBot.__init__` from the caller. In `run_bot` / `run_bots`, change the call sites that compute `effective_allowed` to also capture the source:
+
+```python
+        effective_allowed, auth_source = resolve_project_allowed_users(proj, config)
+        run_bot(
+            ...,
+            allowed_users=effective_allowed or None,
+            auth_source=auth_source,
+            plugins=proj.plugins or None,
+        )
+```
+
+`run_bot` accepts a new `auth_source: str = "project"` kwarg and forwards it to `ProjectBot.__init__`, which stores it on `self._auth_source`. For ad-hoc `--path`/`--token` runs (no config loaded), the auth source is implicitly `"project"` (the in-memory list belongs to the running bot, no global to fall back to).
 
 In `_on_text` (line 1003), at the very end of the body (after `task_manager.submit_agent(...)`), add:
 
@@ -2961,7 +3079,7 @@ async def test_state_changing_button_blocked_for_viewer():
     from link_project_to_chat.transport.base import ButtonClick, ChatKind, ChatRef, Identity, MessageRef
 
     bot = ProjectBot.__new__(ProjectBot)
-    bot._allowed_users = [AllowedUser(username="viewer-user", role="viewer", locked_identity="telegram:42")]
+    bot._allowed_users = [AllowedUser(username="viewer-user", role="viewer", locked_identities=["telegram:42"])]
     bot._init_auth()
     bot._transport = MagicMock()
     bot._transport.send_text = AsyncMock()
@@ -2989,6 +3107,131 @@ Each match is a test referencing the legacy auth model. Rewrite to construct `Al
 
 `run_bots` already passes `allowed_users=proj.allowed_users or None` (added in Task 2 Step 14). After Task 3 lands, `proj.allowed_users` exists — verify by running the suite.
 
+- [ ] **Step 10a: Add scope-aware persistence test**
+
+Append to `tests/test_auth_roles.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_persist_writes_to_global_when_auth_source_is_global(tmp_path):
+    """When the bot inherited users from Config.allowed_users via fallback,
+    first-contact locks are written to the GLOBAL allow-list — NOT cloned
+    into the project's empty list."""
+    import json
+    from link_project_to_chat.config import save_config, Config, ProjectConfig
+
+    cfg_path = tmp_path / "config.json"
+    cfg = Config()
+    cfg.allowed_users = [AllowedUser(username="admin", role="executor")]
+    cfg.projects["p"] = ProjectConfig(path="/tmp/p", telegram_bot_token="t")
+    save_config(cfg, cfg_path)
+
+    # Simulate a bot that inherited from global (auth_source="global").
+    bot = _BotWithRoles(allowed_users=cfg.allowed_users)
+    bot._auth_source = "global"
+    bot._effective_config_path = lambda: cfg_path
+
+    # Wire up _persist_auth_if_dirty's real implementation here. The test
+    # construction may need to import ProjectBot's method into the test bot
+    # via __get__ — adjust to whatever is cleanest given the mixin shape.
+
+    bot._auth_identity(_identity("admin", native_id="99"))
+    assert bot._auth_dirty is True
+    # Simulate the persist call.
+    import asyncio
+    asyncio.run(ProjectBot._persist_auth_if_dirty(bot))
+
+    # Re-read disk. The GLOBAL allow-list must show the locked identity;
+    # the project's allowed_users must remain empty (not promoted to a copy).
+    disk = json.loads(cfg_path.read_text())
+    assert disk["allowed_users"][0]["locked_identities"] == ["telegram:99"]
+    assert disk["projects"]["p"].get("allowed_users", []) == []
+
+
+@pytest.mark.asyncio
+async def test_persist_merges_per_user_not_replace(tmp_path):
+    """Persisting changes for user A must not overwrite changes to user B
+    made by another bot writing concurrently."""
+    import json
+    from link_project_to_chat.config import save_config, Config, ProjectConfig
+
+    cfg_path = tmp_path / "config.json"
+    cfg = Config()
+    cfg.allowed_users = [
+        AllowedUser(username="alice", role="executor"),
+        AllowedUser(username="bob", role="executor"),
+    ]
+    cfg.projects["p"] = ProjectConfig(path="/tmp/p", telegram_bot_token="t")
+    save_config(cfg, cfg_path)
+
+    # Simulate: another bot wrote bob's identity to disk while ours was running.
+    disk_cfg = Config()
+    disk_cfg.allowed_users = [
+        AllowedUser(username="alice", role="executor"),
+        AllowedUser(username="bob", role="executor", locked_identities=["telegram:200"]),
+    ]
+    disk_cfg.projects["p"] = ProjectConfig(path="/tmp/p", telegram_bot_token="t")
+    save_config(disk_cfg, cfg_path)
+
+    # Our bot in-memory only has the original lists. Alice locks her ID.
+    bot = _BotWithRoles(allowed_users=cfg.allowed_users)
+    bot._auth_source = "global"
+    bot._effective_config_path = lambda: cfg_path
+    bot._auth_identity(_identity("alice", native_id="100"))
+    asyncio.run(ProjectBot._persist_auth_if_dirty(bot))
+
+    disk = json.loads(cfg_path.read_text())
+    by_user = {u["username"]: u for u in disk["allowed_users"]}
+    assert by_user["alice"]["locked_identities"] == ["telegram:100"]
+    assert by_user["bob"]["locked_identities"] == ["telegram:200"]  # NOT clobbered
+```
+
+- [ ] **Step 10b: Add multi-transport identity test**
+
+Append to `tests/test_auth_roles.py`:
+
+```python
+def test_multi_transport_user_auths_from_both(tmp_path):
+    """A user with locked_identities=["telegram:X", "web:web-session:Y"]
+    auths successfully from EITHER transport."""
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["telegram:12345", "web:web-session:abc-def"],
+    )
+    bot = _BotWithRoles(allowed_users=[au])
+    # Telegram side.
+    tg_ident = Identity(
+        transport_id="telegram", native_id="12345",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(tg_ident) is True
+    # Web side.
+    web_ident = Identity(
+        transport_id="web", native_id="web-session:abc-def",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(web_ident) is True
+
+
+def test_username_fallback_appends_to_identities_per_transport(tmp_path):
+    """A user with one telegram lock who messages from web for the first
+    time gets the web identity APPENDED — telegram lock is preserved."""
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["telegram:12345"],
+    )
+    bot = _BotWithRoles(allowed_users=[au])
+    web_ident = Identity(
+        transport_id="web", native_id="web-session:new-session",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(web_ident) is True
+    assert au.locked_identities == ["telegram:12345", "web:web-session:new-session"]
+    assert bot._auth_dirty is True
+```
+
 - [ ] **Step 10: Add end-to-end migration integration test**
 
 Create `tests/test_auth_migration_e2e.py`:
@@ -2998,7 +3241,7 @@ Create `tests/test_auth_migration_e2e.py`:
 
 Covers the full path: legacy config.json → load_config → ProjectBot.build()
 with FakeTransport → first message lands → _auth_dirty triggers save →
-on-disk file shows the populated locked_identity.
+on-disk file shows the populated locked_identities.
 """
 from __future__ import annotations
 
@@ -3049,8 +3292,8 @@ async def test_e2e_legacy_load_first_message_locks_id_and_persists(tmp_path: Pat
     assert "trusted_users" not in on_disk["projects"]["p"]
     users = on_disk["projects"]["p"]["allowed_users"]
     by_user = {u["username"]: u for u in users}
-    assert by_user["alice"]["locked_identity"] == 12345
-    assert "locked_identity" not in by_user["bob"]  # not locked yet
+    assert by_user["alice"]["locked_identities"] == ["telegram:12345"]
+    assert "locked_identities" not in by_user["bob"]  # not locked yet (omitted because empty)
 
     # 2. Build ProjectBot from the migrated config + FakeTransport.
     proj = config.projects["p"]
@@ -3087,13 +3330,18 @@ async def test_e2e_legacy_load_first_message_locks_id_and_persists(tmp_path: Pat
     await bot._persist_auth_if_dirty()
     assert bot._auth_dirty is False
 
-    # 4. On-disk file now shows bob with a populated locked_identity.
+    # 4. On-disk file now shows bob with a populated locked_identities. Bob's
+    #    first contact came through FakeTransport, so the identity is
+    #    prefixed with "fake:" (not "telegram:" — Bob was NOT in the legacy
+    #    trusted_users dict, so the migration didn't seed a telegram entry).
     on_disk_after = json.loads(cfg_file.read_text())
     users_after = on_disk_after["projects"]["p"]["allowed_users"]
     by_user_after = {u["username"]: u for u in users_after}
-    assert by_user_after["bob"]["locked_identity"] == 67890
+    assert by_user_after["bob"]["locked_identities"] == ["fake:67890"]
+    # Alice's migrated telegram lock from the legacy config is preserved.
+    assert "telegram:12345" in by_user_after["alice"]["locked_identities"]
 
-    # 5. Second contact by bob: no extra save.
+    # 5. Second contact by bob: no extra save (identity already in the list).
     msg_count_before = len([f for f in tmp_path.iterdir() if f.is_file()])
     bot._auth_identity(bob_identity)
     await bot._persist_auth_if_dirty()
@@ -3104,18 +3352,21 @@ async def test_e2e_legacy_load_first_message_locks_id_and_persists(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_e2e_username_spoof_blocked_after_lock(tmp_path: Path):
-    """After a user's ID is locked, an attacker with the same username but a
-    different native_id is rejected."""
+    """After a user's identity is locked, an attacker with the same username
+    but a different native_id (SAME transport) is rejected."""
     project_path = tmp_path / "project"
     project_path.mkdir()
     cfg_file = tmp_path / "config.json"
+    # The locked identity uses transport_id="fake" because this test drives
+    # FakeTransport. (For a Telegram-transport test, the locked identity would
+    # be "telegram:12345" — must match the transport_id of the running bot.)
     cfg_file.write_text(json.dumps({
         "projects": {
             "p": {
                 "path": str(project_path),
                 "telegram_bot_token": "t",
                 "allowed_users": [
-                    {"username": "alice", "role": "executor", "locked_identity": "telegram:12345"},
+                    {"username": "alice", "role": "executor", "locked_identities": ["fake:12345"]},
                 ],
             }
         }
@@ -3130,19 +3381,66 @@ async def test_e2e_username_spoof_blocked_after_lock(tmp_path: Path):
         config_path=cfg_file,
     )
 
-    # Attacker: same username "alice", different native_id.
+    # Attacker: same username "alice", different native_id on the same transport.
+    # identity_key would be "fake:11111" — not in alice's locked_identities.
     attacker = Identity(
         transport_id="fake", native_id="11111",
         display_name="Alice", handle="alice", is_bot=False,
     )
     assert bot._auth_identity(attacker) is False
 
-    # Real alice still works.
+    # Real alice still works — her identity_key is "fake:12345", in the list.
     real = Identity(
         transport_id="fake", native_id="12345",
         display_name="Anyone", handle="not-the-real-alice", is_bot=False,
     )
     assert bot._auth_identity(real) is True
+
+
+@pytest.mark.asyncio
+async def test_e2e_multi_transport_user_locks_per_transport(tmp_path: Path):
+    """A user authed first from Telegram-shape locks 'telegram:X'; same user
+    first-contacting from Web appends 'web:web-session:Y' — both work."""
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "projects": {
+            "p": {
+                "path": str(project_path),
+                "telegram_bot_token": "t",
+                "allowed_users": [
+                    {"username": "alice", "role": "executor"},
+                ],
+            }
+        }
+    }))
+    config = load_config(cfg_file)
+    proj = config.projects["p"]
+    bot = ProjectBot(
+        name="p", path=project_path, token="t",
+        allowed_users=proj.allowed_users,
+        config_path=cfg_file,
+    )
+
+    tg_ident = Identity(
+        transport_id="telegram", native_id="12345",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(tg_ident) is True
+    await bot._persist_auth_if_dirty()
+
+    web_ident = Identity(
+        transport_id="web", native_id="web-session:abc-def",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    assert bot._auth_identity(web_ident) is True
+    await bot._persist_auth_if_dirty()
+
+    on_disk = json.loads(cfg_file.read_text())
+    alice = next(u for u in on_disk["projects"]["p"]["allowed_users"] if u["username"] == "alice")
+    assert "telegram:12345" in alice["locked_identities"]
+    assert "web:web-session:abc-def" in alice["locked_identities"]
 ```
 
 Run:
@@ -3161,7 +3459,7 @@ Every match outside `_migrate_legacy_auth` and the loader's compatibility shim m
 - Reads of `proj.allowed_usernames` / `proj.trusted_users` / `proj.trusted_user_ids` → `resolve_project_allowed_users(proj, config)`.
 - Reads of `config.allowed_usernames` / `config.trusted_users` → `config.allowed_users`.
 - `_get_trusted_user_ids()` / `_get_trusted_user_bindings()` / `_effective_trusted_users` / `_trust_user` / `_revoke_user` / `_coerce_trust_value` — delete these helpers from `_auth.py` if they exist; their behavior is subsumed by `_get_user_role` and `_persist_auth_if_dirty`.
-- `add_trusted_user_id`, `add_project_trusted_user_id`, `bind_project_trusted_user` (in `config.py`) — rewrite to operate on `AllowedUser.locked_identity` or delete if `_persist_auth_if_dirty` covers them.
+- `add_trusted_user_id`, `add_project_trusted_user_id`, `bind_project_trusted_user` (in `config.py`) — rewrite to operate on `AllowedUser.locked_identities` (append the new identity to the list) or delete if `_persist_auth_if_dirty` covers them.
 
 After this step, **no source file outside `config.py`'s migration helper reads `allowed_usernames` / `trusted_users` / `trusted_user_ids`**. Verify by re-running the grep — only `_migrate_legacy_auth` and its tests should match.
 
@@ -3196,7 +3494,7 @@ feat(auth)!: AllowedUser is sole auth source; legacy fields removed
 
 _auth_identity, _require_executor, and _get_user_role all read
 self._allowed_users exclusively. Empty allowed_users fails closed (no
-legacy allow-all path). Identity-locking via AllowedUser.locked_identity
+legacy allow-all path). Identity-locking via AllowedUser.locked_identities
 (a "transport_id:native_id" string), populated on first contact.
 Validates by identity, not username — preserves the username-spoof
 protection and works for every transport (telegram:, web:, future
@@ -3247,7 +3545,7 @@ The manager bot was also ported to Transport (commands take `CommandInvocation`,
    - `/add_user <username> [viewer|executor]` — default role `executor`.
    - `/remove_user <username>`.
    - `/promote_user <username>` and `/demote_user <username>` — toggle role.
-   - `/reset_user_identityentity <username>` — clear `locked_identity` (recovery path).
+   - `/reset_user_identity <username> [transport_id]` — clear `locked_identities` (recovery path). With a `transport_id` argument, clears only entries with that prefix.
 
 All user-management commands persist via `save_config` and reply with the updated `/users` listing.
 
@@ -3268,7 +3566,7 @@ def _make_manager(monkeypatch, projects=None):
     from link_project_to_chat.config import AllowedUser
     bot = ManagerBot.__new__(ManagerBot)
     bot._project_config_path = None
-    bot._allowed_users = [AllowedUser(username="admin", role="executor", locked_identity="telegram:1")]
+    bot._allowed_users = [AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"])]
     bot._init_auth()
     monkeypatch.setattr(bot, "_load_projects", lambda: projects or {})
     return bot
@@ -3412,7 +3710,7 @@ from link_project_to_chat.transport.base import ChatKind, ChatRef, CommandInvoca
 def _make_manager(tmp_path: Path, users: list[AllowedUser] | None = None) -> ManagerBot:
     cfg_file = tmp_path / "config.json"
     cfg = Config()
-    cfg.allowed_users = list(users or [AllowedUser(username="admin", role="executor", locked_identity="telegram:1")])
+    cfg.allowed_users = list(users or [AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"])])
     save_config(cfg, cfg_file)
 
     bot = ManagerBot.__new__(ManagerBot)
@@ -3434,7 +3732,7 @@ def _invocation(args: list[str], sender_handle: str = "admin", sender_id: str = 
 @pytest.mark.asyncio
 async def test_users_lists_current_state(tmp_path):
     bot = _make_manager(tmp_path, [
-        AllowedUser(username="alice", role="executor", locked_identity="telegram:12345"),
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
         AllowedUser(username="bob", role="viewer"),
     ])
     await bot._on_users(_invocation([]))
@@ -3496,12 +3794,12 @@ async def test_demote_user(tmp_path):
 @pytest.mark.asyncio
 async def test_reset_user_identity_clears_locked_id(tmp_path):
     bot = _make_manager(tmp_path, [
-        AllowedUser(username="alice", role="executor", locked_identity="telegram:12345"),
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
     ])
     await bot._on_reset_user_identity(_invocation(["alice"]))
     from link_project_to_chat.config import load_config
     cfg = load_config(bot._project_config_path)
-    assert cfg.allowed_users[0].locked_identity is None
+    assert cfg.allowed_users[0].locked_identities == []
 
 
 @pytest.mark.asyncio
@@ -3516,7 +3814,7 @@ async def test_add_user_invalid_role_rejected(tmp_path):
 async def test_viewer_cannot_add_user(tmp_path):
     """Viewers must NOT be able to edit the allow-list — only executors."""
     bot = _make_manager(tmp_path, [
-        AllowedUser(username="viewer-admin", role="viewer", locked_identity="telegram:99"),
+        AllowedUser(username="viewer-admin", role="viewer", locked_identities=["telegram:99"]),
     ])
     # Invocation from a viewer.
     inv = _invocation(["charlie"], sender_handle="viewer-admin", sender_id="99")
@@ -3534,7 +3832,7 @@ async def test_viewer_can_list_users(tmp_path):
     """Viewers can use /users (read-only listing)."""
     bot = _make_manager(tmp_path, [
         AllowedUser(username="alice", role="executor"),
-        AllowedUser(username="viewer-bob", role="viewer", locked_identity="telegram:200"),
+        AllowedUser(username="viewer-bob", role="viewer", locked_identities=["telegram:200"]),
     ])
     inv = _invocation([], sender_handle="viewer-bob", sender_id="200")
     await bot._on_users(inv)
@@ -3586,7 +3884,7 @@ Add the handler methods on `ManagerBot`:
             return "No users authorized."
         lines = ["Authorized users:"]
         for u in users:
-            locked = f"[ID locked: {u.locked_identity}]" if u.locked_identity is not None else "[not yet]"
+            locked = f"[identities: {', '.join(u.locked_identities)}]" if u.locked_identities else "[not yet]"
             lines.append(f"  • {u.username} ({u.role}) {locked}")
         return "\n".join(lines)
 
@@ -3674,15 +3972,26 @@ Add the handler methods on `ManagerBot`:
         if not await self._require_executor_or_reply(ci):
             return
         if not ci.args:
-            await self._transport.send_text(ci.chat, "Usage: /reset_user_identity <username>", reply_to=ci.message)
+            await self._transport.send_text(
+                ci.chat,
+                "Usage: /reset_user_identity <username> [transport_id]",
+                reply_to=ci.message,
+            )
             return
         username = ci.args[0].lstrip("@").lower()
+        transport_filter = ci.args[1] if len(ci.args) > 1 else None
         cfg = self._load_config_for_users()
         u = next((x for x in cfg.allowed_users if x.username == username), None)
         if not u:
             await self._transport.send_text(ci.chat, f"User {username!r} not found.", reply_to=ci.message)
             return
-        u.locked_identity = None
+        if transport_filter:
+            u.locked_identities = [
+                ident for ident in u.locked_identities
+                if not ident.startswith(f"{transport_filter}:")
+            ]
+        else:
+            u.locked_identities = []
         self._save_config_for_users(cfg)
         await self._transport.send_text(ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message)
 ```
@@ -3824,7 +4133,7 @@ Viewers can use `/tasks`, `/log`, `/status`, `/help`, `/version`, `/skills`
 (listing), `/context` (display), and any plugin command flagged `viewer_ok`.
 Executors have the full command set. `allowed_users` is the sole auth source —
 an empty list means no one is authorized (fail-closed). The first request
-from each user atomically writes their `locked_identity` back to the config so
+from each user atomically appends their identity to `locked_identities` and writes it back to the config so
 subsequent requests validate by native ID rather than username (preserves the
 username-spoof protection from the pre-v1.0 model).
 ````
@@ -3887,7 +4196,7 @@ Prepend to `docs/CHANGELOG.md` (read the existing top to match format):
   subcommand for invoking plugin tools (used by Claude via Bash).
 - **Plugin toggle UI** in the manager bot (per-project, restart-required).
 - **`AllowedUser` role model** (`viewer` / `executor`) is the sole auth +
-  authority source. Per-user `locked_identity` populated on first contact;
+  authority source. Per-user `locked_identities` list — first contact from each transport appends a new entry;
   subsequent requests validate by native ID, not username.
 - **CLI flags** `--add-user USER[:ROLE]`, `--remove-user USER`,
   `--reset-user-identity USER` on `configure`. Legacy `--username` /
@@ -3978,7 +4287,7 @@ gh pr create --title "Plugin system port + AllowedUser-sole auth (v1.0.0)" --bod
 - Adds transport-portable plugin framework (`plugin.py`) with entry-point discovery, lifecycle hooks, command/button registration, Claude-prompt prepend
 - Adds `Transport.on_stop` Protocol hook for clean plugin shutdown
 - Adds manager-bot plugin toggle UI and `plugin-call` CLI subcommand
-- **BREAKING:** `AllowedUser{username, role, locked_identity}` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` as the sole auth source. `locked_identity` is a `"transport_id:native_id"` string — works for every transport. Legacy fields auto-migrate on load and are stripped on next save.
+- **BREAKING:** `AllowedUser{username, role, locked_identities}` replaces `allowed_usernames` / `trusted_users` / `trusted_user_ids` as the sole auth source. `locked_identities` is a **list** of `"transport_id:native_id"` strings — same username works across Telegram + Web + future transports. Legacy fields auto-migrate on load and are stripped on next save.
 - New CLI flags on `configure`: `--add-user USER[:ROLE]`, `--remove-user`, `--reset-user-identity`. Legacy `--username` / `--remove-username` aliased one release.
 - New manager commands: `/promote_user`, `/demote_user`, `/reset_user_identity`; `/add_user` takes an optional role argument.
 - Adds operational scripts (`restart.sh`, `stop.sh`)
