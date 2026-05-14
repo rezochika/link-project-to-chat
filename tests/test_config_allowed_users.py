@@ -320,3 +320,123 @@ def test_locked_config_rmw_actually_serializes_writers(tmp_path: Path):
     # Both writers' usernames must be present - neither clobbered the other.
     by_name = {u.username for u in final.allowed_users}
     assert by_name == {"alice", "bob", "carol"}
+
+
+def test_save_load_preserves_viewer_role_through_roundtrip(tmp_path: Path):
+    """Regression for C1: viewer roles must survive save->reload->save.
+    Pre-fix, the save-time synthesis always assigned executor, silently
+    promoting viewers."""
+    import json
+    from link_project_to_chat.config import AllowedUser, Config, load_config, save_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg = Config(allowed_users=[
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
+        AllowedUser(username="bob", role="viewer", locked_identities=["telegram:67890"]),
+    ])
+    save_config(cfg, cfg_file)
+    once = load_config(cfg_file)
+    save_config(once, cfg_file)
+    twice = load_config(cfg_file)
+
+    by_user = {u.username: u for u in twice.allowed_users}
+    assert by_user["alice"].role == "executor"
+    assert by_user["bob"].role == "viewer", "viewer role silently promoted to executor"
+
+
+def test_save_load_preserves_non_telegram_identities_through_roundtrip(tmp_path: Path):
+    """Regression for C1: web/discord/slack identities must survive
+    save->reload->save. Pre-fix, the legacy mirror only emitted telegram:
+    identities, so web bindings were dropped."""
+    import json
+    from link_project_to_chat.config import AllowedUser, Config, load_config, save_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg = Config(allowed_users=[
+        AllowedUser(username="alice", role="executor",
+                    locked_identities=["web:web-session:abc-def"]),
+    ])
+    save_config(cfg, cfg_file)
+    once = load_config(cfg_file)
+    save_config(once, cfg_file)
+    twice = load_config(cfg_file)
+
+    alice = twice.allowed_users[0]
+    assert alice.username == "alice"
+    assert alice.locked_identities == ["web:web-session:abc-def"]
+
+
+def test_save_load_preserves_multi_transport_identities_through_roundtrip(tmp_path: Path):
+    """Regression for C1: a user with locks on multiple transports
+    must keep all locks through save->reload->save."""
+    import json
+    from link_project_to_chat.config import AllowedUser, Config, load_config, save_config
+
+    cfg_file = tmp_path / "config.json"
+    cfg = Config(allowed_users=[
+        AllowedUser(username="alice", role="executor",
+                    locked_identities=["telegram:12345", "web:web-session:abc"]),
+    ])
+    save_config(cfg, cfg_file)
+    once = load_config(cfg_file)
+    save_config(once, cfg_file)
+    twice = load_config(cfg_file)
+
+    alice = twice.allowed_users[0]
+    assert set(alice.locked_identities) == {"telegram:12345", "web:web-session:abc"}
+
+
+def test_save_load_preserves_locked_identity_addition_through_roundtrip(tmp_path: Path):
+    """Regression for C1: Task 5's _persist_auth_if_dirty appends a new
+    identity to disk.allowed_users[au].locked_identities. This test
+    simulates that append + save pattern and verifies the new identity
+    survives."""
+    import json
+    from link_project_to_chat.config import (
+        AllowedUser, Config, load_config, save_config, locked_config_rmw,
+    )
+
+    cfg_file = tmp_path / "config.json"
+    save_config(Config(allowed_users=[
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
+    ]), cfg_file)
+
+    # Simulate _persist_auth_if_dirty: load, mutate locked_identities, save.
+    loaded = load_config(cfg_file)
+    alice = loaded.allowed_users[0]
+    alice.locked_identities.append("web:web-session:new-session")
+    save_config(loaded, cfg_file)
+
+    reloaded = load_config(cfg_file)
+    reloaded_alice = reloaded.allowed_users[0]
+    assert set(reloaded_alice.locked_identities) == {
+        "telegram:12345", "web:web-session:new-session",
+    }
+
+
+def test_project_cross_scope_synthesis_fallback_pins_behavior(tmp_path: Path):
+    """Regression for I5: a project with trusted_user_ids and no
+    allowed_usernames must inherit the GLOBAL allowed_usernames as the
+    legacy-synthesis basis, producing a per-project allowed_users entry
+    that mirrors the global username with the project's telegram ID
+    binding.
+
+    This matches the load-time precedence in `resolve_project_auth_scope`
+    (legacy: global usernames + project trusted IDs); we pin it at save
+    time so callers constructing `ProjectConfig(trusted_user_ids=[42])`
+    alongside a global `allowed_usernames=["alice"]` round-trip cleanly.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg = Config(allowed_usernames=["alice"])
+    cfg.projects["myp"] = ProjectConfig(
+        path="/tmp/p",
+        telegram_bot_token="t",
+        trusted_user_ids=[42],
+    )
+    save_config(cfg, cfg_file)
+    reloaded = load_config(cfg_file)
+
+    proj_users = reloaded.projects["myp"].allowed_users
+    assert len(proj_users) == 1
+    assert proj_users[0].username == "alice"
+    assert proj_users[0].locked_identities == ["telegram:42"]

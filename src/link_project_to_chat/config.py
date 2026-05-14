@@ -261,7 +261,18 @@ def _synthesize_allowed_users_from_legacy(
     trusted_users: dict[str, int | str],
     trusted_user_ids: list[int],
 ) -> list["AllowedUser"]:
-    """Save-time mirror: build an ``allowed_users`` list from legacy fields.
+    """Build an ``allowed_users`` list from legacy fields (dual-use helper).
+
+    Has two responsibilities through Tasks 3-4:
+
+    1. **Load-time synthesis** (no longer called directly here — that path
+       lives in ``_migrate_legacy_auth``): produces the initial
+       ``AllowedUser`` list when reading a legacy config from disk.
+    2. **Save-time membership source** (via ``_union_save_view``): when
+       saving a Config back to disk, legacy fields are authoritative for
+       *who* is in the list, so legacy-CLI mutations (e.g., ``configure
+       --remove-username``) propagate. Roles and ``locked_identities`` come
+       from ``config.allowed_users`` via the union helper.
 
     Used when a caller constructs ``Config(allowed_usernames=[...])`` or
     ``ProjectConfig(allowed_usernames=[...])`` (no explicit
@@ -279,6 +290,60 @@ def _synthesize_allowed_users_from_legacy(
         synthetic_raw["trusted_user_ids"] = list(trusted_user_ids)
     users, _ = _migrate_legacy_auth(synthetic_raw)
     return users
+
+
+def _union_save_view(
+    legacy_users: list["AllowedUser"],
+    new_users: list["AllowedUser"],
+) -> list["AllowedUser"]:
+    """Per-user UNION view for save-time persistence (Tasks 3-4 transitional).
+
+    Membership comes from ``legacy_users`` (synthesized from the legacy fields)
+    so removals/additions via legacy-aware code paths (CLI ``configure
+    --remove-username``, manager-bot ``/add_user``) propagate to disk. But for
+    each user that ALSO exists in ``new_users`` (by normalized username), the
+    role and locked_identities come from ``new_users`` — preserving viewer
+    roles and multi-transport identities that the legacy synthesis would
+    otherwise flatten.
+
+    Why this matters:
+      - ``_migrate_legacy_auth`` always assigns role="executor"; without union,
+        viewers get promoted on every save.
+      - ``_mirror_allowed_users_to_legacy`` only mirrors telegram:-prefixed
+        identities; without union, web:/discord:/slack: identities are dropped
+        on save.
+      - Task 5's ``_persist_auth_if_dirty`` writes to ``disk.allowed_users[au].
+        locked_identities`` directly; without union, those merged identities
+        are discarded.
+
+    The caller is responsible for the "legacy fully cleared" vs.
+    "direct-construction with empty legacy" distinction: this helper trusts
+    ``legacy_users`` as the membership source. ``_save_config_unlocked``
+    gates the call on ``migration_pending`` and a non-empty
+    ``legacy_synthesized`` to pick the right discriminator.
+
+    Removed in Task 5 Step 11 once all callers mutate ``config.allowed_users``
+    directly and ``legacy_synthesized`` becomes redundant.
+    """
+    by_name = {u.username: u for u in new_users}
+    out: list["AllowedUser"] = []
+    for legacy_u in legacy_users:
+        new_u = by_name.get(legacy_u.username)
+        if new_u is None:
+            # Only in legacy view (e.g., user added via CLI configure --username).
+            out.append(legacy_u)
+        else:
+            # In both views: prefer new_users' role + locked_identities, but
+            # use legacy username case as authoritative. If new_u's
+            # locked_identities is empty, fall back to legacy's (e.g., a CLI
+            # username-only add hasn't yet been bound to a Telegram ID).
+            merged_identities = list(new_u.locked_identities) or list(legacy_u.locked_identities)
+            out.append(AllowedUser(
+                username=legacy_u.username,
+                role=new_u.role,
+                locked_identities=merged_identities,
+            ))
+    return out
 
 
 def _mirror_allowed_users_to_legacy(
@@ -406,9 +471,9 @@ class Config:
     # New (Task 3) - identity-keyed auth at the global scope.
     allowed_users: list[AllowedUser] = field(default_factory=list)
     # Runtime flag set by load_config when legacy auth fields were read; CLI
-    # start uses it to force a save before serving traffic. Intentionally
-    # serialization-suppressed via ``field(default=False)``; save_config skips
-    # writing it.
+    # start uses it to force a save before serving traffic. ``save_config``
+    # does not emit this key; ``repr=False, compare=False`` keeps it out of
+    # debug output and equality.
     migration_pending: bool = field(default=False, repr=False, compare=False)
 
 
@@ -1116,34 +1181,62 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     # New (Task 3): write identity-keyed auth and strip legacy keys.
     # Legacy fields stay on the dataclass through Task 4 as transitional
     # read-only inputs, but the on-disk format never sees them again.
-    # Save-time precedence: legacy fields are authoritative.
+    #
+    # Save-time precedence (post commit 92dc9b9 + this fix):
+    #   - ``migration_pending=True`` (legacy fields just read from disk):
+    #     legacy is STRICTLY authoritative via ``_union_save_view``.
+    #     Membership and (for users only in legacy) identities come from
+    #     legacy synthesis; for users present in both, role +
+    #     locked_identities come from ``config.allowed_users``. A CLI
+    #     ``remove-username`` that empties the legacy list round-trips to
+    #     an empty disk list.
+    #   - ``migration_pending=False`` + empty legacy (direct-construction
+    #     case, ``Config(allowed_users=[...])`` with no legacy fields):
+    #     fall back to ``config.allowed_users`` directly.
+    #   - ``migration_pending=False`` + non-empty legacy (post-load state):
+    #     use ``_union_save_view`` so legacy-CLI mutations propagate.
     #
     # Through Tasks 3-4, the ONLY producers of ``config.allowed_users`` are
     # ``load_config`` (via migration / parse) and direct test construction.
     # Every existing mutator (CLI ``configure --username`` /
     # ``--remove-username`` at cli.py:240-258, manager bot
     # ``_on_add_user_from_transport`` / ``_on_remove_user_from_transport``
-    # at manager/bot.py:685-733) writes to the legacy fields, so they must
-    # win at save time. Otherwise, after the first migration save clears
-    # ``migration_pending``, subsequent legacy-field mutations (especially
-    # *removals* that leave legacy lists empty) would be silently dropped
-    # in favour of the stale ``allowed_users`` snapshot.
+    # at manager/bot.py:685-733) writes to the legacy fields. To remove a
+    # user via the legacy path, mutators MUST clear ``trusted_users`` /
+    # ``trusted_user_ids`` alongside ``allowed_usernames`` — otherwise the
+    # orphan-trust resurrection path in ``_migrate_legacy_auth`` (line 220:
+    # union of allowed_usernames + legacy_trusted_names) keeps them. Real
+    # mutators (cli.configure --remove-username at cli.py:240-258, manager
+    # bot ``_on_remove_user_from_transport`` at manager/bot.py:707-733)
+    # already do this; documented for future maintainers.
     #
-    # The ``or config.allowed_users`` tail is gated on
-    # ``migration_pending=False``: it covers the test-only direct-
-    # construction case (``Config(allowed_users=[...])`` with empty legacy),
-    # while ``migration_pending=True`` keeps legacy strictly authoritative
-    # so a "user removed everyone via legacy" command round-trips to an
-    # empty disk list on the first post-migration save.
+    # Why the UNION (this fix on top of 92dc9b9): 92dc9b9 used the legacy
+    # synthesis as the WHOLE source of truth on save — losing data: viewer
+    # roles were silently promoted to executor (synthesis always assigns
+    # "executor"), web/discord/slack identities were dropped (legacy mirror
+    # only emits telegram:-prefixed values), and Task 5's
+    # _persist_auth_if_dirty would lose every appended identity. The UNION
+    # fixes all four while still letting legacy drive membership.
     legacy_synthesized = _synthesize_allowed_users_from_legacy(
         config.allowed_usernames,
         config.trusted_users,
         config.trusted_user_ids,
     )
     if config.migration_pending:
-        effective_global_users = legacy_synthesized
+        # Strict: legacy is authoritative for membership (and an empty
+        # legacy means "user cleared everyone", round-trip to empty disk).
+        # _union_save_view with empty legacy returns []; that's the desired
+        # behavior here.
+        effective_global_users = _union_save_view(legacy_synthesized, config.allowed_users)
+    elif legacy_synthesized:
+        # Post-load mutation case: legacy was mirrored from allowed_users at
+        # load time, then mutated. Union preserves roles/identities of
+        # users still present in legacy.
+        effective_global_users = _union_save_view(legacy_synthesized, config.allowed_users)
     else:
-        effective_global_users = legacy_synthesized or config.allowed_users
+        # Direct-construction case (test-only / future Task 5 callers):
+        # no legacy fields populated, use the new shape directly.
+        effective_global_users = list(config.allowed_users)
     if effective_global_users:
         raw["allowed_users"] = _serialize_allowed_users(effective_global_users)
     else:
@@ -1216,22 +1309,26 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         proj["path"] = p.path
         proj["telegram_bot_token"] = p.telegram_bot_token
         # New (Task 3): write identity-keyed auth and strip legacy keys at
-        # the project scope. See the global block above for the rationale.
+        # the project scope. See the global block above for the UNION
+        # rationale.
         # Synthesis fallback: when the project has trusted IDs but no
         # ``allowed_usernames`` of its own, bind them to the GLOBAL allow-list
         # - matches ``resolve_project_auth_scope``'s legacy precedence so a
         # caller constructing ``ProjectConfig(trusted_user_ids=[42])`` with
         # ``Config(allowed_usernames=["alice"])`` still gets alice -> 42.
-        proj_synthesis_usernames = p.allowed_usernames or config.allowed_usernames
+        # Pinned by ``test_project_cross_scope_synthesis_fallback_pins_behavior``.
+        proj_synthesis_usernames = p.allowed_usernames or config.allowed_usernames  # cross-scope fallback for legacy ids
         proj_legacy_synthesized = _synthesize_allowed_users_from_legacy(
             proj_synthesis_usernames,
             p.trusted_users,
             p.trusted_user_ids,
         )
         if config.migration_pending:
-            effective_proj_users = proj_legacy_synthesized
+            effective_proj_users = _union_save_view(proj_legacy_synthesized, p.allowed_users)
+        elif proj_legacy_synthesized:
+            effective_proj_users = _union_save_view(proj_legacy_synthesized, p.allowed_users)
         else:
-            effective_proj_users = proj_legacy_synthesized or p.allowed_users
+            effective_proj_users = list(p.allowed_users)
         if effective_proj_users:
             proj["allowed_users"] = _serialize_allowed_users(effective_proj_users)
         else:
