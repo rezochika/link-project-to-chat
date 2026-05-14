@@ -3563,7 +3563,7 @@ async def test_plugin_consumed_message_still_persists_first_contact_lock():
 
 State-changing handlers to gate (all currently auth'd via `_auth_identity` at the top of their bodies — locate each by name and add the guard immediately after the auth check):
 
-`_on_run`, `_on_backend`, `_on_model`, `_on_effort`, `_on_thinking`, `_on_context` (when toggling, not displaying), `_on_permissions`, `_on_compact`, `_on_reset`, `_on_persona`, `_on_stop_persona`, `_on_create_persona`, `_on_delete_persona`, `_on_use` (skill activate path) / `_on_skills` activation branch, `_on_stop_skill`, `_on_create_skill`, `_on_delete_skill`, `_on_lang`, `_on_halt`, `_on_resume`, `_on_file_from_transport`, `_on_voice_from_transport`.
+`_on_run`, `_on_backend`, `_on_model`, `_on_effort`, `_on_thinking`, `_on_context` (when toggling, not displaying), `_on_permissions`, `_on_compact`, `_on_reset`, `_on_persona`, `_on_stop_persona`, `_on_create_persona`, `_on_delete_persona`, `_on_skills` activation branch (no separate `_on_use` exists today — list/pick UI is all `_on_skills` + `pick_skill_*` buttons), `_on_stop_skill`, `_on_create_skill`, `_on_delete_skill`, `_on_lang`, `_on_halt`, `_on_resume`, `_on_file_from_transport`, `_on_voice_from_transport`.
 
 For each, after the existing `if not self._auth_identity(...): return`, add:
 
@@ -4909,6 +4909,180 @@ Add the handler methods on `ManagerBot`:
         self._save_config_for_users(cfg)
         await self._transport.send_text(ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message)
 ```
+
+- [ ] **Step 9b: Rewrite PTB-side guards in `manager/bot.py`**
+
+Task 5 Step 3 deletes the legacy `_auth(user)` method on `AuthMixin` and re-keys `_failed_auth_counts` / `_rate_limits` on `_identity_key(identity)` instead of raw `user.id`. The manager bot still has two PTB-native call sites that pre-date `_guard_invocation` and would `AttributeError` / silently miss rate-limits after Task 5 lands:
+
+- `_guard(update)` at [manager/bot.py:343](src/link_project_to_chat/manager/bot.py:343) — the wizard ConversationHandler shim. Calls `self._auth(user)` and `self._rate_limited(user.id)`.
+- `_edit_field_save(update, ctx)` at [manager/bot.py:836](src/link_project_to_chat/manager/bot.py:836) — handles `pending_edit` and `setup_awaiting` text input from PTB's `MessageHandler`. Calls `self._auth(update.effective_user)` directly with no rate-limit and no persist tail.
+
+Both paths are still reachable through `ConversationHandler` entry points and the setup-text `MessageHandler` (which never went through the transport-port). The `_guard_invocation` counterpart at [manager/bot.py:369](src/link_project_to_chat/manager/bot.py:369) already uses the new identity-based shape — copy its idioms into both PTB shims and add a persist tail so first-contact locks aren't lost on the wizard / setup-text path.
+
+Edit `_guard(update)`. **Before:**
+
+```python
+    async def _guard(self, update: Update) -> bool:
+        """..."""
+        from ..transport.telegram import chat_ref_from_telegram
+        user = update.effective_user
+        chat = chat_ref_from_telegram(update.effective_chat) if update.effective_chat else None
+        if not user or not self._auth(user):
+            if chat is not None:
+                await self._transport.send_text(chat, "Unauthorized.")
+            return False
+        if self._rate_limited(user.id):
+            if chat is not None:
+                await self._transport.send_text(chat, "Rate limited. Try again shortly.")
+            return False
+        return True
+```
+
+**After:**
+
+```python
+    async def _guard(self, update: Update) -> bool:
+        """..."""
+        from ..transport.telegram import (
+            chat_ref_from_telegram,
+            identity_from_telegram_user,
+        )
+        user = update.effective_user
+        chat = chat_ref_from_telegram(update.effective_chat) if update.effective_chat else None
+        try:
+            if not user:
+                if chat is not None:
+                    await self._transport.send_text(chat, "Unauthorized.")
+                return False
+            identity = identity_from_telegram_user(user)
+            if not self._auth_identity(identity):
+                if chat is not None:
+                    await self._transport.send_text(chat, "Unauthorized.")
+                return False
+            if self._rate_limited(self._identity_key(identity)):
+                if chat is not None:
+                    await self._transport.send_text(chat, "Rate limited. Try again shortly.")
+                return False
+            return True
+        finally:
+            # _auth_identity → _get_user_role may append a first-contact identity;
+            # persist before returning regardless of allow/deny branch.
+            await self._persist_auth_if_dirty()
+```
+
+Edit `_edit_field_save(update, ctx)`. **Before:**
+
+```python
+    async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        # Handle setup text input
+        setup_awaiting = ctx.user_data.get("setup_awaiting")
+        if setup_awaiting:
+            await self._handle_setup_input(update, ctx, setup_awaiting)
+            return
+        # Existing edit logic (unchanged)
+        pending = ctx.user_data.get("pending_edit")
+        if not pending:
+            return
+        if not self._auth(update.effective_user):
+            return
+        ctx.user_data.pop("pending_edit")
+        incoming = self._incoming_from_update(update)
+        await self._apply_edit(incoming.chat, pending["name"], pending["field"], incoming.text.strip())
+```
+
+**After:**
+
+```python
+    async def _edit_field_save(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        from ..transport.telegram import identity_from_telegram_user
+        try:
+            # Handle setup text input
+            setup_awaiting = ctx.user_data.get("setup_awaiting")
+            if setup_awaiting:
+                await self._handle_setup_input(update, ctx, setup_awaiting)
+                return
+            # Existing edit logic
+            pending = ctx.user_data.get("pending_edit")
+            if not pending:
+                return
+            user = update.effective_user
+            if not user:
+                return
+            identity = identity_from_telegram_user(user)
+            if not self._auth_identity(identity):
+                return
+            if self._rate_limited(self._identity_key(identity)):
+                return
+            ctx.user_data.pop("pending_edit")
+            incoming = self._incoming_from_update(update)
+            await self._apply_edit(incoming.chat, pending["name"], pending["field"], incoming.text.strip())
+        finally:
+            # First-contact identity locks from _auth_identity must survive the
+            # wizard path (setup text + pending_edit) the same way transport-
+            # native commands persist them.
+            await self._persist_auth_if_dirty()
+```
+
+**Rate-limit on setup-text:** the rewritten `_edit_field_save` only applies rate-limiting to the `pending_edit` branch (after `setup_awaiting` is handled). That preserves today's behavior — the setup wizard is intentionally unthrottled so users aren't locked out during onboarding while pasting tokens. If the manager later wants to throttle setup text, gate it inside `_handle_setup_input` rather than at the `_edit_field_save` mouth.
+
+**Verify no other PTB call sites call legacy `_auth(user)`:**
+
+```bash
+grep -n "self\._auth(" src/link_project_to_chat/manager/bot.py
+```
+
+Expected: zero matches after this edit. If anything else turns up (e.g., a third ConversationHandler entry that bypasses both `_guard` and `_guard_invocation`), apply the same `identity_from_telegram_user` → `_auth_identity` → `_identity_key` → `_persist_auth_if_dirty` swap.
+
+**Verify rate-limit key consistency:**
+
+```bash
+grep -n "_rate_limited(" src/link_project_to_chat/manager/bot.py
+```
+
+Expected: every call passes `self._identity_key(identity)` (a string), never a raw int from `user.id`. After Task 5 re-keys `_rate_limits` on string keys, a raw int will silently never match — the bucket stays empty and the throttle is bypassed.
+
+**TDD test for this step.** Add to [tests/manager/test_user_commands.py](tests/manager/test_user_commands.py) (the file you create in Step 7):
+
+```python
+async def test_guard_persists_first_contact_identity(tmp_path, monkeypatch):
+    """_guard(update) must persist a first-contact lock from _auth_identity.
+
+    Regression: pre-Task-5 _guard called self._auth(user) which had no
+    persistence tail. After Task 5, _auth_identity may APPEND to
+    locked_identities — without _persist_auth_if_dirty in _guard, the wizard
+    path would lose first-contact locks across restarts.
+    """
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.transport.fake import FakeTransport
+    from types import SimpleNamespace
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(telegram_bot_token="x", allowed_users=[AllowedUser(username="alice")]),
+        cfg_path,
+    )
+    transport = FakeTransport()
+    bot = ManagerBot(transport=transport, config_path=cfg_path)
+    bot._init_auth()
+    bot._allowed_users = [AllowedUser(username="alice")]
+
+    # Construct a minimal Update facade matching what PTB passes _guard.
+    user = SimpleNamespace(id=98765, username="alice", first_name="Alice", is_bot=False)
+    chat = SimpleNamespace(id=98765, type="private")
+    update = SimpleNamespace(effective_user=user, effective_chat=chat)
+
+    assert await bot._guard(update) is True
+    # Identity was first-contact locked AND persisted to disk.
+    from link_project_to_chat.config import load_config
+    reloaded = load_config(cfg_path)
+    alice = next(u for u in reloaded.allowed_users if u.username == "alice")
+    assert "telegram:98765" in alice.locked_identities
+```
+
+Run: `pytest tests/manager/test_user_commands.py::test_guard_persists_first_contact_identity -v`
+Expected (before this step's edits): FAIL — either AttributeError on `_auth`, or the identity isn't persisted.
+Expected (after): PASS.
 
 - [ ] **Step 10: Run tests to verify they pass**
 
