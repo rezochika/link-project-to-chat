@@ -91,3 +91,39 @@ async def test_post_message_form_uses_username_as_display_only(transport: WebTra
     assert len(received) == 1
     assert received[0].sender.handle is None
     assert received[0].sender.display_name == "Alice"
+
+
+async def test_dispatch_uses_server_authenticated_handle_not_form_username(
+    transport: WebTransport,
+):
+    """Only the server-authenticated handle should reach the authorizer."""
+    seen: list[Identity] = []
+
+    async def authorizer(identity: Identity) -> bool:
+        seen.append(identity)
+        return True
+
+    transport.set_authorizer(authorizer)
+
+    received: list[IncomingMessage] = []
+
+    async def handler(msg: IncomingMessage) -> None:
+        received.append(msg)
+
+    transport.on_message(handler)
+
+    await transport._dispatch_event({
+        "event_type": "inbound_message",
+        "chat_id": "default",
+        "payload": {
+            "text": "hello",
+            "sender_native_id": "web-user:bob",
+            "sender_handle": "alice",
+            "authenticated_handle": "bob",
+            "sender_display_name": "Alice Display",
+            "form_username": "alice",
+        },
+    })
+
+    assert seen[0].handle == "bob"
+    assert received[0].sender.handle == "bob"

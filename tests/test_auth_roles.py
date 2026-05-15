@@ -485,3 +485,30 @@ def test_username_fallback_appends_to_identities_per_transport(tmp_path):
     assert bot._auth_identity(web_ident) is True
     assert au.locked_identities == ["telegram:12345", "web:web-session:new-session"]
     assert bot._auth_dirty is True
+
+
+def test_web_user_identity_can_replace_legacy_session_lock():
+    """Server-issued Web auth tokens identify the configured user, not a
+    browser session. A pre-existing legacy web-session lock must not block the
+    stable web-user identity for the same allowed user.
+    """
+    au = AllowedUser(
+        username="alice",
+        role="executor",
+        locked_identities=["web:web-session:old-browser"],
+    )
+    bot = _BotWithRoles(allowed_users=[au])
+    web_ident = Identity(
+        transport_id="web",
+        native_id="web-user:alice",
+        display_name="Alice",
+        handle="alice",
+        is_bot=False,
+    )
+
+    assert bot._auth_identity(web_ident) is True
+    assert au.locked_identities == [
+        "web:web-session:old-browser",
+        "web:web-user:alice",
+    ]
+    assert bot._auth_dirty is True

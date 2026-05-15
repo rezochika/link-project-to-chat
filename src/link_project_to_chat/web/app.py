@@ -10,6 +10,7 @@ import json
 import secrets
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,13 @@ def _new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+@dataclass(frozen=True)
+class _WebAuth:
+    ok: bool
+    supplied_token: str | None = None
+    handle: str | None = None
+
+
 def _session_values(request: Request) -> tuple[str, str]:
     session_id = request.cookies.get(_SESSION_COOKIE) or _new_token()
     csrf_token = request.cookies.get(_CSRF_COOKIE) or _new_token()
@@ -51,24 +59,53 @@ def _attach_session_cookies(response, session_id: str, csrf_token: str) -> None:
     response.set_cookie(_CSRF_COOKIE, csrf_token, httponly=True, samesite="lax")
 
 
-def _valid_web_auth(request: Request, auth_token: str | None) -> bool:
-    if auth_token is None:
-        return True
+def _auth_from_request(
+    request: Request,
+    *,
+    auth_token: str | None,
+    authenticated_handle: str | None,
+    authenticated_handles: dict[str, str] | None,
+) -> _WebAuth:
     supplied = request.query_params.get("token") or request.cookies.get(_AUTH_COOKIE)
-    return bool(supplied) and secrets.compare_digest(supplied, auth_token)
+    if authenticated_handles is not None:
+        if not supplied:
+            return _WebAuth(ok=False)
+        for token, handle in authenticated_handles.items():
+            if secrets.compare_digest(supplied, token):
+                return _WebAuth(ok=True, supplied_token=supplied, handle=handle)
+        return _WebAuth(ok=False)
 
-
-def _require_web_auth(request: Request, auth_token: str | None) -> None:
-    if not _valid_web_auth(request, auth_token):
-        raise HTTPException(status_code=401, detail="Web auth token required")
-
-
-def _attach_auth_cookie(response, request: Request, auth_token: str | None) -> None:
     if auth_token is None:
-        return
-    supplied = request.query_params.get("token")
+        return _WebAuth(ok=True, supplied_token=supplied, handle=authenticated_handle)
     if supplied and secrets.compare_digest(supplied, auth_token):
-        response.set_cookie(_AUTH_COOKIE, auth_token, httponly=True, samesite="lax")
+        return _WebAuth(ok=True, supplied_token=supplied, handle=authenticated_handle)
+    return _WebAuth(ok=False)
+
+
+def _require_web_auth(
+    request: Request,
+    *,
+    auth_token: str | None,
+    authenticated_handle: str | None,
+    authenticated_handles: dict[str, str] | None,
+) -> _WebAuth:
+    auth = _auth_from_request(
+        request,
+        auth_token=auth_token,
+        authenticated_handle=authenticated_handle,
+        authenticated_handles=authenticated_handles,
+    )
+    if not auth.ok:
+        raise HTTPException(status_code=401, detail="Web auth token required")
+    return auth
+
+
+def _attach_auth_cookie(response, request: Request, auth: _WebAuth) -> None:
+    supplied = request.query_params.get("token")
+    if not supplied or not auth.supplied_token:
+        return
+    if secrets.compare_digest(supplied, auth.supplied_token):
+        response.set_cookie(_AUTH_COOKIE, auth.supplied_token, httponly=True, samesite="lax")
 
 
 def _verify_csrf(request: Request, csrf_token: str) -> tuple[str, str]:
@@ -86,10 +123,16 @@ def create_app(
     *,
     authenticated_handle: str | None = None,
     auth_token: str | None = None,
+    authenticated_handles: dict[str, str] | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     templates = Jinja2Templates(directory=_TEMPLATES_DIR)
+    authenticated_handles = (
+        dict(authenticated_handles)
+        if authenticated_handles is not None
+        else None
+    )
 
     @app.get("/")
     async def root():
@@ -97,7 +140,13 @@ def create_app(
 
     @app.get("/chat/{chat_id}", response_class=HTMLResponse)
     async def chat_page(request: Request, chat_id: str):
-        if not _valid_web_auth(request, auth_token):
+        auth = _auth_from_request(
+            request,
+            auth_token=auth_token,
+            authenticated_handle=authenticated_handle,
+            authenticated_handles=authenticated_handles,
+        )
+        if not auth.ok:
             return HTMLResponse("Web auth token required", status_code=401)
         session_id, csrf_token = _session_values(request)
         messages = await store.get_messages(chat_id)
@@ -106,13 +155,18 @@ def create_app(
             "chat.html",
             {"chat_id": chat_id, "messages": messages, "csrf_token": csrf_token},
         )
-        _attach_auth_cookie(response, request, auth_token)
+        _attach_auth_cookie(response, request, auth)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
     @app.get("/chat/{chat_id}/messages", response_class=HTMLResponse)
     async def messages_partial(request: Request, chat_id: str):
-        _require_web_auth(request, auth_token)
+        auth = _require_web_auth(
+            request,
+            auth_token=auth_token,
+            authenticated_handle=authenticated_handle,
+            authenticated_handles=authenticated_handles,
+        )
         session_id, csrf_token = _session_values(request)
         messages = await store.get_messages(chat_id)
         response = templates.TemplateResponse(
@@ -120,7 +174,7 @@ def create_app(
             "messages.html",
             {"messages": messages, "csrf_token": csrf_token},
         )
-        _attach_auth_cookie(response, request, auth_token)
+        _attach_auth_cookie(response, request, auth)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
@@ -133,7 +187,12 @@ def create_app(
         csrf_token: str = Form(""),
         file: UploadFile | None = File(None),
     ):
-        _require_web_auth(request, auth_token)
+        auth = _require_web_auth(
+            request,
+            auth_token=auth_token,
+            authenticated_handle=authenticated_handle,
+            authenticated_handles=authenticated_handles,
+        )
         session_id, _ = _verify_csrf(request, csrf_token)
         files: list[dict] = []
         if file is not None and file.filename:
@@ -171,9 +230,14 @@ def create_app(
             })
         payload = {
             "text": text,
-            "sender_native_id": f"web-session:{session_id}",
+            "sender_native_id": (
+                f"web-user:{auth.handle}"
+                if auth.handle
+                else f"web-session:{session_id}"
+            ),
             "sender_display_name": username or "You",
-            "sender_handle": authenticated_handle,
+            "sender_handle": auth.handle,
+            "authenticated_handle": auth.handle,
             "form_username": username,
             "files": files,
         }
@@ -192,7 +256,12 @@ def create_app(
         value: str = Form(...),
         csrf_token: str = Form(""),
     ):
-        _require_web_auth(request, auth_token)
+        auth = _require_web_auth(
+            request,
+            auth_token=auth_token,
+            authenticated_handle=authenticated_handle,
+            authenticated_handles=authenticated_handles,
+        )
         session_id, _ = _verify_csrf(request, csrf_token)
         await inbound_queue.put({
             "event_type": "button_click",
@@ -200,16 +269,26 @@ def create_app(
             "payload": {
                 "message_id": message_id,
                 "value": value,
-                "sender_native_id": f"web-session:{session_id}",
+                "sender_native_id": (
+                    f"web-user:{auth.handle}"
+                    if auth.handle
+                    else f"web-session:{session_id}"
+                ),
                 "sender_display_name": "You",
-                "sender_handle": authenticated_handle,
+                "sender_handle": auth.handle,
+                "authenticated_handle": auth.handle,
             },
         })
         return HTMLResponse("", status_code=204)
 
     @app.get("/chat/{chat_id}/sse")
     async def chat_sse(request: Request, chat_id: str):
-        _require_web_auth(request, auth_token)
+        _require_web_auth(
+            request,
+            auth_token=auth_token,
+            authenticated_handle=authenticated_handle,
+            authenticated_handles=authenticated_handles,
+        )
         queue: asyncio.Queue = asyncio.Queue()
         sse_queues.setdefault(chat_id, []).append(queue)
 

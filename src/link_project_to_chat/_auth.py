@@ -92,6 +92,14 @@ class AuthMixin:
         for au in self._allowed_users:
             if self._normalize_username(au.username) != uname:
                 continue
+            native_id = str(getattr(identity, "native_id", ""))
+            if identity.transport_id == "web" and native_id.startswith("web-user:"):
+                asserted = self._normalize_username(native_id[len("web-user:"):])
+                if asserted == uname:
+                    if ident_key not in au.locked_identities:
+                        au.locked_identities.append(ident_key)
+                        self._auth_dirty = True
+                    return au.role
             # Same-transport spoof guard. We only username-fallback when the
             # user has NO identity from this transport yet.
             if any(x.startswith(transport_prefix) for x in au.locked_identities):

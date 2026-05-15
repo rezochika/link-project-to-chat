@@ -62,6 +62,44 @@ async def test_chat_page_requires_web_auth_token_when_configured(tmp_path: Path)
         await store.close()
 
 
+async def test_per_user_web_auth_token_sets_server_handle(tmp_path: Path):
+    store = WebStore(tmp_path / "auth-users.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(
+            store,
+            inbound_queue,
+            sse_queues,
+            authenticated_handles={
+                "tok-alice": "alice",
+                "tok-bob": "bob",
+            },
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            denied = await client.get("/chat/default?token=bad")
+            assert denied.status_code == 401
+
+            page = await client.get("/chat/default?token=tok-bob")
+            assert page.status_code == 200
+            token = _csrf_token(page.text)
+
+            resp = await client.post(
+                "/chat/default/message",
+                data={"text": "hello", "csrf_token": token},
+            )
+            assert resp.status_code in (200, 204)
+            event = inbound_queue.get_nowait()
+            assert event["payload"]["sender_native_id"] == "web-user:bob"
+            assert event["payload"]["sender_handle"] == "bob"
+            assert event["payload"]["authenticated_handle"] == "bob"
+    finally:
+        await store.close()
+
+
 def _csrf_token(html: str) -> str:
     match = re.search(r'name="csrf_token" value="([^"]+)"', html)
     assert match is not None

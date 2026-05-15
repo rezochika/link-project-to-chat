@@ -216,10 +216,10 @@ async def test_rejected_message_cleans_payload_files(transport: WebTransport, tm
 
 
 async def test_web_transport_warns_critically_on_non_loopback_bind(tmp_path, caplog):
-    """CA-1: there is no in-app authentication gate. Binding to a
-    non-loopback address without an external reverse proxy is a deploy
-    misconfiguration; the transport must log at CRITICAL so the operator
-    cannot miss the gap.
+    """CA-1: bearer-token web auth is not enough for public exposure.
+    Binding to a non-loopback address without an external reverse proxy is a
+    deploy misconfiguration; the transport must log at CRITICAL so the
+    operator cannot miss the gap.
     """
     with caplog.at_level("CRITICAL", logger="link_project_to_chat.web.transport"):
         t = WebTransport(

@@ -62,6 +62,7 @@ class WebTransport:
         port: int = 8080,
         authenticated_handle: str | None = None,
         auth_token: str | None = None,
+        authenticated_handles: dict[str, str] | None = None,
     ) -> None:
         self._db_path = db_path
         self._bot_identity = bot_identity
@@ -69,24 +70,39 @@ class WebTransport:
         self._port = port
         self._authenticated_handle = authenticated_handle
         self._auth_token = auth_token
+        self._authenticated_handles = (
+            dict(authenticated_handles)
+            if authenticated_handles is not None
+            else None
+        )
 
         # CA-1: WebTransport currently has no in-app authentication. Every
         # browser session that can reach the HTTP listener is mapped to
-        # `authenticated_handle` (typically the single allowed username) and
-        # passes the authorizer. The default bind is loopback, so the
+        # a server-selected authenticated handle and passes the authorizer.
+        # The default bind is loopback, so the
         # implicit trust boundary is "anyone on the host". Binding to a
         # non-loopback address without an external auth proxy is a deploy
         # misconfiguration; loud-log so operators can't miss it.
         if host not in ("127.0.0.1", "localhost", "::1"):
             logger.critical(
                 "WebTransport is binding to a non-loopback host (%r) but has "
-                "NO in-app authentication. Anyone who can reach this listener "
-                "is treated as the configured allowed user. Put the bot "
+                "only bearer-token web authentication. Anyone with a valid "
+                "URL token can reach the remote-shell surface. Put the bot "
                 "behind an authenticating reverse proxy or restrict the "
                 "network with a firewall.",
                 host,
             )
-        if auth_token is not None:
+        if self._authenticated_handles is not None:
+            for token, handle in self._authenticated_handles.items():
+                logger.warning(
+                    "Web UI auth token enabled for %s. Open "
+                    "http://%s:%s/chat/default?token=%s",
+                    handle,
+                    host,
+                    port,
+                    token,
+                )
+        elif auth_token is not None:
             logger.warning(
                 "Web UI auth token enabled. Open http://%s:%s/chat/default?token=%s",
                 host,
@@ -124,6 +140,7 @@ class WebTransport:
             self._sse_queues,
             authenticated_handle=self._authenticated_handle,
             auth_token=self._auth_token,
+            authenticated_handles=self._authenticated_handles,
         )
         config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         self._uvicorn_server = uvicorn.Server(config)
@@ -338,11 +355,14 @@ class WebTransport:
         payload = event.get("payload", {})
         payload_files = payload.get("files", [])
         files_handed_to_message = False
+        authenticated_handle = payload.get("authenticated_handle")
+        if authenticated_handle is None:
+            authenticated_handle = self._authenticated_handle
         sender = Identity(
             transport_id=self.TRANSPORT_ID,
             native_id=payload.get("sender_native_id", BROWSER_USER_ID),
             display_name=payload.get("sender_display_name", "You"),
-            handle=self._authenticated_handle,
+            handle=authenticated_handle,
             is_bot=False,
         )
         # Authorizer gate: silently drop if rejected. Mirrors the C2 DoS-defense

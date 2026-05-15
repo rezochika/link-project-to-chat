@@ -3053,16 +3053,24 @@ class ProjectBot(AuthMixin):
             )
             db_path = Path.home() / ".link-project-to-chat" / "web" / f"{self.name}.db"
             db_path.parent.mkdir(parents=True, exist_ok=True)
+            web_auth_token = None
+            web_authenticated_handle = None
+            web_authenticated_handles = None
+            if len(self._allowed_users) == 1:
+                web_auth_token = secrets.token_urlsafe(32)
+                web_authenticated_handle = self._allowed_users[0].username
+            else:
+                web_authenticated_handles = {
+                    secrets.token_urlsafe(32): user.username
+                    for user in self._allowed_users
+                }
             self._transport = WebTransport(
                 db_path=db_path,
                 bot_identity=bot_identity,
                 port=self.web_port,
-                authenticated_handle=(
-                    self._allowed_users[0].username
-                    if len(self._allowed_users) == 1
-                    else None
-                ),
-                auth_token=secrets.token_urlsafe(32),
+                authenticated_handle=web_authenticated_handle,
+                auth_token=web_auth_token,
+                authenticated_handles=web_authenticated_handles,
             )
             self._app = None  # WebTransport has no PTB Application
         else:
