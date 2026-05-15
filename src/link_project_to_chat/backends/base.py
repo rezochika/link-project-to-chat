@@ -57,6 +57,27 @@ class BaseBackend:
     # bot.py's gate falls through to "this backend doesn't support /model".
     MODEL_OPTIONS: list[tuple[str, str, str]] = []
 
+    # Process-essentials forwarded to every backend subprocess. Anything outside
+    # this list (and outside the per-backend `_env_keep_patterns`) is dropped —
+    # allowlist semantics, so an arbitrary host env var like PGPASSWORD or
+    # OPENID_CLIENT_SECRET cannot leak into the agent CLI.
+    _env_baseline_patterns: Sequence[str] = (
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+        "LANG", "LANGUAGE", "LC_*", "TZ", "TERM",
+        "TMPDIR", "TMP", "TEMP",
+        "XDG_*",
+        "PWD", "OLDPWD",
+        "HOSTNAME",
+        # Node/npm runtime — the Claude/Codex CLIs are node binaries.
+        "NODE_*", "NPM_*", "NVM_DIR", "NVM_BIN",
+        # Python runtime — some backends are Python.
+        "PYTHONPATH", "PYTHONHOME", "PYTHONUNBUFFERED",
+        # SSL/TLS cert configuration commonly required for HTTPS.
+        "SSL_CERT_*", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        # HTTP proxy — operators commonly require proxy passthrough.
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+    )
     _env_keep_patterns: Sequence[str] = ()
     _env_scrub_patterns: Sequence[str] = ()
 
@@ -69,8 +90,16 @@ class BaseBackend:
         env.pop("CLAUDE_CODE_ENTRYPOINT", None)
         for key in list(env):
             if self._matches(key, self._env_keep_patterns):
+                # Backend-specific keep wins over scrub (e.g. Codex needs
+                # OPENAI_API_KEY despite the *_KEY scrub pattern).
+                continue
+            if not self._matches(key, self._env_baseline_patterns):
+                del env[key]
                 continue
             if self._matches(key, self._env_scrub_patterns):
+                # Defense-in-depth: scrub still applies to baseline-allowed
+                # keys, in case a future baseline pattern accidentally
+                # matches a token-shaped name.
                 del env[key]
         return env
 
