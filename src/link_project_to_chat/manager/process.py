@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.parse
 from collections.abc import Callable
 from pathlib import Path
 
@@ -261,8 +262,25 @@ class ProcessManager:
         else:
             logger.warning("%s exited with code %d", name, returncode)
 
+    @staticmethod
+    def _safe_pidfile_basename(key: str) -> str:
+        """Filesystem-safe encoding of a process key for pidfile naming.
+
+        Uses RFC-3986 percent-encoding with no safe characters, so the result
+        only contains [A-Za-z0-9-_.~%]. That keeps team keys (which embed `:`)
+        usable on NTFS, where `:` is reserved for alternate data streams. The
+        inverse via `_key_from_pidfile_basename` round-trips losslessly.
+        """
+        return urllib.parse.quote(key, safe="")
+
+    @staticmethod
+    def _key_from_pidfile_basename(basename: str) -> str:
+        """Inverse of `_safe_pidfile_basename`: the pidfile basename minus
+        the `.pid` extension, percent-decoded back to the original key."""
+        return urllib.parse.unquote(basename)
+
     def _pidfile_path(self, name: str) -> Path:
-        return self._run_dir / f"{name}.pid"
+        return self._run_dir / f"{self._safe_pidfile_basename(name)}.pid"
 
     def _write_pidfile(self, name: str, pid: int) -> None:
         try:
@@ -440,7 +458,7 @@ class ProcessManager:
         if not self._run_dir.exists():
             return adopted
         for pidfile in sorted(self._run_dir.glob("*.pid")):
-            name = pidfile.stem
+            name = self._key_from_pidfile_basename(pidfile.stem)
             try:
                 pid = int(pidfile.read_text().strip())
             except (OSError, ValueError):
@@ -477,6 +495,38 @@ class ProcessManager:
 
     def list_all(self) -> list[tuple[str, str]]:
         return [(name, self.status(name)) for name in self._load_projects()]
+
+    def list_running(self) -> list[str]:
+        """All currently-running keys (project names AND ``team:NAME:ROLE``).
+
+        ``list_all`` only iterates configured projects, so it misses team-bot
+        subprocesses that live in self._processes under ``team:NAME:ROLE``
+        keys. Callers that need to act on every live bot (e.g. user-mutation
+        restart) iterate this instead.
+        """
+        return [
+            name for name, proc in list(self._processes.items())
+            if proc.poll() is None
+        ]
+
+    def restart(self, key: str) -> bool:
+        """Stop and re-spawn a bot, dispatching on key prefix.
+
+        ``team:NAME:ROLE`` keys go through ``start_team(NAME, ROLE)``;
+        anything else through ``start(name)``. Returns True iff the start
+        leg succeeded after the stop. Callers (notably the manager's
+        ``_restart_running_bots_for_user_mutation``) use this so they don't
+        have to know how the key is shaped.
+        """
+        self.stop(key)
+        if key.startswith("team:"):
+            try:
+                _, team_name, role = key.split(":", 2)
+            except ValueError:
+                logger.warning("malformed team key %r passed to restart()", key)
+                return False
+            return self.start_team(team_name, role)
+        return self.start(key)
 
     def start_all(self) -> int:
         return sum(1 for name in self._load_projects() if self.start(name))

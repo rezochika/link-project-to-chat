@@ -249,11 +249,14 @@ def test_start_team_writes_pidfile_under_team_key(tmp_path: Path):
         mock_popen.return_value = mock_proc
         assert pm.start_team("demo", "dev") is True
 
-    pidfile = run_dir / "team:demo:dev.pid"
+    # Filename must be filesystem-safe: `:` is reserved on NTFS (alternate
+    # data streams). The pidfile name uses urllib percent-encoding so the
+    # team key round-trips losslessly via _key_from_pidfile_basename.
+    pidfile = run_dir / "team%3Ademo%3Adev.pid"
     assert pidfile.exists()
+    assert ":" not in pidfile.name
     assert int(pidfile.read_text().strip()) == 4242
-    # And Path.stem round-trips the team key for reap_orphans:
-    assert pidfile.stem == "team:demo:dev"
+    assert ProcessManager._key_from_pidfile_basename(pidfile.stem) == "team:demo:dev"
 
 
 def test_reap_orphans_adopts_team_orphan(tmp_path: Path):
@@ -272,7 +275,7 @@ def test_reap_orphans_adopts_team_orphan(tmp_path: Path):
         **_process_popen_kwargs(),
     )
     try:
-        (run_dir / "team:t1:dev.pid").write_text(str(orphan.pid))
+        (run_dir / "team%3At1%3Adev.pid").write_text(str(orphan.pid))
         pm = ProcessManager(
             project_config_path=_proj_cfg(tmp_path, {}),
             run_dir=run_dir,
@@ -281,7 +284,7 @@ def test_reap_orphans_adopts_team_orphan(tmp_path: Path):
         assert "team:t1:dev" in adopted
         assert pm.status("team:t1:dev") == "running"
         assert pm.stop("team:t1:dev") is True
-        assert not (run_dir / "team:t1:dev.pid").exists()
+        assert not (run_dir / "team%3At1%3Adev.pid").exists()
     finally:
         if orphan.poll() is None:
             orphan.kill()
@@ -320,13 +323,86 @@ def test_start_team_refuses_when_pidfile_points_at_live_process(tmp_path: Path):
         **_process_popen_kwargs(),
     )
     try:
-        (run_dir / "team:t1:mgr.pid").write_text(str(orphan.pid))
+        (run_dir / "team%3At1%3Amgr.pid").write_text(str(orphan.pid))
         pm = ProcessManager(project_config_path=cfg_path, run_dir=run_dir)
         assert pm.start_team("t1", "mgr") is False
     finally:
         if orphan.poll() is None:
             orphan.kill()
             orphan.wait(timeout=5)
+
+
+def test_pidfile_basename_encoding_is_filesystem_safe():
+    """Round-trip via the encoding helpers must preserve the original key
+    while producing a basename free of NTFS-reserved characters."""
+    encoded = ProcessManager._safe_pidfile_basename("team:foo:bar")
+    assert ":" not in encoded
+    assert "/" not in encoded
+    assert "\\" not in encoded
+    decoded = ProcessManager._key_from_pidfile_basename(encoded)
+    assert decoded == "team:foo:bar"
+
+    # Plain project names with no reserved chars survive untouched.
+    assert ProcessManager._safe_pidfile_basename("plain_proj") == "plain_proj"
+    assert ProcessManager._key_from_pidfile_basename("plain_proj") == "plain_proj"
+
+
+def test_list_running_includes_team_keys(tmp_path: Path):
+    """list_all() only iterates configured projects, missing team:NAME:ROLE
+    entries in self._processes. list_running() must surface BOTH so callers
+    that need to act on every live bot (user-mutation restart) see teams."""
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {"proj_a": {"path": str(tmp_path)}}),
+        command_builder=lambda n, c: _sleep_cmd(),
+        run_dir=tmp_path / "run",
+    )
+    pm.start("proj_a")
+    try:
+        # Inject a fake live team-bot entry without going through start_team
+        # (which would require Telethon machinery here).
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        pm._processes["team:demo:dev"] = fake_proc
+
+        running = pm.list_running()
+        assert "proj_a" in running
+        assert "team:demo:dev" in running
+    finally:
+        pm._processes.pop("team:demo:dev", None)
+        pm.stop("proj_a")
+
+
+def test_restart_dispatches_team_keys_through_start_team(tmp_path: Path):
+    """restart('team:NAME:ROLE') must route through start_team(NAME, ROLE).
+    Without dispatch, _pm.start('team:foo:bar') falls through _load_projects()
+    and returns False, so the team bot stays in its old (stale-config) state."""
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {}),
+        run_dir=tmp_path / "run",
+    )
+    with patch.object(pm, "stop", return_value=True) as stop_mock, \
+         patch.object(pm, "start_team", return_value=True) as start_team_mock, \
+         patch.object(pm, "start", return_value=True) as start_mock:
+        ok = pm.restart("team:foo:bar")
+    assert ok is True
+    stop_mock.assert_called_once_with("team:foo:bar")
+    start_team_mock.assert_called_once_with("foo", "bar")
+    start_mock.assert_not_called()
+
+
+def test_restart_dispatches_project_keys_through_start(tmp_path: Path):
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {}),
+        run_dir=tmp_path / "run",
+    )
+    with patch.object(pm, "stop", return_value=True) as stop_mock, \
+         patch.object(pm, "start_team", return_value=True) as start_team_mock, \
+         patch.object(pm, "start", return_value=True) as start_mock:
+        ok = pm.restart("plain_proj")
+    assert ok is True
+    stop_mock.assert_called_once_with("plain_proj")
+    start_mock.assert_called_once_with("plain_proj")
+    start_team_mock.assert_not_called()
 
 
 def test_start_autostart_skips_adopted_orphan(tmp_path: Path):
