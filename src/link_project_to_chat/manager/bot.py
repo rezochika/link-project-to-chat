@@ -2490,9 +2490,26 @@ class ManagerBot(AuthMixin):
             projects[name]["plugins"] = plugins
             self._save_projects(projects)
             assert self._transport is not None
+            # Synchronize the running project bot with the freshly-saved
+            # plugin set. Without this, a 'disabled' plugin keeps serving
+            # commands until the operator notices and restarts manually —
+            # the security policy and the runtime state silently disagree.
+            footer = "Will take effect on next start (project bot is not running)."
+            if self._pm.status(name) == "running":
+                self._pm.stop(name)
+                if self._pm.start(name):
+                    footer = "Restart applied — bot is now running with the new plugin set."
+                else:
+                    footer = (
+                        "Plugin set saved, but the project bot failed to "
+                        "restart. Start it manually to apply changes."
+                    )
             await self._transport.edit_text(
                 click.message,
-                f"Plugins for '{name}':\n✓ = active, + = available\n\nRestart required after changes.",
+                (
+                    f"Plugins for '{name}':\n✓ = active, + = available\n\n"
+                    f"{footer}"
+                ),
                 buttons=self._plugins_buttons(name),
             )
 

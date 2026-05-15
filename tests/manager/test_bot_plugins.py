@@ -84,3 +84,65 @@ async def test_viewer_cannot_toggle_plugin(monkeypatch, tmp_path):
     assert save_called == []
     text = bot._transport.send_text.await_args.args[1].lower()
     assert "read-only" in text or "executor" in text
+
+
+def _executor_click(value: str):
+    from link_project_to_chat.transport.base import (
+        ButtonClick, ChatKind, ChatRef, Identity, MessageRef,
+    )
+    sender = Identity(
+        transport_id="telegram", native_id="1",
+        display_name="Admin", handle="admin", is_bot=False,
+    )
+    chat = ChatRef(transport_id="telegram", native_id="42", kind=ChatKind.DM)
+    msg = MessageRef(transport_id="telegram", native_id="100", chat=chat)
+    return ButtonClick(chat=chat, message=msg, sender=sender, value=value)
+
+
+@pytest.mark.asyncio
+async def test_executor_toggle_restarts_running_bot(monkeypatch):
+    """Toggling a plugin on an actively-running project must stop+start the
+    project bot so the in-memory plugin set matches the freshly-saved config.
+    Without that, a 'disabled' plugin keeps serving requests until the operator
+    notices and restarts manually."""
+    bot = _make_manager(monkeypatch, projects={"myp": {"plugins": []}})
+    bot._transport = MagicMock()
+    bot._transport.send_text = AsyncMock()
+    bot._transport.edit_text = AsyncMock()
+    bot._pm = MagicMock()
+    bot._pm.status = MagicMock(return_value="running")
+    bot._pm.stop = MagicMock(return_value=True)
+    bot._pm.start = MagicMock(return_value=True)
+    monkeypatch.setattr(bot, "_save_projects", lambda p: None)
+    monkeypatch.setattr(bot, "_plugins_buttons", lambda name: None)
+
+    await bot._on_button_from_transport(_executor_click("proj_ptog_demo|myp"))
+
+    bot._pm.stop.assert_called_once_with("myp")
+    bot._pm.start.assert_called_once_with("myp")
+    edit_text = bot._transport.edit_text.await_args.args[1].lower()
+    assert "restart" in edit_text and "applied" in edit_text
+
+
+@pytest.mark.asyncio
+async def test_executor_toggle_when_stopped_does_not_call_pm_start(monkeypatch):
+    """When the project bot is not running, the toggle just persists the
+    config and surfaces 'will take effect on next start'. We must NOT
+    auto-start a stopped bot — that would silently undo a deliberate stop."""
+    bot = _make_manager(monkeypatch, projects={"myp": {"plugins": []}})
+    bot._transport = MagicMock()
+    bot._transport.send_text = AsyncMock()
+    bot._transport.edit_text = AsyncMock()
+    bot._pm = MagicMock()
+    bot._pm.status = MagicMock(return_value="stopped")
+    bot._pm.stop = MagicMock(return_value=False)
+    bot._pm.start = MagicMock(return_value=False)
+    monkeypatch.setattr(bot, "_save_projects", lambda p: None)
+    monkeypatch.setattr(bot, "_plugins_buttons", lambda name: None)
+
+    await bot._on_button_from_transport(_executor_click("proj_ptog_demo|myp"))
+
+    bot._pm.stop.assert_not_called()
+    bot._pm.start.assert_not_called()
+    edit_text = bot._transport.edit_text.await_args.args[1].lower()
+    assert "next start" in edit_text or "not running" in edit_text
