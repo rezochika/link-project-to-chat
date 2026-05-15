@@ -6,9 +6,12 @@ import subprocess
 from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 from ..events import StreamEvent
+
+if TYPE_CHECKING:
+    from ..team_safety import TeamAuthority
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ class AgentBackend(Protocol):
     # Team-mode routing instructions. ProjectBot sets this for every backend;
     # each backend decides how to inject it into its own CLI surface.
     team_system_note: str | None
+    team_authority: TeamAuthority | None
 
     async def chat_stream(
         self,

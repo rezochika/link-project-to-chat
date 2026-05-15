@@ -90,6 +90,8 @@ class TeamConfig:
     group_chat_id: int = 0  # 0 = sentinel "not yet captured"
     bots: dict[str, TeamBotConfig] = field(default_factory=dict)
     room: RoomBinding | None = None
+    max_autonomous_turns: int = 5
+    safety_mode: str = "strict"
 
 
 @dataclass
@@ -639,6 +641,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     role: _make_team_bot_config(b)
                     for role, b in team.get("bots", {}).items()
                 },
+                max_autonomous_turns=int(team.get("max_autonomous_turns", 5)),
+                safety_mode=team.get("safety_mode", "strict"),
             )
             # Backward-compat migration: synthesize a Telegram RoomBinding from
             # the legacy ``group_chat_id`` field so new code can prefer
@@ -832,6 +836,8 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         entry = existing_teams.get(name, {})
         entry["path"] = team.path
         entry["group_chat_id"] = team.group_chat_id
+        entry["max_autonomous_turns"] = team.max_autonomous_turns
+        entry["safety_mode"] = team.safety_mode
         if team.room is not None:
             entry["room"] = {
                 "transport_id": team.room.transport_id,
@@ -1017,6 +1023,8 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
                         role: _make_team_bot_config(b)
                         for role, b in team.get("bots", {}).items()
                     },
+                    max_autonomous_turns=int(team.get("max_autonomous_turns", 5)),
+                    safety_mode=team.get("safety_mode", "strict"),
                 )
                 for name, team in raw.get("teams", {}).items()
             }

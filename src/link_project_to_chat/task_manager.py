@@ -317,6 +317,7 @@ class TaskManager:
     async def _run_agent_turn(self, task: Task, backend: AgentBackend | None = None) -> None:
         """Run one turn of agent conversation, collecting events."""
         collected_text: list[str] = []
+        saw_result = False
         task.pending_questions = []
         active_backend = backend or task._backend or self._backend
 
@@ -336,12 +337,13 @@ class TaskManager:
             elif isinstance(event, AskQuestion):
                 task.pending_questions.extend(event.questions)
             elif isinstance(event, Result):
+                saw_result = True
                 task.result = event.text
             elif isinstance(event, Error):
                 raise RuntimeError(_scrub_error_message(event.message))
 
-        if not task.result:
-            task.result = "".join(collected_text) or "[No response]"
+        if task.result is None and not saw_result:
+            task.result = "".join(collected_text)
 
     async def answer_question(self, task_id: int, answer: str) -> None:
         """Send the user's answer to a WAITING_INPUT task and continue."""

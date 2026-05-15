@@ -30,6 +30,25 @@ from link_project_to_chat.transport.fake import FakeTransport
 from tests.backends.fakes import FakeBackend
 
 
+def test_render_team_safety_block_shows_grants():
+    from link_project_to_chat.bot import _render_team_safety_block
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    authority = TeamAuthority("lpct")
+    authority.record_user_message(7, "--auth push")
+
+    rendered = _render_team_safety_block(
+        authority=authority,
+        consecutive_turns=2,
+        max_autonomous_turns=5,
+    )
+
+    assert "Team safety: strict" in rendered
+    assert "Autonomous turns: 2 / 5" in rendered
+    assert "push" in rendered
+    assert "msg #7" in rendered
+
+
 def _chat() -> ChatRef:
     return ChatRef(transport_id="fake", native_id="42", kind=ChatKind.DM)
 

@@ -6,6 +6,7 @@ import subprocess
 import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..events import Error, Result, StreamEvent, TextDelta
 from .base import BackendCapabilities, BackendStatus, BaseBackend, HealthStatus
@@ -13,6 +14,9 @@ from .codex_parser import parse_codex_line
 from .factory import register
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..team_safety import TeamAuthority
 
 
 class CodexStreamError(Exception):
@@ -77,6 +81,7 @@ class CodexBackend(BaseBackend):
         self.effort: str | None = state.get("effort")
         self.permissions: str | None = state.get("permissions")
         self.team_system_note: str | None = None
+        self.team_authority: TeamAuthority | None = None
         self._proc: subprocess.Popen | None = None
         self._started_at: float | None = None
         self._last_message: str | None = None
@@ -131,6 +136,10 @@ class CodexBackend(BaseBackend):
         if mode in ("acceptEdits", "dontAsk", "auto"):
             return ["--full-auto"]
         if mode in ("bypassPermissions", "dangerously-skip-permissions"):
+            if self.team_system_note:
+                if self.team_authority is not None and self.team_authority.consume_grant("all"):
+                    return ["--dangerously-bypass-approvals-and-sandbox"]
+                return ["--full-auto"]
             return ["--dangerously-bypass-approvals-and-sandbox"]
         raise ValueError(f"Unsupported Codex permissions mode: {mode}")
 
@@ -206,7 +215,7 @@ class CodexBackend(BaseBackend):
                     # manager logs. \n\n between non-empty parts renders them
                     # as visibly distinct paragraphs in the chat.
                     yield Result(
-                        text="\n\n".join(t for t in collected_text if t) or "[No response]",
+                        text="\n\n".join(t for t in collected_text if t),
                         session_id=self.session_id,
                         model=self.model_display,
                     )
@@ -265,7 +274,7 @@ class CodexBackend(BaseBackend):
                 result_text = event.text
             elif isinstance(event, Error):
                 raise CodexStreamError(event.message)
-        return result_text or "[No response]"
+        return result_text
 
     async def probe_health(self) -> HealthStatus:
         try:

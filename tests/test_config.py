@@ -897,3 +897,35 @@ def test_save_config_drops_phantom_project_on_next_write(tmp_path: Path):
     raw = json.loads(p.read_text())
     assert "acme_manager" not in raw["projects"]
     assert "good" in raw["projects"]
+
+
+def test_team_config_safety_defaults():
+    from link_project_to_chat.config import TeamConfig
+
+    team = TeamConfig(path="/tmp/project")
+    assert team.max_autonomous_turns == 5
+    assert team.safety_mode == "strict"
+
+
+def test_team_config_load_save_preserves_safety_fields(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({
+        "teams": {
+            "lpct": {
+                "path": "/tmp/lpct",
+                "group_chat_id": -1001,
+                "max_autonomous_turns": 3,
+                "safety_mode": "strict",
+                "bots": {},
+            }
+        }
+    }))
+
+    cfg = load_config(cfg_path)
+    assert cfg.teams["lpct"].max_autonomous_turns == 3
+    assert cfg.teams["lpct"].safety_mode == "strict"
+
+    save_config(cfg, cfg_path)
+    raw = json.loads(cfg_path.read_text())
+    assert raw["teams"]["lpct"]["max_autonomous_turns"] == 3
+    assert raw["teams"]["lpct"]["safety_mode"] == "strict"

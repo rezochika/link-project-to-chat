@@ -624,6 +624,29 @@ async def test_enable_team_relay_lifecycle():
     assert removed_callbacks == ["_on_new_message", "_on_message_edited"]
 
 
+async def test_enable_team_relay_passes_safety_options():
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    t, _bot = _make_transport_with_mock_bot()
+    authority = TeamAuthority(team_name="acme")
+    mock_client = MagicMock()
+
+    t.enable_team_relay(
+        telethon_client=mock_client,
+        team_bot_usernames={"bot_a", "bot_b"},
+        group_chat_id=-100123,
+        team_name="acme",
+        max_autonomous_turns=9,
+        team_authority=authority,
+        authenticated_user_id=42,
+    )
+
+    assert t._team_relay is not None
+    assert t._team_relay._max_autonomous_turns == 9
+    assert t._team_relay._team_authority is authority
+    assert t._team_relay._authenticated_user_id == "42"
+
+
 async def test_post_hooks_run_ready_callbacks_and_team_relay_for_run_polling():
     """Application.run_polling() uses post hooks rather than TelegramTransport.start()."""
     t, bot = _make_transport_with_mock_bot()

@@ -53,6 +53,7 @@ def test_backend_contract_declares_name_and_capabilities(tmp_path):
     backend = FakeBackend(tmp_path)
     assert isinstance(backend.name, str)
     assert backend.capabilities is not None
+    assert hasattr(backend, "team_authority")
 
 
 @pytest.mark.parametrize(

@@ -34,6 +34,7 @@ class FakeBackend:
         self.disallowed_tools: list[str] = []
         self.append_system_prompt: str | None = None
         self.team_system_note: str | None = None
+        self.team_authority = None
         self.show_thinking: bool = False
         self.turns = list(turns or [[Result(text="ok", session_id=None, model=None)]])
         self.inputs: list[str] = []

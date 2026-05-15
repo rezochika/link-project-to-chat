@@ -48,6 +48,7 @@ from .backends.claude import (
     ClaudeStreamError,
     is_usage_cap_error,
 )
+from .team_safety import TeamAuthority
 from .transport import Button, Buttons, ChatKind, ChatRef, Identity, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
@@ -84,6 +85,28 @@ COMMANDS = [
 ]
 
 _CMD_HELP = "\n".join(f"/{name} - {desc}" for name, desc in COMMANDS)
+
+
+def _render_team_safety_block(
+    authority: TeamAuthority,
+    consecutive_turns: int,
+    max_autonomous_turns: int,
+) -> str:
+    snap = authority.status_snapshot
+    lines = [
+        "Team safety: strict",
+        f"Autonomous turns: {consecutive_turns} / {max_autonomous_turns}",
+    ]
+    if snap["active_grants"]:
+        lines.append("Active grants:")
+        for grant in snap["active_grants"]:
+            scopes = ", ".join(grant["scopes"])
+            lines.append(
+                f"- {scopes} ({grant['age_seconds']}s ago, msg #{grant['user_message_id']})"
+            )
+    else:
+        lines.append("Active grants: none")
+    return "\n".join(lines)
 
 
 def _parse_task_id(data: str) -> int:
@@ -224,6 +247,7 @@ class ProjectBot(AuthMixin):
         self.role = role
         self.peer_bot_username = peer_bot_username
         self.bot_username: str = ""  # populated in _after_ready via transport.on_ready
+        self._team_authority: TeamAuthority | None = None
         # Tell Claude about its own + peer @handle so it uses the correct
         # usernames instead of placeholders ("@developer") or hallucinating a
         # pre-suffix-bump name it remembers from the persona. Called once here
@@ -1618,7 +1642,11 @@ class ProjectBot(AuthMixin):
         backend = self.task_manager.backend
         if not self.peer_bot_username:
             backend.team_system_note = None
+            backend.team_authority = None
             return
+        if self._team_authority is None:
+            self._team_authority = TeamAuthority(team_name=self.team_name or self.name)
+        backend.team_authority = self._team_authority
         peer_role = "developer" if self.role == "manager" else "manager"
         self_line = (
             f"Your own Telegram @handle in this group is @{self.bot_username}. "
@@ -2281,6 +2309,12 @@ class ProjectBot(AuthMixin):
         last_error = st.get("last_error")
         if last_error:
             lines.append(f"Last error: {self._short_status_value(str(last_error))}")
+        authority = getattr(backend, "team_authority", None)
+        if authority is not None:
+            consecutive = getattr(self._transport, "team_relay_consecutive_bot_turns", 0)
+            max_turns = getattr(self._transport, "team_relay_max_autonomous_turns", 5)
+            lines.append("")
+            lines.append(_render_team_safety_block(authority, consecutive, max_turns))
         lines.extend([
             f"Skill: {self._active_skill or 'none'}",
             f"Persona: {self._active_persona or 'none'}",
@@ -2612,6 +2646,8 @@ class ProjectBot(AuthMixin):
                     team_bot_usernames = {
                         b.bot_username for b in team.bots.values() if b.bot_username
                     } if team else set()
+                    trusted_user_ids = self._get_trusted_user_ids()
+                    authenticated_user_id = trusted_user_ids[0] if trusted_user_ids else None
                     if not team_bot_usernames:
                         logger.warning(
                             "Team %r missing from config or has no bot usernames; "
@@ -2626,6 +2662,9 @@ class ProjectBot(AuthMixin):
                             team_bot_usernames=team_bot_usernames,
                             group_chat_id=self.group_chat_id,
                             team_name=self.team_name,
+                            max_autonomous_turns=team.max_autonomous_turns if team else 5,
+                            team_authority=self._team_authority,
+                            authenticated_user_id=authenticated_user_id,
                         )
                     else:
                         self._transport.enable_team_relay_from_session(
@@ -2635,6 +2674,9 @@ class ProjectBot(AuthMixin):
                             team_bot_usernames=team_bot_usernames,
                             group_chat_id=self.group_chat_id,
                             team_name=self.team_name,
+                            max_autonomous_turns=team.max_autonomous_turns if team else 5,
+                            team_authority=self._team_authority,
+                            authenticated_user_id=authenticated_user_id,
                         )
 
     def run(self) -> None:

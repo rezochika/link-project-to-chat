@@ -8,6 +8,7 @@ import subprocess
 import time
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..events import Error, Result, StreamEvent
 from .base import BackendCapabilities, BackendStatus, BaseBackend, HealthStatus
@@ -15,6 +16,9 @@ from .claude_parser import parse_stream_line
 from .factory import register
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..team_safety import TeamAuthority
 
 
 class ClaudeStreamError(Exception):
@@ -96,6 +100,13 @@ _ASK_DISMISSED_HINT = (
     "Instead, output the question clearly as text and wait. "
     "The user's answer will arrive as a follow-up message."
 )
+
+_TEAM_DISALLOWED_TOOLS: dict[str, tuple[str, ...]] = {
+    "push": ("Bash(git push:*)", "Bash(git push)", "Bash(gh pr merge:*)"),
+    "pr_create": ("Bash(gh pr create:*)",),
+    "release": ("Bash(gh release create:*)",),
+    "network": ("Bash(curl:*)", "Bash(wget:*)", "Bash(gh workflow run:*)"),
+}
 
 # Tells the agent it is running inside this Telegram bot so it adapts output, suggests
 # bot commands when relevant, and treats the channel-carrying files as fragile. The
@@ -223,6 +234,7 @@ class ClaudeBackend(BaseBackend):
         # awareness preamble so it survives `/use <skill>` overwriting
         # append_system_prompt.
         self.team_system_note: str | None = None
+        self.team_authority: TeamAuthority | None = None
         self.session_id: str | None = None
         self.show_thinking: bool = False
         self._proc: subprocess.Popen | None = None
@@ -256,7 +268,7 @@ class ClaudeBackend(BaseBackend):
             "--include-partial-messages",
         ]
 
-        if self.skip_permissions:
+        if self.skip_permissions and not self.team_system_note:
             cmd.append("--dangerously-skip-permissions")
 
         if self.permission_mode:
@@ -265,8 +277,15 @@ class ClaudeBackend(BaseBackend):
         if self.allowed_tools:
             cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
 
-        if self.disallowed_tools:
-            cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
+        effective_disallowed = list(self.disallowed_tools)
+        if self.team_system_note:
+            for scope, patterns in _TEAM_DISALLOWED_TOOLS.items():
+                if self.team_authority is not None and self.team_authority.is_authorized(scope):
+                    continue
+                effective_disallowed.extend(patterns)
+
+        if effective_disallowed:
+            cmd.extend(["--disallowedTools", ",".join(effective_disallowed)])
 
         # Combine Telegram awareness, AskUserQuestion hint, team context (if any),
         # and any user/skill prompt.
@@ -330,7 +349,7 @@ class ClaudeBackend(BaseBackend):
                 result_text = event.text
             elif isinstance(event, Error):
                 raise ClaudeStreamError(event.message)
-        return result_text or "[No response]"
+        return result_text
 
     async def probe_health(self) -> HealthStatus:
         """Send a trivial prompt to verify the backend is reachable.

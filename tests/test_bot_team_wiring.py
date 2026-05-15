@@ -1217,6 +1217,8 @@ def _make_team_bot_for_relay_test(tmp_path) -> ProjectBot:
         role="dev",
         group_chat_id=-100123,
         peer_bot_username="acme_manager_bot",
+        allowed_username="rezoc",
+        trusted_user_id=42,
     )
 
 
@@ -1233,6 +1235,7 @@ def _stub_team_config_with_two_bots():
         "acme": TeamConfig(
             path="/tmp/acme",
             group_chat_id=-100123,
+            max_autonomous_turns=7,
             bots={
                 "manager": TeamBotConfig(
                     telegram_bot_token="mt",
@@ -1293,6 +1296,9 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     assert call_kwargs["api_hash"] == "fakehash"
     assert call_kwargs["group_chat_id"] == -100123
     assert call_kwargs["team_name"] == "acme"
+    assert call_kwargs["max_autonomous_turns"] == 7
+    assert call_kwargs["team_authority"] is bot.task_manager.backend.team_authority
+    assert call_kwargs["authenticated_user_id"] == 42
     usernames = call_kwargs["team_bot_usernames"]
     assert "acme_manager_bot" in usernames
     assert "acme_dev_bot" in usernames
@@ -1426,6 +1432,9 @@ def test_team_mode_bot_uses_string_session_env_when_set(tmp_path, monkeypatch):
     assert call_kwargs["api_hash"] == "fakehash"
     assert call_kwargs["group_chat_id"] == -100123
     assert call_kwargs["team_name"] == "acme"
+    assert call_kwargs["max_autonomous_turns"] == 7
+    assert call_kwargs["team_authority"] is bot.task_manager.backend.team_authority
+    assert call_kwargs["authenticated_user_id"] == 42
     assert "acme_manager_bot" in call_kwargs["team_bot_usernames"]
     assert "acme_dev_bot" in call_kwargs["team_bot_usernames"]
 

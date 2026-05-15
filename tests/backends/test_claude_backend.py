@@ -37,6 +37,37 @@ def test_claude_backend_declares_name_and_capabilities():
     assert backend.capabilities.supports_usage_cap_detection is True
 
 
+def test_claude_team_mode_blocks_external_side_effect_tools(tmp_path):
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    backend = ClaudeBackend(project_path=tmp_path, skip_permissions=True)
+    backend.team_system_note = "team mode"
+    backend.team_authority = TeamAuthority("lpct")
+
+    cmd = backend._build_cmd()
+
+    assert "--dangerously-skip-permissions" not in cmd
+    blocked = cmd[cmd.index("--disallowedTools") + 1].split(",")
+    assert "Bash(git push:*)" in blocked
+    assert "Bash(gh pr create:*)" in blocked
+
+
+def test_claude_team_mode_respects_push_grant(tmp_path):
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    authority = TeamAuthority("lpct")
+    authority.record_user_message(1, "--auth push")
+    backend = ClaudeBackend(project_path=tmp_path)
+    backend.team_system_note = "team mode"
+    backend.team_authority = authority
+
+    cmd = backend._build_cmd()
+
+    blocked = cmd[cmd.index("--disallowedTools") + 1].split(",")
+    assert "Bash(git push:*)" not in blocked
+    assert "Bash(gh pr create:*)" in blocked
+
+
 def test_status_includes_permission_tools_and_usage_cap_state():
     backend = ClaudeBackend(
         project_path=Path("/tmp/project"),
@@ -91,6 +122,19 @@ async def test_successful_result_clears_stale_error_state():
     assert events
     assert backend.status["last_error"] is None
     assert backend.status["usage_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_claude_chat_returns_empty_string_when_stream_has_no_result(tmp_path):
+    backend = ClaudeBackend(project_path=tmp_path)
+
+    async def empty_stream(*_args, **_kwargs):
+        if False:
+            yield None
+
+    backend.chat_stream = empty_stream  # type: ignore[method-assign]
+
+    assert await backend.chat("ping") == ""
 
 
 @pytest.mark.asyncio

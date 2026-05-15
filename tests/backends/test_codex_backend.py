@@ -66,6 +66,41 @@ def test_build_cmd_injects_team_system_note_into_prompt(tmp_path):
     assert cmd[-1].endswith("hello")
 
 
+def test_codex_team_mode_downgrades_dangerous_permissions(tmp_path):
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    backend = CodexBackend(tmp_path, {"permissions": "dangerously-skip-permissions"})
+    backend.team_system_note = "team mode"
+    backend.team_authority = TeamAuthority("lpct")
+
+    assert backend._permission_args() == ["--full-auto"]
+
+
+def test_codex_team_mode_all_grant_allows_one_dangerous_turn(tmp_path):
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    authority = TeamAuthority("lpct")
+    authority.record_user_message(1, "--auth all")
+    backend = CodexBackend(tmp_path, {"permissions": "dangerously-skip-permissions"})
+    backend.team_system_note = "team mode"
+    backend.team_authority = authority
+
+    assert backend._permission_args() == ["--dangerously-bypass-approvals-and-sandbox"]
+    assert backend._permission_args() == ["--full-auto"]
+
+
+def test_codex_scoped_network_grant_does_not_enable_full_bypass(tmp_path):
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    authority = TeamAuthority("lpct")
+    authority.record_user_message(1, "--auth network")
+    backend = CodexBackend(tmp_path, {"permissions": "dangerously-skip-permissions"})
+    backend.team_system_note = "team mode"
+    backend.team_authority = authority
+
+    assert backend._permission_args() == ["--full-auto"]
+
+
 def test_build_cmd_includes_model_reasoning_effort_when_set(tmp_path):
     backend = CodexBackend(tmp_path, {"effort": "high"})
     cmd = backend._build_cmd("hi")
@@ -171,6 +206,19 @@ async def test_chat_stream_emits_text_delta_then_result(tmp_path, monkeypatch):
     )
     assert backend.session_id == ACTUAL_THREAD_ID
     assert backend.status["last_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_chat_returns_empty_string_when_stream_has_no_result(tmp_path):
+    backend = CodexBackend(tmp_path, {})
+
+    async def empty_stream(*_args, **_kwargs):
+        if False:
+            yield None
+
+    backend.chat_stream = empty_stream  # type: ignore[method-assign]
+
+    assert await backend.chat("ping") == ""
 
 
 @pytest.mark.asyncio

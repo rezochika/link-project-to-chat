@@ -485,6 +485,7 @@ async def test_relay_alternating_senders_does_not_trigger_streak_halt():
     relay = TeamRelay(
         client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"},
         max_consecutive_bot_relays=999,
+        max_autonomous_turns=20,
     )
     senders = ["acme_mgr_bot", "acme_dev_bot"] * 5  # 10 alternating rounds
     for i, sender in enumerate(senders):
@@ -585,6 +586,129 @@ async def test_relay_fallback_deletes_forward_after_timeout(monkeypatch):
     client.delete_messages.assert_awaited()
     call = client.delete_messages.await_args_list[0]
     assert 900 in list(call.args[1])
+
+
+@pytest.mark.asyncio
+async def test_relay_suppresses_recent_duplicate_forward():
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids(start_id=30_000)
+    relay = TeamRelay(client, "acme", -100_111, {"acme_mgr_bot", "acme_dev_bot"})
+
+    text = "@acme_dev_bot\n\nRequest changes: README quick start is broken."
+    await _dispatch(relay, await _mk_event(text, "acme_mgr_bot", True, msg_id=30_100))
+    await _dispatch(relay, await _mk_event("  " + text + "  \n", "acme_mgr_bot", True, msg_id=30_101))
+
+    forwards = [
+        call for call in client.send_message.await_args_list
+        if call.args[1].startswith("@acme_dev_bot")
+    ]
+    assert len(forwards) == 1
+    assert 30_101 in relay._relayed_ids
+
+
+@pytest.mark.asyncio
+async def test_relay_halts_before_exceeding_autonomous_turn_budget():
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids(start_id=31_000)
+    relay = TeamRelay(
+        client,
+        "acme",
+        -100_111,
+        {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=999,
+        max_autonomous_turns=2,
+    )
+
+    for i in range(3):
+        await _dispatch(
+            relay,
+            await _mk_event(
+                f"@acme_dev_bot batch {i}",
+                "acme_mgr_bot",
+                True,
+                msg_id=31_100 + i,
+            ),
+        )
+
+    forwards = [
+        call for call in client.send_message.await_args_list
+        if call.args[1].startswith("@acme_dev_bot")
+    ]
+    notices = [
+        call for call in client.send_message.await_args_list
+        if "autonomous turn budget" in call.args[1]
+    ]
+    assert len(forwards) == 2
+    assert len(notices) == 1
+    assert relay._halted is True
+
+
+@pytest.mark.asyncio
+async def test_relay_observes_authenticated_user_message_after_own_echo_guard():
+    from link_project_to_chat.team_safety import TeamAuthority
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids(start_id=32_000)
+    authority = TeamAuthority(team_name="acme")
+    relay = TeamRelay(
+        client,
+        "acme",
+        -100_111,
+        {"acme_mgr_bot", "acme_dev_bot"},
+        team_authority=authority,
+        authenticated_user_id=42,
+    )
+
+    relay._own_relay_ids.add(32_100)
+    own_echo = await _mk_event("--auth push", "trusted_user", False, msg_id=32_100)
+    own_echo.get_sender.return_value.id = 42
+    await _dispatch(relay, own_echo)
+    assert authority.is_authorized("push") is False
+
+    user_msg = await _mk_event("--auth push", "trusted_user", False, msg_id=32_101)
+    user_msg.get_sender.return_value.id = 42
+    relay._consecutive_bot_turns = 2
+    await _dispatch(relay, user_msg)
+    assert authority.is_authorized("push") is True
+    assert relay._consecutive_bot_turns == 0
+
+
+@pytest.mark.asyncio
+async def test_relay_peer_response_clears_same_author_streak():
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids(start_id=33_000)
+    relay = TeamRelay(
+        client,
+        "acme",
+        -100_111,
+        {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=999,
+        max_autonomous_turns=20,
+    )
+
+    for i in range(2):
+        await _dispatch(
+            relay,
+            await _mk_event(f"@acme_dev_bot review {i}", "acme_mgr_bot", True, msg_id=33_100 + i),
+        )
+    assert relay._rounds == 2
+
+    await _dispatch(
+        relay,
+        await _mk_event("Patched both items.", "acme_dev_bot", True, msg_id=33_200),
+    )
+    assert relay._rounds == 2
+    assert relay._is_same_author_streak() is False
+
+    await _dispatch(
+        relay,
+        await _mk_event("@acme_dev_bot confirm HEAD", "acme_mgr_bot", True, msg_id=33_300),
+    )
+    assert relay._rounds == 3
+    assert relay._halted is False
 
 
 # --- coalesce of split/multi-part bot messages ---

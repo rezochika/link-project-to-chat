@@ -27,6 +27,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from ..team_safety import TeamAuthority
     from ._telegram_relay import TeamRelay
 
 TRANSPORT_ID = "telegram"
@@ -131,6 +132,14 @@ class TelegramTransport:
         self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
         self._post_init_ran: bool = False
 
+    @property
+    def team_relay_consecutive_bot_turns(self) -> int:
+        return int(getattr(self._team_relay, "_consecutive_bot_turns", 0))
+
+    @property
+    def team_relay_max_autonomous_turns(self) -> int:
+        return int(getattr(self._team_relay, "_max_autonomous_turns", 5))
+
     @classmethod
     def build(
         cls,
@@ -156,6 +165,9 @@ class TelegramTransport:
         team_bot_usernames: set[str],
         group_chat_id: int,
         team_name: str,
+        max_autonomous_turns: int = 5,
+        team_authority: TeamAuthority | None = None,
+        authenticated_user_id: int | str | None = None,
     ) -> None:
         """Activate the Telethon-user-session relay for a team group chat.
 
@@ -173,6 +185,9 @@ class TelegramTransport:
             team_name=team_name,
             group_chat_id=group_chat_id,
             bot_usernames=team_bot_usernames,
+            max_autonomous_turns=max_autonomous_turns,
+            team_authority=team_authority,
+            authenticated_user_id=authenticated_user_id,
         )
 
     def enable_team_relay_from_session(
@@ -184,6 +199,9 @@ class TelegramTransport:
         team_bot_usernames: set[str],
         group_chat_id: int,
         team_name: str,
+        max_autonomous_turns: int = 5,
+        team_authority: TeamAuthority | None = None,
+        authenticated_user_id: int | str | None = None,
     ) -> None:
         """Construct a Telethon client from session credentials and enable the relay.
 
@@ -198,6 +216,9 @@ class TelegramTransport:
             team_bot_usernames=team_bot_usernames,
             group_chat_id=group_chat_id,
             team_name=team_name,
+            max_autonomous_turns=max_autonomous_turns,
+            team_authority=team_authority,
+            authenticated_user_id=authenticated_user_id,
         )
 
     def enable_team_relay_from_session_string(
@@ -209,6 +230,9 @@ class TelegramTransport:
         team_bot_usernames: set[str],
         group_chat_id: int,
         team_name: str,
+        max_autonomous_turns: int = 5,
+        team_authority: TeamAuthority | None = None,
+        authenticated_user_id: int | str | None = None,
     ) -> None:
         """Like ``enable_team_relay_from_session`` but seeds the Telethon
         client from an in-memory ``StringSession`` instead of a SQLite file.
@@ -228,6 +252,9 @@ class TelegramTransport:
             team_bot_usernames=team_bot_usernames,
             group_chat_id=group_chat_id,
             team_name=team_name,
+            max_autonomous_turns=max_autonomous_turns,
+            team_authority=team_authority,
+            authenticated_user_id=authenticated_user_id,
         )
 
     def attach_telegram_routing(

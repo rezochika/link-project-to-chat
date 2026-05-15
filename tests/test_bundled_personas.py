@@ -76,6 +76,25 @@ def test_software_dev_persona_has_message_brevity_rule():
     assert "docs/" in content
 
 
+def test_software_manager_persona_requires_review_surface():
+    p = files("link_project_to_chat.personas").joinpath("software_manager.md")
+    content = p.read_text(encoding="utf-8").lower()
+    assert "review surface" in content
+    assert "working tree" in content
+    assert "head" in content
+    assert "origin" in content
+
+
+def test_software_dev_persona_reports_review_surface_state():
+    p = files("link_project_to_chat.personas").joinpath("software_dev.md")
+    content = p.read_text(encoding="utf-8").lower()
+    assert "review surface" in content
+    assert "unstaged" in content
+    assert "staged" in content
+    assert "committed" in content
+    assert "pushed" in content
+
+
 def test_project_persona_overrides_bundled(tmp_path, monkeypatch):
     from link_project_to_chat import skills
 

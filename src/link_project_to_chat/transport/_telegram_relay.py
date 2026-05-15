@@ -22,12 +22,15 @@ forwards whose peer never responded (bot crashed, error, end of task).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import re
 import time
 from collections import deque
 from typing import Any
+
+from ..team_safety import TeamAuthority
 
 try:
     from telethon import events
@@ -68,6 +71,8 @@ _MAX_CONSECUTIVE_BOT_RELAYS = 6
 _ROUND_WINDOW_SECONDS = 180.0
 _MAX_SAME_AUTHOR_STREAK = 3
 _FALLBACK_DELETE_SECONDS = 60.0
+_DEDUP_WINDOW_SECONDS = 300.0
+_DEDUP_HISTORY_LIMIT = 100
 # Telegram splits bot messages longer than 4096 chars into separate parts,
 # each delivered as its own NewMessage event. Without coalescing, each part
 # becomes an independent forward and spawns its own task in the peer bot's
@@ -214,6 +219,9 @@ class TeamRelay:
         bot_usernames: set[str],
         *,
         max_consecutive_bot_relays: int = _MAX_CONSECUTIVE_BOT_RELAYS,
+        max_autonomous_turns: int = 5,
+        team_authority: TeamAuthority | None = None,
+        authenticated_user_id: int | str | None = None,
     ) -> None:
         if events is None:
             raise ImportError(
@@ -241,7 +249,16 @@ class TeamRelay:
         self._max_rounds = max_consecutive_bot_relays
         self._round_times: deque[float] = deque()
         self._round_senders: deque[str] = deque()
+        self._streak_times: deque[float] = deque()
+        self._streak_senders: deque[str] = deque()
         self._halted = False
+        self._max_autonomous_turns = max_autonomous_turns
+        self._consecutive_bot_turns = 0
+        self._team_authority = team_authority
+        self._authenticated_user_id = (
+            str(authenticated_user_id) if authenticated_user_id is not None else None
+        )
+        self._recent_forward_signatures: dict[tuple[str, str, str], float] = {}
         # Telegram message IDs the relay itself has sent (forwards + halt
         # notices). Needed because Telethon delivers our own sends back as
         # NewMessage events with `is_bot=False`, which would otherwise look
@@ -381,7 +398,15 @@ class TeamRelay:
             if not is_edit:
                 self._round_times.clear()
                 self._round_senders.clear()
+                self._streak_times.clear()
+                self._streak_senders.clear()
+                self._consecutive_bot_turns = 0
                 self._halted = False
+                self._observe_user_message(
+                    msg_id,
+                    getattr(sender, "id", None),
+                    getattr(msg, "message", "") or "",
+                )
             return
         sender_username = (getattr(sender, "username", "") or "").lower()
         if sender_username not in self._bot_usernames:
@@ -390,7 +415,10 @@ class TeamRelay:
         # this exact peer to respond, fire it now (only on NewMessage to
         # avoid firing on every streaming edit of the response).
         if not is_edit:
-            await self._delete_pending_for_peer(sender_username)
+            peer_responded = await self._delete_pending_for_peer(sender_username)
+            if peer_responded and not self._halted:
+                self._streak_times.clear()
+                self._streak_senders.clear()
         text = msg.message or ""
 
         # Continuation of a coalescing message: append regardless of whether
@@ -507,6 +535,18 @@ class TeamRelay:
             if msg_id is not None:
                 self._relayed_ids.add(msg_id)
             return
+        if peer is not None and self._is_recent_duplicate_forward(sender_username, peer, text):
+            logger.info(
+                "TeamRelay: dropping recent duplicate forward from @%s to @%s (team=%s)",
+                sender_username, peer, self._team_name,
+            )
+            if msg_id is not None:
+                self._relayed_ids.add(msg_id)
+            return
+        if self._consecutive_bot_turns >= self._max_autonomous_turns:
+            self._halted = True
+            await self._send_halt_notice("autonomous turn budget exhausted")
+            return
         sent_id = await self._relay(sender_username, text)
         if msg_id is not None:
             self._relayed_ids.add(msg_id)
@@ -516,6 +556,7 @@ class TeamRelay:
             self._pending_delete_timers[sent_id] = asyncio.create_task(
                 self._fallback_delete(sent_id)
             )
+        self._consecutive_bot_turns += 1
         self._record_round(sender_username)
         if not self._halted and (
             len(self._round_times) >= self._max_rounds
@@ -529,19 +570,62 @@ class TeamRelay:
         now = time.monotonic()
         self._round_times.append(now)
         self._round_senders.append(sender_username)
+        self._streak_times.append(now)
+        self._streak_senders.append(sender_username)
         cutoff = now - _ROUND_WINDOW_SECONDS
         while self._round_times and self._round_times[0] < cutoff:
             self._round_times.popleft()
             self._round_senders.popleft()
+        while self._streak_times and self._streak_times[0] < cutoff:
+            self._streak_times.popleft()
+            self._streak_senders.popleft()
+
+    def _observe_user_message(self, msg_id: int | None, sender_id: Any, text: str) -> None:
+        if self._authenticated_user_id is None:
+            return
+        if str(sender_id) != self._authenticated_user_id:
+            return
+        if self._team_authority is None or msg_id is None:
+            return
+        scopes = self._team_authority.record_user_message(msg_id, text)
+        if scopes:
+            logger.info(
+                "TeamRelay: recorded authority grant for team=%s scopes=%s msg_id=%s",
+                self._team_name, sorted(scopes), msg_id,
+            )
+
+    def _is_recent_duplicate_forward(self, sender_username: str, peer: str, text: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - _DEDUP_WINDOW_SECONDS
+        for signature, seen_at in list(self._recent_forward_signatures.items()):
+            if seen_at < cutoff:
+                self._recent_forward_signatures.pop(signature, None)
+
+        body = _body_without_mention(text, peer).lower()
+        normalized = re.sub(r"\s+", " ", body).strip()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        signature = (sender_username, peer, digest)
+        if signature in self._recent_forward_signatures:
+            self._recent_forward_signatures[signature] = now
+            return True
+
+        if len(self._recent_forward_signatures) >= _DEDUP_HISTORY_LIMIT:
+            oldest = min(
+                self._recent_forward_signatures,
+                key=self._recent_forward_signatures.__getitem__,
+            )
+            self._recent_forward_signatures.pop(oldest, None)
+        self._recent_forward_signatures[signature] = now
+        return False
 
     def _is_same_author_streak(self) -> bool:
         """True when the last `_MAX_SAME_AUTHOR_STREAK` recorded forwards are
         all from the same sender. Old entries pruned by the time-window are
         already gone, so this naturally reflects "recent" same-author runs.
         """
-        if len(self._round_senders) < _MAX_SAME_AUTHOR_STREAK:
+        if len(self._streak_senders) < _MAX_SAME_AUTHOR_STREAK:
             return False
-        last_n = list(self._round_senders)[-_MAX_SAME_AUTHOR_STREAK:]
+        last_n = list(self._streak_senders)[-_MAX_SAME_AUTHOR_STREAK:]
         return len(set(last_n)) == 1
 
     @property
@@ -567,14 +651,14 @@ class TeamRelay:
             )
             return None
 
-    async def _send_halt_notice(self) -> None:
-        if self._is_same_author_streak():
-            last_sender = self._round_senders[-1] if self._round_senders else "?"
+    async def _send_halt_notice(self, reason: str | None = None) -> None:
+        if reason is None and self._is_same_author_streak():
+            last_sender = self._streak_senders[-1] if self._streak_senders else "?"
             reason = (
                 f"{_MAX_SAME_AUTHOR_STREAK} consecutive forwards from @{last_sender} "
-                f"with no peer reply between"
+                f"within {int(_ROUND_WINDOW_SECONDS)}s"
             )
-        else:
+        elif reason is None:
             reason = (
                 f"{self._rounds} rounds within {int(_ROUND_WINDOW_SECONDS)}s"
             )
@@ -592,7 +676,7 @@ class TeamRelay:
                 "TeamRelay halt notice send failed (team=%s)", self._team_name,
             )
 
-    async def _delete_pending_for_peer(self, sender_username: str) -> None:
+    async def _delete_pending_for_peer(self, sender_username: str) -> bool:
         """Delete any relay forwards that were waiting for `sender_username` to respond."""
         to_delete = [
             mid for mid, peer in self._pending_deletes.items()
@@ -604,6 +688,7 @@ class TeamRelay:
             if timer is not None and not timer.done():
                 timer.cancel()
             await self._delete_relay_message(mid)
+        return bool(to_delete)
 
     async def _delete_relay_message(self, msg_id: int) -> None:
         try:
