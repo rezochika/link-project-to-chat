@@ -89,11 +89,12 @@ def test_codex_team_mode_all_grant_allows_one_dangerous_turn(tmp_path):
     assert backend._permission_args() == ["--full-auto"]
 
 
-def test_codex_scoped_network_grant_does_not_enable_full_bypass(tmp_path):
+@pytest.mark.parametrize("scope", ["network", "push", "release"])
+def test_codex_scoped_grants_do_not_enable_full_bypass(tmp_path, scope):
     from link_project_to_chat.team_safety import TeamAuthority
 
     authority = TeamAuthority("lpct")
-    authority.record_user_message(1, "--auth network")
+    authority.record_user_message(1, f"--auth {scope}")
     backend = CodexBackend(tmp_path, {"permissions": "dangerously-skip-permissions"})
     backend.team_system_note = "team mode"
     backend.team_authority = authority

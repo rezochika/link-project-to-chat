@@ -1115,6 +1115,24 @@ def test_team_system_note_pins_self_handle_after_refresh(tmp_path):
     assert "@acme_mgr_bot" in note_post    # peer handle still there
 
 
+def test_refresh_team_system_note_preserves_team_authority(tmp_path):
+    from link_project_to_chat.bot import ProjectBot
+
+    bot = ProjectBot(
+        name="acme_dev", path=tmp_path, token="t",
+        team_name="acme", role="dev", group_chat_id=-100_111,
+        peer_bot_username="acme_mgr_bot",
+    )
+    authority = bot.task_manager.backend.team_authority
+    assert authority is not None
+
+    bot.bot_username = "acme_dev_2_bot"
+    bot._refresh_team_system_note()
+
+    assert bot.task_manager.backend.team_authority is authority
+    assert bot._team_authority is authority
+
+
 def test_backfill_own_bot_username_writes_to_team_config(tmp_path, monkeypatch):
     """On startup, a team bot writes its getMe username into TeamConfig if missing."""
     from link_project_to_chat.bot import ProjectBot

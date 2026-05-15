@@ -493,13 +493,17 @@ async def test_relay_peer_response_clears_same_author_streak():
         relay,
         await _mk_event("Patched both items.", "acme_dev_bot", True, msg_id=33_200),
     )
-    assert relay._rounds == 0
+    # A peer reply clears the same-author streak but intentionally leaves the
+    # rolling round-window count intact; high-rate traffic pressure is still
+    # real even when a peer replied.
+    assert relay._rounds == 2
+    assert relay._is_same_author_streak() is False
 
     await _dispatch(
         relay,
         await _mk_event("@acme_dev_bot confirm HEAD", "acme_mgr_bot", True, msg_id=33_300),
     )
-    assert relay._rounds == 1
+    assert relay._rounds == 3
     assert relay._halted is False
 ```
 
