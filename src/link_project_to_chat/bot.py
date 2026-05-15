@@ -2999,6 +2999,18 @@ class ProjectBot(AuthMixin):
             except Exception:
                 logger.warning("plugin %s stop failed", plugin.name, exc_info=True)
 
+    @staticmethod
+    def _is_expected_startup_delivery_failure(exc: BaseException) -> bool:
+        message = (getattr(exc, "message", "") or str(exc) or "").lower()
+        markers = (
+            "chat not found",
+            "bot was blocked by the user",
+            "bot can't initiate conversation",
+            "bot can't send messages to bots",
+            "forbidden",
+        )
+        return any(marker in message for marker in markers)
+
     async def _after_ready(self, self_identity) -> None:
         """Called once after Transport.start() completes platform post-init.
 
@@ -3029,6 +3041,15 @@ class ProjectBot(AuthMixin):
                 if not ident_key.startswith(active_prefix):
                     continue
                 native_id = ident_key[len(active_prefix):]
+                if self._transport.TRANSPORT_ID == "telegram":
+                    try:
+                        int(native_id)
+                    except ValueError:
+                        logger.warning(
+                            "Skipping startup message to invalid Telegram identity %s",
+                            ident_key,
+                        )
+                        continue
                 chat = ChatRef(
                     transport_id=self._transport.TRANSPORT_ID,
                     native_id=native_id,
@@ -3038,8 +3059,19 @@ class ProjectBot(AuthMixin):
                     await self._transport.send_text(
                         chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
                     )
-                except Exception:
-                    logger.error("Failed to send startup message to %s", native_id, exc_info=True)
+                except Exception as exc:
+                    if self._is_expected_startup_delivery_failure(exc):
+                        logger.warning(
+                            "Startup message not delivered to %s. If this is a new Telegram bot, "
+                            "the user must open it and send /start once before it can DM them.",
+                            native_id,
+                        )
+                    else:
+                        logger.error(
+                            "Failed to send startup message to %s",
+                            native_id,
+                            exc_info=True,
+                        )
 
     def _make_web_revocation_check(self):
         """Return a callable the web transport calls on every auth check.

@@ -61,6 +61,43 @@ def test_save_load_roundtrip(tmp_path: Path):
     assert p.plugins == [{"name": "in-app-web-server"}, {"name": "diff", "option": 1}]
 
 
+def test_load_repairs_legacy_web_identity_misclassified_as_telegram(tmp_path: Path):
+    """Earlier migration could save browser_user under the Telegram prefix.
+    That identity is a Web native id, so loading the modern shape should repair
+    it before Telegram startup tries to parse it as an int chat id.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "allowed_users": [
+            {
+                "username": "alice",
+                "role": "executor",
+                "locked_identities": ["telegram:browser_user"],
+            },
+        ],
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_users": [
+                    {
+                        "username": "bob",
+                        "role": "executor",
+                        "locked_identities": ["telegram:web-session:abc"],
+                    },
+                ],
+            }
+        },
+    }))
+
+    loaded = load_config(cfg_file)
+
+    assert loaded.allowed_users[0].locked_identities == ["web:browser_user"]
+    assert loaded.projects["p"].allowed_users[0].locked_identities == [
+        "web:web-session:abc",
+    ]
+
+
 def test_unknown_role_falls_back_to_viewer(tmp_path: Path):
     cfg_file = tmp_path / "config.json"
     raw = {

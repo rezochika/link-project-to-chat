@@ -27,6 +27,22 @@ class ConfigError(Exception):
 _VALID_ROLES = ("viewer", "executor")
 
 
+def _is_web_native_id(native_id: str) -> bool:
+    return (
+        native_id == "browser_user"
+        or native_id.startswith("web-session:")
+        or native_id.startswith("web-user:")
+    )
+
+
+def _repair_locked_identity(identity_key: str) -> str:
+    if identity_key.startswith("telegram:"):
+        native_id = identity_key[len("telegram:"):]
+        if _is_web_native_id(native_id):
+            return f"web:{native_id}"
+    return identity_key
+
+
 @dataclass
 class AllowedUser:
     username: str
@@ -69,7 +85,9 @@ def _parse_allowed_users(raw_list) -> list["AllowedUser"]:
                 username, raw_locked,
             )
             raw_locked = []
-        locked_identities = [s for s in raw_locked if isinstance(s, str)]
+        locked_identities = [
+            _repair_locked_identity(s) for s in raw_locked if isinstance(s, str)
+        ]
         if len(locked_identities) != len(raw_locked):
             logger.warning(
                 "dropped non-string entries from locked_identities for %s", username,
@@ -170,8 +188,8 @@ def _migrate_legacy_auth(raw: dict) -> tuple[list["AllowedUser"], bool]:
         for prefix in _KNOWN_TRANSPORT_PREFIXES:
             if uid_str.startswith(prefix):
                 return uid_str
-        # The Web case: bare "web-session:abc" -> "web:web-session:abc".
-        if uid_str.startswith("web-session:"):
+        # The Web cases: bare Web native ids -> "web:<native_id>".
+        if _is_web_native_id(uid_str):
             return f"web:{uid_str}"
         # Plain numeric or arbitrary string -> telegram (legacy default).
         try:

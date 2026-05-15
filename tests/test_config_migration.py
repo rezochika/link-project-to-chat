@@ -557,6 +557,28 @@ def test_migration_g_web_session_id_normalized(tmp_path: Path):
     assert by_user["alice"].locked_identities == ["web:web-session:abc-def"]
 
 
+def test_migration_g_legacy_browser_user_id_normalized(tmp_path: Path):
+    """Older WebTransport test/helper paths used the bare browser_user id.
+    It is a Web native id, not a Telegram chat id, so migration must keep it
+    under the web transport prefix.
+    """
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": "/tmp/p",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": "browser_user"},
+            }
+        }
+    })
+    loaded = load_config(cfg_file)
+    p = loaded.projects["p"]
+    by_user = {u.username: u for u in p.allowed_users}
+    assert by_user["alice"].locked_identities == ["web:browser_user"]
+
+
 def test_migration_h_unknown_prefix_falls_back_to_telegram(tmp_path: Path):
     """Bare strings that don't match a known transport prefix migrate as
     telegram (the legacy default - pre-multi-transport configs)."""

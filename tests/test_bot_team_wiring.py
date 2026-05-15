@@ -9,6 +9,19 @@ def _team_bot_with_fake_transport(bot: ProjectBot) -> ProjectBot:
     return bot
 
 
+class _TelegramLikeFakeTransport(FakeTransport):
+    TRANSPORT_ID = "telegram"
+
+    async def send_text(self, chat, text, **kwargs):
+        int(chat.native_id)
+        return await super().send_text(chat, text, **kwargs)
+
+
+class _TelegramChatNotFoundTransport(_TelegramLikeFakeTransport):
+    async def send_text(self, chat, text, **kwargs):
+        raise RuntimeError("Chat not found")
+
+
 def _group_chat(chat_id: int) -> ChatRef:
     # transport_id="telegram" because the tests model Telegram-bound bots
     # (constructed with the legacy `group_chat_id: int` kwarg, which synthesizes
@@ -1819,6 +1832,78 @@ async def test_after_ready_solo_bot_sends_startup_dm_ping(tmp_path):
     pings = [m for m in bot._transport.sent_messages if "Bot started" in m.text]
     assert len(pings) == 1
     assert pings[0].chat.native_id == "8206818037"
+
+
+@pytest.mark.asyncio
+async def test_after_ready_telegram_skips_non_numeric_startup_identity(tmp_path, caplog):
+    """Already-saved bad legacy locks like telegram:browser_user must not make
+    Telegram startup ping attempt an invalid chat_id conversion.
+    """
+    from link_project_to_chat.config import AllowedUser
+    bot = ProjectBot(
+        name="solo", path=tmp_path, token="t",
+        allowed_users=[
+            AllowedUser(
+                username="admin",
+                role="executor",
+                locked_identities=[
+                    "telegram:browser_user",
+                    "telegram:8206818037",
+                    "web:browser_user",
+                ],
+            ),
+        ],
+    )
+    bot._transport = _TelegramLikeFakeTransport()
+
+    with caplog.at_level("ERROR", logger="link_project_to_chat.bot"):
+        await bot._after_ready(
+            Identity(
+                transport_id="telegram",
+                native_id="1",
+                display_name="solo_bot",
+                handle="solo_bot",
+                is_bot=True,
+            )
+        )
+
+    pings = [m for m in bot._transport.sent_messages if "Bot started" in m.text]
+    assert [m.chat.native_id for m in pings] == ["8206818037"]
+    assert "Failed to send startup message to browser_user" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_after_ready_telegram_startup_ping_chat_not_found_is_warning(tmp_path, caplog):
+    """A valid Telegram user id still may not be reachable by a newly created
+    bot until the user opens that bot. Startup ping should be best-effort and
+    avoid an error traceback for this expected platform response.
+    """
+    from link_project_to_chat.config import AllowedUser
+    bot = ProjectBot(
+        name="solo", path=tmp_path, token="t",
+        allowed_users=[
+            AllowedUser(
+                username="admin",
+                role="executor",
+                locked_identities=["telegram:8206818037"],
+            ),
+        ],
+    )
+    bot._transport = _TelegramChatNotFoundTransport()
+
+    with caplog.at_level("WARNING", logger="link_project_to_chat.bot"):
+        await bot._after_ready(
+            Identity(
+                transport_id="telegram",
+                native_id="1",
+                display_name="solo_bot",
+                handle="solo_bot",
+                is_bot=True,
+            )
+        )
+
+    assert "Startup message not delivered to 8206818037" in caplog.text
+    assert "Failed to send startup message to 8206818037" not in caplog.text
 
 
 @pytest.mark.asyncio
