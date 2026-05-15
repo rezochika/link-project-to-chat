@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -102,6 +103,155 @@ def test_stale_process_detected(tmp_path: Path):
     pm.start("fast")
     time.sleep(0.3)
     assert pm.status("fast") == "stopped"
+
+
+def test_start_writes_pidfile(tmp_path: Path):
+    """Each running project must have a `.pid` file on disk so a freshly-spawned
+    manager can detect orphans surviving a crash."""
+    run_dir = tmp_path / "run"
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {"sl": {"path": str(tmp_path)}}),
+        command_builder=lambda n, c: _sleep_cmd(),
+        run_dir=run_dir,
+    )
+    pm.start("sl")
+    try:
+        pidfile = run_dir / "sl.pid"
+        assert pidfile.exists()
+        assert int(pidfile.read_text().strip()) == pm._processes["sl"].pid
+    finally:
+        pm.stop("sl")
+
+
+def test_stop_removes_pidfile(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {"sl": {"path": str(tmp_path)}}),
+        command_builder=lambda n, c: _sleep_cmd(),
+        run_dir=run_dir,
+    )
+    pm.start("sl")
+    pidfile = run_dir / "sl.pid"
+    assert pidfile.exists()
+    pm.stop("sl")
+    assert not pidfile.exists()
+
+
+def test_reap_orphans_clears_dead_pidfiles(tmp_path: Path):
+    """A pidfile pointing at a dead pid is just a leftover from a prior crash;
+    the reaper must delete it on startup so subsequent start() doesn't see
+    'already running' against a phantom process."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    # PID 999_999_999 is virtually guaranteed to not exist on Linux.
+    (run_dir / "ghost.pid").write_text("999999999")
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {"ghost": {"path": str(tmp_path)}}),
+        run_dir=run_dir,
+    )
+    adopted = pm.reap_orphans()
+    assert adopted == []
+    assert not (run_dir / "ghost.pid").exists()
+
+
+def test_reap_orphans_adopts_live_orphan(tmp_path: Path):
+    """When the manager finds a pidfile pointing at a live process, it must
+    adopt it so the next status() / stop() can see and terminate it instead
+    of letting it run unmanaged forever."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    # Spawn a real subprocess outside the ProcessManager to simulate an
+    # orphan from a crashed prior manager.
+    orphan = subprocess.Popen(
+        _sleep_cmd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **_process_popen_kwargs(),
+    )
+    try:
+        (run_dir / "lonely.pid").write_text(str(orphan.pid))
+        pm = ProcessManager(
+            project_config_path=_proj_cfg(tmp_path, {"lonely": {"path": str(tmp_path)}}),
+            run_dir=run_dir,
+        )
+        adopted = pm.reap_orphans()
+        assert adopted == ["lonely"]
+        assert pm.status("lonely") == "running"
+
+        # A subsequent start() on the same name must refuse — the bot is
+        # already running (adopted), so we must not spawn a duplicate.
+        assert pm.start("lonely") is False
+
+        assert pm.stop("lonely") is True
+        assert not (run_dir / "lonely.pid").exists()
+        assert pm.status("lonely") == "stopped"
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+
+def test_start_autostart_skips_adopted_orphan(tmp_path: Path):
+    """Reaping must run BEFORE start_autostart so an adopted survivor isn't
+    duplicated into a second running bot polling the same Telegram token."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orphan = subprocess.Popen(
+        _sleep_cmd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **_process_popen_kwargs(),
+    )
+    try:
+        (run_dir / "auto.pid").write_text(str(orphan.pid))
+        pm = ProcessManager(
+            project_config_path=_proj_cfg(tmp_path, {
+                "auto": {"path": str(tmp_path), "autostart": True},
+            }),
+            command_builder=lambda n, c: _sleep_cmd(),
+            run_dir=run_dir,
+        )
+        adopted = pm.reap_orphans()
+        assert adopted == ["auto"]
+        # autostart honors adoption: no new process spawned for "auto" because
+        # start() short-circuits on the already-managed entry.
+        started = pm.start_autostart()
+        assert started == 0
+        assert pm.status("auto") == "running"
+        pm.stop("auto")
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+
+def test_start_refuses_when_pidfile_points_at_live_process(tmp_path: Path):
+    """start() must return False if a pidfile already points at a live process,
+    even if that process isn't in self._processes — covers the 'manager just
+    restarted, hasn't called reap_orphans yet' window."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orphan = subprocess.Popen(
+        _sleep_cmd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **_process_popen_kwargs(),
+    )
+    try:
+        (run_dir / "twin.pid").write_text(str(orphan.pid))
+        pm = ProcessManager(
+            project_config_path=_proj_cfg(tmp_path, {"twin": {"path": str(tmp_path)}}),
+            command_builder=lambda n, c: _sleep_cmd(),
+            run_dir=run_dir,
+        )
+        assert pm.start("twin") is False
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
 
 
 def test_start_uses_custom_config_path_and_default_model(tmp_path: Path):

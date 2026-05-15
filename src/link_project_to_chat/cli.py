@@ -886,6 +886,12 @@ def start_manager(ctx):
         )
 
     pm = ProcessManager(project_config_path=cfg_path)
+    # Adopt or clean up project-bot subprocesses surviving a prior manager
+    # crash BEFORE start_autostart, so a reaped orphan isn't duplicated
+    # into a second running bot polling the same Telegram token.
+    adopted = pm.reap_orphans()
+    if adopted:
+        click.echo(f"Adopted {len(adopted)} orphan project bot(s): {', '.join(adopted)}")
     restored = pm.start_autostart()
     if restored:
         click.echo(f"Autostarted {restored} project(s).")

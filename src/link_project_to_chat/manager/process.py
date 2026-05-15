@@ -127,17 +127,66 @@ def _build_project_bot_env(
     return env
 
 
+class _AdoptedProc:
+    """Lightweight stand-in for subprocess.Popen wrapping a foreign PID.
+
+    ProcessManager builds one of these for each live orphan it finds at
+    startup so the rest of the lifecycle (status, stop, terminate) can
+    operate uniformly on `self._processes` whether the entry is a Popen
+    we spawned or a PID we adopted from a stale pidfile.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.stdout = None
+        self.returncode: int | None = None
+        # _terminate_process_tree consults this to decide whether to
+        # killpg(getpgid(pid)) — adopted orphans were spawned with
+        # start_new_session=True, so killpg is the right hammer.
+        self._kill_process_tree = True
+
+    def poll(self) -> int | None:
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            self.returncode = -1
+            return -1
+        except PermissionError:
+            return None  # exists, signal denied — treat as alive
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        import time as _time
+
+        deadline = _time.monotonic() + timeout if timeout is not None else None
+        while True:
+            rc = self.poll()
+            if rc is not None:
+                return rc
+            if deadline is not None and _time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("wait", timeout)
+            _time.sleep(0.1)
+
+
 class ProcessManager:
     def __init__(
         self,
         project_config_path: Path | None = None,
         command_builder: Callable[[str, dict], list[str]] | None = None,
+        run_dir: Path | None = None,
     ):
         self._project_config_path = project_config_path
         self._command_builder = command_builder or self._default_command_builder
-        self._processes: dict[str, subprocess.Popen] = {}
+        self._processes: dict[str, subprocess.Popen | _AdoptedProc] = {}
         self._logs: dict[str, collections.deque] = {}
         self._log_threads: dict[str, threading.Thread] = {}
+        # `run/` holds one `<name>.pid` per running project bot. A fresh
+        # manager scans this on startup (`reap_orphans`) so it can adopt or
+        # kill subprocesses that survived a previous manager crash.
+        self._run_dir = run_dir or (
+            (project_config_path.parent if project_config_path else DEFAULT_CONFIG.parent)
+            / "run"
+        )
         # Cached spec-D′ StringSession export. ``None`` means "not yet computed";
         # a falsy str means "tried, no usable session" (caller falls back to
         # path-mode env var). Computed lazily on first ``start_team`` so the
@@ -207,9 +256,56 @@ class ProcessManager:
         else:
             logger.warning("%s exited with code %d", name, returncode)
 
+    def _pidfile_path(self, name: str) -> Path:
+        return self._run_dir / f"{name}.pid"
+
+    def _write_pidfile(self, name: str, pid: int) -> None:
+        try:
+            self._run_dir.mkdir(parents=True, exist_ok=True)
+            self._pidfile_path(name).write_text(str(pid))
+        except OSError:
+            logger.warning("could not write pidfile for %s; orphan reap will skip it", name, exc_info=True)
+
+    def _delete_pidfile(self, name: str) -> None:
+        path = self._pidfile_path(name)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("could not delete pidfile %s", path, exc_info=True)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def start(self, project_name: str) -> bool:
         if project_name in self._processes and self._processes[project_name].poll() is None:
             return False
+        # Pidfile fence: if a previous manager left a pidfile pointing at a
+        # live process, refuse the start so we don't spawn a duplicate. A
+        # call to reap_orphans() promotes that survivor into self._processes
+        # and lets the operator decide via stop()/start().
+        pidfile = self._pidfile_path(project_name)
+        if pidfile.exists():
+            try:
+                old_pid = int(pidfile.read_text().strip())
+            except (OSError, ValueError):
+                old_pid = None
+            if old_pid and self._pid_alive(old_pid):
+                logger.warning(
+                    "refusing to start %s: pidfile %s points at live pid %d "
+                    "(call reap_orphans first)",
+                    project_name, pidfile, old_pid,
+                )
+                return False
+            self._delete_pidfile(project_name)
         projects = self._load_projects()
         if project_name not in projects:
             return False
@@ -227,6 +323,7 @@ class ProcessManager:
         thread = threading.Thread(target=self._capture_output, args=(project_name, proc), daemon=True)
         thread.start()
         self._log_threads[project_name] = thread
+        self._write_pidfile(project_name, proc.pid)
         logger.info("Started %s (pid=%d)", project_name, proc.pid)
         self._set_autostart(project_name, True)
         return True
@@ -288,10 +385,12 @@ class ProcessManager:
         proc = self._processes.get(project_name)
         if not proc or proc.poll() is not None:
             self._processes.pop(project_name, None)
+            self._delete_pidfile(project_name)
             return False
         _terminate_process_tree(proc)
         self._processes.pop(project_name, None)
         self._log_threads.pop(project_name, None)
+        self._delete_pidfile(project_name)
         logger.info("Stopped %s", project_name)
         if project_name.startswith("team:"):
             _, team_name, role = project_name.split(":", 2)
@@ -299,6 +398,45 @@ class ProcessManager:
         else:
             self._set_autostart(project_name, False)
         return True
+
+    def reap_orphans(self) -> list[str]:
+        """Scan pidfiles left behind by a previous manager.
+
+        Each `<name>.pid` either:
+          - points at a dead pid → delete the stale file
+          - points at a live pid → adopt it into self._processes so a
+            subsequent stop() can terminate it cleanly
+
+        Returns the list of names adopted (ordered by filename for test
+        determinism). Adopted entries lack stdout/log capture (the original
+        manager owned the pipes), so `logs(name)` returns an empty buffer
+        until next start().
+        """
+        adopted: list[str] = []
+        if not self._run_dir.exists():
+            return adopted
+        for pidfile in sorted(self._run_dir.glob("*.pid")):
+            name = pidfile.stem
+            try:
+                pid = int(pidfile.read_text().strip())
+            except (OSError, ValueError):
+                logger.warning("removing unreadable pidfile %s", pidfile)
+                self._delete_pidfile(name)
+                continue
+            if not self._pid_alive(pid):
+                self._delete_pidfile(name)
+                continue
+            if name in self._processes and self._processes[name].poll() is None:
+                # Already managed in this session — nothing to adopt.
+                continue
+            self._processes[name] = _AdoptedProc(pid)
+            self._logs[name] = collections.deque(maxlen=200)
+            logger.warning(
+                "adopted orphan project bot %s (pid=%d) from prior manager",
+                name, pid,
+            )
+            adopted.append(name)
+        return adopted
 
     def status(self, project_name: str) -> str:
         proc = self._processes.get(project_name)
