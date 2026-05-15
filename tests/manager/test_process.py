@@ -216,6 +216,119 @@ def test_reap_orphans_adopts_live_orphan(tmp_path: Path):
             orphan.wait(timeout=5)
 
 
+def test_start_team_writes_pidfile_under_team_key(tmp_path: Path):
+    """Team-bot subprocesses must also be tracked by pidfile so the orphan
+    reaper covers them on the next manager start. The filename uses the
+    full ``team:NAME:ROLE`` key so reap_orphans can round-trip via Path.stem.
+    """
+    from link_project_to_chat.config import (
+        Config, TeamBotConfig, TeamConfig, save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "demo": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=1,
+                    bots={"dev": TeamBotConfig(telegram_bot_token="tok")},
+                ),
+            },
+        ),
+        cfg_path,
+    )
+    run_dir = tmp_path / "run"
+    pm = ProcessManager(project_config_path=cfg_path, run_dir=run_dir)
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.pid = 4242
+        mock_proc.poll.return_value = None
+        mock_proc.stdout = []
+        mock_popen.return_value = mock_proc
+        assert pm.start_team("demo", "dev") is True
+
+    pidfile = run_dir / "team:demo:dev.pid"
+    assert pidfile.exists()
+    assert int(pidfile.read_text().strip()) == 4242
+    # And Path.stem round-trips the team key for reap_orphans:
+    assert pidfile.stem == "team:demo:dev"
+
+
+def test_reap_orphans_adopts_team_orphan(tmp_path: Path):
+    """A surviving team-bot subprocess from a crashed manager must be adopted
+    on next start, same as project bots. Without this the team bot keeps
+    polling Telegram with its token and the new manager spawns a duplicate
+    that hits 'Conflict: terminated by other getUpdates request'.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orphan = subprocess.Popen(
+        _sleep_cmd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **_process_popen_kwargs(),
+    )
+    try:
+        (run_dir / "team:t1:dev.pid").write_text(str(orphan.pid))
+        pm = ProcessManager(
+            project_config_path=_proj_cfg(tmp_path, {}),
+            run_dir=run_dir,
+        )
+        adopted = pm.reap_orphans()
+        assert "team:t1:dev" in adopted
+        assert pm.status("team:t1:dev") == "running"
+        assert pm.stop("team:t1:dev") is True
+        assert not (run_dir / "team:t1:dev.pid").exists()
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+
+def test_start_team_refuses_when_pidfile_points_at_live_process(tmp_path: Path):
+    """Same fence as start() — if a previous manager left a team pidfile
+    pointing at a live foreign pid, start_team must refuse so we don't
+    spawn a duplicate token-poller before the operator has run reap_orphans.
+    """
+    from link_project_to_chat.config import (
+        Config, TeamBotConfig, TeamConfig, save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            teams={
+                "t1": TeamConfig(
+                    path=str(tmp_path),
+                    group_chat_id=1,
+                    bots={"mgr": TeamBotConfig(telegram_bot_token="tok")},
+                ),
+            },
+        ),
+        cfg_path,
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orphan = subprocess.Popen(
+        _sleep_cmd(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        **_process_popen_kwargs(),
+    )
+    try:
+        (run_dir / "team:t1:mgr.pid").write_text(str(orphan.pid))
+        pm = ProcessManager(project_config_path=cfg_path, run_dir=run_dir)
+        assert pm.start_team("t1", "mgr") is False
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+
 def test_start_autostart_skips_adopted_orphan(tmp_path: Path):
     """Reaping must run BEFORE start_autostart so an adopted survivor isn't
     duplicated into a second running bot polling the same Telegram token."""

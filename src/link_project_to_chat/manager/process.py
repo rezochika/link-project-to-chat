@@ -362,6 +362,24 @@ class ProcessManager:
         key = f"team:{team_name}:{role}"
         if key in self._processes and self._processes[key].poll() is None:
             return False
+        # Pidfile fence (same contract as `start`): refuse if a survivor of
+        # a prior manager is still polling Telegram with the team bot's
+        # token. reap_orphans() promotes that survivor into self._processes
+        # so stop()/start() can decide what to do with it.
+        pidfile = self._pidfile_path(key)
+        if pidfile.exists():
+            try:
+                old_pid = int(pidfile.read_text().strip())
+            except (OSError, ValueError):
+                old_pid = None
+            if old_pid and self._pid_alive(old_pid):
+                logger.warning(
+                    "refusing to start %s: pidfile %s points at live pid %d "
+                    "(call reap_orphans first)",
+                    key, pidfile, old_pid,
+                )
+                return False
+            self._delete_pidfile(key)
         cmd = self._team_command_builder(team_name, role)
         env = _build_project_bot_env(
             team_name=team_name,
@@ -382,6 +400,7 @@ class ProcessManager:
         thread = threading.Thread(target=self._capture_output, args=(key, proc), daemon=True)
         thread.start()
         self._log_threads[key] = thread
+        self._write_pidfile(key, proc.pid)
         logger.info("Started team %s/%s (pid=%d)", team_name, role, proc.pid)
         self._set_team_bot_autostart(team_name, role, True)
         return True
