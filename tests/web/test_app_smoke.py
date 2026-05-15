@@ -228,6 +228,103 @@ async def test_post_with_username_flows_to_inbound_queue(app_client):
     assert event["payload"]["sender_handle"] is None
 
 
+async def test_revocation_check_blocks_previously_valid_token(tmp_path: Path):
+    """A bootstrap-validated token must stop authenticating once the user is
+    no longer in the live allow-list (the revocation_check callback returns
+    False)."""
+    store = WebStore(tmp_path / "revoke.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    revoked: set[str] = set()
+
+    def revocation_check(handle: str) -> bool:
+        return handle not in revoked
+
+    try:
+        app = create_app(
+            store,
+            inbound_queue,
+            sse_queues,
+            authenticated_handles={"tok-alice": "alice"},
+            revocation_check=revocation_check,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.get("/auth?token=tok-alice", follow_redirects=False)
+            ok = await client.get("/chat/default")
+            assert ok.status_code == 200
+
+            # Manager removes alice from the project's allow-list.
+            revoked.add("alice")
+
+            after = await client.get("/chat/default")
+            assert after.status_code == 401
+    finally:
+        await store.close()
+
+
+async def test_revocation_check_runs_on_sse_reconnect(tmp_path: Path):
+    store = WebStore(tmp_path / "revoke-sse.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    revoked: set[str] = set()
+
+    def revocation_check(handle: str) -> bool:
+        return handle not in revoked
+
+    try:
+        app = create_app(
+            store,
+            inbound_queue,
+            sse_queues,
+            authenticated_handles={"tok-bob": "bob"},
+            revocation_check=revocation_check,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.get("/auth?token=tok-bob", follow_redirects=False)
+            revoked.add("bob")
+
+            # New SSE connection attempt must be rejected outright.
+            denied = await client.get("/chat/default/sse")
+            assert denied.status_code == 401
+    finally:
+        await store.close()
+
+
+async def test_revocation_check_skipped_when_handle_unset(tmp_path: Path):
+    """The single auth_token mode (no handle) must not crash the revocation
+    check — the callback is only invoked when there's a handle to check."""
+    store = WebStore(tmp_path / "revoke-anon.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+
+    def revocation_check(handle: str) -> bool:
+        raise AssertionError("revocation_check should not be invoked without a handle")
+
+    try:
+        app = create_app(
+            store,
+            inbound_queue,
+            sse_queues,
+            auth_token="single-token",
+            revocation_check=revocation_check,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.get("/auth?token=single-token", follow_redirects=False)
+            ok = await client.get("/chat/default")
+            assert ok.status_code == 200
+    finally:
+        await store.close()
+
+
 async def test_message_partial_escapes_stored_rich_html(tmp_path: Path):
     store = WebStore(tmp_path / "rich.db")
     await store.open()

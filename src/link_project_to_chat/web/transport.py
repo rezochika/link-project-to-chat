@@ -13,6 +13,7 @@ import asyncio
 import itertools
 import logging
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class WebTransport:
         authenticated_handle: str | None = None,
         auth_token: str | None = None,
         authenticated_handles: dict[str, str] | None = None,
+        revocation_check: Callable[[str], bool] | None = None,
     ) -> None:
         self._db_path = db_path
         self._bot_identity = bot_identity
@@ -75,6 +77,7 @@ class WebTransport:
             if authenticated_handles is not None
             else None
         )
+        self._revocation_check = revocation_check
 
         # CA-1: WebTransport currently has no in-app authentication. Every
         # browser session that can reach the HTTP listener is mapped to
@@ -141,6 +144,7 @@ class WebTransport:
             authenticated_handle=self._authenticated_handle,
             auth_token=self._auth_token,
             authenticated_handles=self._authenticated_handles,
+            revocation_check=self._revocation_check,
         )
         config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         self._uvicorn_server = uvicorn.Server(config)

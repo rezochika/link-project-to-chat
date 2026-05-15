@@ -3041,6 +3041,42 @@ class ProjectBot(AuthMixin):
                 except Exception:
                     logger.error("Failed to send startup message to %s", native_id, exc_info=True)
 
+    def _make_web_revocation_check(self):
+        """Return a callable the web transport calls on every auth check.
+
+        Reads the live config under load_config's existing lock discipline so
+        manager-side mutations (`/remove_user`, `/reset_user_identity`,
+        `/demote_user`) take effect on the next web request without a project
+        restart. Fails closed on read errors so a corrupt config can't keep
+        a revoked user authenticated.
+        """
+        from .config import (
+            _normalize_username,
+            load_config,
+            resolve_project_allowed_users,
+        )
+
+        config_path = self._effective_config_path()
+        project_name = self.name
+
+        def check(handle: str) -> bool:
+            try:
+                config = load_config(config_path)
+            except Exception:
+                logger.exception(
+                    "web revocation check: failed to load config %s; failing closed",
+                    config_path,
+                )
+                return False
+            project = config.projects.get(project_name)
+            if project is None:
+                return False
+            users, _ = resolve_project_allowed_users(project, config)
+            normalized = _normalize_username(handle)
+            return any(_normalize_username(u.username) == normalized for u in users)
+
+        return check
+
     def build(self) -> None:
         if self.transport_kind == "web":
             from .web.transport import WebTransport
@@ -3071,6 +3107,7 @@ class ProjectBot(AuthMixin):
                 authenticated_handle=web_authenticated_handle,
                 auth_token=web_auth_token,
                 authenticated_handles=web_authenticated_handles,
+                revocation_check=self._make_web_revocation_check(),
             )
             self._app = None  # WebTransport has no PTB Application
         else:

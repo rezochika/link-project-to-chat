@@ -10,6 +10,7 @@ import json
 import secrets
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ def _auth_from_request(
     auth_token: str | None,
     authenticated_handle: str | None,
     authenticated_handles: dict[str, str] | None,
+    revocation_check: Callable[[str], bool] | None = None,
 ) -> _WebAuth:
     # Cookie-only auth on normal routes — query-string tokens are rejected
     # because the URL ends up in browser history, proxy/access logs, and
@@ -76,12 +78,20 @@ def _auth_from_request(
             return _WebAuth(ok=False)
         for token, handle in authenticated_handles.items():
             if secrets.compare_digest(supplied, token):
+                if revocation_check is not None and not revocation_check(handle):
+                    return _WebAuth(ok=False)
                 return _WebAuth(ok=True, supplied_token=supplied, handle=handle)
         return _WebAuth(ok=False)
 
     if auth_token is None:
         return _WebAuth(ok=True, supplied_token=supplied, handle=authenticated_handle)
     if supplied and secrets.compare_digest(supplied, auth_token):
+        if (
+            revocation_check is not None
+            and authenticated_handle is not None
+            and not revocation_check(authenticated_handle)
+        ):
+            return _WebAuth(ok=False)
         return _WebAuth(ok=True, supplied_token=supplied, handle=authenticated_handle)
     return _WebAuth(ok=False)
 
@@ -110,12 +120,14 @@ def _require_web_auth(
     auth_token: str | None,
     authenticated_handle: str | None,
     authenticated_handles: dict[str, str] | None,
+    revocation_check: Callable[[str], bool] | None = None,
 ) -> _WebAuth:
     auth = _auth_from_request(
         request,
         auth_token=auth_token,
         authenticated_handle=authenticated_handle,
         authenticated_handles=authenticated_handles,
+        revocation_check=revocation_check,
     )
     if not auth.ok:
         raise HTTPException(status_code=401, detail="Web auth token required")
@@ -142,6 +154,7 @@ def create_app(
     authenticated_handle: str | None = None,
     auth_token: str | None = None,
     authenticated_handles: dict[str, str] | None = None,
+    revocation_check: Callable[[str], bool] | None = None,
 ) -> FastAPI:
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -167,19 +180,28 @@ def create_app(
         supplied = request.query_params.get("token", "")
         next_url = _safe_local_redirect(request.query_params.get("next"))
         validated_token: str | None = None
+        validated_handle: str | None = None
         if authenticated_handles is not None:
-            for token in authenticated_handles:
+            for token, handle in authenticated_handles.items():
                 if secrets.compare_digest(supplied, token):
                     validated_token = token
+                    validated_handle = handle
                     break
         elif auth_token is not None:
             if supplied and secrets.compare_digest(supplied, auth_token):
                 validated_token = auth_token
+                validated_handle = authenticated_handle
         else:
             # Auth not enforced; bootstrap is a no-op redirect.
             return RedirectResponse(next_url, status_code=303)
         if validated_token is None:
             raise HTTPException(status_code=401, detail="Invalid auth token")
+        if (
+            revocation_check is not None
+            and validated_handle is not None
+            and not revocation_check(validated_handle)
+        ):
+            raise HTTPException(status_code=401, detail="Auth handle revoked")
         response = RedirectResponse(next_url, status_code=303)
         _set_auth_cookie(response, validated_token)
         return response
@@ -191,6 +213,7 @@ def create_app(
             auth_token=auth_token,
             authenticated_handle=authenticated_handle,
             authenticated_handles=authenticated_handles,
+            revocation_check=revocation_check,
         )
         if not auth.ok:
             return HTMLResponse("Web auth token required", status_code=401)
@@ -211,6 +234,7 @@ def create_app(
             auth_token=auth_token,
             authenticated_handle=authenticated_handle,
             authenticated_handles=authenticated_handles,
+            revocation_check=revocation_check,
         )
         session_id, csrf_token = _session_values(request)
         messages = await store.get_messages(chat_id)
@@ -236,6 +260,7 @@ def create_app(
             auth_token=auth_token,
             authenticated_handle=authenticated_handle,
             authenticated_handles=authenticated_handles,
+            revocation_check=revocation_check,
         )
         session_id, _ = _verify_csrf(request, csrf_token)
         files: list[dict] = []
@@ -305,6 +330,7 @@ def create_app(
             auth_token=auth_token,
             authenticated_handle=authenticated_handle,
             authenticated_handles=authenticated_handles,
+            revocation_check=revocation_check,
         )
         session_id, _ = _verify_csrf(request, csrf_token)
         await inbound_queue.put({
@@ -332,6 +358,7 @@ def create_app(
             auth_token=auth_token,
             authenticated_handle=authenticated_handle,
             authenticated_handles=authenticated_handles,
+            revocation_check=revocation_check,
         )
         queue: asyncio.Queue = asyncio.Queue()
         sse_queues.setdefault(chat_id, []).append(queue)
@@ -339,6 +366,19 @@ def create_app(
         async def generate():
             try:
                 while True:
+                    # Re-check auth on every iteration so a manager-side
+                    # revocation closes long-lived streams within one
+                    # keepalive cycle, instead of running until the
+                    # client disconnects.
+                    current = _auth_from_request(
+                        request,
+                        auth_token=auth_token,
+                        authenticated_handle=authenticated_handle,
+                        authenticated_handles=authenticated_handles,
+                        revocation_check=revocation_check,
+                    )
+                    if not current.ok:
+                        break
                     try:
                         payload = await asyncio.wait_for(queue.get(), timeout=25)
                         yield f"event: update\ndata: {json.dumps(payload)}\n\n"
