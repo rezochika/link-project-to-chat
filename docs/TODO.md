@@ -1,10 +1,10 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Last refreshed 2026-05-15 to record the plugin-system port + `AllowedUser`-sole auth model rewrite (v1.0.0) on branch `feat/plugin-system` HEAD `cc7661e`. Prior refresh 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, root-level planning docs, and direct code audit findings. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
+_Last refreshed 2026-05-16 to add §8 for the post-v1.0.0 integration hardening sweep on branch `dev` (HEAD `d68d5c4`, 16 commits ahead of `main` after the `b86370c` plugin-system merge). Prior refresh 2026-05-15 to record the plugin-system port + `AllowedUser`-sole auth model rewrite (v1.0.0) on branch `feat/plugin-system` HEAD `cc7661e`. Refresh 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, root-level planning docs, and direct code audit findings. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
 
-Latest verification on `feat/plugin-system` HEAD `b20c40f`: `pytest -q` → **1142 passed, 5 skipped, 2 warnings** in 15.06s. Baseline at Task 0 was 1003 passed; +115 new tests across the 8 plan tasks (1118 at `cc7661e`), then +24 more from the post-merge P1 fix (`b20c40f`). Earlier TODO hardening batch verification was `pytest -q` → **992 passed, 5 skipped, 2 warnings**.
+Latest verification on `feat/plugin-system` HEAD `b20c40f`: `pytest -q` → **1142 passed, 5 skipped, 2 warnings** in 15.06s. Baseline at Task 0 was 1003 passed; +115 new tests across the 8 plan tasks (1118 at `cc7661e`), then +24 more from the post-merge P1 fix (`b20c40f`). Earlier TODO hardening batch verification was `pytest -q` → **992 passed, 5 skipped, 2 warnings**. The §8 hardening sweep on `dev` (HEAD `d68d5c4`) ships per-commit regression tests (≈30 new tests across 16 commits) but `pytest -q` has not been re-run end-to-end since the v1.0.0 baseline.
 
 ---
 
@@ -178,6 +178,8 @@ Severity legend: 🔴 Critical · 🟠 Important · 🟡 Minor · 📚 Doc / Tes
 
 PM analysis: [backend-abstraction-pm-analysis.md](backend-abstraction-pm-analysis.md). Phase 1 smoke evidence: [backend-phase-1-smoke-evidence.md](backend-phase-1-smoke-evidence.md).
 
+§8 below tracks the env-policy follow-up (`cb4e967` + `6d3d6c1`) under the hardening sweep — it carries §2 backend hygiene but landed alongside the manager/web/CLI fixes on `dev`.
+
 ---
 
 ## 3. Earlier Feature Tracks (Shipped)
@@ -317,14 +319,81 @@ These were found by reading current code paths directly, not by reusing the docu
 
 ---
 
+## 8. Post-v1.0.0 Hardening Sweep (`dev` branch)
+
+Branch: `dev` (HEAD `d68d5c4`, 16 commits ahead of `main` after the `b86370c` plugin-system merge). Emergent integration fixes that surfaced post-merge during multi-process operation and Windows runs — no formal spec/plan, captured here for tracking. Not yet merged to `main`. Each commit ships its own regression tests; full `pytest -q` not re-run on `dev` end-to-end since the v1.0.0 baseline (see header).
+
+#### Plugin loader robustness
+
+| Commit | Item | Status |
+|---|---|---|
+| `df2bbf6` | `load_plugin` wraps `ep.load()` and constructor calls in try/except so one broken plugin doesn't take down bot startup. Returns `None` on failure; existing callers already handle `None`. Partial coverage of the v1.0.1 follow-up — the plugin-`start()`-failure inert-command case is still open. | ✅ closed |
+
+#### Manager process lifecycle — pidfile + orphan adoption
+
+Pre-fix: a manager crash left subprocesses orphaned; the next manager start spawned duplicates polling the same Telegram token (`Conflict: terminated by other getUpdates request`).
+
+| Commit | Item | Status |
+|---|---|---|
+| `5abb951` | `ProcessManager` writes per-project pidfiles under `<config_dir>/run/<name>.pid`; `reap_orphans()` adopts surviving processes before the autostart spawn. `cli.start_manager` calls the reap. | ✅ closed |
+| `2217323` | `_capture_output()` deletes the pidfile on observed child exit (clean or non-zero) so the same manager doesn't see a phantom pidfile and refuse to spawn / adopt a stranger. | ✅ closed |
+| `c4aefa0` | `start_team()` writes a pidfile too — team:NAME:ROLE entries get the same orphan adoption as project bots. | ✅ closed |
+| `7b20e05` | Pidfile filenames URL-encode `team:NAME:ROLE` keys so NTFS doesn't reject the reserved `:`. Adds `list_running()` / `restart()` helpers consumed by the user-mutation track below. | ✅ closed |
+| `face82f` | Fake `ProcessManager` fixtures get a no-op `reap_orphans()` stub to match the contract. | ✅ closed |
+
+#### Manager user-mutation restart
+
+Pre-fix: running bots cached `_allowed_users` at startup; mutating commands persisted to disk but left the live process serving stale auth.
+
+| Commit | Item | Status |
+|---|---|---|
+| `5f00a82` | Plugin toggle stops+starts the running project bot — disabled plugins actually stop accepting commands. Does NOT auto-start a deliberately-stopped bot. | ✅ closed |
+| `7320f3e` | `/add_user`, `/remove_user`, `/promote_user`, `/demote_user`, `/reset_user_identity` call `_restart_running_bots_for_user_mutation` after persistence. Covers role changes + identity resets the Web revocation-check missed. | ✅ closed |
+| `56fed9a` | Restart helper switches from `list_all()`+`start()` (project-only) to `list_running()`+`restart()` so mutations land on running `team:NAME:ROLE` bots too. | ✅ closed |
+
+#### Web auth hardening
+
+| Commit | Item | Status |
+|---|---|---|
+| `fa921e0` | Drops query-string token acceptance on chat / messages / SSE / message-POST / button-POST routes. New `GET /auth?token=&next=` bootstrap validates and sets the cookie; `_safe_local_redirect` blocks protocol-relative + off-host `next`. | ✅ closed |
+| `11f8698` | `revocation_check` callable threaded through `create_app` / `WebTransport` / `ProjectBot.build`. Per-request + per-SSE-iteration live-config check so manager-side revocation no longer waits for a project bot restart; fails closed on config read error. | ✅ closed |
+| `a6e51b7` | `GET /auth` renders a sign-in form (no cookie); `POST /auth` is the only path that sets the cookie. Closes residual token-in-URL leak via bookmarked URLs / Referer / proxy logs. Startup banner prints URL and token as separate fields. | ✅ closed |
+
+#### Backend env policy
+
+| Commit | Item | Status |
+|---|---|---|
+| `cb4e967` | `_prepare_env()` flips from `*_TOKEN` / `*_KEY` / `AWS_*` blacklist to allowlist baseline (PATH, HOME, locale, XDG, SSL, proxy, Node/Python runtime). Custom secrets like `PGPASSWORD` / `OPENID_CLIENT_SECRET` / `INTERNAL_STAGING_URL` no longer leak to the agent CLI subprocess. | ✅ closed |
+| `6d3d6c1` | Windows process/profile vars (`APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `SystemRoot`, `WINDIR`, `ComSpec`, `PATHEXT`, `PROGRAMDATA`, `ProgramFiles*`, `CommonProgramFiles*`) added to baseline. Native Node-packaged CLIs (the `claude` binary) crash before stderr without these; no-op on POSIX. | ✅ closed |
+
+#### Config web-identity repair + Telegram startup resilience
+
+| Commit | Item | Status |
+|---|---|---|
+| `27241c5` | `config._repair_locked_identity()` rewrites `telegram:<web-native-id>` → `web:<web-native-id>` on load; `_migrate_legacy_auth` now also catches bare `browser_user` (was `web-session:` only). `bot._after_ready` int-validates Telegram native_ids before constructing `ChatRef` (defends against pre-repair configs), and `_is_expected_startup_delivery_failure` downgrades "chat not found" / "bot was blocked" / "bot can't initiate conversation" / "bot can't send messages to bots" / "forbidden" to warnings with the operator hint that a new Telegram bot must be opened and `/start`-ed before it can DM. | ✅ closed |
+
+#### CLI ASCII safety (Windows console)
+
+| Commit | Item | Status |
+|---|---|---|
+| `d68d5c4` | Em-dashes in CLI help/error strings replaced with ASCII hyphens; parametrized canary test asserts `--help`, `configure --help`, `migrate-config --help` output is ASCII-encodable. Fixes `UnicodeEncodeError` on default Windows console codepage (cp1252 / cp437) on a fresh install before any configuration. | ✅ closed |
+
+#### Notes
+
+- The v1.0.1 follow-up list in §1.4 is orthogonal to this sweep and remains open.
+- Untracked `link-project-to-chat/` directory in the repo root (manager run state, written by current code) is missing from `.gitignore` — either gitignore-add or relocate manager state under user config dir.
+- Three of the 16 sweep commits (`6d3d6c1`, `27241c5`, `d68d5c4`) are Windows-compatibility fixes landed 2026-05-16. The remaining 13 landed earlier on the same `dev` branch and address cross-platform process/auth issues.
+
+---
+
 ## Summary by Status
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path + **Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)** |
+| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path + **Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)** + **Post-v1.0.0 integration hardening on `dev` (16 commits, see §8) — not yet merged to `main`** |
 | 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) |
 | 📋 Designed, not started | 3 transport specs (Discord #2, Slack #3, Google Chat #4), Backend Phase 5 (Gemini adapter), sandbox |
-| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec). 6 non-blocking follow-ups from v1.0.0 final review queued for v1.0.1 (§1.4). Direct code-audit findings CA-1..CA-5 are closed with regression coverage. |
+| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec). 6 non-blocking follow-ups from v1.0.0 final review queued for v1.0.1 (§1.4). Direct code-audit findings CA-1..CA-5 are closed with regression coverage. `dev` sweep (§8) awaiting merge to `main` + end-to-end `pytest -q` re-verification; untracked `link-project-to-chat/` run-state dir needs gitignore-add or relocation. |
 
 ---
 
