@@ -171,6 +171,97 @@ async def test_promote_user_usage_message_says_promote_not_demote(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_user_gets_reply(tmp_path):
+    """Unauthorized callers must receive an 'Unauthorized.' reply, consistent
+    with _guard_invocation. The original Task 6 silently returned, breaking
+    UX symmetry with the rest of the manager bot."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="alice", role="executor"),
+    ])
+    # Sender is NOT in the allow-list.
+    inv = _invocation([], sender_handle="nobody", sender_id="666")
+    await bot._on_users(inv)
+    text = bot._transport.send_text.await_args.args[1]
+    assert "Unauthorized" in text
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_user_on_write_command_gets_reply(tmp_path):
+    """Write commands also must reply 'Unauthorized.' rather than silently
+    returning when the caller is not in the allow-list — symmetric with
+    _guard_invocation."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="alice", role="executor"),
+    ])
+    inv = _invocation(["charlie"], sender_handle="nobody", sender_id="666")
+    await bot._on_add_user(inv)
+    text = bot._transport.send_text.await_args.args[1]
+    assert "Unauthorized" in text
+    # And no write happened.
+    from link_project_to_chat.config import load_config
+    cfg = load_config(bot._project_config_path)
+    assert not any(u.username == "charlie" for u in cfg.allowed_users)
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_user_gets_reply(tmp_path):
+    """Rate-limited callers must receive a 'Rate limited.' reply rather than
+    silent acceptance. Verifies the rate-limit check is present in the new
+    commands."""
+    import collections
+    import time
+
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+    ])
+    # Force rate-limit by maxing out the bucket for the admin identity.
+    inv = _invocation([])
+    key = bot._identity_key(inv.sender)
+    bot._rate_limits[key] = collections.deque(
+        [time.monotonic()] * bot._MAX_MESSAGES_PER_MINUTE
+    )
+    await bot._on_users(inv)
+    text = bot._transport.send_text.await_args.args[1]
+    assert "rate limit" in text.lower() or "try again" in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_user_on_write_command_gets_reply(tmp_path):
+    """Write commands (executor-gated) must also surface the rate-limit
+    feedback rather than silently dropping the write."""
+    import collections
+    import time
+
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+    ])
+    inv = _invocation(["charlie"])
+    key = bot._identity_key(inv.sender)
+    bot._rate_limits[key] = collections.deque(
+        [time.monotonic()] * bot._MAX_MESSAGES_PER_MINUTE
+    )
+    await bot._on_add_user(inv)
+    text = bot._transport.send_text.await_args.args[1]
+    assert "rate limit" in text.lower() or "try again" in text.lower()
+    # And no write happened.
+    from link_project_to_chat.config import load_config
+    cfg = load_config(bot._project_config_path)
+    assert not any(u.username == "charlie" for u in cfg.allowed_users)
+
+
+def test_commands_list_includes_new_user_management_commands():
+    """Task 6 added /promote_user, /demote_user, /reset_user_identity but
+    those must also appear in COMMANDS so Telegram autocomplete shows them
+    AND /help documents them. Without this entry, the commands work but
+    are invisible to operators."""
+    from link_project_to_chat.manager.bot import COMMANDS
+    names = [c[0] for c in COMMANDS]
+    assert "promote_user" in names
+    assert "demote_user" in names
+    assert "reset_user_identity" in names
+
+
+@pytest.mark.asyncio
 async def test_user_commands_work_without_explicit_config_path(monkeypatch, tmp_path):
     """When ManagerBot was constructed without a custom config path,
     `_load_config_for_users()` must fall back to DEFAULT_CONFIG instead of

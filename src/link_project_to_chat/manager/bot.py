@@ -37,6 +37,9 @@ COMMANDS = [
     ("users", "List authorized users"),
     ("add_user", "Add an authorized user"),
     ("remove_user", "Remove an authorized user"),
+    ("promote_user", "Promote a user to executor"),
+    ("demote_user", "Demote a user to viewer"),
+    ("reset_user_identity", "Clear locked identities for a user"),
     ("setup", "Configure GitHub & Telegram API credentials"),
     ("create_project", "Create a new project (GitHub + bot)"),
     ("create_team", "Create a dual-agent team (2 bots + group)"),
@@ -741,15 +744,32 @@ class ManagerBot(AuthMixin):
         return "\n".join(lines)
 
     async def _require_executor_or_reply(self, ci: "CommandInvocation") -> bool:
-        """Common gate for write commands. Auth + executor role enforcement.
+        """Common gate for write commands. Auth + rate-limit + executor role enforcement.
 
         Calling ``_auth_identity`` may append a first-contact identity to a
         user's locked_identities. The persist helper added in Task 5 Step 2b
         (``_persist_auth_if_dirty``) covers both allow and deny branches via
         the try/finally below.
+
+        Mirrors the contract from ``_guard_invocation``: unauthenticated
+        callers receive ``Unauthorized.``, rate-limited callers receive
+        ``Rate limited. Try again shortly.``, and unauthorised role gets a
+        read-only message.
         """
         try:
             if not self._auth_identity(ci.sender):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Unauthorized.",
+                    reply_to=ci.message,
+                )
+                return False
+            if self._rate_limited(self._identity_key(ci.sender)):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Rate limited. Try again shortly.",
+                    reply_to=ci.message,
+                )
                 return False
             if not self._require_executor(ci.sender):
                 await self._transport.send_text(
@@ -765,11 +785,28 @@ class ManagerBot(AuthMixin):
             await self._persist_auth_if_dirty()
 
     async def _on_users(self, ci: "CommandInvocation") -> None:
-        """List all authorized users (viewer-allowed; read-only)."""
+        """List all authorized users (viewer-allowed; read-only).
+
+        Symmetric with ``_guard_invocation``: unauthenticated callers receive
+        an ``Unauthorized.`` reply, rate-limited callers receive a
+        ``Rate limited. Try again shortly.`` reply.
+        """
         # /users LIST is viewer-allowed (read-only). But _auth_identity may
         # still append a first-contact lock; persist before returning.
         try:
             if not self._auth_identity(ci.sender):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Unauthorized.",
+                    reply_to=ci.message,
+                )
+                return
+            if self._rate_limited(self._identity_key(ci.sender)):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Rate limited. Try again shortly.",
+                    reply_to=ci.message,
+                )
                 return
             cfg = self._load_config_for_users()
             await self._transport.send_text(
