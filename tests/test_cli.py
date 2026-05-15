@@ -94,6 +94,14 @@ def test_setup_authenticates_telethon_with_secure_session_before_start(tmp_path,
     assert "Telethon authenticated successfully!" in result.output
 
 
+@pytest.mark.parametrize("args", [["--help"], ["configure", "--help"], ["migrate-config", "--help"]])
+def test_cli_help_is_ascii_safe_for_windows_console(runner, args):
+    result = runner.invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    result.output.encode("ascii")
+
+
 # --- projects add ---
 
 def test_add_project_success(runner, cfg):

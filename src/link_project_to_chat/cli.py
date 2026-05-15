@@ -119,7 +119,7 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
     if username:
         # Translate ``--username X`` to the modern ``allowed_users`` shape.
         # Writing the legacy flat ``username`` key would seem to succeed but
-        # collide with any pre-existing ``allowed_users`` on the next load —
+        # collide with any pre-existing ``allowed_users`` on the next load -
         # the explicit list wins and the new user is silently dropped. The
         # migration helper only re-synthesizes when allowed_users is empty.
         norm = username.lower().lstrip("@")
@@ -207,7 +207,7 @@ def projects_edit(ctx, name: str, field: str, value: str):
     elif field == "username":
         # Translate ``username`` to ``allowed_users`` so the write actually
         # authorizes the new user. Writing the legacy flat key directly would
-        # collide with an existing ``allowed_users`` list on next load — the
+        # collide with an existing ``allowed_users`` list on next load - the
         # explicit list wins and the new user is silently dropped (the loader
         # only re-synthesizes legacy fields when allowed_users is empty).
         norm = value.lower().lstrip("@")
@@ -245,8 +245,8 @@ def projects_edit(ctx, name: str, field: str, value: str):
 
 
 @main.command()
-@click.option("--username", default=None, help="(DEPRECATED — use --add-user) Allowed Telegram username.")
-@click.option("--remove-username", default=None, help="(DEPRECATED — use --remove-user) Remove an allowed username.")
+@click.option("--username", default=None, help="(DEPRECATED - use --add-user) Allowed Telegram username.")
+@click.option("--remove-username", default=None, help="(DEPRECATED - use --remove-user) Remove an allowed username.")
 @click.option(
     "--add-user", "add_user", default=None,
     help="Add an AllowedUser. Format: 'username' or 'username:role' (role = viewer|executor; default executor).",
@@ -511,7 +511,7 @@ def start(
                 whisper_language=config.whisper_language,
             )
         except (ImportError, ValueError) as e:
-            click.echo(f"Warning: Voice disabled — {e}", err=True)
+            click.echo(f"Warning: Voice disabled - {e}", err=True)
 
     synthesizer = None
     if config.tts_backend:
@@ -523,7 +523,7 @@ def start(
                 tts_voice=config.tts_voice,
             )
         except (ImportError, ValueError) as e:
-            click.echo(f"Warning: TTS disabled — {e}", err=True)
+            click.echo(f"Warning: TTS disabled - {e}", err=True)
 
     if team:
         if not role:
@@ -534,7 +534,7 @@ def start(
         if role not in t.bots:
             raise SystemExit(f"Role '{role}' not in team '{team}'. Known roles: {list(t.bots)}")
         bot_cfg = t.bots[role]
-        # Team bots run unattended in a group — a Claude tool-permission prompt
+        # Team bots run unattended in a group - a Claude tool-permission prompt
         # would block forever. Default to dangerously-skip-permissions unless
         # the team config explicitly overrides.
         team_skip, team_pm = resolve_permissions(
@@ -765,7 +765,7 @@ def setup(ctx, github_pat: str | None, telegram_api_id: int | None, telegram_api
                 )
             click.echo(f"Voice: {stt_backend} configured.")
 
-    # TTS (text-to-speech) — reuses the OpenAI API key from STT config
+    # TTS (text-to-speech) - reuses the OpenAI API key from STT config
     tts_changed = False
     if tts_voice is not None and tts_backend is None:
         if not config.tts_backend:
@@ -877,7 +877,7 @@ def start_manager(ctx):
     if not token:
         raise SystemExit("No manager token configured. Run 'configure --manager-token TOKEN' first.")
     # Post-migration the only auth source is allowed_users (global allow-list).
-    # Empty → fail-closed (every message rejected). The manager bot has no
+    # Empty -> fail-closed (every message rejected). The manager bot has no
     # project-scoped fallback (unlike project bots via resolve_project_allowed_users).
     if not main_config.allowed_users:
         raise SystemExit(
@@ -949,7 +949,7 @@ def plugin_call(ctx, project: str, plugin_name: str, tool_name: str, args_json: 
 @click.option("--project", "project_filter", default=None, help="Limit project output to this name.")
 @click.pass_context
 def migrate_config(ctx, dry_run: bool, project_filter: str | None):
-    """Apply the legacy → AllowedUser migration on config.json.
+    """Apply the legacy -> AllowedUser migration on config.json.
 
     Exit code 0 on success; non-zero when any project ends up with empty
     `allowed_users` (operators must populate them before exposing the bot).
@@ -976,7 +976,7 @@ def migrate_config(ctx, dry_run: bool, project_filter: str | None):
 
     if not config.migration_pending:
         click.echo("\nNo migration needed (config.json already in the new shape).")
-        # Still exit non-zero if there are empty allowlists — operator should know.
+        # Still exit non-zero if there are empty allowlists - operator should know.
         if empty_projects:
             click.echo(
                 f"\nERROR: projects with no users authorized: {', '.join(empty_projects)}",
