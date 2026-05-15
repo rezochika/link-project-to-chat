@@ -96,7 +96,7 @@ class WebTransport:
             for token, handle in self._authenticated_handles.items():
                 logger.warning(
                     "Web UI auth token enabled for %s. Open "
-                    "http://%s:%s/chat/default?token=%s",
+                    "http://%s:%s/auth?token=%s",
                     handle,
                     host,
                     port,
@@ -104,7 +104,7 @@ class WebTransport:
                 )
         elif auth_token is not None:
             logger.warning(
-                "Web UI auth token enabled. Open http://%s:%s/chat/default?token=%s",
+                "Web UI auth token enabled. Open http://%s:%s/auth?token=%s",
                 host,
                 port,
                 auth_token,

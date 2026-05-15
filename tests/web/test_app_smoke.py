@@ -52,7 +52,14 @@ async def test_chat_page_requires_web_auth_token_when_configured(tmp_path: Path)
             denied = await client.get("/chat/default")
             assert denied.status_code == 401
 
-            allowed = await client.get("/chat/default?token=secret-token")
+            # Bootstrap exchange: /auth swaps the URL token for the cookie.
+            bootstrap = await client.get(
+                "/auth?token=secret-token", follow_redirects=False
+            )
+            assert bootstrap.status_code in (302, 303, 307)
+            assert "token" not in (bootstrap.headers.get("location") or "")
+
+            allowed = await client.get("/chat/default")
             assert allowed.status_code == 200
             assert 'name="csrf_token"' in allowed.text
 
@@ -80,10 +87,15 @@ async def test_per_user_web_auth_token_sets_server_handle(tmp_path: Path):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            denied = await client.get("/chat/default?token=bad")
+            denied = await client.get("/auth?token=bad", follow_redirects=False)
             assert denied.status_code == 401
 
-            page = await client.get("/chat/default?token=tok-bob")
+            bootstrap = await client.get(
+                "/auth?token=tok-bob", follow_redirects=False
+            )
+            assert bootstrap.status_code in (302, 303, 307)
+
+            page = await client.get("/chat/default")
             assert page.status_code == 200
             token = _csrf_token(page.text)
 
@@ -96,6 +108,69 @@ async def test_per_user_web_auth_token_sets_server_handle(tmp_path: Path):
             assert event["payload"]["sender_native_id"] == "web-user:bob"
             assert event["payload"]["sender_handle"] == "bob"
             assert event["payload"]["authenticated_handle"] == "bob"
+    finally:
+        await store.close()
+
+
+async def test_chat_route_rejects_url_token_directly(tmp_path: Path):
+    """Tokens passed via query string to non-/auth routes must be ignored."""
+    store = WebStore(tmp_path / "url-rej.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(store, inbound_queue, sse_queues, auth_token="secret-token")
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            denied = await client.get("/chat/default?token=secret-token")
+            assert denied.status_code == 401
+
+            denied_partial = await client.get(
+                "/chat/default/messages?token=secret-token"
+            )
+            assert denied_partial.status_code == 401
+
+            denied_sse = await client.get("/chat/default/sse?token=secret-token")
+            assert denied_sse.status_code == 401
+    finally:
+        await store.close()
+
+
+async def test_auth_bootstrap_redirects_to_next_param_only_if_local(tmp_path: Path):
+    """The `next` redirect target must be a local path; reject open-redirect attempts."""
+    store = WebStore(tmp_path / "redir.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(store, inbound_queue, sse_queues, auth_token="secret-token")
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Local path is honored.
+            local = await client.get(
+                "/auth?token=secret-token&next=/chat/special",
+                follow_redirects=False,
+            )
+            assert local.status_code in (302, 303, 307)
+            assert local.headers.get("location") == "/chat/special"
+
+            # Off-host redirect is rejected (falls back to default).
+            offsite = await client.get(
+                "/auth?token=secret-token&next=https://evil.example/x",
+                follow_redirects=False,
+            )
+            assert offsite.status_code in (302, 303, 307)
+            assert offsite.headers.get("location", "").startswith("/chat/")
+
+            # Protocol-relative is rejected.
+            proto_rel = await client.get(
+                "/auth?token=secret-token&next=//evil.example/x",
+                follow_redirects=False,
+            )
+            assert proto_rel.status_code in (302, 303, 307)
+            assert proto_rel.headers.get("location", "").startswith("/chat/")
     finally:
         await store.close()
 

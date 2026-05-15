@@ -66,7 +66,11 @@ def _auth_from_request(
     authenticated_handle: str | None,
     authenticated_handles: dict[str, str] | None,
 ) -> _WebAuth:
-    supplied = request.query_params.get("token") or request.cookies.get(_AUTH_COOKIE)
+    # Cookie-only auth on normal routes — query-string tokens are rejected
+    # because the URL ends up in browser history, proxy/access logs, and
+    # Referer headers. Operators bootstrap a session via GET /auth?token=...,
+    # which sets the cookie and redirects without the token.
+    supplied = request.cookies.get(_AUTH_COOKIE)
     if authenticated_handles is not None:
         if not supplied:
             return _WebAuth(ok=False)
@@ -80,6 +84,24 @@ def _auth_from_request(
     if supplied and secrets.compare_digest(supplied, auth_token):
         return _WebAuth(ok=True, supplied_token=supplied, handle=authenticated_handle)
     return _WebAuth(ok=False)
+
+
+def _safe_local_redirect(next_param: str | None, default: str = "/chat/default") -> str:
+    """Return `next_param` only if it's a same-host local path; else `default`.
+
+    Rejects: full URLs (https://evil.example/...), protocol-relative URLs
+    (//evil.example/...), and Windows-style paths. The bootstrap endpoint uses
+    this to prevent open-redirect against a stolen-but-valid token.
+    """
+    if not next_param:
+        return default
+    if not next_param.startswith("/"):
+        return default
+    if next_param.startswith("//"):
+        return default
+    if "\\" in next_param:
+        return default
+    return next_param
 
 
 def _require_web_auth(
@@ -100,12 +122,8 @@ def _require_web_auth(
     return auth
 
 
-def _attach_auth_cookie(response, request: Request, auth: _WebAuth) -> None:
-    supplied = request.query_params.get("token")
-    if not supplied or not auth.supplied_token:
-        return
-    if secrets.compare_digest(supplied, auth.supplied_token):
-        response.set_cookie(_AUTH_COOKIE, auth.supplied_token, httponly=True, samesite="lax")
+def _set_auth_cookie(response, token: str) -> None:
+    response.set_cookie(_AUTH_COOKIE, token, httponly=True, samesite="lax")
 
 
 def _verify_csrf(request: Request, csrf_token: str) -> tuple[str, str]:
@@ -138,6 +156,34 @@ def create_app(
     async def root():
         return RedirectResponse("/chat/default")
 
+    @app.get("/auth")
+    async def auth_bootstrap(request: Request):
+        """One-shot exchange: validate `?token=...`, set cookie, redirect.
+
+        This is the only route that accepts a token in the URL. It immediately
+        sets the auth cookie and redirects to `next` (or /chat/default), so
+        the token never appears in any page-load URL after the bootstrap.
+        """
+        supplied = request.query_params.get("token", "")
+        next_url = _safe_local_redirect(request.query_params.get("next"))
+        validated_token: str | None = None
+        if authenticated_handles is not None:
+            for token in authenticated_handles:
+                if secrets.compare_digest(supplied, token):
+                    validated_token = token
+                    break
+        elif auth_token is not None:
+            if supplied and secrets.compare_digest(supplied, auth_token):
+                validated_token = auth_token
+        else:
+            # Auth not enforced; bootstrap is a no-op redirect.
+            return RedirectResponse(next_url, status_code=303)
+        if validated_token is None:
+            raise HTTPException(status_code=401, detail="Invalid auth token")
+        response = RedirectResponse(next_url, status_code=303)
+        _set_auth_cookie(response, validated_token)
+        return response
+
     @app.get("/chat/{chat_id}", response_class=HTMLResponse)
     async def chat_page(request: Request, chat_id: str):
         auth = _auth_from_request(
@@ -155,7 +201,6 @@ def create_app(
             "chat.html",
             {"chat_id": chat_id, "messages": messages, "csrf_token": csrf_token},
         )
-        _attach_auth_cookie(response, request, auth)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
@@ -174,7 +219,6 @@ def create_app(
             "messages.html",
             {"messages": messages, "csrf_token": csrf_token},
         )
-        _attach_auth_cookie(response, request, auth)
         _attach_session_cookies(response, session_id, csrf_token)
         return response
 
