@@ -251,6 +251,11 @@ class ProcessManager:
             return
         self._processes.pop(name, None)
         self._log_threads.pop(name, None)
+        # Same-process pidfile cleanup: without this, a normal exit (clean
+        # or non-zero) leaves a stale pidfile that the next start() / a
+        # follow-on reap_orphans() will misread as a live bot if the pid
+        # gets recycled to an unrelated process.
+        self._delete_pidfile(name)
         if returncode == 0:
             logger.info("%s exited cleanly", name)
         else:

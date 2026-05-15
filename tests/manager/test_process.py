@@ -105,6 +105,30 @@ def test_stale_process_detected(tmp_path: Path):
     assert pm.status("fast") == "stopped"
 
 
+def test_pidfile_deleted_when_child_exits_normally(tmp_path: Path):
+    """A fast-exiting child leaves _capture_output to clean up self._processes,
+    but the pidfile must also be removed — otherwise a later start() or
+    reap_orphans() sees a phantom pidfile and either refuses the start or
+    'adopts' an unrelated process that happens to land on the recycled pid.
+    """
+    run_dir = tmp_path / "run"
+    pm = ProcessManager(
+        project_config_path=_proj_cfg(tmp_path, {"fast": {"path": str(tmp_path)}}),
+        command_builder=lambda n, c: _true_cmd(),
+        run_dir=run_dir,
+    )
+    pm.start("fast")
+    pidfile = run_dir / "fast.pid"
+    assert pidfile.exists()
+    # _true_cmd runs `python -c ""` which exits immediately.
+    # Wait for _capture_output's reader thread to observe EOF + proc.wait.
+    deadline = time.monotonic() + 5
+    while pm._processes.get("fast") is not None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert pm.status("fast") == "stopped"
+    assert not pidfile.exists(), "pidfile must be cleaned up when child exits normally"
+
+
 def test_start_writes_pidfile(tmp_path: Path):
     """Each running project must have a `.pid` file on disk so a freshly-spawned
     manager can detect orphans surviving a crash."""
