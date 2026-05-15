@@ -1325,6 +1325,7 @@ def test_start_manager_passes_allowed_users_into_manager_bot(tmp_path, monkeypat
     class _FakePM:
         def __init__(self, **kwargs): pass
         def start_autostart(self): return 0
+        def reap_orphans(self): return []
 
     monkeypatch.setattr("link_project_to_chat.manager.process.ProcessManager", _FakePM)
 
@@ -1362,7 +1363,8 @@ def test_start_manager_runs_migration_on_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "link_project_to_chat.manager.process.ProcessManager",
         type("_FPM", (), {"__init__": lambda *a, **k: None,
-                          "start_autostart": lambda self: 0}),
+                          "start_autostart": lambda self: 0,
+                          "reap_orphans": lambda self: []}),
     )
 
     runner = CliRunner()
