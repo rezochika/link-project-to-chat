@@ -1147,23 +1147,33 @@ class ManagerBot(AuthMixin):
             # setup text, gate it inside _handle_setup_input.
             setup_awaiting = ctx.user_data.get("setup_awaiting")
             if setup_awaiting:
-                # Defense-in-depth: viewers shouldn't be able to write API
-                # tokens or Telethon credentials even if they somehow armed
-                # setup_awaiting (e.g. via PTB state left over from a prior
-                # executor session). The /setup entry point is already
-                # executor-gated, but text input lands here regardless of
-                # who pressed the button.
+                # Defense-in-depth: nobody should be able to write API tokens
+                # or Telethon credentials except an authenticated executor,
+                # even if setup_awaiting was somehow armed by PTB state left
+                # over from a prior executor session. The /setup entry point
+                # is already executor-gated, but text input lands here
+                # regardless of who pressed the button — including
+                # unauthenticated callers if state leaks across users.
+                # Order matters: clear setup_awaiting on any non-executor
+                # path so a single bad reply can't keep collecting writes.
                 user = update.effective_user
-                if user is not None:
-                    identity = identity_from_telegram_user(user)
-                    if self._auth_identity(identity) and not self._require_executor(identity):
-                        incoming = self._incoming_from_update(update)
-                        ctx.user_data.pop("setup_awaiting", None)
-                        await self._transport.send_text(
-                            incoming.chat,
-                            "Read-only access — only executors can complete setup.",
-                        )
-                        return
+                if user is None:
+                    ctx.user_data.pop("setup_awaiting", None)
+                    return
+                identity = identity_from_telegram_user(user)
+                if not self._auth_identity(identity):
+                    incoming = self._incoming_from_update(update)
+                    ctx.user_data.pop("setup_awaiting", None)
+                    await self._transport.send_text(incoming.chat, "Unauthorized.")
+                    return
+                if not self._require_executor(identity):
+                    incoming = self._incoming_from_update(update)
+                    ctx.user_data.pop("setup_awaiting", None)
+                    await self._transport.send_text(
+                        incoming.chat,
+                        "Read-only access — only executors can complete setup.",
+                    )
+                    return
                 await self._handle_setup_input(update, ctx, setup_awaiting)
                 return
             # Existing edit logic

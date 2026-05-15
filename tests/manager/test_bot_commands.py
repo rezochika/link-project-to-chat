@@ -1002,6 +1002,42 @@ async def test_viewer_cannot_complete_setup_input_via_text(viewer_bot_env, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_user_cannot_complete_setup_input_via_text(bot_env, tmp_path: Path):
+    """Regression for the post-v1.0 P1: an unauthenticated caller with a
+    stale/leaked setup_awaiting state must NOT be able to write setup
+    values like github_pat.
+
+    Previous guard at manager/bot.py:1159 was
+    ``self._auth_identity(identity) and not self._require_executor(identity)``
+    — which only blocks AUTHENTICATED viewers. Unauthenticated callers fell
+    through to _handle_setup_input and successfully wrote ghp_BAD into the
+    config. Fix requires authenticated executor before _handle_setup_input;
+    clears setup_awaiting and replies Unauthorized./Read-only on every
+    non-executor branch so a single bad reply can't keep collecting writes.
+    """
+    bot, _pm, proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
+    # mallory is NOT in the allow-list (bot_env locks testuser to telegram:1
+    # as the only allowed executor). Picking user_id=999 + username=mallory
+    # guarantees _auth_identity returns False.
+    update, ctx = _make_update(user_id=999, username="mallory", text="ghp_BAD")
+    ctx.user_data = {
+        "setup_awaiting": "github_pat",
+        "setup_config_path": str(proj_cfg),
+    }
+    await bot._edit_field_save(update, ctx)
+    raw = json.loads(proj_cfg.read_text()) if proj_cfg.exists() else {}
+    assert raw.get("github_pat") in (None, "", False), (
+        f"unauthorized user wrote github_pat: {raw.get('github_pat')!r}"
+    )
+    # setup_awaiting must be cleared so a stale state can't keep collecting writes.
+    assert "setup_awaiting" not in ctx.user_data
+    # Reply is "Unauthorized." (the viewer-blocked path would say "read-only").
+    text = fake.sent_messages[-1].text.lower()
+    assert "unauthorized" in text
+
+
+@pytest.mark.asyncio
 async def test_viewer_cannot_run_add_project_wizard(viewer_bot_env):
     """Regression for P1 #1: /add_project wizard entry must gate to executor."""
     from telegram.ext import ConversationHandler
