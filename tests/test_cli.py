@@ -169,7 +169,11 @@ def test_add_project_optional_fields(runner, cfg):
     ])
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["optproj"]
-    assert proj["username"] == "bob"
+    # P1 #2: --username now writes the modern allowed_users shape rather than
+    # the legacy flat ``username`` key (which would lose to a pre-existing
+    # allowed_users list on next load).
+    assert "username" not in proj
+    assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
     assert proj["model"] == "sonnet"
     assert proj["permissions"] == "default"
 
@@ -318,6 +322,108 @@ def test_edit_project_invalid_permissions_value_fails(runner, cfg):
     assert "Invalid permissions value" in result.output
 
 
+# --- P1 #2: legacy `username` writes must translate to allowed_users ---
+
+def test_projects_add_with_username_writes_allowed_users(tmp_path):
+    """Regression for P1 #2: `projects add --username X` must produce an
+    actually-authorizing config rather than a legacy `username` flat key
+    that loses to any pre-existing allowed_users on next load.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"projects": {}}))
+    proj_dir = tmp_path / "myproj"
+    proj_dir.mkdir()
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "add",
+        "--name", "myproj",
+        "--path", str(proj_dir),
+        "--token", "t",
+        "--username", "alice",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg_file.read_text())
+    proj = on_disk["projects"]["myproj"]
+    # Legacy flat key must not be present.
+    assert "username" not in proj
+    # Modern shape with role=executor.
+    assert proj["allowed_users"] == [{"username": "alice", "role": "executor"}]
+
+
+def test_projects_add_with_username_uppercase_and_at_normalized(tmp_path):
+    """Symmetry with the legacy normalization: lowercase + strip @."""
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"projects": {}}))
+    proj_dir = tmp_path / "p"
+    proj_dir.mkdir()
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "add",
+        "--name", "p", "--path", str(proj_dir), "--token", "t",
+        "--username", "@AliceUpper",
+    ])
+    assert result.exit_code == 0, result.output
+    on_disk = json.loads(cfg_file.read_text())
+    assert on_disk["projects"]["p"]["allowed_users"] == [
+        {"username": "aliceupper", "role": "executor"}
+    ]
+
+
+def test_projects_edit_username_replaces_allowed_users(tmp_path):
+    """Regression for P1 #2: `projects edit NAME username X` must actually
+    authorize X — historically it wrote a legacy flat key that lost to a
+    pre-existing allowed_users on next load.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "allowed_users": [{"username": "alice", "role": "executor"}],
+            }
+        }
+    }))
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "myproj", "username", "bob",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg_file.read_text())
+    proj = on_disk["projects"]["myproj"]
+    # Bob fully replaces alice in the modern shape (matches the legacy
+    # ``username`` semantics of "the allowed user").
+    assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
+    # Legacy flat key gone.
+    assert "username" not in proj
+    # Deprecation hint surfaced to stderr.
+    assert "allowed_users" in result.stderr or "/add_user" in result.stderr
+
+
+def test_projects_edit_username_normalizes_handle(tmp_path):
+    """Edit semantics match add: lowercase + strip leading @."""
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "myproj", "username", "@BobUpper",
+    ])
+    assert result.exit_code == 0, result.output
+    on_disk = json.loads(cfg_file.read_text())
+    assert on_disk["projects"]["myproj"]["allowed_users"] == [
+        {"username": "bobupper", "role": "executor"}
+    ]
+
+
 # --- configure --manager-token ---
 
 def test_configure_manager_token(runner, cfg):
@@ -327,8 +433,9 @@ def test_configure_manager_token(runner, cfg):
     assert "OKEN" in result.output
     data = json.loads(p.read_text())
     assert data["manager_telegram_bot_token"] == "MGR_TOKEN"
-    # existing keys preserved (migrated from allowed_username to allowed_usernames)
-    assert data["allowed_usernames"] == ["alice"]
+    # existing auth carried forward via the new identity-keyed shape (Task 3
+    # strips legacy ``allowed_usernames`` from disk).
+    assert [u["username"] for u in data["allowed_users"]] == ["alice"]
     assert "projects" in data
 
 
@@ -348,8 +455,12 @@ def test_configure_remove_username_revokes_trusted_binding(runner, tmp_path):
 
     assert result.exit_code == 0
     data = json.loads(p.read_text())
-    assert data["allowed_usernames"] == []
+    # Task 3: legacy keys are stripped from disk; the new shape carries the
+    # data forward. After removing alice, neither legacy nor new shape
+    # contains an entry for her.
+    assert "allowed_usernames" not in data
     assert "trusted_users" not in data
+    assert data.get("allowed_users", []) == []
 
 
 def test_configure_no_args_fails(runner, cfg):
@@ -843,20 +954,19 @@ def test_start_team_wrong_role_errors(tmp_path, monkeypatch):
     assert "not in team" in (result.output or str(result.exception)) or "dev" in (result.output or str(result.exception))
 
 
-def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+def test_start_project_with_project_usernames_uses_project_allowed_users(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -876,25 +986,23 @@ def test_start_project_with_project_usernames_uses_project_trusted_ids_only(tmp_
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["bob"]
+    assert kwargs["auth_source"] == "project"
 
 
-def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatch):
+def test_start_project_username_override_uses_one_user_allow_list(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
-                    trusted_user_ids=[202],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -914,24 +1022,22 @@ def test_start_project_username_override_clears_trusted_ids(tmp_path, monkeypatc
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["carol"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["carol"]
 
 
-def test_start_single_project_without_project_flag_uses_project_trusted_ids_only(tmp_path, monkeypatch):
+def test_start_single_project_without_project_flag_uses_project_allowed_users(tmp_path, monkeypatch):
     import link_project_to_chat.cli as cli
-    from link_project_to_chat.config import Config, ProjectConfig, save_config
+    from link_project_to_chat.config import AllowedUser, Config, ProjectConfig, save_config
 
     cfg_path = tmp_path / "config.json"
     save_config(
         Config(
-            allowed_usernames=["alice"],
-            trusted_user_ids=[101],
+            allowed_users=[AllowedUser(username="alice", role="executor")],
             projects={
                 "demo": ProjectConfig(
                     path=str(tmp_path),
                     telegram_bot_token="tok",
-                    allowed_usernames=["bob"],
+                    allowed_users=[AllowedUser(username="bob", role="executor")],
                 )
             },
         ),
@@ -948,8 +1054,7 @@ def test_start_single_project_without_project_flag_uses_project_trusted_ids_only
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["bob"]
-    assert kwargs["trusted_users"] == {}
+    assert [u.username for u in kwargs["allowed_users"]] == ["bob"]
 
 
 def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkeypatch):
@@ -978,6 +1083,333 @@ def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkey
 
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
-    assert kwargs["allowed_usernames"] == ["alice"]
-    assert kwargs.get("on_trust") is None
-    assert kwargs.get("trusted_users") is None
+    assert [u.username for u in kwargs["allowed_users"]] == ["alice"]
+    # Legacy ``on_trust`` callback was removed in v1.0; verify the call site
+    # no longer passes it.
+    assert "on_trust" not in kwargs
+
+
+def test_plugin_call_unknown_plugin_exits_nonzero(tmp_path):
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(
+        '{"projects": {"p": {"path": "/tmp", "telegram_bot_token": "t"}}}'
+    )
+
+    result = runner.invoke(
+        main,
+        ["--config", str(cfg), "plugin-call", "p", "does-not-exist", "tool", "{}"],
+    )
+    assert result.exit_code != 0
+
+
+def test_migrate_config_dry_run_does_not_write(tmp_path):
+    """`migrate-config --dry-run` shows the migration without modifying the file."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {
+                "path": "/tmp",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    }))
+    before = cfg.read_text()
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config", "--dry-run"])
+    assert result.exit_code == 0
+    assert "alice" in result.output
+    assert "executor" in result.output
+    # File is unchanged.
+    assert cfg.read_text() == before
+
+
+def test_migrate_config_applies_migration(tmp_path):
+    """`migrate-config` (no --dry-run) writes the new shape to disk."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {
+                "path": "/tmp",
+                "telegram_bot_token": "t",
+                "allowed_usernames": ["alice"],
+                "trusted_users": {"alice": 12345},
+            }
+        }
+    }))
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config"])
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    assert "allowed_usernames" not in written["projects"]["p"]
+    assert written["projects"]["p"]["allowed_users"] == [
+        {"username": "alice", "role": "executor", "locked_identities": ["telegram:12345"]},
+    ]
+
+
+def test_migrate_config_nonzero_exit_on_empty_allowlist(tmp_path):
+    """Migration that leaves any project with empty allowed_users exits non-zero."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "p": {"path": "/tmp", "telegram_bot_token": "t"}
+        }
+    }))
+    result = runner.invoke(main, ["--config", str(cfg), "migrate-config"])
+    assert result.exit_code != 0
+
+
+def test_configure_add_user_persists(tmp_path):
+    """`configure --add-user alice:executor` writes an AllowedUser to the global allow-list."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    result = runner.invoke(main, ["--config", str(cfg), "configure", "--add-user", "alice:executor"])
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    assert written["allowed_users"] == [
+        {"username": "alice", "role": "executor"},
+    ]
+
+
+def test_configure_reset_user_identity_per_transport(tmp_path):
+    """`configure --reset-user-identity alice:web` clears web entries only,
+    leaving other transports' locks intact. Regression test for the bug
+    where the whole string was normalized before the colon-split."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice:web"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    assert alice["locked_identities"] == ["telegram:12345"]
+
+
+def test_configure_reset_user_identity_clears_all(tmp_path):
+    """`configure --reset-user-identity alice` (no :transport) clears all."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "allowed_users": [{
+            "username": "alice",
+            "role": "executor",
+            "locked_identities": ["telegram:12345", "web:web-session:abc"],
+        }],
+        "projects": {},
+    }))
+    result = runner.invoke(
+        main, ["--config", str(cfg), "configure", "--reset-user-identity", "alice"],
+    )
+    assert result.exit_code == 0
+    written = json.loads(cfg.read_text())
+    alice = written["allowed_users"][0]
+    # Empty list serializes as the absent key.
+    assert alice.get("locked_identities", []) == []
+
+
+def test_configure_legacy_username_flag_warns(tmp_path):
+    """Legacy `--username` flag works but emits a deprecation warning."""
+    import json
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+
+    runner = CliRunner()
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    result = runner.invoke(main, ["--config", str(cfg), "configure", "--username", "bob"])
+    assert result.exit_code == 0
+    assert "deprecated" in result.output.lower() or "deprecated" in (result.stderr or "").lower()
+    written = json.loads(cfg.read_text())
+    assert any(u["username"] == "bob" for u in written.get("allowed_users", []))
+
+
+def test_start_manager_requires_allowed_users(tmp_path, monkeypatch):
+    """start-manager must hard-fail when allowed_users is empty (fail-closed)."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Manager token set, but NO allowed_users. (Config has no top-level
+    # telegram_bot_token field — that's per-ProjectConfig. start-manager
+    # only needs manager_telegram_bot_token.)
+    save_config(
+        Config(manager_telegram_bot_token="m", allowed_users=[]),
+        cfg_path,
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code != 0
+    assert "No users authorized" in (result.output + str(result.exception))
+
+
+def test_start_manager_passes_allowed_users_into_manager_bot(tmp_path, monkeypatch):
+    """start-manager must construct ManagerBot with allowed_users=, not the
+    legacy allowed_usernames=. Regression: pre-Task-4 start_manager passed
+    allowed_usernames= and trusted_users=, both of which Task 5 deletes."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    save_config(
+        Config(
+            manager_telegram_bot_token="m",
+            allowed_users=[AllowedUser(username="alice", role="executor")],
+        ),
+        cfg_path,
+    )
+
+    captured_kwargs: dict = {}
+
+    class _FakeBot:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs["args"] = args
+            captured_kwargs["kwargs"] = kwargs
+
+        def build(self):
+            class _App:
+                def run_polling(self_inner): return None
+            return _App()
+
+    monkeypatch.setattr("link_project_to_chat.manager.bot.ManagerBot", _FakeBot)
+
+    class _FakePM:
+        def __init__(self, **kwargs): pass
+        def start_autostart(self): return 0
+
+    monkeypatch.setattr("link_project_to_chat.manager.process.ProcessManager", _FakePM)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+    # allowed_users= must be present; legacy kwargs must NOT be passed.
+    assert "allowed_users" in captured_kwargs["kwargs"]
+    assert captured_kwargs["kwargs"]["allowed_users"][0].username == "alice"
+    assert "allowed_usernames" not in captured_kwargs["kwargs"]
+    assert "trusted_users" not in captured_kwargs["kwargs"]
+
+
+def test_start_manager_runs_migration_on_pending(tmp_path, monkeypatch):
+    """start-manager must call save_config when load_config sets migration_pending,
+    mirroring start's behavior."""
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import AllowedUser, Config, save_config
+    from click.testing import CliRunner
+
+    cfg_path = tmp_path / "config.json"
+    # Write a legacy-shaped config that load_config will migrate.
+    import json
+    cfg_path.write_text(json.dumps({
+        "telegram_bot_token": "x",
+        "manager_telegram_bot_token": "m",
+        "allowed_usernames": ["alice"],  # legacy → will trigger migration
+    }))
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.bot.ManagerBot",
+        type("_FB", (), {"__init__": lambda *a, **k: None,
+                        "build": lambda self: type("_A", (), {"run_polling": lambda s: None})()}),
+    )
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.process.ProcessManager",
+        type("_FPM", (), {"__init__": lambda *a, **k: None,
+                          "start_autostart": lambda self: 0}),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--config", str(cfg_path), "start-manager"])
+    assert result.exit_code == 0, result.output
+
+    # After migration, the on-disk file no longer has the legacy key and DOES
+    # have allowed_users with role=executor for alice.
+    reloaded = json.loads(cfg_path.read_text())
+    assert "allowed_usernames" not in reloaded
+    assert any(u["username"] == "alice" and u["role"] == "executor"
+               for u in reloaded.get("allowed_users", []))
+
+
+def test_manager_bot_accepts_allowed_users_kwarg():
+    """Constructor regression: ManagerBot must accept allowed_users= and set
+    self._allowed_users. Catches a future caller that drops this kwarg."""
+    from link_project_to_chat.config import AllowedUser
+    from link_project_to_chat.manager.bot import ManagerBot
+    from link_project_to_chat.manager.process import ProcessManager
+
+    pm = ProcessManager.__new__(ProcessManager)
+    bot = ManagerBot(
+        token="t",
+        process_manager=pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    assert bot._allowed_users == [AllowedUser(username="alice", role="executor")]
+
+
+# Removed in Task 5 Step 11: ``test_manager_bot_legacy_auth_works_with_allowed_users_only``
+# called the deleted legacy ``_auth(user)`` method. The post-rewrite
+# equivalent (an authorized user authenticates via ``_auth_identity``) is
+# covered by ``tests/test_auth_roles.py``.
+
+
+def test_version_is_consistent_across_pyproject_and_init():
+    """Version string in pyproject.toml must match src/.../__init__.py."""
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+    pyproject_version = pyproject["project"]["version"]
+
+    import link_project_to_chat
+    assert link_project_to_chat.__version__ == pyproject_version, (
+        f"Version drift: pyproject.toml={pyproject_version!r} vs "
+        f"__init__.py={link_project_to_chat.__version__!r}"
+    )

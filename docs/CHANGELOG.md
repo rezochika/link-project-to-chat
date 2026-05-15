@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.0.0 — 2026-05-14
+
+### BREAKING CHANGES
+- **`config.json` schema:** `allowed_usernames`, `trusted_users`, and
+  `trusted_user_ids` are removed. The new `allowed_users` field is the sole
+  auth source. Legacy fields are read once on load (synthesized into
+  `AllowedUser{role="executor"}` entries), then stripped on next save.
+  Operators upgrading need to verify the migrated `allowed_users` list before
+  exposing the bot to traffic. An empty `allowed_users` list now fails closed
+  (every request denied) — pre-v1.0 ambiguous behavior is gone.
+
+### Added
+- **Plugin framework** (`plugin.py`) with `Plugin` base, `PluginContext`,
+  `BotCommand`, entry-point discovery via `lptc.plugins`. Hooks: `start`,
+  `stop`, `on_message`, `on_button`, `on_task_complete`, `on_tool_use`,
+  `get_context`. Plugins are transport-portable: same plugin runs on
+  Telegram, Web, and future Discord/Slack/Google Chat transports.
+- **`Transport.on_stop(callback)`** Protocol method, fired during shutdown
+  before the platform tears down. Implemented in TelegramTransport,
+  FakeTransport, and WebTransport.
+- **`plugin-call <project> <plugin_name> <tool_name> <args_json>`** CLI
+  subcommand for invoking plugin tools (used by Claude via Bash).
+- **Plugin toggle UI** in the manager bot (per-project, restart-required).
+- **`AllowedUser` role model** (`viewer` / `executor`) is the sole auth +
+  authority source. Per-user `locked_identities` list — first contact from each transport appends a new entry;
+  subsequent requests validate by native ID, not username.
+- **CLI flags** `--add-user USER[:ROLE]`, `--remove-user USER`,
+  `--reset-user-identity USER` on `configure`. Legacy `--username` /
+  `--remove-username` aliased for this release; removed in 1.1.
+- **Manager bot user-management commands** `/promote_user`, `/demote_user`,
+  `/reset_user_identity` added; `/add_user` accepts an optional `[viewer|executor]`
+  role argument (defaults to `executor`).
+- **Operational scripts** `scripts/restart.sh` and `scripts/stop.sh` for the
+  manager process.
+
+### Notes
+- The plugin framework is in this repo; specific plugins (e.g.,
+  `in-app-web-server`, `diff-reviewer`) live in a separate
+  `link-project-to-chat-plugins` package.
+- `get_context()` is Claude-only by design; Codex/Gemini turns ignore it.
+
 ## Unreleased
 
 ### Added

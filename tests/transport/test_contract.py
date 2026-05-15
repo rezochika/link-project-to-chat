@@ -391,6 +391,17 @@ async def test_prompt_open_returns_prompt_ref(transport):
     assert ref.key == "q"
 
 
+async def test_on_stop_callback_is_awaited_on_shutdown(transport):
+    """Every Transport must invoke registered on_stop callbacks during shutdown.
+    Plugins rely on this hook to release resources (sockets, files, sessions)
+    before the platform tears down.
+    """
+    cb = AsyncMock()
+    transport.on_stop(cb)
+    await transport.stop()
+    assert cb.await_count == 1
+
+
 async def test_prompt_submit_fires_handler(transport):
     if not hasattr(transport, "inject_prompt_submit"):
         pytest.skip(f"{type(transport).__name__} does not support inject_prompt_submit")

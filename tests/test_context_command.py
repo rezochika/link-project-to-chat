@@ -453,13 +453,14 @@ def test_context_settings_round_trip_through_config(tmp_path):
         save_config,
     )
 
+    from link_project_to_chat.config import AllowedUser
     cfg_path = tmp_path / "config.json"
     config = Config(
         projects={
             "proj": ProjectConfig(
                 path=str(tmp_path),
                 telegram_bot_token="t",
-                allowed_usernames=["alice"],
+                allowed_users=[AllowedUser(username="alice", role="executor")],
                 context_enabled=False,
                 context_history_limit=25,
             )

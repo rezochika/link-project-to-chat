@@ -19,11 +19,15 @@ from link_project_to_chat.transport.fake import FakeTransport
 def _make_project_bot_stub(with_synthesizer: bool = False):
     """Minimal ProjectBot stub with FakeTransport + mock transcriber."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import AllowedUser
     bot = ProjectBot.__new__(ProjectBot)
     bot._transport = FakeTransport()
     bot._app = SimpleNamespace(bot=None)
-    bot._allowed_usernames = ["alice"]
-    bot._trusted_user_ids = [42]
+    bot._allowed_users = [
+        AllowedUser(username="alice", role="executor", locked_identities=["fake:42"]),
+    ]
+    bot._auth_source = "project"
+    bot._auth_dirty = False
     bot._rate_limits = {}
     bot._failed_auth_counts = {}
     bot.group_mode = False
@@ -126,7 +130,7 @@ async def test_voice_task_not_tracked_when_synthesizer_unset(tmp_path):
 
 async def test_voice_unauthorized_sender_ignored(tmp_path):
     bot = _make_project_bot_stub()
-    bot._allowed_usernames = []  # fail-closed
+    bot._allowed_users = []  # fail-closed
     incoming = _audio_incoming(tmp_path)
     await bot._on_voice_from_transport(incoming)
     # No status message sent; no task submitted.
@@ -242,7 +246,7 @@ async def test_unified_dispatch_unsupported_fallback():
 async def test_unified_dispatch_unsupported_unauthorized_ignored():
     """Unsupported messages from unauthorized users are silently dropped."""
     bot = _make_project_bot_stub()
-    bot._allowed_usernames = []  # fail-closed
+    bot._allowed_users = []  # fail-closed
     chat = ChatRef(transport_id="fake", native_id="12345", kind=ChatKind.DM)
     sender = Identity(
         transport_id="fake", native_id="42", display_name="Alice",

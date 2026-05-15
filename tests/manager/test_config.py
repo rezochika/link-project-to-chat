@@ -3,11 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from link_project_to_chat.config import (
-    clear_trusted_user_id,
-    load_trusted_user_id,
-    save_trusted_user_id,
-)
 from link_project_to_chat.manager.config import (
     load_project_configs,
     save_project_configs,
@@ -183,10 +178,6 @@ def test_set_team_bot_autostart_unknown_role_is_noop(tmp_path: Path):
     assert "autostart" not in raw["teams"]["acme"]["bots"]["manager"]
 
 
-def test_trusted_user_id(tmp_path: Path):
-    path = tmp_path / "uid.json"
-    assert load_trusted_user_id(path) is None
-    save_trusted_user_id(12345, path)
-    assert load_trusted_user_id(path) == 12345
-    clear_trusted_user_id(path)
-    assert load_trusted_user_id(path) is None
+# Removed in Task 5 Step 12: ``test_trusted_user_id`` exercised
+# ``load_trusted_user_id`` / ``save_trusted_user_id`` / ``clear_trusted_user_id``,
+# all deleted along with the legacy fields.

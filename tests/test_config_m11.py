@@ -112,7 +112,8 @@ def test_concurrent_save_config_no_data_loss(tmp_path: Path):
 
 def test_save_config_atomic_write_leaves_no_tmp_files(tmp_path: Path):
     """After save_config, no *.tmp files should linger in the config directory."""
+    from link_project_to_chat.config import AllowedUser
     p = tmp_path / "cfg.json"
-    save_config(Config(allowed_usernames=["alice"]), p)
+    save_config(Config(allowed_users=[AllowedUser(username="alice", role="executor")]), p)
     tmp_files = list(tmp_path.glob("*.tmp"))
     assert tmp_files == [], f"Stale tmp files found: {tmp_files}"

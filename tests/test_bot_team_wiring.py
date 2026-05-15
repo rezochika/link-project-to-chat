@@ -151,12 +151,15 @@ async def test_group_mode_no_chat_id_set_does_not_reject(tmp_path):
 async def test_first_group_message_captures_chat_id(tmp_path, monkeypatch):
     """When group_chat_id=0 (sentinel), a trusted-user message captures the actual chat_id."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import AllowedUser
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=0,
+        allowed_users=[
+            AllowedUser(username="rezoc666", role="executor", locked_identities=["telegram:12345"]),
+        ],
     )
     bot.bot_username = "acme_manager"
-    bot._auth = MagicMock(return_value=True)
     _team_bot_with_fake_transport(bot)
 
     captured = []
@@ -193,7 +196,7 @@ async def test_unauth_user_does_not_trigger_capture(tmp_path, monkeypatch):
         team_name="acme", role="manager", group_chat_id=0,
     )
     bot.bot_username = "acme_manager"
-    bot._auth = MagicMock(return_value=False)  # unauthorized
+    # No allowed_users → fail-closed (every sender denied).
     _team_bot_with_fake_transport(bot)
 
     captured = []
@@ -216,12 +219,15 @@ async def test_unauth_user_does_not_trigger_capture(tmp_path, monkeypatch):
 async def test_second_message_after_capture_routes_normally(tmp_path, monkeypatch):
     """After chat_id is captured, subsequent messages from the same group should NOT re-trigger capture."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import AllowedUser
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=0,
+        allowed_users=[
+            AllowedUser(username="rezoc666", role="executor", locked_identities=["telegram:12345"]),
+        ],
     )
     bot.bot_username = "acme_manager"
-    bot._auth = MagicMock(return_value=True)
     _team_bot_with_fake_transport(bot)
 
     captured = []
@@ -260,12 +266,15 @@ async def test_second_message_after_capture_routes_normally(tmp_path, monkeypatc
 async def test_message_from_other_group_after_capture_rejected(tmp_path, monkeypatch):
     """After chat_id is captured, a message from a DIFFERENT group is silently rejected."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.config import AllowedUser
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=-100_111,  # already captured
+        allowed_users=[
+            AllowedUser(username="rezo", role="executor", locked_identities=["telegram:1"]),
+        ],
     )
     bot.bot_username = "acme_manager"
-    bot._auth = MagicMock(return_value=True)
     _team_bot_with_fake_transport(bot)
     bot.task_manager.submit_agent = MagicMock()
 
@@ -491,7 +500,7 @@ async def test_team_resumed_turn_human_path_omits_persona_and_history(tmp_path):
     """Same gate must apply to human-in-group messages (_on_text path), since
     they hit the same agent and the same loop risk."""
     from link_project_to_chat.bot import ProjectBot
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
@@ -503,6 +512,8 @@ async def test_team_resumed_turn_human_path_omits_persona_and_history(tmp_path):
     bot.task_manager._backend = _make_fake_backend(session_id="zzz-999")
     # Bypass auth + rate limit gates for this prompt-building test.
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
     bot._rate_limited = MagicMock(return_value=False)
 
     captured = []
@@ -531,7 +542,7 @@ async def test_team_mode_persona_change_clears_backend_session(tmp_path):
     turn to be fresh, re-injecting the new persona."""
     from link_project_to_chat.bot import ProjectBot
     from link_project_to_chat.transport import CommandInvocation
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
@@ -542,6 +553,8 @@ async def test_team_mode_persona_change_clears_backend_session(tmp_path):
     _team_bot_with_fake_transport(bot)
     bot.task_manager._backend = _make_fake_backend(session_id="session-before-swap")
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
 
     chat = _group_chat(-100_111)
     ci = CommandInvocation(
@@ -565,7 +578,7 @@ async def test_team_mode_stop_persona_clears_backend_session(tmp_path):
     the resumed agent keeps acting under the old persona until /reset."""
     from link_project_to_chat.bot import ProjectBot
     from link_project_to_chat.transport import CommandInvocation
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(
         name="acme_manager", path=tmp_path, token="t",
@@ -576,6 +589,8 @@ async def test_team_mode_stop_persona_clears_backend_session(tmp_path):
     _team_bot_with_fake_transport(bot)
     bot.task_manager._backend = _make_fake_backend(session_id="session-before-stop")
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
 
     chat = _group_chat(-100_111)
     ci = CommandInvocation(
@@ -597,7 +612,7 @@ async def test_solo_mode_persona_change_preserves_backend_session(tmp_path):
     solo users who change persona mid-conversation."""
     from link_project_to_chat.bot import ProjectBot
     from link_project_to_chat.transport import CommandInvocation
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(
         name="solo", path=tmp_path, token="t",
@@ -608,6 +623,8 @@ async def test_solo_mode_persona_change_preserves_backend_session(tmp_path):
     _team_bot_with_fake_transport(bot)
     bot.task_manager._backend = _make_fake_backend(session_id="solo-session-keep")
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
 
     chat = ChatRef(transport_id="telegram", native_id="55", kind=ChatKind.DM)
     ci = CommandInvocation(
@@ -630,7 +647,7 @@ async def test_solo_mode_resumed_session_still_injects_persona_and_history(tmp_p
     the relay-loop failure mode, and changing solo persona injection would
     silently break /persona-mid-conversation flows users rely on today."""
     from link_project_to_chat.bot import ProjectBot
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(
         name="solo", path=tmp_path, token="t",
@@ -641,6 +658,8 @@ async def test_solo_mode_resumed_session_still_injects_persona_and_history(tmp_p
     _team_bot_with_fake_transport(bot)
     bot.task_manager._backend = _make_fake_backend(session_id="solo-session")
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
     bot._rate_limited = MagicMock(return_value=False)
 
     captured = []
@@ -691,6 +710,8 @@ async def test_auto_capture_on_non_telegram_writes_only_room(tmp_path, monkeypat
     )
     bot.bot_username = "acme_manager"
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
     _team_bot_with_fake_transport(bot)
 
     captured = []
@@ -735,6 +756,8 @@ async def test_same_native_id_different_transport_treated_as_wrong_room(tmp_path
     )
     bot.bot_username = "acme_manager"
     bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()
     _team_bot_with_fake_transport(bot)
     bot.task_manager.submit_agent = MagicMock()
 
@@ -764,7 +787,9 @@ async def test_group_mode_rejects_wrong_room_with_non_int_native_id(tmp_path):
         room=RoomBinding(transport_id="google_chat", native_id="spaces/RIGHT"),
     )
     bot.bot_username = "acme_manager"
-    bot._auth_identity = MagicMock(return_value=True)  # bypass auth
+    bot._auth_identity = MagicMock(return_value=True)
+    bot._require_executor = MagicMock(return_value=True)
+    bot._persist_auth_if_dirty = AsyncMock()  # bypass auth
     _team_bot_with_fake_transport(bot)
     bot.task_manager.submit_agent = MagicMock()
 
@@ -804,7 +829,6 @@ async def test_permissions_callback_works_in_group_chat(tmp_path):
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=-100_111,
         allowed_usernames=["rezo"],
-        trusted_user_ids=[42],
     )
     # Stub the transport so we can observe the resulting edit.
     mock_app = MagicMock()
@@ -1226,7 +1250,12 @@ def test_teambotconfig_round_trips_permissions_and_bot_username(tmp_path):
 # Spec #0c Task 5: build() wires enable_team_relay from LP2C_TELETHON_SESSION.
 # -----------------------------------------------------------------------------
 def _make_team_bot_for_relay_test(tmp_path) -> ProjectBot:
-    """Construct a team-mode ProjectBot with minimum kwargs for build() tests."""
+    """Construct a team-mode ProjectBot with minimum kwargs for build() tests.
+
+    Uses the AllowedUser model (post-v1.0 auth). The locked telegram identity
+    is what the team-relay safety code reads as `authenticated_user_id`.
+    """
+    from link_project_to_chat.config import AllowedUser
     return ProjectBot(
         name="acme_dev",
         path=tmp_path,
@@ -1235,8 +1264,13 @@ def _make_team_bot_for_relay_test(tmp_path) -> ProjectBot:
         role="dev",
         group_chat_id=-100123,
         peer_bot_username="acme_manager_bot",
-        allowed_username="rezoc",
-        trusted_user_id=42,
+        allowed_users=[
+            AllowedUser(
+                username="rezoc",
+                role="executor",
+                locked_identities=["telegram:42"],
+            )
+        ],
     )
 
 
@@ -1279,17 +1313,25 @@ def _stub_config_with_api_creds():
 
 
 def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, monkeypatch):
-    """When LP2C_TELETHON_SESSION is set and the bot is team-mode,
-    build() delegates to TelegramTransport.enable_team_relay_from_session.
+    """When LP2C_TELETHON_SESSION is set (and LP2C_TELETHON_SESSION_STRING is
+    absent) and the bot is team-mode, build() delegates to
+    TelegramTransport.enable_team_relay_from_session.
 
     Telethon client construction lives inside TelegramTransport (see
     test_enable_team_relay_from_session_builds_client in test_telegram_transport);
     here we just assert the bot hands the session credentials over.
+
+    Hermeticity: production code prefers LP2C_TELETHON_SESSION_STRING when
+    present (see bot.py:_after_ready), so this test must clear it before
+    exercising the file-path fallback. Otherwise the test fails in any
+    runtime where the string-session var is set globally (e.g., the team
+    relay's own session).
     """
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
     session_path.touch()
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
     monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
 
     bot = _make_team_bot_for_relay_test(tmp_path)
@@ -1308,6 +1350,7 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
         bot.build()
 
     mock_transport.enable_team_relay_from_session.assert_called_once()
+    mock_transport.enable_team_relay_from_session_string.assert_not_called()
     call_kwargs = mock_transport.enable_team_relay_from_session.call_args.kwargs
     assert call_kwargs["session_path"] == str(session_path)
     assert call_kwargs["api_id"] == 12345
@@ -1316,7 +1359,55 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
     assert call_kwargs["team_name"] == "acme"
     assert call_kwargs["max_autonomous_turns"] == 7
     assert call_kwargs["team_authority"] is bot.task_manager.backend.team_authority
-    assert call_kwargs["authenticated_user_id"] == 42
+    assert call_kwargs["authenticated_user_id"] == "42"
+    usernames = call_kwargs["team_bot_usernames"]
+    assert "acme_manager_bot" in usernames
+    assert "acme_dev_bot" in usernames
+
+
+def test_team_mode_bot_prefers_session_string_when_both_env_vars_set(
+    tmp_path, monkeypatch
+):
+    """When BOTH LP2C_TELETHON_SESSION_STRING and LP2C_TELETHON_SESSION are
+    set, the string-session path wins and the file-path fallback is not
+    called.
+
+    Production behavior (bot.py:_after_ready): the string session is the
+    preferred path because it avoids the on-disk SQLite session-file lock
+    contention that hits when both the manager and the project bot try to
+    open the same telethon.session file. This regression test makes the
+    precedence explicit so a future refactor can't silently flip it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION_STRING", "sentinel-string-session")
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ):
+        bot.build()
+
+    mock_transport.enable_team_relay_from_session_string.assert_called_once()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
+    call_kwargs = mock_transport.enable_team_relay_from_session_string.call_args.kwargs
+    assert call_kwargs["session_string"] == "sentinel-string-session"
+    assert call_kwargs["api_id"] == 12345
+    assert call_kwargs["api_hash"] == "fakehash"
+    assert call_kwargs["group_chat_id"] == -100123
+    assert call_kwargs["team_name"] == "acme"
     usernames = call_kwargs["team_bot_usernames"]
     assert "acme_manager_bot" in usernames
     assert "acme_dev_bot" in usernames
@@ -1350,7 +1441,7 @@ def test_project_bot_build_registers_after_ready_callback(tmp_path):
 def test_bot_run_delegates_to_transport_run(tmp_path):
     """ProjectBot.run() must call self._transport.run() — the Transport owns
     the polling loop lifecycle (PTB run_polling, websocket loop, HTTP server)."""
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
 
     bot = ProjectBot(name="solo", path=tmp_path, token="t")
     mock_transport = MagicMock()
@@ -1452,7 +1543,7 @@ def test_team_mode_bot_uses_string_session_env_when_set(tmp_path, monkeypatch):
     assert call_kwargs["team_name"] == "acme"
     assert call_kwargs["max_autonomous_turns"] == 7
     assert call_kwargs["team_authority"] is bot.task_manager.backend.team_authority
-    assert call_kwargs["authenticated_user_id"] == 42
+    assert call_kwargs["authenticated_user_id"] == "42"
     assert "acme_manager_bot" in call_kwargs["team_bot_usernames"]
     assert "acme_dev_bot" in call_kwargs["team_bot_usernames"]
 
@@ -1673,6 +1764,7 @@ async def test_after_ready_team_bot_skips_startup_dm_ping(tmp_path):
         cfg_path,
     )
 
+    from link_project_to_chat.config import AllowedUser
     bot = ProjectBot(
         name="acme_manager",
         path=tmp_path,
@@ -1681,10 +1773,11 @@ async def test_after_ready_team_bot_skips_startup_dm_ping(tmp_path):
         role="manager",
         group_chat_id=-100_111,
         config_path=cfg_path,
+        allowed_users=[
+            AllowedUser(username="admin", role="executor", locked_identities=["fake:8206818037"]),
+        ],
     )
     bot._transport = FakeTransport()
-    # Force a non-empty trusted-user list so the loop would run without the skip.
-    bot._get_trusted_user_ids = lambda: [8206818037]
 
     await bot._after_ready(
         Identity(
@@ -1704,9 +1797,14 @@ async def test_after_ready_team_bot_skips_startup_dm_ping(tmp_path):
 @pytest.mark.asyncio
 async def test_after_ready_solo_bot_sends_startup_dm_ping(tmp_path):
     """Solo (non-team) bots must still send the startup ping to trusted users."""
-    bot = ProjectBot(name="solo", path=tmp_path, token="t")
+    from link_project_to_chat.config import AllowedUser
+    bot = ProjectBot(
+        name="solo", path=tmp_path, token="t",
+        allowed_users=[
+            AllowedUser(username="admin", role="executor", locked_identities=["fake:8206818037"]),
+        ],
+    )
     bot._transport = FakeTransport()
-    bot._get_trusted_user_ids = lambda: [8206818037]
 
     await bot._after_ready(
         Identity(
@@ -1821,6 +1919,7 @@ async def test_reset_confirm_clears_team_session_from_team_config(tmp_path):
     )
     bot._transport = FakeTransport()
     bot._auth_identity = lambda _sender: True
+    bot._require_executor = lambda _sender: True
     bot.task_manager.backend.session_id = "sess-123"
     bot.task_manager.cancel_all = lambda: 0
 

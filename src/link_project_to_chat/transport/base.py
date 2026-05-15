@@ -282,6 +282,15 @@ class Transport(Protocol):
         """
         ...
 
+    def on_stop(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Register a callback fired during the Transport's shutdown sequence,
+        BEFORE the platform actually tears down. Plugins use this to release
+        resources, send a final message, etc. Multiple callbacks fire in
+        registration order; exceptions are logged but do not block other
+        callbacks or the transport shutdown.
+        """
+        ...
+
     def render_markdown(self, md: str) -> str:
         """Render markdown into the platform's native rich-text dialect.
 

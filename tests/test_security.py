@@ -200,12 +200,14 @@ def test_rate_limit_works_with_non_numeric_native_id():
     succeed and return False on first call, True after exceeding the cap.
     """
     from link_project_to_chat._auth import AuthMixin
+    from link_project_to_chat.config import AllowedUser
 
     class _Bot(AuthMixin):
-        _allowed_usernames = ["alice"]
+        def __init__(self):
+            self._allowed_users = [AllowedUser(username="alice", role="executor")]
+            self._init_auth()
 
     bot = _Bot()
-    bot._init_auth()
 
     key = "discord:abc123-snowflake"
     # 30 messages allowed per minute by default.
@@ -217,12 +219,14 @@ def test_rate_limit_works_with_non_numeric_native_id():
 
 def test_failed_auth_count_works_with_string_key():
     from link_project_to_chat._auth import AuthMixin
+    from link_project_to_chat.config import AllowedUser
 
     class _Bot(AuthMixin):
-        _allowed_usernames = ["alice"]
+        def __init__(self):
+            self._allowed_users = [AllowedUser(username="alice", role="executor")]
+            self._init_auth()
 
     bot = _Bot()
-    bot._init_auth()
     bot._failed_auth_counts["telegram:42"] = 5
     # Direct check: lockout dict accepts string keys without TypeError.
     assert bot._failed_auth_counts.get("telegram:42") == 5
@@ -233,19 +237,21 @@ def test_auth_identity_with_non_numeric_native_id_uses_string_keyed_counts():
     snowflake), exercising _auth_identity through the username-mismatch path
     must increment _failed_auth_counts with a single key.
 
-    This pins down the contract that the int-coercion fallback in
-    _auth_identity does not silently mix int and string keys inside
-    _failed_auth_counts when the same non-numeric user is denied twice.
+    Pins the contract that ``_failed_auth_counts`` is consistently
+    string-keyed on ``_identity_key`` (transport_id:native_id) so the same
+    non-numeric user denied twice ends up in exactly one bucket.
     """
     from types import SimpleNamespace
 
     from link_project_to_chat._auth import AuthMixin
+    from link_project_to_chat.config import AllowedUser
 
     class _Bot(AuthMixin):
-        _allowed_usernames = ["alice"]
+        def __init__(self):
+            self._allowed_users = [AllowedUser(username="alice", role="executor")]
+            self._init_auth()
 
     bot = _Bot()
-    bot._init_auth()
 
     identity = SimpleNamespace(
         transport_id="discord",
@@ -265,22 +271,25 @@ def test_auth_identity_with_non_numeric_native_id_uses_string_keyed_counts():
 
 def test_auth_identity_succeeds_for_non_numeric_native_id_with_allowed_username():
     """A Discord/Slack user with non-numeric native_id whose handle matches the
-    allowlist must succeed (no ValueError) and be added to the trust dict.
-    Regression for the _trust_user int-cast bug."""
+    allowlist must succeed (no ValueError) and append the discord identity
+    to the allowed user's locked_identities."""
     from link_project_to_chat._auth import AuthMixin
+    from link_project_to_chat.config import AllowedUser
     from types import SimpleNamespace
 
+    au = AllowedUser(username="bob", role="executor")
+
     class _Bot(AuthMixin):
-        _allowed_usernames = ["bob"]
+        def __init__(self):
+            self._allowed_users = [au]
+            self._init_auth()
 
     bot = _Bot()
-    bot._init_auth()
 
     identity = SimpleNamespace(transport_id="discord", native_id="snowflake-abc-123", handle="bob")
     assert bot._auth_identity(identity) is True
-    # Idempotent: a second call from the same identity also succeeds (cached trust).
+    # Idempotent: a second call from the same identity also succeeds (cached
+    # identity-lock fast path).
     assert bot._auth_identity(identity) is True
-    # _trust_user was called and the trusted-users dict contains an entry for "bob"
-    # (regardless of value type, the key must be present).
-    trusted = bot._get_trusted_user_bindings()
-    assert "bob" in trusted
+    # First-contact appended the identity_key to bob's locked_identities.
+    assert "discord:snowflake-abc-123" in au.locked_identities

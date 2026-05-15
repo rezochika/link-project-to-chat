@@ -38,6 +38,9 @@ pipx install "link-project-to-chat[all]"
 
 ## Quick start
 
+The ad-hoc `--path`/`--token` flow bypasses the config file, so the allowed user
+must be supplied on the same command line via `--username`:
+
 ```bash
 link-project-to-chat start --path /path/to/project --token YOUR_BOT_TOKEN --username your_telegram_username
 ```
@@ -45,8 +48,8 @@ link-project-to-chat start --path /path/to/project --token YOUR_BOT_TOKEN --user
 ## Setup with config
 
 ```bash
-# Add your Telegram username
-link-project-to-chat configure --username your_telegram_username
+# Add your Telegram username (defaults to executor role)
+link-project-to-chat configure --add-user your_telegram_username
 
 # Add a project
 link-project-to-chat projects add --name myproject --path /path/to/project --token YOUR_BOT_TOKEN
@@ -187,15 +190,103 @@ pipx install "link-project-to-chat[voice]"
 Multiple Telegram users can access the same bot:
 
 ```bash
-# Add users
-link-project-to-chat configure --username alice
-link-project-to-chat configure --username bob
+# Add users (defaults to executor; append `:viewer` for read-only role)
+link-project-to-chat configure --add-user alice
+link-project-to-chat configure --add-user bob:viewer
 
 # Remove a user
-link-project-to-chat configure --remove-username bob
+link-project-to-chat configure --remove-user bob
 ```
 
 Users can also be managed from the Manager Bot via `/add_user` and `/remove_user`.
+
+## Plugins
+
+Plugins extend the project bot with custom commands, message handlers,
+task hooks, button handlers, and Claude prompt context. They are external
+Python packages discovered via the `lptc.plugins` entry point group, and
+they're **transport-portable**: the same plugin works on Telegram, on the
+Web UI, and on any future Discord/Slack/Google Chat transport.
+
+### Activating plugins for a project
+
+Add them to the project's config entry:
+
+```json
+{
+  "projects": {
+    "myproject": {
+      "path": "/path/to/project",
+      "telegram_bot_token": "...",
+      "plugins": [
+        {"name": "in-app-web-server"},
+        {"name": "diff-reviewer"}
+      ]
+    }
+  }
+}
+```
+
+Or toggle them in the manager bot: open a project → Plugins → tap a plugin.
+Restart the bot after changes.
+
+### Writing a plugin
+
+```python
+from link_project_to_chat.plugin import Plugin, BotCommand
+
+
+class MyPlugin(Plugin):
+    name = "my-plugin"
+    depends_on = []
+
+    async def start(self):
+        ...
+
+    async def stop(self):
+        ...
+
+    async def on_message(self, msg):
+        # msg is an IncomingMessage — text, sender, chat, files all available
+        return False  # True consumes; the agent (Claude/Codex) is skipped
+
+    def get_context(self):
+        # Only used when the active backend is Claude; ignored for Codex/Gemini.
+        return "Extra system-prompt context"
+
+    def commands(self):
+        async def hello(invocation):
+            # invocation is a CommandInvocation
+            await self._ctx.transport.send_text(invocation.chat, "hi")
+        return [BotCommand(command="hello", description="say hi", handler=hello)]
+```
+
+Expose it via your plugin package's `pyproject.toml`:
+
+```toml
+[project.entry-points."lptc.plugins"]
+my-plugin = "my_package:MyPlugin"
+```
+
+### Role-based access
+
+Set `allowed_users` on a project to enable per-user roles:
+
+```json
+"allowed_users": [
+  {"username": "alice", "role": "executor"},
+  {"username": "bob", "role": "viewer"}
+]
+```
+
+Viewers can use `/tasks` (including the per-task **Log** button it surfaces),
+`/status`, `/help`, `/version`, `/skills` (listing), `/context` (display), and
+any plugin command flagged `viewer_ok`. Executors have the full command set.
+`allowed_users` is the sole auth source — an empty list means no one is
+authorized (fail-closed). The first request from each user atomically appends
+their identity to `locked_identities` and writes it back to the config so
+subsequent requests validate by native ID rather than username (preserves the
+username-spoof protection from the pre-v1.0 model).
 
 ## Manager bot
 

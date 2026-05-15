@@ -118,7 +118,14 @@ def bot_env(tmp_path: Path):
     proj_cfg = tmp_path / "projects.json"
     proj_cfg.write_text(json.dumps({"projects": {}}))
     pm = ProcessManager(project_config_path=proj_cfg)
-    bot = ManagerBot("TOKEN", pm, allowed_username="testuser", trusted_user_id=1, project_config_path=proj_cfg)
+    from link_project_to_chat.config import AllowedUser
+    bot = ManagerBot(
+        "TOKEN", pm,
+        allowed_users=[
+            AllowedUser(username="testuser", role="executor", locked_identities=["telegram:1"]),
+        ],
+        project_config_path=proj_cfg,
+    )
     return bot, pm, proj_cfg
 
 
@@ -189,7 +196,11 @@ async def test_addproject_with_all_options(bot_env, tmp_path: Path):
     assert result == ConversationHandler.END
     proj = json.loads(proj_cfg.read_text())["projects"]["fullproj"]
     assert proj["telegram_bot_token"] == "MYTOKEN"
-    assert proj["username"] == "myuser"
+    # P1 #2: the wizard now writes the modern allowed_users shape rather than
+    # the legacy flat ``username`` key (which would silently lose to any
+    # pre-existing allowed_users on next load).
+    assert "username" not in proj
+    assert proj["allowed_users"] == [{"username": "myuser", "role": "executor"}]
     assert proj["model"] == "opus"
 
 
@@ -787,31 +798,358 @@ async def test_guard_returns_false_when_effective_user_is_none(bot_env):
     assert any("Unauthorized" in m.text for m in fake.sent_messages)
 
 
+# --- P1 #1: viewer cannot run state-changing manager buttons ---
+
+@pytest.fixture
+def viewer_bot_env(tmp_path: Path):
+    """Manager bot with a single viewer user. Used to verify P1 #1 button gating.
+
+    Locks the viewer's identity to ``fake:1`` and ``telegram:1`` so both the
+    button (FakeTransport) and the wizard (telegram-shaped Update from
+    ``_make_update``) code paths authenticate the same caller as a viewer.
+    Without the telegram lock, viewer-driven `/edit_project` etc. would fall
+    out before hitting the executor gate (the wizard's ``_guard`` path uses
+    ``transport_id="telegram"`` via ``identity_from_telegram_user``).
+    """
+    proj_cfg = tmp_path / "projects.json"
+    proj_cfg.write_text(json.dumps({"projects": {}}))
+    pm = ProcessManager(project_config_path=proj_cfg)
+    from link_project_to_chat.config import AllowedUser
+    bot = ManagerBot(
+        "TOKEN", pm,
+        allowed_users=[
+            AllowedUser(
+                username="viewer-bob",
+                role="viewer",
+                locked_identities=["fake:1", "telegram:1"],
+            ),
+        ],
+        project_config_path=proj_cfg,
+    )
+    return bot, pm, proj_cfg
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_start_project_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: viewer pressing the Start button on a project
+    detail card receives a read-only reply and the ProcessManager is NOT
+    asked to spawn the subprocess."""
+    bot, pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    pm.start = MagicMock()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_start_myproj")
+    await bot._on_button_from_transport(click)
+    pm.start.assert_not_called()
+    # No state-changing edit; we instead expect a read-only reply.
+    assert fake.edited_messages == []
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_stop_project_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: viewer pressing Stop is blocked."""
+    bot, pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    pm.stop = MagicMock()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_stop_myproj")
+    await bot._on_button_from_transport(click)
+    pm.stop.assert_not_called()
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_remove_project_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: viewer pressing Remove cannot delete the project."""
+    bot, pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_remove_myproj")
+    await bot._on_button_from_transport(click)
+    # Project still present on disk.
+    assert "myproj" in json.loads(proj_cfg.read_text())["projects"]
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_open_edit_keyboard_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: the Edit button itself is gated — the keyboard
+    it would render leads straight into write operations."""
+    bot, pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_edit_myproj")
+    await bot._on_button_from_transport(click)
+    assert fake.edited_messages == []
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_pick_proj_model_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: viewer cannot write a per-project model via the
+    inline picker."""
+    bot, pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_model_opus_myproj")
+    await bot._on_button_from_transport(click)
+    assert json.loads(proj_cfg.read_text())["projects"]["myproj"].get("model") != "opus"
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_set_global_model_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: viewer cannot set the global default model
+    through the model picker keyboard."""
+    bot, pm, proj_cfg = viewer_bot_env
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("global_model_opus")
+    await bot._on_button_from_transport(click)
+    raw = json.loads(proj_cfg.read_text()) if proj_cfg.exists() else {}
+    assert raw.get("default_model_claude") != "opus"
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_start_team_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: team_start_* must gate to executor."""
+    bot, pm, proj_cfg = viewer_bot_env
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
+    pm.start_team = MagicMock()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_start_acme")
+    await bot._on_button_from_transport(click)
+    pm.start_team.assert_not_called()
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_stop_team_via_button(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: team_stop_* must gate to executor."""
+    bot, pm, proj_cfg = viewer_bot_env
+    _write_team(proj_cfg, "acme", {
+        "manager": {"telegram_bot_token": "t1"},
+        "dev":     {"telegram_bot_token": "t2"},
+    })
+    pm.stop = MagicMock()
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("team_stop_acme")
+    await bot._on_button_from_transport(click)
+    pm.stop.assert_not_called()
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_arm_setup_gh_via_button(viewer_bot_env):
+    """Regression for P1 #1: setup_* buttons must gate to executor. These
+    arm a setup_awaiting state whose follow-up text input writes the
+    GitHub PAT / API credentials to config.json — a viewer must not be
+    able to start that flow."""
+    bot, _pm, _proj_cfg = viewer_bot_env
+    fake = _swap_fake_transport(bot)
+    click, state = _make_button_click("setup_gh")
+    await bot._on_button_from_transport(click)
+    assert "setup_awaiting" not in state
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_complete_pending_edit_via_text(viewer_bot_env, tmp_path: Path):
+    """Defense-in-depth: even if pending_edit somehow ends up in user_data
+    for a viewer (e.g. carried over from a prior executor session in the
+    same PTB process), the text-save path must refuse the write."""
+    bot, _pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
+    update, ctx = _make_update(text="newname")
+    ctx.user_data = {"pending_edit": {"name": "myproj", "field": "name"}}
+    await bot._edit_field_save(update, ctx)
+    # Project was not renamed.
+    assert "myproj" in json.loads(proj_cfg.read_text())["projects"]
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_complete_setup_input_via_text(viewer_bot_env, tmp_path: Path):
+    """Defense-in-depth: even if setup_awaiting is leaked into a viewer's
+    user_data slot, the text path must refuse to write."""
+    bot, _pm, proj_cfg = viewer_bot_env
+    fake = _swap_fake_transport(bot)
+    update, ctx = _make_update(text="ghp_secret_pat_abc123")
+    ctx.user_data = {
+        "setup_awaiting": "github_pat",
+        "setup_config_path": str(proj_cfg),
+    }
+    await bot._edit_field_save(update, ctx)
+    raw = json.loads(proj_cfg.read_text()) if proj_cfg.exists() else {}
+    assert raw.get("github_pat") in (None, "", False)
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_user_cannot_complete_setup_input_via_text(bot_env, tmp_path: Path):
+    """Regression for the post-v1.0 P1: an unauthenticated caller with a
+    stale/leaked setup_awaiting state must NOT be able to write setup
+    values like github_pat.
+
+    Previous guard at manager/bot.py:1159 was
+    ``self._auth_identity(identity) and not self._require_executor(identity)``
+    — which only blocks AUTHENTICATED viewers. Unauthenticated callers fell
+    through to _handle_setup_input and successfully wrote ghp_BAD into the
+    config. Fix requires authenticated executor before _handle_setup_input;
+    clears setup_awaiting and replies Unauthorized./Read-only on every
+    non-executor branch so a single bad reply can't keep collecting writes.
+    """
+    bot, _pm, proj_cfg = bot_env
+    fake = _swap_fake_transport(bot)
+    # mallory is NOT in the allow-list (bot_env locks testuser to telegram:1
+    # as the only allowed executor). Picking user_id=999 + username=mallory
+    # guarantees _auth_identity returns False.
+    update, ctx = _make_update(user_id=999, username="mallory", text="ghp_BAD")
+    ctx.user_data = {
+        "setup_awaiting": "github_pat",
+        "setup_config_path": str(proj_cfg),
+    }
+    await bot._edit_field_save(update, ctx)
+    raw = json.loads(proj_cfg.read_text()) if proj_cfg.exists() else {}
+    assert raw.get("github_pat") in (None, "", False), (
+        f"unauthorized user wrote github_pat: {raw.get('github_pat')!r}"
+    )
+    # setup_awaiting must be cleared so a stale state can't keep collecting writes.
+    assert "setup_awaiting" not in ctx.user_data
+    # Reply is "Unauthorized." (the viewer-blocked path would say "read-only").
+    text = fake.sent_messages[-1].text.lower()
+    assert "unauthorized" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_run_add_project_wizard(viewer_bot_env):
+    """Regression for P1 #1: /add_project wizard entry must gate to executor."""
+    from telegram.ext import ConversationHandler
+    bot, _pm, _proj_cfg = viewer_bot_env
+    fake = _swap_fake_transport(bot)
+    update, ctx = _make_update(username="viewer-bob")
+    result = await bot._on_add_project(update, ctx)
+    assert result == ConversationHandler.END
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_run_edit_project_command(viewer_bot_env, tmp_path: Path):
+    """Regression for P1 #1: /edit_project must gate to executor."""
+    bot, _pm, proj_cfg = viewer_bot_env
+    proj_cfg.write_text(json.dumps({"projects": {"myproj": {"path": str(tmp_path)}}}))
+    fake = _swap_fake_transport(bot)
+    update, ctx = _make_update(["myproj", "token", "X"], username="viewer-bob")
+    await bot._on_edit_project(update, ctx)
+    # Project token must remain untouched.
+    proj = json.loads(proj_cfg.read_text())["projects"]["myproj"]
+    assert proj.get("telegram_bot_token") != "X"
+    text = fake.sent_messages[-1].text.lower()
+    assert "read-only" in text or "executor" in text
+
+
+# --- P1 #2: manager username writes must translate to allowed_users ---
+
+@pytest.mark.asyncio
+async def test_apply_edit_username_replaces_allowed_users(bot_env, tmp_path: Path):
+    """Regression for P1 #2: `/edit_project NAME username X` must produce an
+    actually-authorizing allowed_users entry — historically wrote a legacy
+    flat ``username`` key that loses to any pre-existing allowed_users on
+    next load.
+    """
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "T",
+                "allowed_users": [{"username": "alice", "role": "executor"}],
+            }
+        }
+    }))
+    fake = _swap_fake_transport(bot)
+    update, ctx = _make_update(["myproj", "username", "bob"])
+    await bot._on_edit_project(update, ctx)
+    proj = json.loads(proj_cfg.read_text())["projects"]["myproj"]
+    # bob fully replaces alice.
+    assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
+    # Legacy flat key removed.
+    assert "username" not in proj
+    # Operator gets the deprecation hint pointing to /add_user / /remove_user.
+    last_text = fake.sent_messages[-1].text
+    assert "allowed_users" in last_text or "/add_user" in last_text
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_username_normalizes_handle(bot_env, tmp_path: Path):
+    """Manager-side normalization matches CLI: lowercase + strip leading @."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {"path": str(tmp_path), "telegram_bot_token": "T"}
+        }
+    }))
+    _swap_fake_transport(bot)
+    update, ctx = _make_update(["myproj", "username", "@BobUpper"])
+    await bot._on_edit_project(update, ctx)
+    proj = json.loads(proj_cfg.read_text())["projects"]["myproj"]
+    assert proj["allowed_users"] == [{"username": "bobupper", "role": "executor"}]
+
+
 @pytest.mark.asyncio
 async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
+    from link_project_to_chat.config import AllowedUser
     bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(
         json.dumps(
             {
-                "allowed_usernames": ["testuser", "alice"],
-                "trusted_users": {"alice": 42},
+                "allowed_users": [
+                    {"username": "testuser", "role": "executor", "locked_identities": ["fake:1"]},
+                    {"username": "alice", "role": "executor", "locked_identities": ["telegram:42"]},
+                ],
                 "projects": {},
             }
         )
     )
-    bot._allowed_usernames = ["testuser", "alice"]
-    bot._trusted_users = {"alice": 42}
+    bot._allowed_users = [
+        AllowedUser(username="testuser", role="executor", locked_identities=["fake:1"]),
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:42"]),
+    ]
     fake = _swap_fake_transport(bot)
 
+    # Task 6: /remove_user now goes through _on_remove_user, which gates to
+    # executor role and replies with the full updated /users listing.
     invocation = _make_invocation("remove_user", args=["alice"])
-    await bot._on_remove_user_from_transport(invocation)
+    await bot._on_remove_user(invocation)
 
-    assert fake.sent_messages[-1].text == "Removed @alice."
+    last_text = fake.sent_messages[-1].text
+    assert "alice" not in last_text and "testuser" in last_text
     raw = json.loads(proj_cfg.read_text())
-    assert raw["allowed_usernames"] == ["testuser"]
-    assert raw["trusted_users"] == {"testuser": 1}
+    # Legacy keys never appear post-Task-5.
+    assert "allowed_usernames" not in raw
+    assert "trusted_users" not in raw
+    surviving = {u["username"] for u in raw.get("allowed_users", [])}
+    assert surviving == {"testuser"}
+    # Alice's locked identity is gone — she can no longer auth.
     revoked = Identity(
-        transport_id="fake",
+        transport_id="telegram",
         native_id="42",
         display_name="alice",
         handle="alice",

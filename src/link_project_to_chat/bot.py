@@ -7,7 +7,6 @@ import secrets
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,10 +14,10 @@ if TYPE_CHECKING:
     from .transcriber import Synthesizer, Transcriber
 
 from .config import (
+    AllowedUser,
     Config,
     DEFAULT_CONFIG,
     RoomBinding,
-    bind_project_trusted_user,
     clear_session,
     load_config,
     load_session,
@@ -29,7 +28,7 @@ from .config import (
     patch_team_bot_backend,
     patch_team_bot_backend_state,
     resolve_permissions,
-    resolve_project_auth_scope,
+    resolve_project_allowed_users,
     resolve_start_model,
     save_session,
 )
@@ -53,6 +52,7 @@ from .transport import Button, Buttons, ChatKind, ChatRef, Identity, MessageRef
 from .transport.streaming import StreamingMessage
 from .stream import Question, StreamEvent, TextDelta, ThinkingDelta, ToolUse
 from .task_manager import Task, TaskManager, TaskStatus, TaskType
+from .plugin import BotCommand, Plugin, PluginContext, load_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,41 @@ def _parse_task_id(data: str) -> int:
     return int(data.split("_")[-1])
 
 
+def _topo_sort(plugins: "list[Plugin]") -> "list[Plugin]":
+    """Order plugins so each comes after the plugins it depends_on.
+
+    Missing dependencies are logged but do not drop the plugin (best-effort).
+    """
+    by_name = {p.name: p for p in plugins}
+    visited: set[str] = set()
+    temp: set[str] = set()
+    out: list[Plugin] = []
+
+    def visit(p: Plugin) -> None:
+        if p.name in visited:
+            return
+        if p.name in temp:
+            logger.warning("plugin dependency cycle involving %s", p.name)
+            return
+        temp.add(p.name)
+        for dep in p.depends_on:
+            target = by_name.get(dep)
+            if target is None:
+                logger.warning(
+                    "plugin %s depends_on %s which is not installed; ignoring",
+                    p.name, dep,
+                )
+                continue
+            visit(target)
+        temp.discard(p.name)
+        visited.add(p.name)
+        out.append(p)
+
+    for p in plugins:
+        visit(p)
+    return out
+
+
 class ProjectBot(AuthMixin):
     def __init__(
         self,
@@ -120,15 +155,11 @@ class ProjectBot(AuthMixin):
         path: Path,
         token: str,
         allowed_username: str = "",
-        trusted_user_id: int | None = None,
-        on_trust: Callable[[int, str], None] | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         allowed_usernames: list[str] | None = None,
-        trusted_users: dict[str, int] | None = None,
-        trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
@@ -146,6 +177,9 @@ class ProjectBot(AuthMixin):
         context_enabled: bool = True,
         context_history_limit: int = 10,
         conversation_log: ConversationLog | None = None,
+        plugins: list[dict] | None = None,
+        allowed_users: list | None = None,
+        auth_source: str = "project",
     ):
         self.name = name
         self.path = path.resolve()
@@ -153,17 +187,10 @@ class ProjectBot(AuthMixin):
         self._config_path = config_path
         self.transport_kind = transport_kind
         self.web_port = web_port
-        if allowed_usernames is not None:
-            self._allowed_usernames = allowed_usernames
-        else:
-            self._allowed_username = allowed_username
-        if trusted_users is not None:
-            self._trusted_users = dict(trusted_users)
-        if trusted_user_ids is not None:
-            self._trusted_user_ids = trusted_user_ids
-        else:
-            self._trusted_user_id = trusted_user_id
-        self._on_trust_fn = on_trust
+        # Legacy ``allowed_usernames`` is the only pre-v1.0 kwarg still accepted
+        # on the signature; it is consumed by the synthesis block below to seed
+        # ``_allowed_users``. The ``trusted_*`` kwargs and ``on_trust`` callback
+        # are gone — the AllowedUser model carries per-user locked_identities.
         self._started_at = time.monotonic()
         self._app = None
         self._transport = None  # TelegramTransport — set in _build_app
@@ -257,6 +284,38 @@ class ProjectBot(AuthMixin):
         from .group_state import GroupStateRegistry
         self._group_state = GroupStateRegistry(max_bot_rounds=20)
         self._probe_tasks: set[asyncio.Task] = set()
+        # Plugin framework state. Populated in _after_ready after transport is ready.
+        self._plugin_configs: list[dict] = list(plugins or [])
+        self._plugins: list[Plugin] = []
+        self._plugin_command_handlers: dict[str, list] = {}
+        self._shared_ctx: PluginContext | None = None
+        # Sole auth + authority source. Empty list → fail-closed (no users authorized).
+        # TRANSITION SHIM (Task 5): when callers pass legacy
+        # ``allowed_username`` / ``allowed_usernames`` but not ``allowed_users``,
+        # synthesize a list of executor AllowedUser entries from the legacy
+        # kwargs. Lets the existing test suite (and a small handful of
+        # external callers) keep working through Tasks 5–6 while the new
+        # auth path becomes the only one. Step 11/12 strip the legacy kwargs.
+        if allowed_users is not None:
+            self._allowed_users: list = list(allowed_users)
+        elif allowed_usernames:
+            self._allowed_users = [
+                AllowedUser(username=str(u).lstrip("@").lower(), role="executor")
+                for u in allowed_usernames
+            ]
+        elif allowed_username:
+            self._allowed_users = [
+                AllowedUser(
+                    username=str(allowed_username).lstrip("@").lower(),
+                    role="executor",
+                ),
+            ]
+        else:
+            self._allowed_users = []
+        # Track which scope this allow-list came from so _persist_auth_if_dirty
+        # writes back to the right place. "project" for per-project lists,
+        # "global" when run_bots used the Config.allowed_users fallback.
+        self._auth_source: str = auth_source if auth_source in ("project", "global") else "project"
 
     @property
     def _claude(self) -> ClaudeBackend:
@@ -371,10 +430,6 @@ class ProjectBot(AuthMixin):
             except ValueError:
                 pass
 
-    def _on_trust(self, user_id: int, username: str) -> None:
-        if self._on_trust_fn:
-            self._on_trust_fn(user_id, username)
-
     async def _on_task_started(self, task: Task) -> None:
         # Only show typing indicator for Claude tasks, not /run commands
         if task.type == TaskType.COMMAND:
@@ -478,6 +533,7 @@ class ProjectBot(AuthMixin):
         elif isinstance(event, ToolUse):
             if event.path and self._is_image(event.path):
                 await self._send_image(task.chat, event.path, reply_to=task.message)
+            await self._dispatch_plugin_tool_use(event)
 
     async def _send_html(
         self,
@@ -794,6 +850,7 @@ class ProjectBot(AuthMixin):
                 await self._log_assistant_turn(task.chat, assistant_text)
         else:
             await self._finalize_command_task(task)
+        await self._dispatch_plugin_task_complete(task)
 
     def _question_buttons(self, task_id: int, q_idx: int, question: Question) -> Buttons:
         rows: list[list[Button]] = []
@@ -1022,7 +1079,106 @@ class ProjectBot(AuthMixin):
             if persona:
                 prompt = format_persona_prompt(persona, prompt)
         prompt = await self._history_block(chat) + prompt
+        prompt = self._plugin_context_prepend(prompt)
         return prompt
+
+    async def _persist_auth_if_dirty(self) -> None:
+        """Save config.json once if ``_auth_dirty`` was set by a first-contact lock.
+
+        Called from message-handling tails (``_on_text``, ``_on_run``, etc.)
+        after the message is processed. Cheap when nothing to do (single
+        bool check).
+
+        Three correctness properties:
+
+        1. **Atomic read-modify-write.** The load → merge → save sequence
+           holds the existing ``_config_lock`` (fcntl.flock POSIX,
+           msvcrt.locking Windows) for the WHOLE duration, not just the
+           write phase. Without this, two concurrent first-contacts would
+           each load the pre-write state, each merge in their own change,
+           each save — last writer wins and silently drops one lock. The
+           lock is provided by ``locked_config_rmw(path)`` in ``config.py``.
+        2. **Scope-aware.** Writes back to whichever scope the bot's
+           ``_allowed_users`` came from. When the bot inherited the global
+           allow-list via ``resolve_project_allowed_users`` fallback,
+           ``self._auth_source == "global"`` and we update
+           ``Config.allowed_users`` on disk — NOT the project's empty list
+           (which would silently promote the global list to a project-
+           scoped copy).
+        3. **Per-user merge.** Find the AllowedUser by username, union its
+           ``locked_identities`` with our in-memory copy, write. Does NOT
+           replace the full list. Concurrent edits to OTHER users on disk
+           are preserved.
+        """
+        if not self._auth_dirty:
+            return
+        from .config import locked_config_rmw, save_config_within_lock
+        cfg_path = self._effective_config_path()
+        try:
+            with locked_config_rmw(cfg_path) as disk:
+                # disk is a freshly-loaded Config with the file lock held.
+                if self._auth_source == "project":
+                    if self.name not in disk.projects:
+                        logger.warning(
+                            "Auth persist skipped: project %r missing from disk", self.name,
+                        )
+                        return
+                    target = disk.projects[self.name].allowed_users
+                else:  # "global"
+                    target = disk.allowed_users
+
+                # Per-user merge: union our in-memory locks with disk's.
+                in_memory_by_user = {u.username: u for u in self._allowed_users}
+                for au in target:
+                    mem = in_memory_by_user.get(au.username)
+                    if mem is None:
+                        continue
+                    merged = list(au.locked_identities)
+                    for ident in mem.locked_identities:
+                        if ident not in merged:
+                            merged.append(ident)
+                    au.locked_identities = merged
+
+                # Inside the context manager — save_config_within_lock writes
+                # without re-locking (the context manager already holds the
+                # lock).
+                save_config_within_lock(disk, cfg_path)
+
+            self._auth_dirty = False
+        except Exception:
+            logger.exception("Failed to persist auth state; will retry on next message")
+
+    async def _guard_executor(self, ci_or_msg) -> bool:
+        """Return True if the user may run state-changing actions.
+
+        Replies 'Read-only access' on the active transport when blocked.
+        ``ci_or_msg`` accepts either a ``CommandInvocation`` or an
+        ``IncomingMessage`` — both expose ``.sender``, ``.chat``, and
+        ``.message``.
+
+        IMPORTANT: persists ``_auth_dirty`` on BOTH the success AND the
+        viewer-denied path. ``_require_executor`` may have appended a
+        first-contact identity to the user's ``locked_identities`` even
+        when the role check ultimately fails (e.g., the user is a viewer
+        logging in from a new transport — they get authed, locked, then
+        denied for the state-changing action). Skipping the save on the
+        deny path would lose that lock.
+        """
+        sender = getattr(ci_or_msg, "sender", None)
+        if sender is None:
+            return False
+        allowed = self._require_executor(sender)
+        # Persist first-contact locks regardless of allow/deny outcome.
+        await self._persist_auth_if_dirty()
+        if allowed:
+            return True
+        assert self._transport is not None
+        await self._transport.send_text(
+            ci_or_msg.chat,
+            "Read-only access — your role is viewer.",
+            reply_to=getattr(ci_or_msg, "message", None),
+        )
+        return False
 
     async def _on_text(self, incoming) -> None:
         """Handle a plain-text message: auth, rate-limit, pending skill/persona
@@ -1045,6 +1201,16 @@ class ProjectBot(AuthMixin):
             await self._transport.send_text(
                 incoming.chat, "Rate limited. Try again shortly.", reply_to=incoming.message,
             )
+            return
+
+        consumed = await self._dispatch_plugin_on_message(incoming)
+        if consumed:
+            return
+
+        # Role gate: only executors may submit prompts / answer questions /
+        # trigger backend turns. Read-only viewers should not be able to push
+        # the agent forward.
+        if not await self._guard_executor(incoming):
             return
 
         if incoming.has_unsupported_media:
@@ -1125,6 +1291,8 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
+            return
+        if not await self._guard_executor(ci):
             return
         if not ci.args:
             await self._transport.send_text(ci.chat, "Usage: /run <command>", reply_to=ci.message)
@@ -1211,6 +1379,8 @@ class ProjectBot(AuthMixin):
     async def _on_model(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         backend = self.task_manager.backend
         models = tuple(backend.capabilities.models)
@@ -1247,6 +1417,8 @@ class ProjectBot(AuthMixin):
     async def _on_effort(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         backend = self.task_manager.backend
         levels = tuple(backend.capabilities.effort_levels)
@@ -1280,6 +1452,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_thinking(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_thinking:
@@ -1340,7 +1514,11 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         args = ci.args or []
         if not args:
+            # Read-only — viewers may inspect the current state.
             await self._transport.send_text(ci.chat, self._context_status_text())
+            return
+        # Toggling / setting limit is state-changing — gate to executor.
+        if not await self._guard_executor(ci):
             return
         arg = args[0].lower()
         if arg in ("on", "off"):
@@ -1391,6 +1569,8 @@ class ProjectBot(AuthMixin):
     async def _on_permissions(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_permissions:
             await self._transport.send_text(ci.chat, "This backend doesn't support /permissions.")
@@ -1403,6 +1583,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_compact(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self.task_manager.backend.capabilities.supports_compact:
@@ -1477,6 +1659,8 @@ class ProjectBot(AuthMixin):
         """
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
 
         if not ci.args:
@@ -1505,6 +1689,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_reset(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         buttons = Buttons(rows=[[
@@ -1537,6 +1723,9 @@ class ProjectBot(AuthMixin):
             )
             return
         if ci.args:
+            # Activation branch is state-changing — gate to executor.
+            if not await self._guard_executor(ci):
+                return
             name = ci.args[0].lower()
             from .skills import load_skill
             skill = load_skill(name, self.path)
@@ -1568,6 +1757,8 @@ class ProjectBot(AuthMixin):
     async def _on_stop_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self._backend_supports_prompt_customization():
             await self._transport.send_text(
@@ -1584,6 +1775,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_create_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1608,6 +1801,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_delete_skill(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1821,6 +2016,9 @@ class ProjectBot(AuthMixin):
                 return
             await self._transport.send_text(ci.chat, "Pick a persona to activate:", buttons=buttons)
             return
+        # Activation branch is state-changing — gate to executor.
+        if not await self._guard_executor(ci):
+            return
         name = ci.args[0].lower()
         from .skills import load_persona
         persona = load_persona(name, self.path)
@@ -1836,6 +2034,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_stop_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not self._active_persona:
@@ -1859,6 +2059,8 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
+        if not await self._guard_executor(ci):
+            return
         self._group_state.halt(ci.chat)
         await self._transport.send_text(
             ci.chat, "Halted. Use /resume to continue.", reply_to=ci.message,
@@ -1876,11 +2078,15 @@ class ProjectBot(AuthMixin):
         if not self._auth_identity(ci.sender):
             await self._transport.send_text(ci.chat, "Unauthorized.", reply_to=ci.message)
             return
+        if not await self._guard_executor(ci):
+            return
         self._group_state.resume(ci.chat)
         await self._transport.send_text(ci.chat, "Resumed.", reply_to=ci.message)
 
     async def _on_create_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1904,6 +2110,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_delete_persona(self, ci) -> None:
         if not self._auth_identity(ci.sender):
+            return
+        if not await self._guard_executor(ci):
             return
         assert self._transport is not None
         if not ci.args:
@@ -1958,6 +2166,8 @@ class ProjectBot(AuthMixin):
     async def _on_lang(self, ci) -> None:
         if not self._auth_identity(ci.sender):
             return
+        if not await self._guard_executor(ci):
+            return
         assert self._transport is not None
         if not self._transcriber:
             await self._transport.send_text(ci.chat, "Voice is not configured.")
@@ -1985,6 +2195,36 @@ class ProjectBot(AuthMixin):
             buttons=Buttons(rows=rows),
         )
 
+    # State-changing button prefixes / exact values — used by the role gate
+    # in _on_button. A button click matching any of these requires executor
+    # role. Plugin-registered buttons go through _dispatch_plugin_button BEFORE
+    # this check, so they are responsible for their own gating per the spec.
+    _STATE_CHANGING_BUTTON_PREFIXES = (
+        "model_set_",
+        "effort_set_",
+        "thinking_set_",
+        "permissions_set_",
+        "backend_set_",
+        "task_cancel_",
+        "lang_set_",
+        "ask_",
+        "skill_scope_",
+        "pick_skill_",
+        "skill_delete_confirm_",
+        "persona_scope_",
+        "pick_persona_",
+        "persona_delete_confirm_",
+    )
+    _STATE_CHANGING_BUTTON_EXACT = frozenset({
+        "reset_confirm",
+        "reset_cancel",
+    })
+
+    def _is_state_changing_button(self, value: str) -> bool:
+        if value in self._STATE_CHANGING_BUTTON_EXACT:
+            return True
+        return any(value.startswith(p) for p in self._STATE_CHANGING_BUTTON_PREFIXES)
+
     async def _on_button(self, click) -> None:
         """Transport-native button-click handler. Replaces legacy _on_callback."""
         if not self._auth_identity(click.sender):
@@ -1993,6 +2233,15 @@ class ProjectBot(AuthMixin):
         value = click.value
         msg_ref = click.message
         chat = click.chat
+        if await self._dispatch_plugin_button(click):
+            return
+
+        # Role gate for state-changing buttons. Read-only branches (task_info_*,
+        # task_log_*, tasks_back, show_thinking_*, skill_delete_cancel,
+        # persona_delete_cancel) fall through.
+        if self._is_state_changing_button(value):
+            if not await self._guard_executor(click):
+                return
 
         if value.startswith("model_set_"):
             name = value[len("model_set_"):]
@@ -2342,6 +2591,8 @@ class ProjectBot(AuthMixin):
 
         if not self._auth_identity(incoming.sender):
             return
+        if not await self._guard_executor(incoming):
+            return
         if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
@@ -2396,6 +2647,8 @@ class ProjectBot(AuthMixin):
 
     async def _on_voice_from_transport(self, incoming) -> None:
         if not self._auth_identity(incoming.sender):
+            return
+        if not await self._guard_executor(incoming):
             return
         if self._rate_limited(self._identity_key(incoming.sender)):
             assert self._transport is not None
@@ -2516,6 +2769,236 @@ class ProjectBot(AuthMixin):
         except asyncio.CancelledError:
             pass
 
+    async def _dispatch_plugin_on_message(self, msg) -> bool:
+        """Fire on_message for each plugin. Return True if ANY plugin consumed.
+
+        Tolerates ``ProjectBot.__new__``-built stubs that skip plugin-state
+        initialization — they implicitly behave as "no plugins loaded".
+        """
+        consumed = False
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                if await plugin.on_message(msg):
+                    consumed = True
+            except Exception:
+                logger.warning("plugin %s on_message failed", plugin.name, exc_info=True)
+        return consumed
+
+    async def _dispatch_plugin_button(self, click) -> bool:
+        """Fire on_button for each plugin. Return True if ANY plugin consumed."""
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                if await plugin.on_button(click):
+                    return True
+            except Exception:
+                logger.warning("plugin %s on_button failed", plugin.name, exc_info=True)
+        return False
+
+    async def _dispatch_plugin_tool_use(self, event) -> None:
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                await plugin.on_tool_use(event.tool, event.path)
+            except Exception:
+                logger.warning("plugin %s on_tool_use failed", plugin.name, exc_info=True)
+
+    async def _dispatch_plugin_task_complete(self, task) -> None:
+        if task.status == TaskStatus.CANCELLED:
+            return
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                await plugin.on_task_complete(task)
+            except Exception:
+                logger.warning("plugin %s on_task_complete failed", plugin.name, exc_info=True)
+
+    def _plugin_context_prepend(self, prompt: str) -> str:
+        """Prepend get_context() outputs to a Claude prompt.
+
+        Only active when the current backend is Claude. Non-Claude backends
+        (Codex, future Gemini) don't accept arbitrary system-prompt prepends
+        the same way, so plugins that care should branch on ctx.backend_name.
+        """
+        if getattr(self, "_backend_name", None) != "claude":
+            return prompt
+        parts: list[str] = []
+        for plugin in getattr(self, "_plugins", ()):
+            try:
+                ctx = plugin.get_context()
+            except Exception:
+                logger.warning("plugin %s get_context failed", plugin.name, exc_info=True)
+                continue
+            if ctx:
+                parts.append(ctx)
+        if not parts:
+            return prompt
+        return "\n\n".join(parts) + "\n\n---\n\n" + prompt
+
+    def _wrap_plugin_command(self, plugin, bc):
+        """Wrap a plugin command handler with auth + role gating + persist.
+
+        Three guards:
+        1. **Active-plugin check.** If `plugin.start()` failed (we removed
+           the plugin from `self._plugins`), the registered command handler
+           silently no-ops. Without this, a failed plugin would still serve
+           half-initialized state via its commands.
+        2. **Auth + role gate.** `_auth_identity` then `_require_executor`
+           (unless `bc.viewer_ok=True`). Same pattern as `_guard_executor`,
+           inlined here because `_guard_executor` expects an `IncomingMessage`
+           or `CommandInvocation` shape that matches the core handler chain.
+        3. **try/finally persist.** Plugin commands can append a first-
+           contact identity (via `_auth_identity` → `_get_user_role`). The
+           `finally` block calls `_persist_auth_if_dirty` so that lock isn't
+           lost when the plugin handler exits — including the viewer-denied
+           and exception paths.
+        """
+        from functools import wraps
+        handler = bc.handler
+        viewer_ok = bc.viewer_ok
+        plugin_ref = plugin  # captured for the active-plugin check
+
+        @wraps(handler)
+        async def _wrapped(invocation):
+            try:
+                # 1. Active-plugin check — plugin may have been removed from
+                #    self._plugins after its start() failed.
+                if plugin_ref not in self._plugins:
+                    logger.debug(
+                        "Plugin %s command %r invoked after start failure; "
+                        "ignoring",
+                        plugin_ref.name, bc.command,
+                    )
+                    return
+                # 2a. Auth (defense-in-depth; transport's authorizer already gated).
+                if not self._auth_identity(invocation.sender):
+                    return
+                # 2b. Role gate (unless viewer_ok).
+                if not viewer_ok and not self._require_executor(invocation.sender):
+                    assert self._transport is not None
+                    await self._transport.send_text(
+                        invocation.chat,
+                        "Read-only access — your role is viewer.",
+                        reply_to=invocation.message,
+                    )
+                    return
+                await handler(invocation)
+            finally:
+                # 3. Always persist any first-contact lock the auth checks
+                #    above may have appended.
+                await self._persist_auth_if_dirty()
+
+        return _wrapped
+
+    async def _init_plugins(self) -> None:
+        """Instantiate, register, and start plugins. Called from _after_ready."""
+        if not self._plugin_configs or self._transport is None:
+            return
+        # PluginContext field provenance:
+        #   bot_name / project_path / bot_username / backend_name / transport
+        #     — sourced from ProjectBot state (set in __init__ / _after_ready).
+        #   data_dir — fixed convention `~/.link-project-to-chat/meta/<bot_name>`;
+        #     created with mkdir below.
+        #   _identity_resolver — live bound method (see comment inline).
+        #   web_port / public_url / register_in_app_web_handler — INTENTIONALLY
+        #     left at their None defaults in v1.0.0. They're API surface
+        #     reserved for the future external in-app-web-server plugin and
+        #     would be populated by a follow-up spec that wires bot.py to the
+        #     Web transport's port / public URL and registers an HTTP-route
+        #     callback. Plugins that need them must check for None and
+        #     degrade gracefully (documented in PluginContext's docstring).
+        self._shared_ctx = PluginContext(
+            bot_name=self.name,
+            project_path=self.path,
+            bot_username=self.bot_username,
+            data_dir=Path.home() / ".link-project-to-chat" / "meta" / self.name,
+            backend_name=self._backend_name,
+            transport=self._transport,
+            # LIVE identity resolver. Plugins call ctx.is_allowed(identity) /
+            # ctx.is_executor(identity); the helpers consult the bot's
+            # _allowed_users at call time, so locks added AFTER plugin init
+            # (e.g., a user first-contacting from a new transport later)
+            # are visible. The earlier draft snapshotted allowed_identities /
+            # executor_identities as flat lists here — that went stale.
+            _identity_resolver=self._get_user_role,
+        )
+        self._shared_ctx.data_dir.mkdir(parents=True, exist_ok=True)
+
+        for cfg in self._plugin_configs:
+            pname = cfg.get("name")
+            if not pname:
+                logger.warning("skipping plugin entry without 'name': %r", cfg)
+                continue
+            plugin = load_plugin(pname, self._shared_ctx, cfg)
+            if plugin:
+                self._plugins.append(plugin)
+
+        # Core command names plugins are NOT allowed to shadow. Sourced from
+        # `ported_commands` in bot.py:build()/setup; keep in sync if a new
+        # core command is added.
+        CORE_COMMAND_NAMES: set[str] = {
+            "help", "version", "status", "tasks", "backend", "model", "effort",
+            "thinking", "context", "permissions", "compact", "reset", "skills",
+            "stop_skill", "create_skill", "delete_skill", "persona",
+            "stop_persona", "create_persona", "delete_persona", "lang", "start",
+            "run", "voice", "halt", "resume",
+        }
+
+        # Track which plugin owns which command so we can detect duplicates
+        # across plugins (last-load-wins is silently wrong — plugins should
+        # not clobber each other).
+        registered_command_owner: dict[str, str] = {}
+
+        # Register each plugin's commands on the transport.
+        for plugin in self._plugins:
+            try:
+                cmds = plugin.commands()
+            except Exception:
+                logger.warning("plugin %s commands() failed; skipping plugin", plugin.name, exc_info=True)
+                continue
+            for bc in cmds:
+                name = bc.command
+                if name in CORE_COMMAND_NAMES:
+                    logger.warning(
+                        "Plugin %s tried to register reserved core command /%s; "
+                        "ignoring this command (other commands from this plugin "
+                        "remain registered)",
+                        plugin.name, name,
+                    )
+                    continue
+                prior_owner = registered_command_owner.get(name)
+                if prior_owner is not None:
+                    logger.warning(
+                        "Plugin %s tried to register /%s already claimed by "
+                        "plugin %s; ignoring",
+                        plugin.name, name, prior_owner,
+                    )
+                    continue
+                wrapped = self._wrap_plugin_command(plugin, bc)
+                self._transport.on_command(name, wrapped)
+                self._plugin_command_handlers.setdefault(plugin.name, []).append(name)
+                registered_command_owner[name] = plugin.name
+
+        # Start plugins in dependency order; on failure, "unregister" by
+        # removing from _plugins so further dispatch skips them. Transport
+        # doesn't expose remove-handler, so the registered command stays
+        # wired but its plugin is dead — log clearly so this is visible.
+        for plugin in _topo_sort(list(self._plugins)):
+            try:
+                await plugin.start()
+            except Exception:
+                logger.warning(
+                    "plugin %s start failed; removing from dispatch (commands %s remain inert)",
+                    plugin.name, self._plugin_command_handlers.get(plugin.name, []),
+                    exc_info=True,
+                )
+                if plugin in self._plugins:
+                    self._plugins.remove(plugin)
+
+    async def _shutdown_plugins(self) -> None:
+        for plugin in reversed(self._plugins):
+            try:
+                await plugin.stop()
+            except Exception:
+                logger.warning("plugin %s stop failed", plugin.name, exc_info=True)
+
     async def _after_ready(self, self_identity) -> None:
         """Called once after Transport.start() completes platform post-init.
 
@@ -2529,6 +3012,7 @@ class ProjectBot(AuthMixin):
         if self.team_name and self.role and self.bot_username:
             self._backfill_own_bot_username()
         self._refresh_team_system_note()
+        await self._init_plugins()
 
         # Startup ping to trusted users. Skipped for team bots: they live in
         # the team supergroup and have no DM with trusted users, so every send
@@ -2536,18 +3020,26 @@ class ProjectBot(AuthMixin):
         assert self._transport is not None
         if self.team_name and self.role:
             return
-        for uid in self._get_trusted_user_ids():
-            chat = ChatRef(
-                transport_id=self._transport.TRANSPORT_ID,
-                native_id=str(uid),
-                kind=ChatKind.DM,
-            )
-            try:
-                await self._transport.send_text(
-                    chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+        # Each AllowedUser's locked_identities holds entries in the new
+        # "transport_id:native_id" shape (Task 3). For the startup ping we
+        # only want identities matching the bot's active transport.
+        active_prefix = f"{self._transport.TRANSPORT_ID}:"
+        for au in self._allowed_users:
+            for ident_key in au.locked_identities:
+                if not ident_key.startswith(active_prefix):
+                    continue
+                native_id = ident_key[len(active_prefix):]
+                chat = ChatRef(
+                    transport_id=self._transport.TRANSPORT_ID,
+                    native_id=native_id,
+                    kind=ChatKind.DM,
                 )
-            except Exception:
-                logger.error("Failed to send startup message to %d", uid, exc_info=True)
+                try:
+                    await self._transport.send_text(
+                        chat, f"Bot started.\nProject: {self.name}\nPath: {self.path}",
+                    )
+                except Exception:
+                    logger.error("Failed to send startup message to %s", native_id, exc_info=True)
 
     def build(self) -> None:
         if self.transport_kind == "web":
@@ -2566,8 +3058,8 @@ class ProjectBot(AuthMixin):
                 bot_identity=bot_identity,
                 port=self.web_port,
                 authenticated_handle=(
-                    self._get_allowed_usernames()[0]
-                    if len(self._get_allowed_usernames()) == 1
+                    self._allowed_users[0].username
+                    if len(self._allowed_users) == 1
                     else None
                 ),
                 auth_token=secrets.token_urlsafe(32),
@@ -2578,6 +3070,7 @@ class ProjectBot(AuthMixin):
             self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
             self._app = self._transport.app  # PTB Application
         self._transport.on_ready(self._after_ready)
+        self._transport.on_stop(self._shutdown_plugins)
 
         async def _pre_authorize(identity) -> bool:
             return self._auth_identity(identity)
@@ -2613,10 +3106,24 @@ class ProjectBot(AuthMixin):
             ("halt", self._on_halt),
             ("resume", self._on_resume),
         )
-        self._transport.on_message(self._on_text_from_transport)
-        self._transport.on_button(self._on_button)
+        # Wrap every top-level handler in a try/finally that fires
+        # _persist_auth_if_dirty on every exit path (success, deny, plugin
+        # consume, exception). Without this, first-contact identity locks
+        # added by the transport authorizer would be lost on bot restart
+        # whenever the path skipped _guard_executor (read-only commands,
+        # plugin-consumed messages, error paths).
+        def _wrap_with_persist(handler):
+            async def _wrapped(arg):
+                try:
+                    await handler(arg)
+                finally:
+                    await self._persist_auth_if_dirty()
+            return _wrapped
+
+        self._transport.on_message(_wrap_with_persist(self._on_text_from_transport))
+        self._transport.on_button(_wrap_with_persist(self._on_button))
         for _name, _handler in ported_commands:
-            self._transport.on_command(_name, _handler)
+            self._transport.on_command(_name, _wrap_with_persist(_handler))
 
         if self.transport_kind == "telegram":
             # Main routing — registers MessageHandler/CommandHandler/CallbackQueryHandler.
@@ -2646,8 +3153,22 @@ class ProjectBot(AuthMixin):
                     team_bot_usernames = {
                         b.bot_username for b in team.bots.values() if b.bot_username
                     } if team else set()
-                    trusted_user_ids = self._get_trusted_user_ids()
-                    authenticated_user_id = trusted_user_ids[0] if trusted_user_ids else None
+                    # Extract the bot's authenticated Telegram user ID from the
+                    # AllowedUser-locked-identities model (post-v1.0 auth). The
+                    # relay uses this to identify which group messages are the
+                    # authenticated user's vs peer-bot forwards. This block is
+                    # inside a Telethon-only path, so we look for the "telegram:"
+                    # prefix directly rather than reading TRANSPORT_ID from
+                    # self._transport (which tests sometimes patch with a Mock).
+                    authenticated_user_id = next(
+                        (
+                            ident_key[len("telegram:"):]
+                            for au in self._allowed_users
+                            for ident_key in au.locked_identities
+                            if ident_key.startswith("telegram:")
+                        ),
+                        None,
+                    )
                     if not team_bot_usernames:
                         logger.warning(
                             "Team %r missing from config or has no bot usernames; "
@@ -2700,11 +3221,7 @@ def run_bot(
     permission_mode: str | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
-    trusted_user_id: int | None = None,
-    on_trust: Callable[[int, str], None] | None = None,
     allowed_usernames: list[str] | None = None,
-    trusted_users: dict[str, int] | None = None,
-    trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
     team_name: str | None = None,
@@ -2721,11 +3238,19 @@ def run_bot(
     backend_state: dict[str, dict] | None = None,
     context_enabled: bool = True,
     context_history_limit: int = 10,
+    plugins: list[dict] | None = None,
+    allowed_users: list | None = None,
+    auth_source: str = "project",
 ) -> None:
+    # Determine effective auth — prefer the modern allowed_users; fall back
+    # to synthesizing executor entries from the legacy usernames so the
+    # transition shim in ProjectBot.__init__ has something to consume.
     effective_usernames = allowed_usernames or ([username] if username else [])
-    if not effective_usernames:
+    if not allowed_users and not effective_usernames:
         raise SystemExit(
-            "No allowed username configured. Use --username or run 'configure --username'."
+            "No allowed user configured. For one-shot --path/--token starts, "
+            "pass --username USER. For configured projects, run "
+            "'configure --add-user USER[:ROLE]'."
         )
     if session_id:
         save_session(
@@ -2738,9 +3263,6 @@ def run_bot(
     bot = ProjectBot(
         name, path, token,
         allowed_usernames=effective_usernames,
-        trusted_users=trusted_users,
-        trusted_user_ids=trusted_user_ids or ([trusted_user_id] if trusted_user_id else []),
-        on_trust=on_trust,
         skip_permissions=skip_permissions,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
@@ -2761,6 +3283,9 @@ def run_bot(
         backend_state=backend_state,
         context_enabled=context_enabled,
         context_history_limit=context_history_limit,
+        plugins=plugins,
+        allowed_users=allowed_users,
+        auth_source=auth_source,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -2773,9 +3298,7 @@ def run_bot(
     if effort:
         bot.task_manager.backend.effort = effort
     bot.build()
-    logger.info(
-        "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
-    )
+    logger.info("Bot '%s' started at %s", name, path)
     bot.run()
 
 
@@ -2794,15 +3317,7 @@ def run_bots(
 ) -> None:
     if len(config.projects) == 1:
         name, proj = next(iter(config.projects.items()))
-        effective_usernames, effective_trusted_users = resolve_project_auth_scope(
-            proj,
-            config,
-        )
-        on_trust = None
-        if config_path:
-            _name = name
-            _path = config_path
-            on_trust = lambda uid, username: bind_project_trusted_user(_name, username, uid, _path)
+        effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
         proj_skip, proj_pm = resolve_permissions(proj.permissions)
         project_state = proj.backend_state.get(proj.backend, {})
         run_bot(
@@ -2820,9 +3335,6 @@ def run_bots(
             permission_mode=permission_mode or proj_pm,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
-            on_trust=on_trust,
-            allowed_usernames=effective_usernames,
-            trusted_users=effective_trusted_users,
             transcriber=transcriber,
             synthesizer=synthesizer,
             active_persona=proj.active_persona,
@@ -2834,6 +3346,9 @@ def run_bots(
             backend_state=proj.backend_state,
             context_enabled=proj.context_enabled,
             context_history_limit=proj.context_history_limit,
+            plugins=getattr(proj, "plugins", None) or None,
+            allowed_users=effective_allowed_users or None,
+            auth_source=project_auth_source,
         )
     else:
         names = ", ".join(config.projects.keys())

@@ -24,6 +24,262 @@ class ConfigError(Exception):
     """Raised when config.json contains structurally invalid data."""
 
 
+_VALID_ROLES = ("viewer", "executor")
+
+
+@dataclass
+class AllowedUser:
+    username: str
+    role: str = "viewer"
+    locked_identities: list[str] = field(default_factory=list)
+    # Platform-portable identity locks: list of "transport_id:native_id" strings.
+    # Each transport a user contacts from gets a new entry appended on first
+    # contact (no replacement). Auth succeeds if any entry matches the
+    # current identity. Examples after first contact:
+    #   ["telegram:12345"]
+    #   ["web:web-session:abc-def"]
+    #   ["telegram:12345", "web:web-session:abc-def"]  (same user, two transports)
+    # Replaces the int-only ID locking from the legacy design.
+
+
+def _parse_allowed_users(raw_list) -> list["AllowedUser"]:
+    out: list[AllowedUser] = []
+    if not isinstance(raw_list, list):
+        return out
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            logger.warning("malformed allowed_users entry (not a dict): %r", entry)
+            continue
+        username = entry.get("username")
+        if not username:
+            logger.warning("malformed allowed_users entry (missing username): %r", entry)
+            continue
+        role = entry.get("role", "viewer")
+        if role not in _VALID_ROLES:
+            logger.warning("unknown role %r for %s; defaulting to viewer", role, username)
+            role = "viewer"
+        # Accept the new list shape; tolerate the single-string shape used
+        # during the migration window (auto-wrap).
+        raw_locked = entry.get("locked_identities", [])
+        if isinstance(raw_locked, str):
+            raw_locked = [raw_locked]
+        if not isinstance(raw_locked, list):
+            logger.warning(
+                "malformed locked_identities for %s (expected list of strings): %r; dropping",
+                username, raw_locked,
+            )
+            raw_locked = []
+        locked_identities = [s for s in raw_locked if isinstance(s, str)]
+        if len(locked_identities) != len(raw_locked):
+            logger.warning(
+                "dropped non-string entries from locked_identities for %s", username,
+            )
+        out.append(AllowedUser(
+            username=str(username).lstrip("@").lower(),
+            role=role,
+            locked_identities=locked_identities,
+        ))
+    return out
+
+
+def _serialize_allowed_users(users: list["AllowedUser"]) -> list[dict]:
+    out = []
+    for u in users:
+        entry: dict = {"username": u.username, "role": u.role}
+        if u.locked_identities:
+            entry["locked_identities"] = list(u.locked_identities)
+        out.append(entry)
+    return out
+
+
+def _parse_plugins(raw_list) -> list[dict]:
+    out: list[dict] = []
+    if not isinstance(raw_list, list):
+        return out
+    for entry in raw_list:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("name"):
+            continue
+        out.append(entry)
+    return out
+
+
+def _migrate_legacy_auth(raw: dict) -> tuple[list["AllowedUser"], bool]:
+    """One-way migration from legacy fields -> AllowedUser list.
+
+    Reads `allowed_usernames` (list[str]), `trusted_users` (dict[str, int|str]
+    OR legacy list[str]), and `trusted_user_ids` (list[int], legacy-only) from
+    `raw` and synthesizes `AllowedUser{role="executor"}` entries.
+
+    Returns (allowed_users, migrated) where `migrated` is True iff any legacy
+    field was present in `raw`. The caller uses `migrated` to set
+    `migration_pending` on the Config so the CLI saves on first start.
+
+    Username normalization: lowercase, strip leading `@`.
+    Locked ID source order:
+      1. `trusted_users` dict - explicit username -> user_id mapping (current shape).
+      2. `trusted_users` list (pre-A1) aligned with `trusted_user_ids` by index.
+      3. `trusted_user_ids` aligned with `allowed_usernames` by index (oldest shape).
+    On mismatched lengths in the list paths, IDs are dropped and the entries
+    re-lock on next contact (logged at WARNING).
+    """
+    # Accept both the list-shaped (``allowed_usernames``) and the singular
+    # (``allowed_username``) keys, plus the per-project ``username`` key,
+    # so older configs migrate cleanly. Similarly for ``trusted_user_id``.
+    legacy_unames = list(raw.get("allowed_usernames") or [])
+    if not legacy_unames:
+        singular_uname = raw.get("allowed_username") or raw.get("username")
+        if singular_uname:
+            legacy_unames = [singular_uname]
+    raw_trusted = raw.get("trusted_users")
+    legacy_ids = list(raw.get("trusted_user_ids") or [])
+    if not legacy_ids:
+        singular_tid = raw.get("trusted_user_id")
+        if singular_tid is not None:
+            try:
+                legacy_ids = [int(singular_tid)]
+            except (TypeError, ValueError):
+                pass
+    if not (legacy_unames or raw_trusted or legacy_ids):
+        return [], False
+
+    def _norm(name) -> str:
+        return str(name).lstrip("@").lower()
+
+    # Build a username -> locked_identities map ("telegram:<id>" strings).
+    # Legacy fields predate multi-transport support, so every legacy ID belongs
+    # to Telegram; we prefix with "telegram:" so each entry in locked_identities is
+    # immediately usable by the new identity-keyed auth comparison.
+    # Returns lists (not single strings) so the migration is shape-compatible
+    # with the new `locked_identities` field.
+    identities_for: dict[str, list[str]] = {}
+    legacy_trusted_names: list[str] = []
+    # Only values that already start with a KNOWN transport prefix are passed
+    # through; everything else is assumed Telegram (legacy default). This is
+    # the fix for the Web case: pre-v1.0 Web bound trusted_users["alice"] =
+    # "web-session:abc" - contains ":" but does NOT have the "web:" transport
+    # prefix that auth comparisons need. We detect this by matching a known
+    # transport whitelist; anything else falls back to telegram or to bare
+    # passthrough only if a known prefix is present.
+    _KNOWN_TRANSPORT_PREFIXES = ("telegram:", "web:", "discord:", "slack:")
+
+    def _normalize_legacy_trust_id(uid_str: str) -> str:
+        """Turn a legacy trusted_users value into a 'transport_id:native_id' string."""
+        # Already correctly prefixed?
+        for prefix in _KNOWN_TRANSPORT_PREFIXES:
+            if uid_str.startswith(prefix):
+                return uid_str
+        # The Web case: bare "web-session:abc" -> "web:web-session:abc".
+        if uid_str.startswith("web-session:"):
+            return f"web:{uid_str}"
+        # Plain numeric or arbitrary string -> telegram (legacy default).
+        try:
+            return f"telegram:{int(uid_str)}"
+        except (TypeError, ValueError):
+            return f"telegram:{uid_str}"
+
+    # SHAPE DISCRIMINATOR - isinstance() dispatches the three on-disk
+    # trusted_users shapes (see spec section "Migration semantics" and
+    # Step 2's golden-file tests (b)/(c) [dict shape] and (d) [list shape]).
+    # Without this branch, dict-shape configs would silently fall into the
+    # list branch and crash on `for name, uid in zip(...)` with a TypeError.
+    if isinstance(raw_trusted, dict):
+        # Current on-disk shape: username -> user_id (int or str).
+        # Covered by tests (b) test_migration_b_trusted_users_dict_subset
+        # and (c) test_migration_c_trusted_users_dict_full.
+        for uname, uid in raw_trusted.items():
+            norm = _norm(uname)
+            legacy_trusted_names.append(norm)
+            if uid is None:
+                continue
+            identities_for.setdefault(norm, []).append(_normalize_legacy_trust_id(str(uid)))
+    elif isinstance(raw_trusted, list):
+        # Pre-A1 shape: list of usernames aligned with trusted_user_ids by index.
+        # Covered by test (d) test_migration_d_legacy_list_with_ids_aligned.
+        legacy_trusted_names = [_norm(n) for n in raw_trusted]
+        if len(legacy_trusted_names) == len(legacy_ids):
+            for name, uid in zip(legacy_trusted_names, legacy_ids):
+                identities_for.setdefault(name, []).append(f"telegram:{int(uid)}")
+        elif legacy_ids:
+            logger.warning(
+                "legacy trusted_users(list) / trusted_user_ids length mismatch "
+                "(%d vs %d); dropping IDs - affected users will re-lock on next contact",
+                len(legacy_trusted_names), len(legacy_ids),
+            )
+        else:
+            # list trusted_users without ids; emit WARNING for length mismatch
+            # so the test_legacy_list_length_mismatch_drops_ids case is covered.
+            logger.warning(
+                "legacy trusted_users(list) / trusted_user_ids length mismatch "
+                "(%d vs %d); dropping IDs - affected users will re-lock on next contact",
+                len(legacy_trusted_names), len(legacy_ids),
+            )
+    elif legacy_ids and legacy_unames:
+        # Oldest shape: trusted_user_ids aligned with allowed_usernames by index.
+        norm_allowed = [_norm(n) for n in legacy_unames]
+        if len(norm_allowed) == len(legacy_ids):
+            for name, uid in zip(norm_allowed, legacy_ids):
+                identities_for.setdefault(name, []).append(f"telegram:{int(uid)}")
+        else:
+            logger.warning(
+                "legacy allowed_usernames / trusted_user_ids length mismatch "
+                "(%d vs %d); dropping IDs", len(norm_allowed), len(legacy_ids),
+            )
+
+    # Union of allowed_usernames + any trusted-only usernames (orphan trust);
+    # all become executor.
+    seen: set[str] = set()
+    out: list[AllowedUser] = []
+    for raw_name in list(legacy_unames) + list(legacy_trusted_names):
+        norm = _norm(raw_name)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(AllowedUser(
+            username=norm,
+            role="executor",
+            locked_identities=list(identities_for.get(norm, [])),
+        ))
+    locked_count = sum(1 for u in out if u.locked_identities)
+    logger.info(
+        "migrated legacy auth fields -> %d AllowedUser entries (%d with locked identities)",
+        len(out), locked_count,
+    )
+    return out, True
+
+
+def resolve_project_allowed_users(project, config) -> tuple[list["AllowedUser"], str]:
+    """Project allow-list with global fallback. Returns (users, source).
+
+    Source is "project" when the project's own allow-list is non-empty,
+    "global" when falling back to Config.allowed_users. The bot uses the
+    source to write back to the matching scope when persisting first-contact
+    locks via `_persist_auth_if_dirty`.
+
+    Matches the precedence of the existing `resolve_project_auth_scope`
+    (project overrides global, falls back to global) so deployments where the
+    project list is empty don't suddenly fail-closed when only the global
+    list is populated.
+
+    Callers in bot.py / cli.py / manager/bot.py use this helper instead of
+    reading project.allowed_usernames / project.trusted_users directly.
+    """
+    if project.allowed_users:
+        return project.allowed_users, "project"
+    return config.allowed_users, "global"
+
+
+# Removed in Task 5 Step 12:
+#   - ``_synthesize_allowed_users_from_legacy`` (legacy-field synthesis)
+#   - ``_union_save_view`` (save-time merge of legacy and new shapes)
+#   - ``_mirror_allowed_users_to_legacy`` (load-time mirror to legacy fields)
+# All three existed to bridge the legacy ``allowed_usernames`` /
+# ``trusted_users`` / ``trusted_user_ids`` fields with the new
+# ``allowed_users`` list shape. With the legacy fields gone from the
+# dataclasses, these helpers are dead code.
+
+
 @dataclass(frozen=True)
 class BotPeerRef:
     transport_id: str
@@ -42,9 +298,6 @@ class RoomBinding:
 class ProjectConfig:
     path: str
     telegram_bot_token: str
-    allowed_usernames: list[str] = field(default_factory=list)  # per-project override
-    trusted_users: dict[str, int | str] = field(default_factory=dict)
-    trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     model: str | None = None
     effort: str | None = None
     permissions: str | None = None  # one of PERMISSION_MODES or "dangerously-skip-permissions"
@@ -59,6 +312,10 @@ class ProjectConfig:
     # log visible to the next prompt.
     context_enabled: bool = True
     context_history_limit: int = 10
+    # New (Task 3) - plugin system + identity-keyed auth. Legacy fields above
+    # stay through Task 4 as transitional read-only inputs.
+    allowed_users: list[AllowedUser] = field(default_factory=list)
+    plugins: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -96,9 +353,6 @@ class TeamConfig:
 
 @dataclass
 class Config:
-    allowed_usernames: list[str] = field(default_factory=list)
-    trusted_users: dict[str, int | str] = field(default_factory=dict)
-    trusted_user_ids: list[int] = field(default_factory=list)  # legacy read-only input
     github_pat: str = ""
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
@@ -115,6 +369,13 @@ class Config:
     default_model_claude: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     teams: dict[str, TeamConfig] = field(default_factory=dict)
+    # New (Task 3) - identity-keyed auth at the global scope.
+    allowed_users: list[AllowedUser] = field(default_factory=list)
+    # Runtime flag set by load_config when legacy auth fields were read; CLI
+    # start uses it to force a save before serving traffic. ``save_config``
+    # does not emit this key; ``repr=False, compare=False`` keeps it out of
+    # debug output and equality.
+    migration_pending: bool = field(default=False, repr=False, compare=False)
 
 
 def _lock_file(lock_handle) -> None:
@@ -157,38 +418,9 @@ def _config_lock(path: Path):
             _unlock_file(lf)
 
 
-def resolve_project_auth_scope(
-    project: ProjectConfig,
-    config: Config,
-    username_override: str | None = None,
-) -> tuple[list[str], dict[str, int | str]]:
-    """Return the effective usernames and trusted-user bindings for a project bot.
-
-    Project-specific allowlists must not inherit unrelated global trusted IDs:
-    once a project narrows ``allowed_usernames``, only its own trusted IDs
-    should be honored. Likewise, a CLI ``--username`` override is a hard
-    override and intentionally starts with no trusted IDs.
-    """
-    if username_override:
-        return [_normalize_username(username_override)], {}
-    if project.allowed_usernames:
-        return list(project.allowed_usernames), _effective_trusted_users(
-            project.allowed_usernames,
-            trusted_users=project.trusted_users,
-            trusted_user_ids=project.trusted_user_ids,
-        )
-    trusted_users = _effective_trusted_users(
-        config.allowed_usernames,
-        trusted_users=project.trusted_users,
-        trusted_user_ids=project.trusted_user_ids,
-    )
-    if not trusted_users:
-        trusted_users = _effective_trusted_users(
-            config.allowed_usernames,
-            trusted_users=config.trusted_users,
-            trusted_user_ids=config.trusted_user_ids,
-        )
-    return list(config.allowed_usernames), trusted_users
+# ``resolve_project_auth_scope`` was removed in Task 5 Step 12 — callers
+# now resolve auth via ``resolve_project_allowed_users`` (which returns
+# ``(list[AllowedUser], "project"|"global")``).
 
 
 def _normalize_username(username: str) -> str:
@@ -305,96 +537,17 @@ def resolve_start_model(
     return None
 
 
-def _migrate_usernames(raw: dict, list_key: str, singular_key: str) -> list[str]:
-    """Load a list of usernames, migrating from old singular key if needed."""
-    if list_key in raw:
-        return [_normalize_username(u) for u in raw[list_key]]
-    singular = raw.get(singular_key, "")
-    if singular:
-        return [_normalize_username(singular)]
-    return []
-
-
-def _migrate_user_ids(raw: dict, list_key: str, singular_key: str) -> list[int]:
-    """Load a list of user IDs, migrating from old singular key if needed."""
-    if list_key in raw:
-        return list(raw[list_key])
-    singular = raw.get(singular_key)
-    if singular is not None:
-        return [int(singular)]
-    return []
-
-
-def _coerce_user_id(user_id: object) -> int | str:
-    """Coerce a persisted user_id, preserving non-numeric (Web/Discord) ids.
-
-    Telegram ids are integers, but cross-platform ids (Discord snowflakes,
-    arbitrary Web user ids) are opaque strings. We try int() for legacy
-    compatibility and fall back to the raw value so ids round-trip through
-    save→load without ValueError. AuthMixin tolerates mixed-type values
-    (per PR #6 0ad608e).
-    """
-    try:
-        return int(user_id)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return user_id  # type: ignore[return-value]
-
-
-def _effective_trusted_users(
-    allowed_usernames: list[str],
-    *,
-    trusted_users: dict[str, int | str] | None = None,
-    trusted_user_ids: list[int] | None = None,
-) -> dict[str, int | str]:
-    normalized_allowed = [_normalize_username(username) for username in allowed_usernames]
-    allowed_set = set(normalized_allowed)
-    if trusted_users:
-        effective: dict[str, int | str] = {}
-        for username, user_id in trusted_users.items():
-            normalized = _normalize_username(username)
-            if normalized in allowed_set:
-                effective[normalized] = _coerce_user_id(user_id)
-        if effective:
-            return effective
-    return {
-        username: _coerce_user_id(user_id)
-        for username, user_id in zip(normalized_allowed, trusted_user_ids or [])
-    }
-
-
-def _migrate_trusted_users(
-    raw: dict,
-    allowed_usernames: list[str],
-    map_key: str,
-    list_key: str,
-    singular_key: str,
-) -> dict[str, int | str]:
-    trusted_users = raw.get(map_key)
-    if isinstance(trusted_users, dict):
-        return _effective_trusted_users(
-            allowed_usernames,
-            trusted_users=trusted_users,
-        )
-    return _effective_trusted_users(
-        allowed_usernames,
-        trusted_user_ids=_migrate_user_ids(raw, list_key, singular_key),
-    )
-
-
-def _write_raw_trusted_users(
-    raw: dict,
-    trusted_users: dict[str, int | str],
-    *,
-    map_key: str,
-    list_key: str,
-    singular_key: str,
-) -> None:
-    if trusted_users:
-        raw[map_key] = trusted_users
-    else:
-        raw.pop(map_key, None)
-    raw.pop(list_key, None)
-    raw.pop(singular_key, None)
+# Removed in Task 5 Step 12:
+#   - ``_migrate_usernames`` (legacy ``allowed_usernames`` / ``allowed_username``)
+#   - ``_migrate_user_ids`` (legacy ``trusted_user_ids`` / ``trusted_user_id``)
+#   - ``_coerce_user_id`` (int-with-fallback for cross-platform user ids)
+#   - ``_effective_trusted_users``
+#   - ``_migrate_trusted_users``
+#   - ``_write_raw_trusted_users``
+# All six supported the legacy ``allowed_usernames`` / ``trusted_users`` /
+# ``trusted_user_ids`` fields, gone now from the dataclass and on-disk format.
+# ``_migrate_legacy_auth`` (the loader's compat shim) reads raw JSON keys
+# directly so it doesn't need these helpers either.
 
 
 def _split_project_entries(projects: object) -> tuple[dict[str, dict], list[str]]:
@@ -532,20 +685,54 @@ def _make_team_bot_config(b: dict) -> TeamBotConfig:
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
+    """Public API: acquires _config_lock for the read.
+
+    Returns a fresh Config built from the file on disk. Runs the legacy-auth
+    migration during parsing (sets ``Config.migration_pending`` when any
+    legacy field was present) - see ``_migrate_legacy_auth``. Best-effort
+    on-disk cleanup of malformed project/team entries runs AFTER the lock
+    is released (each cleanup call re-acquires the lock; doing it inside
+    would deadlock).
+    """
+    malformed_projects: list[str] = []
+    malformed_teams: list[str] = []
+    with _config_lock(path):
+        config = _load_config_unlocked(
+            path,
+            _malformed_projects=malformed_projects,
+            _malformed_teams=malformed_teams,
+        )
+    if malformed_projects:
+        _cleanup_malformed_projects(path, malformed_projects)
+    if malformed_teams:
+        _cleanup_malformed_teams(path, malformed_teams)
+    return config
+
+
+def _load_config_unlocked(
+    path: Path,
+    *,
+    _malformed_projects: list[str] | None = None,
+    _malformed_teams: list[str] | None = None,
+) -> Config:
+    """Load Config without acquiring _config_lock. Caller must hold the lock.
+
+    When ``_malformed_projects`` / ``_malformed_teams`` lists are provided,
+    the loader appends names of skipped malformed entries to them for the
+    caller to clean up outside the lock. Used by the public ``load_config``
+    wrapper. ``locked_config_rmw`` callers pass nothing (None) since they're
+    doing their own RMW and don't need disk cleanup.
+    """
     config = Config()
     if path.exists():
         raw = json.loads(path.read_text())
-        config.allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
-        config.trusted_user_ids = _migrate_user_ids(raw, "trusted_user_ids", "trusted_user_id")
-        config.trusted_users = _migrate_trusted_users(
-            raw,
-            config.allowed_usernames,
-            "trusted_users",
-            "trusted_user_ids",
-            "trusted_user_id",
-        )
-        if not config.trusted_user_ids and config.trusted_users:
-            config.trusted_user_ids = list(config.trusted_users.values())
+        # Global allow-list: explicit `allowed_users` always wins; the legacy
+        # migration helper fills in only when no explicit list is present.
+        explicit_global = _parse_allowed_users(raw.get("allowed_users", []))
+        migrated_global, did_migrate_global = _migrate_legacy_auth(raw)
+        config.allowed_users = explicit_global or migrated_global
+        if did_migrate_global:
+            config.migration_pending = True
         config.github_pat = raw.get("github_pat", "")
         config.telegram_api_id = raw.get("telegram_api_id", 0)
         config.telegram_api_hash = raw.get("telegram_api_hash", "")
@@ -573,12 +760,10 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
             # lets the manager start; we also clean them up best-effort so the
             # warning does not repeat on every subsequent load.
             logger.warning("skipping malformed project %r (no path) in config", name)
-        if malformed_projects:
-            _cleanup_malformed_projects(path, malformed_projects)
+        if malformed_projects and _malformed_projects is not None:
+            _malformed_projects.extend(malformed_projects)
 
         for name, proj in valid_projects.items():
-            project_allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
-            trust_scope_usernames = project_allowed_usernames or config.allowed_usernames
             proj_model = proj.get("model")
             proj_effort = proj.get("effort")
             proj_permissions = _load_permissions(proj)
@@ -591,18 +776,16 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 proj_session_id,
                 proj_show_thinking,
             )
+            # Per-project allowed_users: explicit shape wins, migration helper
+            # synthesizes from legacy fields when no explicit list is present.
+            explicit_proj = _parse_allowed_users(proj.get("allowed_users", []))
+            migrated_proj, did_migrate_proj = _migrate_legacy_auth(proj)
+            effective = explicit_proj or migrated_proj
+            if did_migrate_proj:
+                config.migration_pending = True
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
-                allowed_usernames=project_allowed_usernames,
-                trusted_users=_migrate_trusted_users(
-                    proj,
-                    trust_scope_usernames,
-                    "trusted_users",
-                    "trusted_user_ids",
-                    "trusted_user_id",
-                ),
-                trusted_user_ids=_migrate_user_ids(proj, "trusted_user_ids", "trusted_user_id"),
                 model=proj_model,
                 effort=proj_effort,
                 permissions=proj_permissions,
@@ -614,13 +797,16 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                 backend_state=backend_state,
                 context_enabled=bool(proj.get("context_enabled", True)),
                 context_history_limit=int(proj.get("context_history_limit", 10)),
+                allowed_users=effective,
+                plugins=_parse_plugins(proj.get("plugins", [])),
             )
-            if (
-                not config.projects[name].trusted_user_ids
-                and config.projects[name].trusted_users
-            ):
-                config.projects[name].trusted_user_ids = list(
-                    config.projects[name].trusted_users.values()
+            if not effective and not config.allowed_users:
+                # Only warn when BOTH scopes are empty - global fallback would
+                # otherwise cover an empty project list.
+                logger.warning(
+                    "project %r has no users authorized at either project or "
+                    "global scope; bot will reject all messages until populated",
+                    name,
                 )
         valid_teams, malformed_teams = _split_team_entries(raw.get("teams", {}))
         if malformed_teams:
@@ -629,9 +815,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> Config:
                     "Skipping malformed team %r in %s — missing required field(s): %s",
                     name, path, ", ".join(missing),
                 )
-            _cleanup_malformed_teams(
-                path, [name for name, _ in malformed_teams]
-            )
+            if _malformed_teams is not None:
+                _malformed_teams.extend(name for name, _ in malformed_teams)
         for name, team in valid_teams.items():
             team_cfg = TeamConfig(
                 path=team["path"],
@@ -696,11 +881,39 @@ def _serialize_team_bot(b: "TeamBotConfig") -> dict:
 
 
 def save_config(config: Config, path: Path = DEFAULT_CONFIG) -> None:
+    """Public API: acquires _config_lock for the write."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         path.parent.chmod(0o700)
     with _config_lock(path):
         _save_config_unlocked(config, path)
+
+
+@contextmanager
+def locked_config_rmw(path: Path = DEFAULT_CONFIG):
+    """Hold _config_lock across a load-modify-save cycle.
+
+    Yields a freshly-loaded Config; caller mutates it; the context manager's
+    block writes it back via ``save_config_within_lock`` (do NOT call
+    ``save_config`` inside the block - it would deadlock by re-acquiring the
+    same lock).
+
+    Used by ProjectBot._persist_auth_if_dirty so concurrent first-contact
+    locks serialize correctly. Without this, two processes could each
+    ``load_config()`` the same pre-write state, append different identities,
+    and ``save_config()`` - last writer wins.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        path.parent.chmod(0o700)
+    with _config_lock(path):
+        yield _load_config_unlocked(path)
+
+
+def save_config_within_lock(config: Config, path: Path = DEFAULT_CONFIG) -> None:
+    """Save Config without re-acquiring _config_lock. For callers inside
+    ``locked_config_rmw`` who already hold the lock."""
+    _save_config_unlocked(config, path)
 
 
 def _save_config_unlocked(config: Config, path: Path) -> None:
@@ -710,20 +923,18 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             raw = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             pass
-    # Write new plural keys, remove old singular keys
-    raw["allowed_usernames"] = config.allowed_usernames
+    # Task 5 Step 12: ``Config.allowed_users`` is the sole source of truth.
+    # The legacy on-disk fields (``allowed_usernames``, ``trusted_users``,
+    # ``trusted_user_ids``) are stripped on every save.
+    if config.allowed_users:
+        raw["allowed_users"] = _serialize_allowed_users(config.allowed_users)
+    else:
+        raw.pop("allowed_users", None)
+    raw.pop("allowed_usernames", None)
     raw.pop("allowed_username", None)
-    _write_raw_trusted_users(
-        raw,
-        _effective_trusted_users(
-            config.allowed_usernames,
-            trusted_users=config.trusted_users,
-            trusted_user_ids=config.trusted_user_ids,
-        ),
-        map_key="trusted_users",
-        list_key="trusted_user_ids",
-        singular_key="trusted_user_id",
-    )
+    raw.pop("trusted_users", None)
+    raw.pop("trusted_user_ids", None)
+    raw.pop("trusted_user_id", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.github_pat:
@@ -786,21 +997,21 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         proj = existing_projects.get(name, {})
         proj["path"] = p.path
         proj["telegram_bot_token"] = p.telegram_bot_token
-        # Write new plural keys, remove old singular keys
-        proj["allowed_usernames"] = p.allowed_usernames
+        # Task 5 Step 12: per-project ``allowed_users`` is the sole shape.
+        if p.allowed_users:
+            proj["allowed_users"] = _serialize_allowed_users(p.allowed_users)
+        else:
+            proj.pop("allowed_users", None)
+        if p.plugins:
+            proj["plugins"] = p.plugins
+        else:
+            proj.pop("plugins", None)
+        # Strip any legacy keys lingering on the raw entry.
+        proj.pop("allowed_usernames", None)
         proj.pop("username", None)
-        trust_scope_usernames = p.allowed_usernames or config.allowed_usernames
-        _write_raw_trusted_users(
-            proj,
-            _effective_trusted_users(
-                trust_scope_usernames,
-                trusted_users=p.trusted_users,
-                trusted_user_ids=p.trusted_user_ids,
-            ),
-            map_key="trusted_users",
-            list_key="trusted_user_ids",
-            singular_key="trusted_user_id",
-        )
+        proj.pop("trusted_users", None)
+        proj.pop("trusted_user_ids", None)
+        proj.pop("trusted_user_id", None)
         backend_state = _effective_backend_state(
             p.backend_state,
             model=p.model,
@@ -856,6 +1067,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     # Remove projects that no longer exist in config
     raw["projects"] = {k: v for k, v in existing_projects.items() if k in config.projects}
     _atomic_write(path, json.dumps(raw, indent=2) + "\n")
+    # New (Task 3): clear the in-memory migration flag so callers can re-read
+    # state without re-saving. The disk format no longer contains legacy keys,
+    # so the next load will load with migration_pending=False.
+    config.migration_pending = False
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -1206,182 +1421,13 @@ def patch_team_bot_backend(
     _patch_json(_patch, path)
 
 
-def load_trusted_user_id(path: Path = DEFAULT_CONFIG) -> int | None:
-    """Load the global trusted_user_id from config.json."""
-    if path.exists():
-        try:
-            return json.loads(path.read_text()).get("trusted_user_id")
-        except (json.JSONDecodeError, OSError):
-            pass
-    return None
-
-
-def save_trusted_user_id(user_id: int, path: Path = DEFAULT_CONFIG) -> None:
-    """Save the global trusted_user_id into config.json."""
-    _patch_json(lambda raw: raw.update({"trusted_user_id": user_id}), path)
-
-
-def save_project_trusted_user_id(
-    project_name: str, user_id: int, path: Path = DEFAULT_CONFIG
-) -> None:
-    """Save a per-project trusted_user_id into config.json."""
-    def _patch(raw: dict) -> None:
-        raw.setdefault("projects", {}).setdefault(project_name, {})["trusted_user_id"] = user_id
-    _patch_json(_patch, path)
-
-
-def clear_trusted_user_id(path: Path = DEFAULT_CONFIG) -> None:
-    """Remove the global trusted_user_id from config.json."""
-    def _patch(raw: dict) -> None:
-        raw.pop("trusted_user_id", None)
-    _patch_json(_patch, path)
-
-
-def add_trusted_user_id(user_id: int, path: Path = DEFAULT_CONFIG) -> None:
-    """Append a user_id to the global trusted_user_ids list if not already present."""
-    def _patch(raw: dict) -> None:
-        ids = raw.get("trusted_user_ids", [])
-        if user_id not in ids:
-            ids.append(user_id)
-        raw["trusted_user_ids"] = ids
-    _patch_json(_patch, path)
-
-
-def add_project_trusted_user_id(project_name: str, user_id: int, path: Path = DEFAULT_CONFIG) -> None:
-    """Append a user_id to a project's trusted_user_ids list if not already present."""
-    def _patch(raw: dict) -> None:
-        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
-        ids = proj.get("trusted_user_ids", [])
-        if user_id not in ids:
-            ids.append(user_id)
-        proj["trusted_user_ids"] = ids
-    _patch_json(_patch, path)
-
-
-def bind_trusted_user(username: str, user_id: int | str, path: Path = DEFAULT_CONFIG) -> None:
-    """Bind a trusted user ID to a specific allowed username.
-
-    user_id may be int (Telegram) or str (Web/Discord opaque id); the
-    raw value is persisted as-is when non-numeric.
-    """
-    normalized = _normalize_username(username)
-
-    def _patch(raw: dict) -> None:
-        allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
-        trusted_users = _migrate_trusted_users(
-            raw,
-            allowed_usernames,
-            "trusted_users",
-            "trusted_user_ids",
-            "trusted_user_id",
-        )
-        trusted_users[normalized] = _coerce_user_id(user_id)
-        _write_raw_trusted_users(
-            raw,
-            trusted_users,
-            map_key="trusted_users",
-            list_key="trusted_user_ids",
-            singular_key="trusted_user_id",
-        )
-
-    _patch_json(_patch, path)
-
-
-def bind_project_trusted_user(
-    project_name: str,
-    username: str,
-    user_id: int | str,
-    path: Path = DEFAULT_CONFIG,
-) -> None:
-    """Bind a trusted user ID to a specific allowed username for one project.
-
-    user_id may be int (Telegram) or str (Web/Discord opaque id); the
-    raw value is persisted as-is when non-numeric.
-    """
-    normalized = _normalize_username(username)
-
-    def _patch(raw: dict) -> None:
-        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
-        allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
-        trust_scope_usernames = allowed_usernames or _migrate_usernames(
-            raw,
-            "allowed_usernames",
-            "allowed_username",
-        )
-        trusted_users = _migrate_trusted_users(
-            proj,
-            trust_scope_usernames,
-            "trusted_users",
-            "trusted_user_ids",
-            "trusted_user_id",
-        )
-        trusted_users[normalized] = _coerce_user_id(user_id)
-        _write_raw_trusted_users(
-            proj,
-            trusted_users,
-            map_key="trusted_users",
-            list_key="trusted_user_ids",
-            singular_key="trusted_user_id",
-        )
-
-    _patch_json(_patch, path)
-
-
-def unbind_trusted_user(username: str, path: Path = DEFAULT_CONFIG) -> None:
-    """Remove a trusted-user binding for a username."""
-    normalized = _normalize_username(username)
-
-    def _patch(raw: dict) -> None:
-        allowed_usernames = _migrate_usernames(raw, "allowed_usernames", "allowed_username")
-        trusted_users = _migrate_trusted_users(
-            raw,
-            allowed_usernames,
-            "trusted_users",
-            "trusted_user_ids",
-            "trusted_user_id",
-        )
-        trusted_users.pop(normalized, None)
-        _write_raw_trusted_users(
-            raw,
-            trusted_users,
-            map_key="trusted_users",
-            list_key="trusted_user_ids",
-            singular_key="trusted_user_id",
-        )
-
-    _patch_json(_patch, path)
-
-
-def unbind_project_trusted_user(
-    project_name: str,
-    username: str,
-    path: Path = DEFAULT_CONFIG,
-) -> None:
-    """Remove a per-project trusted-user binding for a username."""
-    normalized = _normalize_username(username)
-
-    def _patch(raw: dict) -> None:
-        proj = raw.setdefault("projects", {}).setdefault(project_name, {})
-        allowed_usernames = _migrate_usernames(proj, "allowed_usernames", "username")
-        trust_scope_usernames = allowed_usernames or _migrate_usernames(
-            raw,
-            "allowed_usernames",
-            "allowed_username",
-        )
-        trusted_users = _migrate_trusted_users(
-            proj,
-            trust_scope_usernames,
-            "trusted_users",
-            "trusted_user_ids",
-            "trusted_user_id",
-        )
-        trusted_users.pop(normalized, None)
-        _write_raw_trusted_users(
-            proj,
-            trusted_users,
-            map_key="trusted_users",
-            list_key="trusted_user_ids",
-            singular_key="trusted_user_id",
-        )
-
-    _patch_json(_patch, path)
+# Removed in Task 5 Step 12 (all wrote to legacy ``trusted_user_id`` /
+# ``trusted_user_ids`` keys on disk):
+#   - ``load_trusted_user_id`` / ``save_trusted_user_id``
+#   - ``save_project_trusted_user_id`` / ``clear_trusted_user_id``
+#   - ``add_trusted_user_id`` / ``add_project_trusted_user_id``
+#   - ``bind_trusted_user`` / ``bind_project_trusted_user``
+#   - ``unbind_trusted_user`` / ``unbind_project_trusted_user``
+# The new auth flow appends to ``AllowedUser.locked_identities`` via
+# ``_persist_auth_if_dirty``; manager-bot ``/add_user`` / ``/remove_user``
+# mutate ``Config.allowed_users``.

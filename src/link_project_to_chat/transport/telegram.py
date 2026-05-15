@@ -127,10 +127,13 @@ class TelegramTransport:
         self._command_handlers: dict[str, CommandHandler] = {}
         self._button_handlers: list[ButtonHandler] = []
         self._on_ready_callbacks: list = []
+        self._on_stop_callbacks: list = []
         self._authorizer: AuthorizerCallback | None = None
         self._menu: Any = None
         self._team_relay: "TeamRelay | None" = None  # Set by enable_team_relay; lifecycle-tied to start/stop.
         self._post_init_ran: bool = False
+        self._routing_attached: bool = False
+        self._group_mode_attached: bool = False
 
     @property
     def team_relay_consecutive_bot_turns(self) -> int:
@@ -316,6 +319,9 @@ class TelegramTransport:
         self._app.add_handler(CallbackQueryHandler(self._dispatch_button))
         self._app.add_error_handler(self._default_error_handler)
 
+        self._routing_attached = True
+        self._group_mode_attached = group_mode
+
     @property
     def app(self) -> Any:
         """Expose the underlying telegram.ext.Application.
@@ -418,7 +424,15 @@ class TelegramTransport:
     def on_ready(self, callback) -> None:
         self._on_ready_callbacks.append(callback)
 
+    def on_stop(self, callback) -> None:
+        self._on_stop_callbacks.append(callback)
+
     async def post_stop(self, _app: Any = None) -> None:
+        for cb in self._on_stop_callbacks:
+            try:
+                await cb()
+            except Exception:
+                logger.exception("on_stop callback failed")
         if self._team_relay is not None:
             try:
                 await self._team_relay.stop()
@@ -808,8 +822,26 @@ class TelegramTransport:
     def on_message(self, handler: MessageHandler) -> None:
         self._message_handlers.append(handler)
 
-    def on_command(self, name: str, handler: CommandHandler) -> None:
+    def on_command(self, name: str, handler) -> None:
         self._command_handlers[name] = handler
+        # If routing is already attached, also register a PTB CommandHandler
+        # so this command name reaches our dispatcher. Without this, late
+        # registrations (e.g., plugin commands wired in _after_ready, which
+        # fires AFTER attach_telegram_routing) silently fail — PTB drops the
+        # update at the filter level.
+        if self._app is not None and self._routing_attached:
+            from telegram.ext import CommandHandler as _PTBCommandHandler
+            from telegram.ext import filters as _filters
+
+            chat_filter = (
+                _filters.ChatType.GROUPS if self._group_mode_attached
+                else _filters.ChatType.PRIVATE
+            )
+            self._app.add_handler(_PTBCommandHandler(
+                name,
+                lambda u, c, _n=name: self._dispatch_command(_n, u, c),
+                filters=chat_filter,
+            ))
 
     def on_button(self, handler: ButtonHandler) -> None:
         self._button_handlers.append(handler)
