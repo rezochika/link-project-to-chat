@@ -225,15 +225,25 @@ class Plugin:
 def load_plugin(name: str, context: PluginContext, config: dict) -> Plugin | None:
     """Instantiate a plugin by name using the 'lptc.plugins' entry point group.
 
-    Returns None if the plugin is not installed (caller logs and continues).
+    Returns None if the plugin is not installed, fails to import, or its
+    constructor raises. Failures are logged with the plugin name; the caller
+    keeps starting up so one bad plugin can't take the whole bot down.
     """
     from importlib.metadata import entry_points
 
     eps = entry_points(group="lptc.plugins")
     for ep in eps:
         if ep.name == name:
-            cls = ep.load()
-            return cls(context, config)
+            try:
+                cls = ep.load()
+            except Exception:
+                logger.exception("plugin %r failed to load (entry-point import error)", name)
+                return None
+            try:
+                return cls(context, config)
+            except Exception:
+                logger.exception("plugin %r constructor raised", name)
+                return None
 
     logger.error("plugin %r not found — is it installed?", name)
     return None

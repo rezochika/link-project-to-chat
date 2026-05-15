@@ -66,6 +66,42 @@ def test_load_plugin_returns_none_when_missing():
     assert load_plugin("definitely-not-installed", ctx, {}) is None
 
 
+def test_load_plugin_swallows_entry_point_load_exception(caplog):
+    from unittest.mock import MagicMock, patch
+
+    fake_ep = MagicMock()
+    fake_ep.name = "boom"
+    fake_ep.load.side_effect = ImportError("missing dep")
+
+    ctx = PluginContext(bot_name="b", project_path=Path("/tmp"))
+    with patch("importlib.metadata.entry_points", return_value=[fake_ep]):
+        with caplog.at_level("ERROR"):
+            result = load_plugin("boom", ctx, {})
+
+    assert result is None
+    assert any("boom" in r.message for r in caplog.records)
+
+
+def test_load_plugin_swallows_constructor_exception(caplog):
+    from unittest.mock import MagicMock, patch
+
+    class BoomPlugin:
+        def __init__(self, ctx, cfg):
+            raise RuntimeError("init failed")
+
+    fake_ep = MagicMock()
+    fake_ep.name = "boom"
+    fake_ep.load.return_value = BoomPlugin
+
+    ctx = PluginContext(bot_name="b", project_path=Path("/tmp"))
+    with patch("importlib.metadata.entry_points", return_value=[fake_ep]):
+        with caplog.at_level("ERROR"):
+            result = load_plugin("boom", ctx, {})
+
+    assert result is None
+    assert any("boom" in r.message for r in caplog.records)
+
+
 @pytest.mark.asyncio
 async def test_send_message_filters_unsupported_kwargs_to_transport(caplog):
     """Transport.send_text accepts (chat, text, *, buttons, html, reply_to).
