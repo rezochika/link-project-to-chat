@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import logging
 import time
 import warnings
@@ -711,54 +712,189 @@ class ManagerBot(AuthMixin):
         await self._transport.send_text(incoming.chat, f"Added project '{name}'.")
         return ConversationHandler.END
 
-    async def _on_users_from_transport(self, invocation: "CommandInvocation") -> None:
-        """Transport-native handler for /users."""
-        if not await self._guard_invocation(invocation):
-            return
-        if not self._allowed_users:
-            await self._transport.send_text(invocation.chat, "No authorized users.")
-            return
-        text = "Authorized users:\n" + "\n".join(f"  @{u.username}" for u in self._allowed_users)
-        await self._transport.send_text(invocation.chat, text)
+    # ------------------------------------------------------------------
+    # User-management commands (Task 6). Operate on the GLOBAL
+    # ``Config.allowed_users`` allow-list; replace the pre-v1.0 single-
+    # username-per-call legacy handlers (``_on_users_from_transport`` etc.)
+    # whose write paths edited the same list with weaker role semantics.
+    # All write commands gate to executor role via
+    # ``_require_executor_or_reply``; ``/users`` is viewer-allowed.
+    # ------------------------------------------------------------------
+    def _load_config_for_users(self):
+        """Helper: load the global config (uses _users_config_path from Task 5 Step 2b)."""
+        from ..config import load_config
+        return load_config(self._users_config_path())
 
-    async def _on_add_user_from_transport(self, invocation: "CommandInvocation") -> None:
-        """Transport-native handler for /add_user."""
-        if not await self._guard_invocation(invocation):
-            return
-        if not invocation.args:
-            await self._transport.send_text(invocation.chat, "Usage: /add_user <username>")
-            return
-        new_user = invocation.args[0].lower().lstrip("@")
-        if any(u.username == new_user for u in self._allowed_users):
-            await self._transport.send_text(invocation.chat, f"@{new_user} is already authorized.")
-            return
-        self._allowed_users.append(AllowedUser(username=new_user, role="executor"))
-        from ..config import load_config, save_config
-        path = self._project_config_path or DEFAULT_CONFIG
-        config = load_config(path)
-        if not any(u.username == new_user for u in config.allowed_users):
-            config.allowed_users.append(AllowedUser(username=new_user, role="executor"))
-            save_config(config, path)
-        await self._transport.send_text(invocation.chat, f"Added @{new_user}.")
+    def _save_config_for_users(self, cfg) -> None:
+        from ..config import save_config
+        save_config(cfg, self._users_config_path())
+        # Refresh our own in-memory allow-list to match.
+        self._allowed_users = list(cfg.allowed_users)
 
-    async def _on_remove_user_from_transport(self, invocation: "CommandInvocation") -> None:
-        """Transport-native handler for /remove_user."""
-        if not await self._guard_invocation(invocation):
+    def _format_users_list(self, users) -> str:
+        if not users:
+            return "No users authorized."
+        lines = ["Authorized users:"]
+        for u in users:
+            locked = f"[identities: {', '.join(u.locked_identities)}]" if u.locked_identities else "[not yet]"
+            lines.append(f"  • {u.username} ({u.role}) {locked}")
+        return "\n".join(lines)
+
+    async def _require_executor_or_reply(self, ci: "CommandInvocation") -> bool:
+        """Common gate for write commands. Auth + executor role enforcement.
+
+        Calling ``_auth_identity`` may append a first-contact identity to a
+        user's locked_identities. The persist helper added in Task 5 Step 2b
+        (``_persist_auth_if_dirty``) covers both allow and deny branches via
+        the try/finally below.
+        """
+        try:
+            if not self._auth_identity(ci.sender):
+                return False
+            if not self._require_executor(ci.sender):
+                await self._transport.send_text(
+                    ci.chat,
+                    "Read-only access — only executors can edit the allow-list.",
+                    reply_to=ci.message,
+                )
+                return False
+            return True
+        finally:
+            # Always persist any first-contact lock from the _auth_identity
+            # call above. Covers both allow and deny branches.
+            await self._persist_auth_if_dirty()
+
+    async def _on_users(self, ci: "CommandInvocation") -> None:
+        """List all authorized users (viewer-allowed; read-only)."""
+        # /users LIST is viewer-allowed (read-only). But _auth_identity may
+        # still append a first-contact lock; persist before returning.
+        try:
+            if not self._auth_identity(ci.sender):
+                return
+            cfg = self._load_config_for_users()
+            await self._transport.send_text(
+                ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+            )
+        finally:
+            await self._persist_auth_if_dirty()
+
+    async def _on_add_user(self, ci: "CommandInvocation") -> None:
+        """/add_user <username> [viewer|executor] — default executor."""
+        if not await self._require_executor_or_reply(ci):
             return
-        if not invocation.args:
-            await self._transport.send_text(invocation.chat, "Usage: /remove_user <username>")
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat,
+                "Usage: /add_user <username> [viewer|executor]",
+                reply_to=ci.message,
+            )
             return
-        rm_user = invocation.args[0].lower().lstrip("@")
-        if not any(u.username == rm_user for u in self._allowed_users):
-            await self._transport.send_text(invocation.chat, f"@{rm_user} is not authorized.")
+        username = ci.args[0].lstrip("@").lower()
+        role = ci.args[1] if len(ci.args) > 1 else "executor"
+        if role not in ("viewer", "executor"):
+            await self._transport.send_text(
+                ci.chat,
+                f"Invalid role {role!r}. Use 'viewer' or 'executor'.",
+                reply_to=ci.message,
+            )
             return
-        self._allowed_users = [u for u in self._allowed_users if u.username != rm_user]
-        from ..config import load_config, save_config
-        path = self._project_config_path or DEFAULT_CONFIG
-        config = load_config(path)
-        config.allowed_users = [u for u in config.allowed_users if u.username != rm_user]
-        save_config(config, path)
-        await self._transport.send_text(invocation.chat, f"Removed @{rm_user}.")
+        cfg = self._load_config_for_users()
+        existing = next((u for u in cfg.allowed_users if u.username == username), None)
+        if existing:
+            existing.role = role
+        else:
+            cfg.allowed_users.append(AllowedUser(username=username, role=role))
+        self._save_config_for_users(cfg)
+        await self._transport.send_text(
+            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+        )
+
+    async def _on_remove_user(self, ci: "CommandInvocation") -> None:
+        """/remove_user <username> — drop the user and any locked identities."""
+        if not await self._require_executor_or_reply(ci):
+            return
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat, "Usage: /remove_user <username>", reply_to=ci.message,
+            )
+            return
+        username = ci.args[0].lstrip("@").lower()
+        cfg = self._load_config_for_users()
+        cfg.allowed_users = [u for u in cfg.allowed_users if u.username != username]
+        self._save_config_for_users(cfg)
+        await self._transport.send_text(
+            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+        )
+
+    async def _set_role(self, ci: "CommandInvocation", new_role: str) -> None:
+        """Shared body for /promote_user and /demote_user.
+
+        ``new_role`` is the role to assign — "executor" or "viewer". The
+        command name for the usage hint is derived from new_role:
+            executor → "/promote_user"
+            viewer   → "/demote_user"
+        """
+        if not await self._require_executor_or_reply(ci):
+            return
+        cmd_name = "promote_user" if new_role == "executor" else "demote_user"
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat, f"Usage: /{cmd_name} <username>", reply_to=ci.message,
+            )
+            return
+        username = ci.args[0].lstrip("@").lower()
+        cfg = self._load_config_for_users()
+        u = next((x for x in cfg.allowed_users if x.username == username), None)
+        if not u:
+            await self._transport.send_text(
+                ci.chat, f"User {username!r} not found.", reply_to=ci.message,
+            )
+            return
+        u.role = new_role
+        self._save_config_for_users(cfg)
+        await self._transport.send_text(
+            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+        )
+
+    async def _on_promote_user(self, ci: "CommandInvocation") -> None:
+        """/promote_user <username> — set role to 'executor'."""
+        await self._set_role(ci, "executor")
+
+    async def _on_demote_user(self, ci: "CommandInvocation") -> None:
+        """/demote_user <username> — set role to 'viewer'."""
+        await self._set_role(ci, "viewer")
+
+    async def _on_reset_user_identity(self, ci: "CommandInvocation") -> None:
+        """/reset_user_identity <username> [transport_id] — clear locks."""
+        if not await self._require_executor_or_reply(ci):
+            return
+        if not ci.args:
+            await self._transport.send_text(
+                ci.chat,
+                "Usage: /reset_user_identity <username> [transport_id]",
+                reply_to=ci.message,
+            )
+            return
+        username = ci.args[0].lstrip("@").lower()
+        transport_filter = ci.args[1] if len(ci.args) > 1 else None
+        cfg = self._load_config_for_users()
+        u = next((x for x in cfg.allowed_users if x.username == username), None)
+        if not u:
+            await self._transport.send_text(
+                ci.chat, f"User {username!r} not found.", reply_to=ci.message,
+            )
+            return
+        if transport_filter:
+            u.locked_identities = [
+                ident for ident in u.locked_identities
+                if not ident.startswith(f"{transport_filter}:")
+            ]
+        else:
+            u.locked_identities = []
+        self._save_config_for_users(cfg)
+        await self._transport.send_text(
+            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+        )
 
     async def _on_setup_from_transport(self, invocation: "CommandInvocation") -> None:
         """Transport-native handler for /setup."""
@@ -1889,9 +2025,27 @@ class ManagerBot(AuthMixin):
             rows.append([Button(label="Logs", value=f"proj_logs_{name}")])
         else:
             rows.append([Button(label="Start", value=f"proj_start_{name}")])
+        rows.append([Button(label="Plugins", value=f"proj_plugins_{name}")])
         rows.append([Button(label="Edit", value=f"proj_edit_{name}")])
         rows.append([Button(label="Remove", value=f"proj_remove_{name}")])
         rows.append([Button(label="« Back", value="proj_back")])
+        return Buttons(rows=rows)
+
+    def _available_plugins(self) -> list[str]:
+        """Return sorted entry-point names registered under ``lptc.plugins``."""
+        eps = importlib.metadata.entry_points(group="lptc.plugins")
+        return sorted(ep.name for ep in eps)
+
+    def _plugins_buttons(self, name: str) -> Buttons:
+        """Plugin-toggle keyboard for the given project."""
+        projects = self._load_projects()
+        active = {p.get("name") for p in projects.get(name, {}).get("plugins", [])}
+        available = self._available_plugins()
+        rows: list[list[Button]] = []
+        for plugin_name in available:
+            label = f"✓ {plugin_name}" if plugin_name in active else f"+ {plugin_name}"
+            rows.append([Button(label=label, value=f"proj_ptog_{plugin_name}|{name}")])
+        rows.append([Button(label="« Back", value=f"proj_info_{name}")])
         return Buttons(rows=rows)
 
     def _team_detail_buttons(self, team_name: str, team) -> Buttons:
@@ -2102,6 +2256,60 @@ class ManagerBot(AuthMixin):
                     buttons=self._global_model_buttons(),
                 )
 
+        elif value.startswith("proj_plugins_"):
+            name = value[len("proj_plugins_"):]
+            available = self._available_plugins()
+            assert self._transport is not None
+            if not available:
+                await self._transport.edit_text(
+                    click.message,
+                    "No plugins installed.\n\n"
+                    "Install the link-project-to-chat-plugins package to add plugins.",
+                    buttons=Buttons(rows=[[Button(label="« Back", value=f"proj_info_{name}")]]),
+                )
+            else:
+                await self._transport.edit_text(
+                    click.message,
+                    f"Plugins for '{name}':\n✓ = active, + = available\n\nRestart required after changes.",
+                    buttons=self._plugins_buttons(name),
+                )
+
+        elif value.startswith("proj_ptog_"):
+            # Plugin toggle changes config state — gate to executor role.
+            # Without this, a viewer with manager-bot access could enable
+            # arbitrary plugin code on any project. The surrounding
+            # _on_button_from_transport try/finally persists any first-contact
+            # lock from _auth_identity regardless of allow/deny branch.
+            if not self._require_executor(click.sender):
+                assert self._transport is not None
+                await self._transport.send_text(
+                    click.chat,
+                    "Read-only access — only executors can toggle plugins.",
+                    reply_to=click.message,
+                )
+                return
+            suffix = value[len("proj_ptog_"):]
+            if "|" not in suffix:
+                return
+            plugin_name, name = suffix.rsplit("|", 1)
+            projects = self._load_projects()
+            if name not in projects:
+                return
+            plugins = projects[name].get("plugins", [])
+            active_names = [p.get("name") for p in plugins]
+            if plugin_name in active_names:
+                plugins = [p for p in plugins if p.get("name") != plugin_name]
+            else:
+                plugins = plugins + [{"name": plugin_name}]
+            projects[name]["plugins"] = plugins
+            self._save_projects(projects)
+            assert self._transport is not None
+            await self._transport.edit_text(
+                click.message,
+                f"Plugins for '{name}':\n✓ = active, + = available\n\nRestart required after changes.",
+                buttons=self._plugins_buttons(name),
+            )
+
         elif value.startswith("proj_remove_"):
             name = value[len("proj_remove_"):]
             projects = self._load_projects()
@@ -2254,12 +2462,9 @@ class ManagerBot(AuthMixin):
             "teams": self._on_teams_from_transport,
             "version": self._on_version_from_transport,
             "help": self._on_help_from_transport,
-            "users": self._on_users_from_transport,
             "start_all": self._on_start_all_from_transport,
             "stop_all": self._on_stop_all_from_transport,
             "model": self._on_model_from_transport,
-            "add_user": self._on_add_user_from_transport,
-            "remove_user": self._on_remove_user_from_transport,
             "setup": self._on_setup_from_transport,
         }
 
@@ -2275,6 +2480,24 @@ class ManagerBot(AuthMixin):
             self._transport.on_command(name, _wrap_with_persist(handler))
             if app is not None:
                 app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))
+
+        # Task 6: user-management commands. Replace the pre-v1.0 legacy
+        # handlers (_on_users_from_transport / _on_add_user_from_transport /
+        # _on_remove_user_from_transport, deleted from this file) with role-
+        # aware variants that operate on Config.allowed_users exclusively.
+        # /users is viewer-allowed; all writes require executor role.
+        _new_manager_commands = {
+            "users": self._on_users,
+            "add_user": self._on_add_user,
+            "remove_user": self._on_remove_user,
+            "promote_user": self._on_promote_user,
+            "demote_user": self._on_demote_user,
+            "reset_user_identity": self._on_reset_user_identity,
+        }
+        for _name, _handler in _new_manager_commands.items():
+            self._transport.on_command(_name, _wrap_with_persist(_handler))
+            if app is not None:
+                app.add_handler(CommandHandler(_name, self._transport.bridge_command(_name)))
 
     async def _post_init(self, app) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)

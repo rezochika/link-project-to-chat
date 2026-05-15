@@ -802,7 +802,7 @@ async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
         json.dumps(
             {
                 "allowed_users": [
-                    {"username": "testuser", "role": "executor"},
+                    {"username": "testuser", "role": "executor", "locked_identities": ["fake:1"]},
                     {"username": "alice", "role": "executor", "locked_identities": ["telegram:42"]},
                 ],
                 "projects": {},
@@ -810,15 +810,18 @@ async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
         )
     )
     bot._allowed_users = [
-        AllowedUser(username="testuser", role="executor"),
+        AllowedUser(username="testuser", role="executor", locked_identities=["fake:1"]),
         AllowedUser(username="alice", role="executor", locked_identities=["telegram:42"]),
     ]
     fake = _swap_fake_transport(bot)
 
+    # Task 6: /remove_user now goes through _on_remove_user, which gates to
+    # executor role and replies with the full updated /users listing.
     invocation = _make_invocation("remove_user", args=["alice"])
-    await bot._on_remove_user_from_transport(invocation)
+    await bot._on_remove_user(invocation)
 
-    assert fake.sent_messages[-1].text == "Removed @alice."
+    last_text = fake.sent_messages[-1].text
+    assert "alice" not in last_text and "testuser" in last_text
     raw = json.loads(proj_cfg.read_text())
     # Legacy keys never appear post-Task-5.
     assert "allowed_usernames" not in raw
