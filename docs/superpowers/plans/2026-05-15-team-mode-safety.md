@@ -16,16 +16,19 @@
 |---|---|
 | `src/link_project_to_chat/team_safety.py` | Create — `AuthorityGrant`, `TeamAuthority`, `parse_auth_directives` |
 | `src/link_project_to_chat/config.py` | Modify — add `max_autonomous_turns` and `safety_mode` to `TeamConfig` plus migration |
-| `src/link_project_to_chat/transport/_telegram_relay.py` | Modify — content-hash dedupe, autonomous-turn budget, halt-notice rewording, `TeamAuthority` observation |
+| `src/link_project_to_chat/transport/_telegram_relay.py` | Modify — content-hash dedupe, autonomous-turn budget, halt-notice rewording, peer-response-resets-streak, `TeamAuthority` observation |
 | `src/link_project_to_chat/backends/base.py` | Modify — add `team_authority` and `compose_user_prompt` to Protocol |
 | `src/link_project_to_chat/backends/claude.py` | Modify — `compose_user_prompt`, team-mode `--disallowedTools` augment |
 | `src/link_project_to_chat/backends/codex.py` | Modify — `compose_user_prompt` with hash-skip, `_permission_args` sandbox downgrade |
 | `src/link_project_to_chat/bot.py` | Modify — wire `team_authority` into backend; replace inline prepend with `compose_user_prompt`; suppress empty `[No response]`; `/status` team-safety block |
+| `src/link_project_to_chat/personas/software_manager.md` | Modify — review-surface discipline prose |
+| `src/link_project_to_chat/personas/software_dev.md` | Modify — review-surface handoff prose |
 | `tests/test_team_safety.py` | Create — directive parser, `AuthorityGrant`, `TeamAuthority` |
-| `tests/transport/test_telegram_relay.py` | Extend — dedupe, autonomous-turn budget, halt-notice |
+| `tests/test_team_relay.py` | Extend — dedupe, autonomous-turn budget, halt-notice, peer-response-resets-streak |
 | `tests/test_backend_claude.py` | Extend — team-mode disallowed-tools, `compose_user_prompt` |
 | `tests/test_backend_codex.py` | Extend — sandbox downgrade, grant consumption |
 | `tests/test_codex_resume_no_reinjection.py` | Create — codex hash-skip on resume |
+| `tests/test_bundled_personas.py` | Extend — review-surface persona invariants |
 
 Run the targeted test for each task via `pytest <path>::<name> -v`. Run the full suite via `pytest -q` at task boundaries. The team-bot env hermeticity fix from `080fa9d` is already in place, so the suite should not need `env -u LP2C_TELETHON_SESSION_STRING`.
 
@@ -523,12 +526,12 @@ spec section 10."
 
 **Files:**
 - Modify: `src/link_project_to_chat/transport/_telegram_relay.py`
-- Modify: `tests/transport/test_telegram_relay.py` (or wherever the relay tests live — verify first)
+- Modify: `tests/test_team_relay.py` (or wherever the relay tests live — verify first)
 
 - [ ] **Step 1: Locate the relay test file**
 
 Run: `find tests -name "*.py" | xargs grep -l "TeamRelay\|team_relay" 2>/dev/null | head -5`
-Use the file that already imports `TeamRelay`. If multiple, use the most-tested one. If none exists, create `tests/transport/test_telegram_relay.py` with the imports cloned from a sibling test file.
+Use the file that already imports `TeamRelay`. If multiple, use the most-tested one. If none exists, create `tests/test_team_relay.py` with the imports cloned from a sibling test file.
 
 - [ ] **Step 2: Add the failing test**
 
@@ -565,28 +568,27 @@ def test_is_recent_duplicate_ignores_whitespace_diffs(relay_instance):
     assert relay._is_recent_duplicate("mgr_bot", "  approved  \n") is True
 ```
 
-Add a fixture for `relay_instance` at the top of the file:
+The existing test file already provides `_mk_client_with_ids`, `_mk_event`, and `_dispatch` helpers (see `tests/test_team_relay.py` around lines 23-134). Reuse them. Add a small fixture at the top of the new test block:
 ```python
 import pytest
-from unittest.mock import MagicMock
 
 from link_project_to_chat.transport._telegram_relay import TeamRelay
 
 
 @pytest.fixture
 def relay_instance():
-    client = MagicMock()
+    client = _mk_client_with_ids(start_id=20_000)
     return TeamRelay(
         client=client,
         team_name="test_team",
-        group_chat_id=-1001234567890,
+        group_chat_id=-100_111,
         bot_usernames={"mgr_bot", "dev_bot"},
     )
 ```
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `pytest tests/transport/test_telegram_relay.py::test_is_recent_duplicate_drops_byte_identical_body -v`
+Run: `pytest tests/test_team_relay.py::test_is_recent_duplicate_drops_byte_identical_body -v`
 Expected: AttributeError / `'TeamRelay' object has no attribute '_is_recent_duplicate'`
 
 - [ ] **Step 4: Implement the dedupe gate**
@@ -629,13 +631,13 @@ def _is_recent_duplicate(self, sender: str, body: str) -> bool:
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v -k "is_recent_duplicate"`
+Run: `pytest tests/test_team_relay.py -v -k "is_recent_duplicate"`
 Expected: 4 passed
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/link_project_to_chat/transport/_telegram_relay.py tests/transport/test_telegram_relay.py
+git add src/link_project_to_chat/transport/_telegram_relay.py tests/test_team_relay.py
 git commit -m "feat(team-relay): content-hash dedupe for verbatim duplicate forwards
 
 Catches the 2026-05-15 manager loop shape where codex re-sent
@@ -650,7 +652,7 @@ spec section 6.3."
 
 **Files:**
 - Modify: `src/link_project_to_chat/transport/_telegram_relay.py`
-- Modify: `tests/transport/test_telegram_relay.py`
+- Modify: `tests/test_team_relay.py`
 
 - [ ] **Step 1: Find the forward path**
 
@@ -659,7 +661,7 @@ The forward path is the function that calls `self._relay(...)` after deciding to
 
 - [ ] **Step 2: Add the failing tests**
 
-Append to `tests/transport/test_telegram_relay.py`:
+Append to `tests/test_team_relay.py`:
 ```python
 def test_consecutive_bot_turns_increments_on_forward(relay_instance):
     """Each accepted forward bumps the relay's autonomous-turn counter."""
@@ -688,11 +690,11 @@ def test_user_message_resets_counter(relay_instance):
     assert relay._consecutive_bot_turns == 0
 ```
 
-These are minimal sanity tests for the new fields. A full integration test for the forward path will live in Task 7 after `TeamAuthority` is wired in.
+These are minimal sanity tests for the new fields. A full integration test for the forward path will live in Task 8 after `TeamAuthority` is wired in.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v -k "consecutive_bot_turns or user_message_resets"`
+Run: `pytest tests/test_team_relay.py -v -k "consecutive_bot_turns or user_message_resets"`
 Expected: AttributeError / `'TeamRelay' object has no attribute '_consecutive_bot_turns'`
 
 - [ ] **Step 4: Add the counter fields and constructor wiring**
@@ -717,13 +719,13 @@ def __init__(
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v -k "consecutive_bot_turns or user_message_resets"`
+Run: `pytest tests/test_team_relay.py -v -k "consecutive_bot_turns or user_message_resets"`
 Expected: 3 passed
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/link_project_to_chat/transport/_telegram_relay.py tests/transport/test_telegram_relay.py
+git add src/link_project_to_chat/transport/_telegram_relay.py tests/test_team_relay.py
 git commit -m "feat(team-relay): add autonomous-turn counter scaffolding
 
 Adds _max_autonomous_turns and _consecutive_bot_turns to TeamRelay.
@@ -737,11 +739,11 @@ task once TeamAuthority observation lands. Per spec section 6.2."
 
 **Files:**
 - Modify: `src/link_project_to_chat/transport/_telegram_relay.py` (specifically `_send_halt_notice` at ~line 570)
-- Modify: `tests/transport/test_telegram_relay.py`
+- Modify: `tests/test_team_relay.py`
 
 - [ ] **Step 1: Add the failing test**
 
-Append to `tests/transport/test_telegram_relay.py`:
+Append to `tests/test_team_relay.py`:
 ```python
 @pytest.mark.asyncio
 async def test_halt_notice_streak_wording_no_peer_reply_claim(relay_instance):
@@ -769,7 +771,7 @@ async def test_halt_notice_streak_wording_no_peer_reply_claim(relay_instance):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/transport/test_telegram_relay.py::test_halt_notice_streak_wording_no_peer_reply_claim -v`
+Run: `pytest tests/test_team_relay.py::test_halt_notice_streak_wording_no_peer_reply_claim -v`
 Expected: AssertionError on `"no peer reply between" not in notice` (current wording still says it)
 
 - [ ] **Step 3: Update halt-notice wording**
@@ -797,13 +799,13 @@ async def _send_halt_notice(self) -> None:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/transport/test_telegram_relay.py::test_halt_notice_streak_wording_no_peer_reply_claim -v`
+Run: `pytest tests/test_team_relay.py::test_halt_notice_streak_wording_no_peer_reply_claim -v`
 Expected: 1 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/link_project_to_chat/transport/_telegram_relay.py tests/transport/test_telegram_relay.py
+git add src/link_project_to_chat/transport/_telegram_relay.py tests/test_team_relay.py
 git commit -m "fix(team-relay): halt-notice wording no longer claims missing peer reply
 
 The streak rule checks last-N-forwards-same-sender; it does not
@@ -815,15 +817,149 @@ Per spec section 6.4."
 
 ---
 
-## Task 7: Wire `TeamAuthority` into `TeamRelay` + forward-path enforcement
+## Task 7: Peer response resets same-author streak
 
 **Files:**
 - Modify: `src/link_project_to_chat/transport/_telegram_relay.py`
-- Modify: `tests/transport/test_telegram_relay.py`
+- Modify: `tests/test_team_relay.py`
+
+**Rationale:** The existing `_MAX_SAME_AUTHOR_STREAK` cap halts after N consecutive forwards from the same sender. Its halt-notice (post-Task 6) says "consecutive forwards from @X within Ns" — accurate, but the cap is overly aggressive when the *peer actually did reply* in between: streaming-edit timing can cause the peer's reply to land in the relay's round-recording *after* the next same-author forward, so the streak counts mgr→mgr→mgr even though the peer responded. Reset the streak when a peer responds. This complements (not replaces) the bot-turn budget from Task 8 — the budget is "stop after N total bot turns since last user msg"; the streak reset is "the streak rule fires only if the peer truly hasn't engaged."
+
+- [ ] **Step 1: Add the failing test**
+
+Append to `tests/test_team_relay.py`:
+```python
+@pytest.mark.asyncio
+async def test_peer_response_clears_same_author_streak():
+    """A peer-bot response zeros the round buffer so the streak cap can't
+    trip on prior same-author forwards.
+    """
+    from link_project_to_chat.transport._telegram_relay import TeamRelay
+
+    client = _mk_client_with_ids(start_id=15_000)
+    relay = TeamRelay(
+        client,
+        "acme",
+        -100_111,
+        {"acme_mgr_bot", "acme_dev_bot"},
+        max_consecutive_bot_relays=3,
+    )
+
+    for i in range(2):
+        ev = await _mk_event(
+            f"@acme_dev_bot review request {i}",
+            sender_username="acme_mgr_bot",
+            sender_is_bot=True,
+            msg_id=15_100 + i,
+        )
+        await _dispatch(relay, ev)
+    assert relay._rounds == 2
+    assert relay._halted is False
+
+    peer_reply = await _mk_event(
+        "Patched both items; re-review please.",
+        sender_username="acme_dev_bot",
+        sender_is_bot=True,
+        msg_id=15_200,
+    )
+    await _dispatch(relay, peer_reply)
+    assert relay._rounds == 0
+    assert relay._halted is False
+
+    # After reset, a fresh manager forward should be round=1, not round=3.
+    ev = await _mk_event(
+        "@acme_dev_bot please confirm the committed diff",
+        sender_username="acme_mgr_bot",
+        sender_is_bot=True,
+        msg_id=15_300,
+    )
+    await _dispatch(relay, ev)
+    assert relay._rounds == 1
+    assert relay._halted is False
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `pytest tests/test_team_relay.py::test_peer_response_clears_same_author_streak -q`
+Expected: `AssertionError: assert 2 == 0` (the streak is not reset on peer reply yet).
+
+- [ ] **Step 3: Make `_delete_pending_for_peer` report whether anything was deleted**
+
+In `src/link_project_to_chat/transport/_telegram_relay.py`, replace `_delete_pending_for_peer`:
+```python
+async def _delete_pending_for_peer(self, sender_username: str) -> bool:
+    """Delete relay forwards waiting on `sender_username`; return True iff any existed."""
+    to_delete = [
+        mid for mid, peer in self._pending_deletes.items()
+        if peer == sender_username
+    ]
+    for mid in to_delete:
+        self._pending_deletes.pop(mid, None)
+        timer = self._pending_delete_timers.pop(mid, None)
+        if timer is not None and not timer.done():
+            timer.cancel()
+        await self._delete_relay_message(mid)
+    return bool(to_delete)
+```
+
+- [ ] **Step 4: Reset round state when a pending peer response arrives**
+
+Find the call site of `_delete_pending_for_peer` (likely inside `_handle_event` or `_on_new_message`). Run: `grep -n "_delete_pending_for_peer" src/link_project_to_chat/transport/_telegram_relay.py`. The existing call looks like:
+```python
+if not is_edit:
+    await self._delete_pending_for_peer(sender_username)
+```
+
+Replace with:
+```python
+if not is_edit:
+    peer_responded = await self._delete_pending_for_peer(sender_username)
+    if peer_responded and not self._halted:
+        # The peer engaged; zero the streak so the same-author cap won't
+        # fire on forwards that preceded the peer's reply. The bot-turn
+        # budget (Task 8) still bounds total autonomous activity.
+        self._round_times.clear()
+        self._round_senders.clear()
+```
+
+- [ ] **Step 5: Run the test**
+
+Run: `pytest tests/test_team_relay.py::test_peer_response_clears_same_author_streak -q`
+Expected: 1 passed.
+
+- [ ] **Step 6: Run all relay tests**
+
+Run: `pytest tests/test_team_relay.py -q`
+Expected: all tests pass.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/link_project_to_chat/transport/_telegram_relay.py tests/test_team_relay.py
+git commit -m "fix(team-relay): peer response resets same-author streak
+
+The streak cap's intent is 'halt when one bot dominates without
+peer engagement.' Streaming-edit timing on 2026-05-15 caused the
+peer's reply to land after the next same-author forward in
+round-recording order, tripping the streak even though the peer
+DID respond. Reset the round buffer when a pending peer response
+arrives. The bot-turn budget from Task 8 remains the hard cap on
+total autonomous activity. Idea adapted from the team-bot plan
+docs/superpowers/plans/2026-05-15-team-relay-review-surface-fixes.md
+Task 1, layered on top of (not replacing) the existing caps."
+```
+
+---
+
+## Task 8: Wire `TeamAuthority` into `TeamRelay` + forward-path enforcement
+
+**Files:**
+- Modify: `src/link_project_to_chat/transport/_telegram_relay.py`
+- Modify: `tests/test_team_relay.py`
 
 - [ ] **Step 1: Add the failing tests**
 
-Append to `tests/transport/test_telegram_relay.py`:
+Append to `tests/test_team_relay.py`:
 ```python
 @pytest.fixture
 def relay_with_authority():
@@ -867,7 +1003,7 @@ def test_relay_user_message_resets_counter_even_without_auth(relay_with_authorit
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v -k "records_user_message or ignores_non_authenticated or resets_counter_even_without_auth"`
+Run: `pytest tests/test_team_relay.py -v -k "records_user_message or ignores_non_authenticated or resets_counter_even_without_auth"`
 Expected: TypeError on missing `team_authority` / `authenticated_user_id` kwargs
 
 - [ ] **Step 3: Extend `__init__` and add `_observe_user_message`**
@@ -921,7 +1057,7 @@ def _observe_user_message(self, msg_id: int, from_id: int, text: str) -> None:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v -k "records_user_message or ignores_non_authenticated or resets_counter_even_without_auth"`
+Run: `pytest tests/test_team_relay.py -v -k "records_user_message or ignores_non_authenticated or resets_counter_even_without_auth"`
 Expected: 3 passed
 
 - [ ] **Step 5: Hook `_observe_user_message` into the Telethon event handler**
@@ -947,44 +1083,99 @@ async def _on_new_message(self, event):
     # ... rest of existing handler logic ...
 ```
 
-- [ ] **Step 6: Add the integration test**
+- [ ] **Step 6: Add the integration test using existing helpers**
 
-Append to `tests/transport/test_telegram_relay.py`:
+Append to `tests/test_team_relay.py` (uses `_mk_event` and `_dispatch` from the existing module):
 ```python
 @pytest.mark.asyncio
-async def test_forward_path_halts_at_autonomous_turn_budget(relay_with_authority):
+async def test_forward_path_halts_at_autonomous_turn_budget():
     """3 bot forwards with no user reset triggers halt via _max_autonomous_turns."""
-    relay, _auth = relay_with_authority
-    # Stub _relay to no-op so we can drive the counter without Telethon I/O.
-    relay._relay = AsyncMock(return_value=42)
-    relay._send_halt_notice = AsyncMock()
+    from link_project_to_chat.team_safety import TeamAuthority
 
-    # Simulate three accepted bot forwards.
-    for _ in range(3):
-        relay._consecutive_bot_turns += 1
-        if relay._consecutive_bot_turns >= relay._max_autonomous_turns:
-            relay._halted = True
-            await relay._send_halt_notice()
-            break
+    client = _mk_client_with_ids(start_id=14_000)
+    auth = TeamAuthority(team_name="acme")
+    relay = TeamRelay(
+        client=client,
+        team_name="acme",
+        group_chat_id=-100_111,
+        bot_usernames={"acme_mgr_bot", "acme_dev_bot"},
+        max_autonomous_turns=3,
+        team_authority=auth,
+        authenticated_user_id=42,
+    )
 
+    # Three manager-bot forwards in a row, no peer reply, no user reset.
+    for i in range(4):  # 4 attempts — the 4th should be blocked by halt
+        ev = await _mk_event(
+            f"@acme_dev_bot please review batch {i}",
+            sender_username="acme_mgr_bot",
+            sender_is_bot=True,
+            msg_id=14_100 + i,
+        )
+        await _dispatch(relay, ev)
+
+    # By the 3rd accepted forward the relay should have halted.
     assert relay._halted is True
-    relay._send_halt_notice.assert_awaited_once()
+    # Halt notice should have been sent at least once.
+    halt_messages = [
+        c for c in client.send_message.await_args_list
+        if "paused" in str(c.args[1]).lower()
+    ]
+    assert len(halt_messages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_user_message_resets_autonomous_turn_counter():
+    """An authenticated-user message resets the consecutive-turn counter."""
+    from link_project_to_chat.team_safety import TeamAuthority
+
+    client = _mk_client_with_ids(start_id=14_500)
+    relay = TeamRelay(
+        client=client,
+        team_name="acme",
+        group_chat_id=-100_111,
+        bot_usernames={"acme_mgr_bot", "acme_dev_bot"},
+        max_autonomous_turns=5,
+        team_authority=TeamAuthority(team_name="acme"),
+        authenticated_user_id=42,
+    )
+
+    # Two manager-bot forwards.
+    for i in range(2):
+        ev = await _mk_event(
+            f"@acme_dev_bot batch {i}",
+            sender_username="acme_mgr_bot",
+            sender_is_bot=True,
+            msg_id=14_600 + i,
+        )
+        await _dispatch(relay, ev)
+    assert relay._consecutive_bot_turns == 2
+
+    # User message arrives.
+    user_ev = await _mk_event(
+        "let me check that --auth push",
+        sender_username="rezo",
+        sender_is_bot=False,
+        msg_id=14_700,
+    )
+    # Need to set the sender id on the mock so it matches authenticated_user_id.
+    user_ev.message.sender_id = 42
+    await _dispatch(relay, user_ev)
+
+    assert relay._consecutive_bot_turns == 0
 ```
 
-Add at the top of the file:
-```python
-from unittest.mock import AsyncMock
-```
+(Adapt the `_mk_event` arguments if the real helper requires different kwargs — the signature is at `tests/test_team_relay.py:98-118`.)
 
 - [ ] **Step 7: Run all relay tests**
 
-Run: `pytest tests/transport/test_telegram_relay.py -v`
+Run: `pytest tests/test_team_relay.py -v`
 Expected: all tests pass
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/link_project_to_chat/transport/_telegram_relay.py tests/transport/test_telegram_relay.py
+git add src/link_project_to_chat/transport/_telegram_relay.py tests/test_team_relay.py
 git commit -m "feat(team-relay): wire TeamAuthority + autonomous-turn budget
 
 TeamRelay now observes group user messages, parses --auth directives,
@@ -995,7 +1186,7 @@ NewMessage handler. Per spec section 6.1-6.2."
 
 ---
 
-## Task 8: Backend Protocol gains `team_authority` and `compose_user_prompt`
+## Task 9: Backend Protocol gains `team_authority` and `compose_user_prompt`
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/base.py`
@@ -1093,7 +1284,7 @@ session resume. Per spec sections 7.1, 8.2."
 
 ---
 
-## Task 9: Claude backend — `team_authority` field + team-mode `--disallowedTools` augment
+## Task 10: Claude backend — `team_authority` field + team-mode `--disallowedTools` augment
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/claude.py:203-219` (constructor) and `:240-283` (`_build_cmd`)
@@ -1264,7 +1455,7 @@ granted the matching scope via --auth. Per spec section 7.2."
 
 ---
 
-## Task 10: Codex backend — `team_authority` field + sandbox downgrade in team mode
+## Task 11: Codex backend — `team_authority` field + sandbox downgrade in team mode
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/codex.py:58-93` (constructor) and `:125-135` (`_permission_args`)
@@ -1415,17 +1606,17 @@ elevates one turn via consume_grant. Per spec section 7.3."
 
 ---
 
-## ⚠ Note before Task 11 — re-injection already partially fixed
+## ⚠ Note before Task 12 — re-injection already partially fixed
 
 While writing this plan, verification of [bot.py:958-974](src/link_project_to_chat/bot.py:958) showed that `_team_session_active()` **already** skips persona + history injection on team-mode resume turns. The docstring there explicitly references the 2026-04-27 codex loop. The memory note that drove the spec's Section 8 design was outdated.
 
-**What's still missing in the existing fix:** the current blanket-skip approach does not detect persona/team-note CHANGES mid-session — if the user runs `/use other_persona`, the agent will never see the new persona because injection stays off for the resumed session. Tasks 11-13 below add the hash-based detection that fixes this corner case AND move the composition into backends so each backend owns its own re-injection policy.
+**What's still missing in the existing fix:** the current blanket-skip approach does not detect persona/team-note CHANGES mid-session — if the user runs `/use other_persona`, the agent will never see the new persona because injection stays off for the resumed session. Tasks 12-14 below add the hash-based detection that fixes this corner case AND move the composition into backends so each backend owns its own re-injection policy.
 
-**Priority:** Tasks 11-13 are **architectural improvement + corner-case bug fix**, not "fix the loop." If you want the minimum viable safety landing, ship Tasks 1-10, 14, 15, 16 and defer 11-13 to a follow-up.
+**Priority:** Tasks 12-14 are **architectural improvement + corner-case bug fix**, not "fix the loop." If you want the minimum viable safety landing, ship Tasks 1-11, 15, 16, 17, 18 and defer 12-14 to a follow-up.
 
 ---
 
-## Task 11: Claude `compose_user_prompt` (current behavior preserved)
+## Task 12: Claude `compose_user_prompt` (current behavior preserved)
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/claude.py`
@@ -1519,7 +1710,7 @@ Per spec section 8.2."
 
 ---
 
-## Task 12: Codex `compose_user_prompt` with hash-skip on resume
+## Task 13: Codex `compose_user_prompt` with hash-skip on resume
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/codex.py`
@@ -1686,7 +1877,7 @@ def compose_user_prompt(
     return "\n\n".join(parts)
 ```
 
-Also delete the old `_build_prompt` method in `codex.py:115-123` and update `_build_cmd` (line ~104) to use `compose_user_prompt` directly OR keep `_build_prompt` as a thin wrapper that calls `compose_user_prompt` with no persona/history. The simpler route: keep `_build_cmd` unchanged and have bot.py pass the composed result in (handled in Task 13).
+Also delete the old `_build_prompt` method in `codex.py:115-123` and update `_build_cmd` (line ~104) to use `compose_user_prompt` directly OR keep `_build_prompt` as a thin wrapper that calls `compose_user_prompt` with no persona/history. The simpler route: keep `_build_cmd` unchanged and have bot.py pass the composed result in (handled in Task 14).
 
 Actually: `_build_cmd` currently takes `user_message` and calls `_build_prompt(user_message)`. After this task, bot.py will already call `compose_user_prompt` and pass the *composed* result in as `user_message` to `_build_cmd`. So `_build_prompt` becomes a no-op (or just `return user_message`). Either delete it or simplify:
 
@@ -1718,7 +1909,7 @@ codex retains it in conversation. Per spec section 8.2."
 
 ---
 
-## Task 13: bot.py — replace inline prepend with `backend.compose_user_prompt`
+## Task 14: bot.py — replace inline prepend with `backend.compose_user_prompt`
 
 **Files:**
 - Modify: `src/link_project_to_chat/bot.py:986-1005` (turn-path prompt composition)
@@ -1813,7 +2004,7 @@ async def _build_user_prompt(
     )
 ```
 
-Important: this **removes** the `if self._team_session_active(): return prompt` early-return because the equivalent skip-on-resume logic now lives in `CodexBackend.compose_user_prompt` (Task 12). Verify the deletion is safe by confirming Task 12 has shipped first if you serialize the work.
+Important: this **removes** the `if self._team_session_active(): return prompt` early-return because the equivalent skip-on-resume logic now lives in `CodexBackend.compose_user_prompt` (Task 13). Verify the deletion is safe by confirming Task 13 has shipped first if you serialize the work.
 
 - [ ] **Step 4: Run the targeted test**
 
@@ -1839,7 +2030,7 @@ Per spec section 8.3."
 
 ---
 
-## Task 14: Wire `team_authority` into the backend at team-mode init
+## Task 15: Wire `team_authority` into the backend at team-mode init
 
 **Files:**
 - Modify: `src/link_project_to_chat/bot.py` (search for `_refresh_team_system_note`)
@@ -1984,7 +2175,7 @@ observation) share state. Per spec section 7.1 and section 4
 
 ---
 
-## Task 15: Suppress `[No response]` placeholder
+## Task 16: Suppress `[No response]` placeholder
 
 **Files:**
 - Modify: `src/link_project_to_chat/backends/claude.py:333`
@@ -2069,7 +2260,7 @@ content. Per spec section 9.1."
 
 ---
 
-## Task 16: `/status` team-safety block
+## Task 17: `/status` team-safety block
 
 **Files:**
 - Modify: `src/link_project_to_chat/bot.py` (find the `/status` command handler)
@@ -2187,9 +2378,93 @@ spec section 9.2."
 
 ---
 
+## Task 18: Persona prose — name your review surface
+
+**Files:**
+- Modify: `src/link_project_to_chat/personas/software_manager.md`
+- Modify: `src/link_project_to_chat/personas/software_dev.md`
+- Modify: `tests/test_bundled_personas.py`
+
+**Rationale:** The 2026-05-15 chat showed the manager (codex) reviewing what appeared to be the working tree but actually reading either committed state or a separate editable install. Dev's fixes were unstaged; manager kept citing the pre-patch README. Dev eventually diagnosed it in message #54 ("if you're reading via `git show`/`git cat-file`/a separate clone..."). Hard guardrails alone can't prevent this confusion — the personas should explicitly name what they're reviewing. Cheap, additive, soft layer over the executor-layer guarantees from Tasks 9-11.
+
+- [ ] **Step 1: Add the failing test**
+
+Append to `tests/test_bundled_personas.py`:
+```python
+def test_software_manager_persona_names_review_surface():
+    """Manager persona explicitly tells the agent to name its review surface."""
+    from importlib.resources import files
+    p = files("link_project_to_chat.personas").joinpath("software_manager.md")
+    content = p.read_text(encoding="utf-8").lower()
+    assert "review surface" in content
+    assert "working tree" in content
+    assert "head" in content
+    assert "origin" in content
+
+
+def test_software_dev_persona_reports_review_surface_state():
+    """Dev persona tells the agent to state staged/unstaged/committed status."""
+    from importlib.resources import files
+    p = files("link_project_to_chat.personas").joinpath("software_dev.md")
+    content = p.read_text(encoding="utf-8").lower()
+    assert "review surface" in content
+    assert "unstaged" in content
+    assert "committed" in content
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `pytest tests/test_bundled_personas.py -v -k "review_surface"`
+Expected: AssertionError on the missing strings in current personas.
+
+- [ ] **Step 3: Update the manager persona**
+
+In `src/link_project_to_chat/personas/software_manager.md`, locate the "Review protocol" sentence and extend it:
+
+Find:
+```
+Review protocol: before approving any change, read the actual files the Developer modified. Do not rely solely on their summary.
+```
+
+Replace with:
+```
+Review protocol: before approving any change, read the actual files the Developer modified. Do not rely solely on their summary. Always name the review surface you are checking: working tree (`git diff` / `cat <file>`), staged changes (`git diff --staged`), a local commit (`git show HEAD` or `git show <hash>`), or remote comparison (`git diff origin/<branch>..HEAD`). If the Developer says fixes are unstaged but your read of the file still shows pre-fix content, stop repeating the same review findings — ask them to confirm which surface to check, or to create a local review commit, and then review THAT surface explicitly.
+```
+
+- [ ] **Step 4: Update the dev persona**
+
+In `src/link_project_to_chat/personas/software_dev.md`, after the existing "Execution:" or work-protocol paragraph, add a new line:
+
+```
+Review surface: when handing work back to the Manager, state explicitly whether your changes are unstaged, staged, committed locally, or pushed. Include the exact commit hash when committed (`git rev-parse HEAD`), or say "working tree only" when not. If the Manager appears to be reviewing stale content, include `git status --short --branch` in your reply, name the surface they should use, and ask before creating a commit solely to stabilize the review surface.
+```
+
+- [ ] **Step 5: Run the tests**
+
+Run: `pytest tests/test_bundled_personas.py -v`
+Expected: all bundled-persona tests pass, including the two new ones.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/link_project_to_chat/personas/software_manager.md src/link_project_to_chat/personas/software_dev.md tests/test_bundled_personas.py
+git commit -m "docs(personas): require explicit review-surface naming
+
+Adds review-surface discipline to the bundled software_manager and
+software_dev personas: manager must name what it's checking (working
+tree / staged / commit / remote); dev must state whether handoff is
+unstaged / staged / committed / pushed and include the commit hash
+when committed. Soft guardrail layered on top of the executor-layer
+push block from Tasks 10-11. Idea adapted from the team-bot plan
+docs/superpowers/plans/2026-05-15-team-relay-review-surface-fixes.md
+Task 3."
+```
+
+---
+
 ## Final verification
 
-After all 16 tasks are committed:
+After all 18 tasks are committed:
 
 - [ ] **Step 1: Run the full suite**
 
@@ -2222,8 +2497,9 @@ Expected: roughly the file-change-summary from spec section 12 (~750 LOC).
 
 - This plan is large. Use `superpowers:subagent-driven-development` (one subagent per task) for the cleanest review cadence. The tasks are designed to be independently committable and small enough for a fresh agent to complete with no prior context beyond the spec + this plan.
 - Tasks 1-3 are pure data-layer and have no upstream dependencies — safe to parallelize across subagents if you prefer.
-- Tasks 4-7 (relay) all touch the same file; serialize them.
-- Tasks 8-13 (backends) all touch backend files but split cleanly by file; safe to parallelize backend-side.
-- Task 14 (bot.py wiring) is the integration point — do it after Tasks 8-13 land.
-- Tasks 15 + 16 are independent surface fixes; can land any order after Task 14.
+- Tasks 4-8 (relay) all touch the same file; serialize them.
+- Tasks 9-14 (backends) all touch backend files but split cleanly by file; safe to parallelize backend-side.
+- Task 15 (bot.py wiring) is the integration point — do it after Tasks 9-14 land.
+- Tasks 16 + 17 are independent surface fixes; can land any order after Task 15.
+- Task 18 (persona prose) is independent of everything else; ship whenever.
 - If a task's test code makes assumptions that don't match the project's actual test fixtures, adapt the assertions but keep the *behavior under test* identical.
