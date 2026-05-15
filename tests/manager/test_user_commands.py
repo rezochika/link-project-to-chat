@@ -261,6 +261,84 @@ def test_commands_list_includes_new_user_management_commands():
     assert "reset_user_identity" in names
 
 
+# --- P1 #1: viewer cannot run state-changing manager commands ---
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_start_all(tmp_path):
+    """Regression for P1 #1: viewers must not be able to start every project
+    via /start_all — _guard_invocation only enforced auth + rate-limit, so a
+    viewer could trigger process spawn without any executor gate."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="viewer-bob", role="viewer", locked_identities=["telegram:200"]),
+    ])
+    bot._pm = MagicMock()
+    bot._pm.start_all = MagicMock(return_value=99)
+    inv = _invocation([], sender_handle="viewer-bob", sender_id="200")
+    await bot._on_start_all_from_transport(inv)
+    text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in text or "executor" in text
+    # Critical: no actual start was attempted.
+    bot._pm.start_all.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_stop_all(tmp_path):
+    """Regression for P1 #1: viewers must not be able to stop every project."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="viewer-bob", role="viewer", locked_identities=["telegram:200"]),
+    ])
+    bot._pm = MagicMock()
+    bot._pm.stop_all = MagicMock(return_value=99)
+    inv = _invocation([], sender_handle="viewer-bob", sender_id="200")
+    await bot._on_stop_all_from_transport(inv)
+    text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in text or "executor" in text
+    bot._pm.stop_all.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_open_setup(tmp_path):
+    """Regression for P1 #1: viewers must not be able to even render the
+    /setup keyboard — every button arms a setup_awaiting state that ends in
+    a credential write."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="viewer-bob", role="viewer", locked_identities=["telegram:200"]),
+    ])
+    inv = _invocation([], sender_handle="viewer-bob", sender_id="200")
+    await bot._on_setup_from_transport(inv)
+    text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_viewer_cannot_open_global_model_picker(tmp_path):
+    """Regression for P1 #1: viewers must not be able to render the
+    global-default-model picker — clicking any option writes
+    default_model_claude."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="viewer-bob", role="viewer", locked_identities=["telegram:200"]),
+    ])
+    inv = _invocation([], sender_handle="viewer-bob", sender_id="200")
+    await bot._on_model_from_transport(inv)
+    text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_executor_can_still_run_start_all(tmp_path):
+    """Sanity: the executor path remains functional after gating."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:12345"]),
+    ])
+    bot._pm = MagicMock()
+    bot._pm.start_all = MagicMock(return_value=3)
+    inv = _invocation([], sender_handle="alice", sender_id="12345")
+    await bot._on_start_all_from_transport(inv)
+    bot._pm.start_all.assert_called_once()
+    last_text = bot._transport.send_text.await_args.args[1].lower()
+    assert "read-only" not in last_text
+
+
 @pytest.mark.asyncio
 async def test_user_commands_work_without_explicit_config_path(monkeypatch, tmp_path):
     """When ManagerBot was constructed without a custom config path,

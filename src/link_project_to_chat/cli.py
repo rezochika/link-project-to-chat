@@ -117,7 +117,13 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
         raise SystemExit(f"Project '{name}' already exists.")
     entry: dict = {"path": str(Path(project_path).resolve()), "telegram_bot_token": token}
     if username:
-        entry["username"] = username.lower().lstrip("@")
+        # Translate ``--username X`` to the modern ``allowed_users`` shape.
+        # Writing the legacy flat ``username`` key would seem to succeed but
+        # collide with any pre-existing ``allowed_users`` on the next load —
+        # the explicit list wins and the new user is silently dropped. The
+        # migration helper only re-synthesizes when allowed_users is empty.
+        norm = username.lower().lstrip("@")
+        entry["allowed_users"] = [{"username": norm, "role": "executor"}]
     # Phase 2: write the new shape (backend + backend_state). load_config()
     # mirrors legacy flat fields back from backend_state on read, and
     # save_config() keeps the legacy mirror in sync, so older code paths
@@ -199,9 +205,23 @@ def projects_edit(ctx, name: str, field: str, value: str):
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' token.")
     elif field == "username":
-        projects[name][field] = value
+        # Translate ``username`` to ``allowed_users`` so the write actually
+        # authorizes the new user. Writing the legacy flat key directly would
+        # collide with an existing ``allowed_users`` list on next load — the
+        # explicit list wins and the new user is silently dropped (the loader
+        # only re-synthesizes legacy fields when allowed_users is empty).
+        norm = value.lower().lstrip("@")
+        projects[name]["allowed_users"] = [{"username": norm, "role": "executor"}]
+        # Drop any stale legacy ``username`` key so the source of truth is
+        # the explicit allowed_users list going forward.
+        projects[name].pop("username", None)
         save_project_configs(projects, cfg_path)
-        click.echo(f"Updated '{name}' {field} to {value}.")
+        click.echo(
+            f"Updated '{name}' allowed_users to [{norm}] (executor). "
+            f"For multi-user lists use `configure --add-user`/`--remove-user` "
+            f"or the manager bot.",
+            err=True,
+        )
     elif field == "model":
         # Phase 2: write the new shape into backend_state[<active_backend>]
         # and mirror the legacy flat key for downgrade safety.

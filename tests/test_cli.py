@@ -169,7 +169,11 @@ def test_add_project_optional_fields(runner, cfg):
     ])
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["optproj"]
-    assert proj["username"] == "bob"
+    # P1 #2: --username now writes the modern allowed_users shape rather than
+    # the legacy flat ``username`` key (which would lose to a pre-existing
+    # allowed_users list on next load).
+    assert "username" not in proj
+    assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
     assert proj["model"] == "sonnet"
     assert proj["permissions"] == "default"
 
@@ -316,6 +320,108 @@ def test_edit_project_invalid_permissions_value_fails(runner, cfg):
 
     assert result.exit_code != 0
     assert "Invalid permissions value" in result.output
+
+
+# --- P1 #2: legacy `username` writes must translate to allowed_users ---
+
+def test_projects_add_with_username_writes_allowed_users(tmp_path):
+    """Regression for P1 #2: `projects add --username X` must produce an
+    actually-authorizing config rather than a legacy `username` flat key
+    that loses to any pre-existing allowed_users on next load.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"projects": {}}))
+    proj_dir = tmp_path / "myproj"
+    proj_dir.mkdir()
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "add",
+        "--name", "myproj",
+        "--path", str(proj_dir),
+        "--token", "t",
+        "--username", "alice",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg_file.read_text())
+    proj = on_disk["projects"]["myproj"]
+    # Legacy flat key must not be present.
+    assert "username" not in proj
+    # Modern shape with role=executor.
+    assert proj["allowed_users"] == [{"username": "alice", "role": "executor"}]
+
+
+def test_projects_add_with_username_uppercase_and_at_normalized(tmp_path):
+    """Symmetry with the legacy normalization: lowercase + strip @."""
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({"projects": {}}))
+    proj_dir = tmp_path / "p"
+    proj_dir.mkdir()
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "add",
+        "--name", "p", "--path", str(proj_dir), "--token", "t",
+        "--username", "@AliceUpper",
+    ])
+    assert result.exit_code == 0, result.output
+    on_disk = json.loads(cfg_file.read_text())
+    assert on_disk["projects"]["p"]["allowed_users"] == [
+        {"username": "aliceupper", "role": "executor"}
+    ]
+
+
+def test_projects_edit_username_replaces_allowed_users(tmp_path):
+    """Regression for P1 #2: `projects edit NAME username X` must actually
+    authorize X — historically it wrote a legacy flat key that lost to a
+    pre-existing allowed_users on next load.
+    """
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "allowed_users": [{"username": "alice", "role": "executor"}],
+            }
+        }
+    }))
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "myproj", "username", "bob",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg_file.read_text())
+    proj = on_disk["projects"]["myproj"]
+    # Bob fully replaces alice in the modern shape (matches the legacy
+    # ``username`` semantics of "the allowed user").
+    assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
+    # Legacy flat key gone.
+    assert "username" not in proj
+    # Deprecation hint surfaced to stderr.
+    assert "allowed_users" in result.stderr or "/add_user" in result.stderr
+
+
+def test_projects_edit_username_normalizes_handle(tmp_path):
+    """Edit semantics match add: lowercase + strip leading @."""
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    result = CliRunner().invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "myproj", "username", "@BobUpper",
+    ])
+    assert result.exit_code == 0, result.output
+    on_disk = json.loads(cfg_file.read_text())
+    assert on_disk["projects"]["myproj"]["allowed_users"] == [
+        {"username": "bobupper", "role": "executor"}
+    ]
 
 
 # --- configure --manager-token ---
