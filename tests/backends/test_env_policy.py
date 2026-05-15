@@ -76,6 +76,26 @@ def test_claude_keeps_baseline_path_and_home(monkeypatch, tmp_path):
     assert env["HOME"] == "/home/test"
 
 
+def test_claude_keeps_windows_runtime_profile_baseline(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", r"C:\Users\alice\AppData\Roaming")
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\alice\AppData\Local")
+    monkeypatch.setenv("USERPROFILE", r"C:\Users\alice")
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("ComSpec", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    env = ClaudeBackend(project_path=tmp_path)._prepare_env()
+
+    def env_value(name: str) -> str:
+        return next(value for key, value in env.items() if key.upper() == name.upper())
+
+    assert env_value("APPDATA") == r"C:\Users\alice\AppData\Roaming"
+    assert env_value("LOCALAPPDATA") == r"C:\Users\alice\AppData\Local"
+    assert env_value("USERPROFILE") == r"C:\Users\alice"
+    assert env_value("SystemRoot") == r"C:\Windows"
+    assert env_value("ComSpec") == r"C:\Windows\System32\cmd.exe"
+    assert env_value("PATHEXT") == ".COM;.EXE;.BAT;.CMD"
+
+
 def test_codex_keeps_baseline_path_and_home(monkeypatch, tmp_path):
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     monkeypatch.setenv("HOME", "/home/test")

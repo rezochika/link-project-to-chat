@@ -77,6 +77,12 @@ class BaseBackend:
         # HTTP proxy — operators commonly require proxy passthrough.
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "no_proxy",
+        # Windows process/profile runtime. Native Node-packaged CLIs can crash
+        # before emitting stderr if these are missing, and APPDATA/LOCALAPPDATA
+        # also point them at their non-secret config/cache roots.
+        "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "PROGRAMDATA",
+        "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles*",
     )
     _env_keep_patterns: Sequence[str] = ()
     _env_scrub_patterns: Sequence[str] = ()
