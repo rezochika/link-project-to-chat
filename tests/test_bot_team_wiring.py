@@ -829,7 +829,6 @@ async def test_permissions_callback_works_in_group_chat(tmp_path):
         name="acme_manager", path=tmp_path, token="t",
         team_name="acme", role="manager", group_chat_id=-100_111,
         allowed_usernames=["rezo"],
-        trusted_user_ids=[42],
     )
     # Stub the transport so we can observe the resulting edit.
     mock_app = MagicMock()

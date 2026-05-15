@@ -7,7 +7,6 @@ import secrets
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -133,15 +132,11 @@ class ProjectBot(AuthMixin):
         path: Path,
         token: str,
         allowed_username: str = "",
-        trusted_user_id: int | None = None,
-        on_trust: Callable[[int, str], None] | None = None,
         skip_permissions: bool = False,
         permission_mode: str | None = None,
         allowed_tools: list[str] | None = None,
         disallowed_tools: list[str] | None = None,
         allowed_usernames: list[str] | None = None,
-        trusted_users: dict[str, int] | None = None,
-        trusted_user_ids: list[int] | None = None,
         transcriber: "Transcriber | None" = None,
         synthesizer: "Synthesizer | None" = None,
         active_persona: str | None = None,
@@ -169,11 +164,10 @@ class ProjectBot(AuthMixin):
         self._config_path = config_path
         self.transport_kind = transport_kind
         self.web_port = web_port
-        # Legacy auth kwargs are still on the signature for callers that haven't
-        # migrated; they're consumed only by the synthesis block below to seed
-        # ``_allowed_users``. The legacy ``_allowed_usernames`` / ``_trusted_*``
-        # instance attributes from older AuthMixin are deleted in Task 5 Step 3.
-        self._on_trust_fn = on_trust
+        # Legacy ``allowed_usernames`` is the only pre-v1.0 kwarg still accepted
+        # on the signature; it is consumed by the synthesis block below to seed
+        # ``_allowed_users``. The ``trusted_*`` kwargs and ``on_trust`` callback
+        # are gone — the AllowedUser model carries per-user locked_identities.
         self._started_at = time.monotonic()
         self._app = None
         self._transport = None  # TelegramTransport — set in _build_app
@@ -411,10 +405,6 @@ class ProjectBot(AuthMixin):
                 self.group_chat_id = int(new_room.native_id)
             except ValueError:
                 pass
-
-    def _on_trust(self, user_id: int, username: str) -> None:
-        if self._on_trust_fn:
-            self._on_trust_fn(user_id, username)
 
     async def _on_task_started(self, task: Task) -> None:
         # Only show typing indicator for Claude tasks, not /run commands
@@ -1165,19 +1155,6 @@ class ProjectBot(AuthMixin):
             reply_to=getattr(ci_or_msg, "message", None),
         )
         return False
-
-    async def _with_auth_persist(self, awaitable):
-        """Run an awaitable, guaranteeing ``_persist_auth_if_dirty`` fires after.
-
-        Use this in top-level handler bodies whose flow may exit through
-        any of: plugin consume, viewer-denied gate, exception, normal path.
-        Cheap when no first-contact happened (the persist is a single bool
-        check that no-ops).
-        """
-        try:
-            await awaitable
-        finally:
-            await self._persist_auth_if_dirty()
 
     async def _on_text(self, incoming) -> None:
         """Handle a plain-text message: auth, rate-limit, pending skill/persona
@@ -3188,11 +3165,7 @@ def run_bot(
     permission_mode: str | None = None,
     allowed_tools: list[str] | None = None,
     disallowed_tools: list[str] | None = None,
-    trusted_user_id: int | None = None,
-    on_trust: Callable[[int, str], None] | None = None,
     allowed_usernames: list[str] | None = None,
-    trusted_users: dict[str, int] | None = None,
-    trusted_user_ids: list[int] | None = None,
     transcriber: "Transcriber | None" = None,
     synthesizer: "Synthesizer | None" = None,
     team_name: str | None = None,
@@ -3232,9 +3205,6 @@ def run_bot(
     bot = ProjectBot(
         name, path, token,
         allowed_usernames=effective_usernames,
-        trusted_users=trusted_users,
-        trusted_user_ids=trusted_user_ids or ([trusted_user_id] if trusted_user_id else []),
-        on_trust=on_trust,
         skip_permissions=skip_permissions,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
@@ -3270,9 +3240,7 @@ def run_bot(
     if effort:
         bot.task_manager.backend.effort = effort
     bot.build()
-    logger.info(
-        "Bot '%s' started at %s (trusted_user_id=%s)", name, path, trusted_user_id
-    )
+    logger.info("Bot '%s' started at %s", name, path)
     bot.run()
 
 

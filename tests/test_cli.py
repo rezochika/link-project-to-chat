@@ -978,7 +978,9 @@ def test_start_ad_hoc_does_not_attach_persistent_trust_callback(tmp_path, monkey
     assert result.exit_code == 0, result.output
     _, kwargs = calls[0]
     assert [u.username for u in kwargs["allowed_users"]] == ["alice"]
-    assert kwargs.get("on_trust") is None
+    # Legacy ``on_trust`` callback was removed in v1.0; verify the call site
+    # no longer passes it.
+    assert "on_trust" not in kwargs
 
 
 def test_plugin_call_unknown_plugin_exits_nonzero(tmp_path):
@@ -1289,3 +1291,19 @@ def test_manager_bot_accepts_allowed_users_kwarg():
 # called the deleted legacy ``_auth(user)`` method. The post-rewrite
 # equivalent (an authorized user authenticates via ``_auth_identity``) is
 # covered by ``tests/test_auth_roles.py``.
+
+
+def test_version_is_consistent_across_pyproject_and_init():
+    """Version string in pyproject.toml must match src/.../__init__.py."""
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+    pyproject_version = pyproject["project"]["version"]
+
+    import link_project_to_chat
+    assert link_project_to_chat.__version__ == pyproject_version, (
+        f"Version drift: pyproject.toml={pyproject_version!r} vs "
+        f"__init__.py={link_project_to_chat.__version__!r}"
+    )
