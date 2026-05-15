@@ -95,22 +95,22 @@ class WebTransport:
                 "network with a firewall.",
                 host,
             )
+        # Print the bootstrap URL and token on separate lines so the URL alone
+        # never carries the secret. Operators visit the URL, paste the token
+        # into the form, and the token-in-URL leak vector (history/proxy logs/
+        # Referer) is closed.
         if self._authenticated_handles is not None:
             for token, handle in self._authenticated_handles.items():
                 logger.warning(
-                    "Web UI auth token enabled for %s. Open "
-                    "http://%s:%s/auth?token=%s",
-                    handle,
-                    host,
-                    port,
-                    token,
+                    "Web UI auth token enabled for %s. Open http://%s:%s/auth "
+                    "and paste token: %s",
+                    handle, host, port, token,
                 )
         elif auth_token is not None:
             logger.warning(
-                "Web UI auth token enabled. Open http://%s:%s/auth?token=%s",
-                host,
-                port,
-                auth_token,
+                "Web UI auth token enabled. Open http://%s:%s/auth and paste "
+                "token: %s",
+                host, port, auth_token,
             )
 
         self._store: WebStore | None = None

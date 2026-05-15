@@ -52,9 +52,10 @@ async def test_chat_page_requires_web_auth_token_when_configured(tmp_path: Path)
             denied = await client.get("/chat/default")
             assert denied.status_code == 401
 
-            # Bootstrap exchange: /auth swaps the URL token for the cookie.
-            bootstrap = await client.get(
-                "/auth?token=secret-token", follow_redirects=False
+            # Bootstrap exchange: POST /auth with the token in the body
+            # (the URL never carries the token).
+            bootstrap = await client.post(
+                "/auth", data={"token": "secret-token"}, follow_redirects=False,
             )
             assert bootstrap.status_code in (302, 303, 307)
             assert "token" not in (bootstrap.headers.get("location") or "")
@@ -87,11 +88,13 @@ async def test_per_user_web_auth_token_sets_server_handle(tmp_path: Path):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            denied = await client.get("/auth?token=bad", follow_redirects=False)
+            denied = await client.post(
+                "/auth", data={"token": "bad"}, follow_redirects=False,
+            )
             assert denied.status_code == 401
 
-            bootstrap = await client.get(
-                "/auth?token=tok-bob", follow_redirects=False
+            bootstrap = await client.post(
+                "/auth", data={"token": "tok-bob"}, follow_redirects=False,
             )
             assert bootstrap.status_code in (302, 303, 307)
 
@@ -137,6 +140,53 @@ async def test_chat_route_rejects_url_token_directly(tmp_path: Path):
         await store.close()
 
 
+async def test_get_auth_with_url_token_does_not_authenticate(tmp_path: Path):
+    """Critical: /auth?token=X via GET must NOT set the auth cookie. The URL
+    token would otherwise still leak into browser history, proxy/access logs,
+    and the Referer header on the redirect target. GET /auth renders the form
+    only; POST /auth with the token in the body is the sole exchange path."""
+    store = WebStore(tmp_path / "get-token.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(store, inbound_queue, sse_queues, auth_token="secret-token")
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # GET /auth?token=valid returns the form (200) — NOT a redirect.
+            page = await client.get(
+                "/auth?token=secret-token", follow_redirects=False,
+            )
+            assert page.status_code == 200
+            assert "lp2c_web_auth" not in page.headers.get("set-cookie", "")
+            # And subsequent chat access still requires the POST exchange.
+            denied = await client.get("/chat/default")
+            assert denied.status_code == 401
+    finally:
+        await store.close()
+
+
+async def test_get_auth_renders_form_without_token(tmp_path: Path):
+    store = WebStore(tmp_path / "form.db")
+    await store.open()
+    inbound_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sse_queues: dict[str, list[asyncio.Queue]] = {}
+    try:
+        app = create_app(store, inbound_queue, sse_queues, auth_token="secret-token")
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            page = await client.get("/auth")
+            assert page.status_code == 200
+            lower = page.text.lower()
+            assert "<form" in lower
+            assert "method='post'" in lower or 'method="post"' in lower
+            assert "name='token'" in lower or 'name="token"' in lower
+    finally:
+        await store.close()
+
+
 async def test_auth_bootstrap_redirects_to_next_param_only_if_local(tmp_path: Path):
     """The `next` redirect target must be a local path; reject open-redirect attempts."""
     store = WebStore(tmp_path / "redir.db")
@@ -149,24 +199,27 @@ async def test_auth_bootstrap_redirects_to_next_param_only_if_local(tmp_path: Pa
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
             # Local path is honored.
-            local = await client.get(
-                "/auth?token=secret-token&next=/chat/special",
+            local = await client.post(
+                "/auth",
+                data={"token": "secret-token", "next": "/chat/special"},
                 follow_redirects=False,
             )
             assert local.status_code in (302, 303, 307)
             assert local.headers.get("location") == "/chat/special"
 
             # Off-host redirect is rejected (falls back to default).
-            offsite = await client.get(
-                "/auth?token=secret-token&next=https://evil.example/x",
+            offsite = await client.post(
+                "/auth",
+                data={"token": "secret-token", "next": "https://evil.example/x"},
                 follow_redirects=False,
             )
             assert offsite.status_code in (302, 303, 307)
             assert offsite.headers.get("location", "").startswith("/chat/")
 
             # Protocol-relative is rejected.
-            proto_rel = await client.get(
-                "/auth?token=secret-token&next=//evil.example/x",
+            proto_rel = await client.post(
+                "/auth",
+                data={"token": "secret-token", "next": "//evil.example/x"},
                 follow_redirects=False,
             )
             assert proto_rel.status_code in (302, 303, 307)
@@ -252,7 +305,7 @@ async def test_revocation_check_blocks_previously_valid_token(tmp_path: Path):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await client.get("/auth?token=tok-alice", follow_redirects=False)
+            await client.post("/auth", data={"token": "tok-alice"}, follow_redirects=False)
             ok = await client.get("/chat/default")
             assert ok.status_code == 200
 
@@ -286,7 +339,7 @@ async def test_revocation_check_runs_on_sse_reconnect(tmp_path: Path):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await client.get("/auth?token=tok-bob", follow_redirects=False)
+            await client.post("/auth", data={"token": "tok-bob"}, follow_redirects=False)
             revoked.add("bob")
 
             # New SSE connection attempt must be rejected outright.
@@ -318,7 +371,7 @@ async def test_revocation_check_skipped_when_handle_unset(tmp_path: Path):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            await client.get("/auth?token=single-token", follow_redirects=False)
+            await client.post("/auth", data={"token": "single-token"}, follow_redirects=False)
             ok = await client.get("/chat/default")
             assert ok.status_code == 200
     finally:

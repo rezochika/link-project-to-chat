@@ -169,31 +169,67 @@ def create_app(
     async def root():
         return RedirectResponse("/chat/default")
 
-    @app.get("/auth")
-    async def auth_bootstrap(request: Request):
-        """One-shot exchange: validate `?token=...`, set cookie, redirect.
-
-        This is the only route that accepts a token in the URL. It immediately
-        sets the auth cookie and redirects to `next` (or /chat/default), so
-        the token never appears in any page-load URL after the bootstrap.
-        """
-        supplied = request.query_params.get("token", "")
-        next_url = _safe_local_redirect(request.query_params.get("next"))
-        validated_token: str | None = None
-        validated_handle: str | None = None
+    def _validate_bootstrap_token(supplied: str) -> tuple[str | None, str | None]:
+        """Returns (validated_token, validated_handle) or (None, None)."""
         if authenticated_handles is not None:
             for token, handle in authenticated_handles.items():
                 if secrets.compare_digest(supplied, token):
-                    validated_token = token
-                    validated_handle = handle
-                    break
-        elif auth_token is not None:
+                    return token, handle
+            return None, None
+        if auth_token is not None:
             if supplied and secrets.compare_digest(supplied, auth_token):
-                validated_token = auth_token
-                validated_handle = authenticated_handle
-        else:
-            # Auth not enforced; bootstrap is a no-op redirect.
+                return auth_token, authenticated_handle
+            return None, None
+        return None, None
+
+    def _auth_enforced() -> bool:
+        return authenticated_handles is not None or auth_token is not None
+
+    @app.get("/auth", response_class=HTMLResponse)
+    async def auth_form(request: Request):
+        """Render the bootstrap form. The token MUST be supplied via POST body
+        (see auth_submit). GET never authenticates — even when a stale ``?token=``
+        appears in the URL — because that URL would otherwise leak into browser
+        history, proxy/access logs, and Referer headers on the redirect target.
+        """
+        if not _auth_enforced():
+            return RedirectResponse(
+                _safe_local_redirect(request.query_params.get("next")),
+                status_code=303,
+            )
+        next_url = _safe_local_redirect(request.query_params.get("next"))
+        # Minimal hand-rolled HTML — no Jinja template needed and no static
+        # assets so the bootstrap page works before any auth is in place.
+        # `next` is HTML-escaped by quote() before landing in the value attr.
+        from html import escape as _html_escape
+        next_attr = _html_escape(next_url, quote=True)
+        body = (
+            "<!doctype html>"
+            "<html><head><meta charset='utf-8'><title>Sign in</title></head>"
+            "<body>"
+            "<h1>Sign in</h1>"
+            "<form method='post' action='/auth'>"
+            f"<input type='hidden' name='next' value='{next_attr}'>"
+            "<label>Token: <input type='password' name='token' autofocus></label>"
+            "<button type='submit'>Sign in</button>"
+            "</form>"
+            "</body></html>"
+        )
+        return HTMLResponse(body, status_code=200)
+
+    @app.post("/auth")
+    async def auth_submit(
+        request: Request,
+        token: str = Form(""),
+        next: str = Form(""),
+    ):
+        """Bootstrap exchange: validate the body-supplied token, set the auth
+        cookie, redirect to `next` (sanitized to a local path). The token never
+        travels through the URL — only through the form body."""
+        next_url = _safe_local_redirect(next)
+        if not _auth_enforced():
             return RedirectResponse(next_url, status_code=303)
+        validated_token, validated_handle = _validate_bootstrap_token(token)
         if validated_token is None:
             raise HTTPException(status_code=401, detail="Invalid auth token")
         if (
