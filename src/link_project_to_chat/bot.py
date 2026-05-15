@@ -3192,7 +3192,9 @@ def run_bot(
     effective_usernames = allowed_usernames or ([username] if username else [])
     if not allowed_users and not effective_usernames:
         raise SystemExit(
-            "No allowed username configured. Use --username or run 'configure --username'."
+            "No allowed user configured. For one-shot --path/--token starts, "
+            "pass --username USER. For configured projects, run "
+            "'configure --add-user USER[:ROLE]'."
         )
     if session_id:
         save_session(

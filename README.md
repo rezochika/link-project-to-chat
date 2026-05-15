@@ -38,6 +38,9 @@ pipx install "link-project-to-chat[all]"
 
 ## Quick start
 
+The ad-hoc `--path`/`--token` flow bypasses the config file, so the allowed user
+must be supplied on the same command line via `--username`:
+
 ```bash
 link-project-to-chat start --path /path/to/project --token YOUR_BOT_TOKEN --username your_telegram_username
 ```
@@ -45,8 +48,8 @@ link-project-to-chat start --path /path/to/project --token YOUR_BOT_TOKEN --user
 ## Setup with config
 
 ```bash
-# Add your Telegram username
-link-project-to-chat configure --username your_telegram_username
+# Add your Telegram username (defaults to executor role)
+link-project-to-chat configure --add-user your_telegram_username
 
 # Add a project
 link-project-to-chat projects add --name myproject --path /path/to/project --token YOUR_BOT_TOKEN
@@ -187,12 +190,12 @@ pipx install "link-project-to-chat[voice]"
 Multiple Telegram users can access the same bot:
 
 ```bash
-# Add users
-link-project-to-chat configure --username alice
-link-project-to-chat configure --username bob
+# Add users (defaults to executor; append `:viewer` for read-only role)
+link-project-to-chat configure --add-user alice
+link-project-to-chat configure --add-user bob:viewer
 
 # Remove a user
-link-project-to-chat configure --remove-username bob
+link-project-to-chat configure --remove-user bob
 ```
 
 Users can also be managed from the Manager Bot via `/add_user` and `/remove_user`.
@@ -254,7 +257,6 @@ class MyPlugin(Plugin):
     def commands(self):
         async def hello(invocation):
             # invocation is a CommandInvocation
-            from link_project_to_chat.transport.base import ChatRef
             await self._ctx.transport.send_text(invocation.chat, "hi")
         return [BotCommand(command="hello", description="say hi", handler=hello)]
 ```
@@ -277,11 +279,12 @@ Set `allowed_users` on a project to enable per-user roles:
 ]
 ```
 
-Viewers can use `/tasks`, `/log`, `/status`, `/help`, `/version`, `/skills`
-(listing), `/context` (display), and any plugin command flagged `viewer_ok`.
-Executors have the full command set. `allowed_users` is the sole auth source —
-an empty list means no one is authorized (fail-closed). The first request
-from each user atomically appends their identity to `locked_identities` and writes it back to the config so
+Viewers can use `/tasks` (including the per-task **Log** button it surfaces),
+`/status`, `/help`, `/version`, `/skills` (listing), `/context` (display), and
+any plugin command flagged `viewer_ok`. Executors have the full command set.
+`allowed_users` is the sole auth source — an empty list means no one is
+authorized (fail-closed). The first request from each user atomically appends
+their identity to `locked_identities` and writes it back to the config so
 subsequent requests validate by native ID rather than username (preserves the
 username-spoof protection from the pre-v1.0 model).
 

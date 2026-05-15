@@ -314,6 +314,80 @@ async def test_plugin_cannot_shadow_core_command(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_plugin_command_inert_when_start_fails(monkeypatch):
+    """If plugin.start() raises, _init_plugins removes the plugin from
+    self._plugins. Commands registered before start ran stay wired on the
+    transport (the Transport Protocol exposes no remove-handler), but
+    invoking them must be a no-op via _wrap_plugin_command's active-plugin
+    guard. Without this, a half-initialised plugin would still serve its
+    commands and could trip over unset state.
+    """
+    from link_project_to_chat.transport.base import CommandInvocation
+
+    inner_called: list[bool] = []
+
+    async def _real_handler(_ci):  # the plugin's own handler
+        inner_called.append(True)
+
+    p = _RecordingCommandPlugin(_ctx(), {})
+    p.name = "rec"
+    p.start_raises = True
+    p._commands_to_register = [
+        BotCommand(command="rec_open", description="", handler=_real_handler)
+    ]
+
+    registered: list[tuple[str, Any]] = []
+
+    class _FakeTransport:
+        TRANSPORT_ID = "fake"
+        def on_command(self, name, handler):
+            registered.append((name, handler))
+
+    bot = _make_bot([])
+    bot._transport = _FakeTransport()
+    bot._plugin_configs = [{"name": "rec"}]
+    # NOTE: leave bot._plugins empty — _init_plugins appends from load_plugin.
+    # Pre-seeding here would double-register the same plugin instance.
+    bot._auth_dirty = False  # _persist_auth_if_dirty no-ops in the finally.
+    # Force the auth/role checks in _wrap_plugin_command to pass so we
+    # actually exercise the active-plugin guard. With empty _allowed_users,
+    # _auth_identity fails closed and the handler is skipped for an
+    # unrelated reason — masking whether the guard works.
+    bot._auth_identity = lambda _identity: True
+    bot._require_executor = lambda _identity: True
+    import link_project_to_chat.bot as bot_mod
+    monkeypatch.setattr(bot_mod, "load_plugin", lambda *a, **kw: p)
+    # NOTE: DO NOT stub bot._wrap_plugin_command here — we need the real
+    # one, including its `plugin_ref not in self._plugins` guard.
+
+    await bot._init_plugins()
+
+    # The failed plugin must be removed from dispatch.
+    assert p not in bot._plugins, "plugin must be removed after start() failure"
+    # The command was registered before start ran — transport still holds it.
+    names = [n for n, _ in registered]
+    assert "rec_open" in names, "command must have been registered pre-start"
+
+    # Invoke the registered (wrapped) handler. The active-plugin guard
+    # must short-circuit before the inner handler runs.
+    wrapped = next(h for n, h in registered if n == "rec_open")
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="42",
+        display_name="A", handle="alice", is_bot=False,
+    )
+    msg_ref = MessageRef(transport_id="fake", native_id="100", chat=chat)
+    invocation = CommandInvocation(
+        chat=chat, sender=sender, name="rec_open",
+        args=[], raw_text="/rec_open", message=msg_ref,
+    )
+    await wrapped(invocation)
+    assert inner_called == [], (
+        "inner plugin handler must not run after start() failure"
+    )
+
+
+@pytest.mark.asyncio
 async def test_plugin_command_collision_between_plugins(monkeypatch, caplog):
     """Two plugins both claim /share_cmd. First-load wins; the second
     plugin's /share_cmd is dropped, but its other commands still register."""

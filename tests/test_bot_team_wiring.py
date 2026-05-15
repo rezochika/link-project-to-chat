@@ -1282,17 +1282,25 @@ def _stub_config_with_api_creds():
 
 
 def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, monkeypatch):
-    """When LP2C_TELETHON_SESSION is set and the bot is team-mode,
-    build() delegates to TelegramTransport.enable_team_relay_from_session.
+    """When LP2C_TELETHON_SESSION is set (and LP2C_TELETHON_SESSION_STRING is
+    absent) and the bot is team-mode, build() delegates to
+    TelegramTransport.enable_team_relay_from_session.
 
     Telethon client construction lives inside TelegramTransport (see
     test_enable_team_relay_from_session_builds_client in test_telegram_transport);
     here we just assert the bot hands the session credentials over.
+
+    Hermeticity: production code prefers LP2C_TELETHON_SESSION_STRING when
+    present (see bot.py:_after_ready), so this test must clear it before
+    exercising the file-path fallback. Otherwise the test fails in any
+    runtime where the string-session var is set globally (e.g., the team
+    relay's own session).
     """
     from unittest.mock import MagicMock, patch
 
     session_path = tmp_path / "telethon.session"
     session_path.touch()
+    monkeypatch.delenv("LP2C_TELETHON_SESSION_STRING", raising=False)
     monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
 
     bot = _make_team_bot_for_relay_test(tmp_path)
@@ -1311,8 +1319,57 @@ def test_team_mode_bot_calls_enable_team_relay_when_session_env_set(tmp_path, mo
         bot.build()
 
     mock_transport.enable_team_relay_from_session.assert_called_once()
+    mock_transport.enable_team_relay_from_session_string.assert_not_called()
     call_kwargs = mock_transport.enable_team_relay_from_session.call_args.kwargs
     assert call_kwargs["session_path"] == str(session_path)
+    assert call_kwargs["api_id"] == 12345
+    assert call_kwargs["api_hash"] == "fakehash"
+    assert call_kwargs["group_chat_id"] == -100123
+    assert call_kwargs["team_name"] == "acme"
+    usernames = call_kwargs["team_bot_usernames"]
+    assert "acme_manager_bot" in usernames
+    assert "acme_dev_bot" in usernames
+
+
+def test_team_mode_bot_prefers_session_string_when_both_env_vars_set(
+    tmp_path, monkeypatch
+):
+    """When BOTH LP2C_TELETHON_SESSION_STRING and LP2C_TELETHON_SESSION are
+    set, the string-session path wins and the file-path fallback is not
+    called.
+
+    Production behavior (bot.py:_after_ready): the string session is the
+    preferred path because it avoids the on-disk SQLite session-file lock
+    contention that hits when both the manager and the project bot try to
+    open the same telethon.session file. This regression test makes the
+    precedence explicit so a future refactor can't silently flip it.
+    """
+    from unittest.mock import MagicMock, patch
+
+    session_path = tmp_path / "telethon.session"
+    session_path.touch()
+    monkeypatch.setenv("LP2C_TELETHON_SESSION_STRING", "sentinel-string-session")
+    monkeypatch.setenv("LP2C_TELETHON_SESSION", str(session_path))
+
+    bot = _make_team_bot_for_relay_test(tmp_path)
+
+    mock_transport = MagicMock()
+    with patch(
+        "link_project_to_chat.transport.telegram.TelegramTransport.build",
+        return_value=mock_transport,
+    ), patch(
+        "link_project_to_chat.bot.load_teams",
+        return_value=_stub_team_config_with_two_bots(),
+    ), patch(
+        "link_project_to_chat.bot.load_config",
+        return_value=_stub_config_with_api_creds(),
+    ):
+        bot.build()
+
+    mock_transport.enable_team_relay_from_session_string.assert_called_once()
+    mock_transport.enable_team_relay_from_session.assert_not_called()
+    call_kwargs = mock_transport.enable_team_relay_from_session_string.call_args.kwargs
+    assert call_kwargs["session_string"] == "sentinel-string-session"
     assert call_kwargs["api_id"] == 12345
     assert call_kwargs["api_hash"] == "fakehash"
     assert call_kwargs["group_chat_id"] == -100123
