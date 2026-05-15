@@ -33,17 +33,17 @@ def _invocation(args: list[str], sender_handle: str = "admin", sender_id: str = 
     return CommandInvocation(chat=chat, sender=sender, name="cmd", args=args, raw_text=" ".join(args), message=msg)
 
 
-def _attach_running_pm(bot, running_names: list[str]):
-    """Attach a mock ProcessManager to `bot` reporting the given names as
-    running so user-mutation commands can record stop+start calls.
+def _attach_running_pm(bot, running_keys: list[str]):
+    """Attach a mock ProcessManager to `bot` reporting the given keys as
+    running so user-mutation commands can record restart() calls.
 
-    Returns the mock so assertions can inspect call arguments.
+    `running_keys` may include both project names and ``team:NAME:ROLE``
+    keys — the helper uses _pm.list_running() (which covers both) and
+    _pm.restart() (which dispatches by prefix).
     """
     pm = MagicMock()
-    pm.list_all = MagicMock(return_value=[(n, "running") for n in running_names])
-    pm.stop = MagicMock(return_value=True)
-    pm.start = MagicMock(return_value=True)
-    pm.status = MagicMock(side_effect=lambda n: "running" if n in running_names else "stopped")
+    pm.list_running = MagicMock(return_value=list(running_keys))
+    pm.restart = MagicMock(return_value=True)
     bot._pm = pm
     return pm
 
@@ -392,10 +392,8 @@ async def test_add_user_restarts_running_project_bots(tmp_path):
     bot = _make_manager(tmp_path)
     pm = _attach_running_pm(bot, ["proj_a", "proj_b"])
     await bot._on_add_user(_invocation(["charlie"]))
-    pm.stop.assert_any_call("proj_a")
-    pm.stop.assert_any_call("proj_b")
-    pm.start.assert_any_call("proj_a")
-    pm.start.assert_any_call("proj_b")
+    pm.restart.assert_any_call("proj_a")
+    pm.restart.assert_any_call("proj_b")
 
 
 @pytest.mark.asyncio
@@ -406,8 +404,7 @@ async def test_remove_user_restarts_running_project_bots(tmp_path):
     ])
     pm = _attach_running_pm(bot, ["proj_a"])
     await bot._on_remove_user(_invocation(["alice"]))
-    pm.stop.assert_called_once_with("proj_a")
-    pm.start.assert_called_once_with("proj_a")
+    pm.restart.assert_called_once_with("proj_a")
 
 
 @pytest.mark.asyncio
@@ -418,8 +415,7 @@ async def test_promote_user_restarts_running_project_bots(tmp_path):
     ])
     pm = _attach_running_pm(bot, ["proj_a"])
     await bot._on_promote_user(_invocation(["alice"]))
-    pm.stop.assert_called_once_with("proj_a")
-    pm.start.assert_called_once_with("proj_a")
+    pm.restart.assert_called_once_with("proj_a")
 
 
 @pytest.mark.asyncio
@@ -430,8 +426,7 @@ async def test_demote_user_restarts_running_project_bots(tmp_path):
     ])
     pm = _attach_running_pm(bot, ["proj_a"])
     await bot._on_demote_user(_invocation(["alice"]))
-    pm.stop.assert_called_once_with("proj_a")
-    pm.start.assert_called_once_with("proj_a")
+    pm.restart.assert_called_once_with("proj_a")
 
 
 @pytest.mark.asyncio
@@ -442,8 +437,24 @@ async def test_reset_user_identity_restarts_running_project_bots(tmp_path):
     ])
     pm = _attach_running_pm(bot, ["proj_a"])
     await bot._on_reset_user_identity(_invocation(["alice"]))
-    pm.stop.assert_called_once_with("proj_a")
-    pm.start.assert_called_once_with("proj_a")
+    pm.restart.assert_called_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_user_mutation_restarts_running_team_bot(tmp_path):
+    """Regression for the round-2 gap: list_all() only returned project names,
+    so user mutations missed running team:NAME:ROLE keys. The helper now uses
+    list_running() (which surfaces team keys) + restart() (which dispatches
+    them through start_team), so demoting/removing/resetting a user reaches
+    the running team bot too."""
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+        AllowedUser(username="alice", role="executor"),
+    ])
+    pm = _attach_running_pm(bot, ["proj_a", "team:demo:dev"])
+    await bot._on_demote_user(_invocation(["alice"]))
+    pm.restart.assert_any_call("proj_a")
+    pm.restart.assert_any_call("team:demo:dev")
 
 
 @pytest.mark.asyncio
@@ -453,8 +464,7 @@ async def test_user_mutation_skips_restart_when_no_bots_running(tmp_path):
     bot = _make_manager(tmp_path)
     pm = _attach_running_pm(bot, [])  # nothing running
     await bot._on_add_user(_invocation(["charlie"]))
-    pm.stop.assert_not_called()
-    pm.start.assert_not_called()
+    pm.restart.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -464,5 +474,4 @@ async def test_user_mutation_no_op_does_not_restart(tmp_path):
     bot = _make_manager(tmp_path)
     pm = _attach_running_pm(bot, ["proj_a"])
     await bot._on_add_user(_invocation(["charlie", "godmode"]))
-    pm.stop.assert_not_called()
-    pm.start.assert_not_called()
+    pm.restart.assert_not_called()

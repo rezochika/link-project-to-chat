@@ -908,8 +908,10 @@ class ManagerBot(AuthMixin):
         not change a running bot's authorization view until a restart. This
         helper, invoked at the tail of every user-mutation command, makes the
         change effective immediately. Transport-agnostic (Telegram bots have
-        the same staleness as web bots) and team-bot-aware (covers entries
-        keyed `team:NAME:ROLE`).
+        the same staleness as web bots) and team-bot-aware: uses
+        ProcessManager.list_running() (which surfaces team:NAME:ROLE keys
+        that list_all() does not) and ProcessManager.restart() (which
+        dispatches team keys through start_team).
 
         Returns the list of bot keys actually restarted so callers can surface
         the count in the operator reply.
@@ -917,12 +919,9 @@ class ManagerBot(AuthMixin):
         restarted: list[str] = []
         if getattr(self, "_pm", None) is None:
             return restarted
-        for name, status in list(self._pm.list_all()):
-            if status != "running":
-                continue
-            self._pm.stop(name)
-            if self._pm.start(name):
-                restarted.append(name)
+        for key in list(self._pm.list_running()):
+            if self._pm.restart(key):
+                restarted.append(key)
         return restarted
 
     async def _on_add_user(self, ci: "CommandInvocation") -> None:
