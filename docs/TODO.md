@@ -1,10 +1,10 @@
 # Project TODO — Consolidated Specs & Plans
 
-_Last refreshed 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, root-level planning docs, and direct code audit findings. Reflects status as of branch `feat/transport-abstraction` HEAD after TODO hardening commit `b396b1e` plus docs commit `5494753`. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
+_Last refreshed 2026-05-15 to record the plugin-system port + `AllowedUser`-sole auth model rewrite (v1.0.0) on branch `feat/plugin-system` HEAD `cc7661e`. Prior refresh 2026-04-27 from all spec/plan documents under `docs/superpowers/specs/`, `docs/superpowers/plans/`, root-level planning docs, and direct code audit findings. Phase 4 post-completion audit added §2.1 on 2026-04-26 (HEAD `1d45dea`); Phase 5 (Gemini adapter) design drafted 2026-04-27._
 
 Status legend: ✅ shipped · 🟡 in progress / partial · 📋 designed, not started · ⏳ small pending fix
 
-Latest verification for the TODO hardening batch: `pytest -q` → **992 passed, 5 skipped, 2 warnings**; `git diff --check` and `python3 -m compileall -q src/link_project_to_chat` passed.
+Latest verification on `feat/plugin-system` HEAD `cc7661e`: `pytest -q` → **1118 passed, 5 skipped, 2 warnings** in 14.90s. Baseline at Task 0 was 1003 passed; net delta is +115 new tests across the 8 plan tasks. Earlier TODO hardening batch verification was `pytest -q` → **992 passed, 5 skipped, 2 warnings**.
 
 ---
 
@@ -48,6 +48,37 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | #2 Discord | [spec](superpowers/specs/2026-04-21-transport-discord-design.md) | [plan](superpowers/plans/2026-04-21-discord-transport.md) | 📋 | Uses discord.py 2.x, depends on #1 primitives. |
 | #3 Slack | [spec](superpowers/specs/2026-04-21-transport-slack-design.md) | [plan](superpowers/plans/2026-04-21-slack-transport.md) | 📋 | slack_bolt + Socket Mode; final cross-platform validation. |
 | #4 Google Chat | [spec](superpowers/specs/2026-04-25-transport-google-chat-design.md) | — | 📋 | HTTP Chat app events + Google Chat REST API; Cards v2/dialogs map to `Buttons`/`PromptSpec`; depends on public HTTPS endpoint or future Pub/Sub delivery. |
+
+### 1.4 Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)
+
+Branch: `feat/plugin-system` (HEAD `cc7661e`, 11 commits ahead of `main` as of 2026-05-15).
+
+Design doc: [2026-05-13-merge-gitlab-plugin-system-design.md](superpowers/specs/2026-05-13-merge-gitlab-plugin-system-design.md) (14 review iterations: rev `2026-05-14` → `2026-05-14n`).
+Plan: [2026-05-13-merge-gitlab-plugin-system.md](superpowers/plans/2026-05-13-merge-gitlab-plugin-system.md) (8 tasks; executed via subagent-driven-development with two-stage review per task).
+
+Verification: `pytest -q` → **1118 passed, 5 skipped** (baseline 1003 + 115 net new tests).
+
+| Task | Commit | Scope | Status |
+|---|---|---|---|
+| 0 | `9dd1d2d` | Branch + baseline pin | ✅ |
+| 1 | `9dd40b1` | `plugin.py` framework (`Plugin`, `PluginContext`, `BotCommand`, `load_plugin`); `Transport.on_stop` Protocol method across Telegram/Fake/Web; TelegramTransport dynamic `on_command` PTB-handler registration fix; operational scripts `restart.sh` / `stop.sh` | ✅ |
+| 2 | `2a9c719` | ProjectBot plugin lifecycle: `_topo_sort`, `_dispatch_plugin_*`, `_plugin_context_prepend` (Claude-only), `_wrap_plugin_command` (active-plugin + auth+role + persist), `_init_plugins` (CORE_COMMAND_NAMES blocklist + cross-plugin collision check), `_shutdown_plugins`. Hooks fire from `_on_stream_event`, `_on_task_complete`, `_on_text`, `_on_button`, `_build_user_prompt`. Plus I-1 follow-up filtering kwargs in `PluginContext.send_message` Transport fallback. | ✅ |
+| 3 | `50e5cb7` + `92dc9b9` + `7792155` | Config schema: `AllowedUser(username, role, locked_identities: list[str])` dataclass, `_migrate_legacy_auth` (3-shape discriminator + web-session normalization), `resolve_project_allowed_users` (project→global fallback returning `(users, source)`), `locked_config_rmw` + `save_config_within_lock` atomic RMW. Two follow-up fixes for save-time precedence (legacy mutations win on save; per-user UNION preserves roles + non-Telegram identities). | ✅ |
+| 4 | `4abece6` | CLI surfaces: `plugin-call` (standalone plugin tool invocation), `migrate-config [--dry-run]`, `configure --add-user USER[:ROLE]` / `--remove-user` / `--reset-user-identity USER[:TRANSPORT]`. Legacy `--username` / `--remove-username` aliased with deprecation. `start` and `start-manager` honor `Config.migration_pending` (eager save). `start-manager` hard-fails on empty `Config.allowed_users`. ManagerBot.__init__ transition shim. | ✅ |
+| 5 | `ab6c4fc` + `ce04662` | AuthMixin rewrite around `AllowedUser` (sole source). `_get_user_role` (identity-lock + username fallback + same-transport spoof guard); `_auth_identity` (fail-closed on empty + brute-force lockout); `_require_executor`. ProjectBot `_persist_auth_if_dirty` (scope-aware project/global, per-user merge via `locked_config_rmw`), `_guard_executor` (persists on success and viewer-deny), `_with_auth_persist` + `_wrap_with_persist`. 22 state-changing commands gated. 16 state-changing button prefixes/exact-values gated. Manager bot rewrite (`_users_config_path`, `_persist_auth_if_dirty`, rewritten `_guard` + `_edit_field_save`). Legacy fields removed from `ProjectConfig` and `Config`. Follow-up fix wraps manager command/button paths with `_wrap_with_persist` so first-contact locks survive on transport-native paths. | ✅ |
+| 6 | `9e0b994` + `f3d00ec` | Manager UI: Plugins toggle (per-project, restart-required) with active/inactive markers, executor-gated. Six new user-management commands: `/users` (viewer-allowed), `/add_user`, `/remove_user`, `/promote_user`, `/demote_user`, `/reset_user_identity` (all executor-only via `_require_executor_or_reply`). Legacy `_on_*_from_transport` handlers REMOVED. Follow-up fix adds `COMMANDS` entries for the three new manager commands, rate-limit check, and `Unauthorized.` reply for consistency with `_guard_invocation`. | ✅ |
+| 7 | `cc7661e` | Docs + version bump: README Plugins section (activation, transport-portable authoring, role-based access), CHANGELOG v1.0.0 entry with BREAKING CHANGES call-out, version bumped to `1.0.0` in both `pyproject.toml` and `__init__.py`. `test_version_is_consistent_across_pyproject_and_init` regression test. Parametrized `on_stop` contract test in `tests/transport/test_contract.py` over `[fake, telegram, web]` (closes Task 1 I-2 follow-up). Dead-code cleanup: `_on_trust`, `_with_auth_persist`, dead `trusted_user_*` pass-through kwargs on `ProjectBot.__init__` and `run_bot`. | ✅ |
+
+#### Outstanding follow-ups (non-blocking, queue for v1.0.1)
+
+| Severity | Item | Location |
+|---|---|---|
+| 🟠 Important | Stale "use --username" error message in `run_bot` (should mention `--add-user`). | [bot.py:3194](../src/link_project_to_chat/bot.py) |
+| 🟠 Important | No test for plugin-`start()`-failure → inert command behavior. The `_RecordingPlugin.start_raises` flag exists but no test sets it `True`. | [tests/test_bot_plugin_hooks.py](../tests/test_bot_plugin_hooks.py) |
+| 🟡 Minor | README Quick start / Multi-user sections still recommend the deprecated `--username` flag. CHANGELOG promotes `--add-user`. | [README.md](../README.md) |
+| 🟡 Minor | README plugin snippet imports unused `ChatRef`. | [README.md](../README.md) |
+| 🟡 Minor | `ProjectBot.__init__` comment slightly imprecise about which legacy kwargs remain. | [bot.py](../src/link_project_to_chat/bot.py) |
+| 🟡 Minor | `_persist_auth_if_dirty` swallows all exceptions; no N-failure alerting for repeated disk-write failures. | [bot.py](../src/link_project_to_chat/bot.py), [manager/bot.py](../src/link_project_to_chat/manager/bot.py) |
 
 ---
 
@@ -288,17 +319,17 @@ These were found by reading current code paths directly, not by reusing the docu
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path |
+| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path + **Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)** |
 | 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) |
 | 📋 Designed, not started | 3 transport specs (Discord #2, Slack #3, Google Chat #4), Backend Phase 5 (Gemini adapter), sandbox |
-| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec). Direct code-audit findings CA-1..CA-5 are closed with regression coverage. |
+| ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec). 6 non-blocking follow-ups from v1.0.0 final review queued for v1.0.1 (§1.4). Direct code-audit findings CA-1..CA-5 are closed with regression coverage. |
 
 ---
 
 ## Source Documents
 
-**Specs:** [docs/superpowers/specs/](superpowers/specs/) (17 design docs)
-**Plans:** [docs/superpowers/plans/](superpowers/plans/) (23 implementation plans)
+**Specs:** [docs/superpowers/specs/](superpowers/specs/) (18 design docs, incl. plugin system port)
+**Plans:** [docs/superpowers/plans/](superpowers/plans/) (24 implementation plans, incl. plugin system port)
 **Audit:** [issues-2026-04-22.md](issues-2026-04-22.md) · [2026-04-22-remediation-plan.md](2026-04-22-remediation-plan.md) · [review-2026-04-22-batch1.md](review-2026-04-22-batch1.md)
 **Follow-ups:** [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 **State:** [where-are-we.md](../where-are-we.md) · [CHANGELOG.md](CHANGELOG.md)
