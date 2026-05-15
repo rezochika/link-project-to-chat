@@ -124,21 +124,17 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
         # migration helper only re-synthesizes when allowed_users is empty.
         norm = username.lower().lstrip("@")
         entry["allowed_users"] = [{"username": norm, "role": "executor"}]
-    # Phase 2: write the new shape (backend + backend_state). load_config()
-    # mirrors legacy flat fields back from backend_state on read, and
-    # save_config() keeps the legacy mirror in sync, so older code paths
-    # still see the values they expect.
+    # Canonical post-v1.0 shape: backend + backend_state["claude"][*]. The
+    # pre-v1.0 top-level legacy mirror (model / permissions) was kept one
+    # release for downgrade safety; v1.0.0 stopped emitting it.
     entry["backend"] = "claude"
     claude_state: dict[str, object] = {}
     if model:
         claude_state["model"] = model
-        entry["model"] = model  # legacy mirror for downgrade safety
     if skip_permissions:
         claude_state["permissions"] = "dangerously-skip-permissions"
-        entry["permissions"] = "dangerously-skip-permissions"
     elif permission_mode:
         claude_state["permissions"] = permission_mode
-        entry["permissions"] = permission_mode
     entry["backend_state"] = {"claude": claude_state} if claude_state else {}
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")

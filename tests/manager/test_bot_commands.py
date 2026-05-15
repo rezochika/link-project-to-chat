@@ -201,7 +201,10 @@ async def test_addproject_with_all_options(bot_env, tmp_path: Path):
     # pre-existing allowed_users on next load).
     assert "username" not in proj
     assert proj["allowed_users"] == [{"username": "myuser", "role": "executor"}]
-    assert proj["model"] == "opus"
+    # v1.0.0 dropped the legacy top-level mirror; canonical home is
+    # backend_state["claude"]["model"].
+    assert proj["backend_state"]["claude"]["model"] == "opus"
+    assert "model" not in proj
 
 
 @pytest.mark.asyncio
@@ -487,7 +490,10 @@ async def test_edit_field_prompt_and_save(bot_env, tmp_path: Path):
     # Clicking a model option saves it
     click2, _ = _make_button_click("proj_model_opus_myproj")
     await bot._on_button_from_transport(click2)
-    assert json.loads(proj_cfg.read_text())["projects"]["myproj"].get("model") == "opus"
+    # v1.0.0 dropped the legacy top-level mirror; canonical home is backend_state.
+    proj = json.loads(proj_cfg.read_text())["projects"]["myproj"]
+    assert proj["backend_state"]["claude"]["model"] == "opus"
+    assert "model" not in proj
 
 
 @pytest.mark.asyncio

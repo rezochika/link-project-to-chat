@@ -102,12 +102,24 @@ def test_new_shape_round_trip_preserves_backend_state(tmp_path: Path):
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     assert raw["projects"]["demo"]["backend"] == "claude"
-    assert raw["projects"]["demo"]["backend_state"]["claude"]["model"] == "opus"
-    assert raw["projects"]["demo"]["session_id"] == "sess-1"
-    assert raw["default_model"] == "sonnet"
+    state = raw["projects"]["demo"]["backend_state"]["claude"]
+    assert state["model"] == "opus"
+    assert state["session_id"] == "sess-1"
+    assert state["permissions"] == "plan"
+    assert state["show_thinking"] is True
+    # Legacy top-level mirror was dropped in v1.0.0; only the canonical
+    # nested shape is written now.
+    for legacy_key in ("model", "session_id", "permissions", "show_thinking", "effort"):
+        assert legacy_key not in raw["projects"]["demo"], (
+            f"legacy mirror key {legacy_key!r} should not be re-emitted on save"
+        )
+    assert raw["default_model_claude"] == "sonnet"
+    assert "default_model" not in raw
 
 
-def test_save_session_writes_backend_state_and_legacy_mirror(tmp_path: Path):
+def test_save_session_writes_backend_state_only_no_legacy_mirror(tmp_path: Path):
+    """save_session writes session_id under backend_state["claude"] and strips
+    any legacy top-level mirror that may have lingered from a pre-v1.0 config."""
     from link_project_to_chat.config import save_session
 
     path = tmp_path / "config.json"
@@ -120,6 +132,9 @@ def test_save_session_writes_backend_state_and_legacy_mirror(tmp_path: Path):
                         "telegram_bot_token": "tok",
                         "backend": "claude",
                         "backend_state": {"claude": {}},
+                        # Simulate a lingering legacy top-level mirror from a
+                        # pre-v1.0 on-disk config — the save path must strip it.
+                        "session_id": "old-legacy",
                     }
                 }
             }
@@ -131,7 +146,9 @@ def test_save_session_writes_backend_state_and_legacy_mirror(tmp_path: Path):
     raw = json.loads(path.read_text(encoding="utf-8"))
 
     assert raw["projects"]["demo"]["backend_state"]["claude"]["session_id"] == "sess-1"
-    assert raw["projects"]["demo"]["session_id"] == "sess-1"
+    assert "session_id" not in raw["projects"]["demo"], (
+        "legacy top-level session_id mirror should be stripped on save"
+    )
 
 
 def test_save_session_uses_active_non_claude_backend_without_legacy_mirror(tmp_path: Path):
@@ -160,7 +177,10 @@ def test_save_session_uses_active_non_claude_backend_without_legacy_mirror(tmp_p
 
     assert raw["projects"]["demo"]["backend_state"]["codex"]["session_id"] == "sess-codex"
     assert raw["projects"]["demo"]["backend_state"]["claude"]["session_id"] == "old-claude"
-    assert raw["projects"]["demo"]["session_id"] == "old-claude"
+    # The legacy top-level session_id mirror was kept for one release; v1.0.0
+    # dropped it. Codex saves never emitted the Claude mirror — confirm the
+    # leftover legacy key from the seed JSON is stripped on save.
+    assert "session_id" not in raw["projects"]["demo"]
 
 
 def test_load_session_prefers_backend_state(tmp_path: Path):

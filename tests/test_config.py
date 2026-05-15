@@ -241,8 +241,10 @@ def test_patch_json_serializes_overlapping_writes(tmp_path: Path, monkeypatch):
     assert second_ready.is_set()
 
     raw = json.loads(p.read_text())
-    assert raw["projects"]["proj1"]["session_id"] == "sess-123"
-    assert raw["projects"]["proj2"]["session_id"] == "sess-456"
+    # v1.0.0 dropped the legacy top-level mirror; canonical home is
+    # backend_state["claude"]["session_id"].
+    assert raw["projects"]["proj1"]["backend_state"]["claude"]["session_id"] == "sess-123"
+    assert raw["projects"]["proj2"]["backend_state"]["claude"]["session_id"] == "sess-456"
 
 
 def test_per_project_username_legacy_migrate_strips_at(tmp_path: Path):
@@ -713,6 +715,94 @@ def test_project_show_thinking_defaults_false(tmp_path: Path):
     }))
     loaded = load_config(p)
     assert loaded.projects["proj"].show_thinking is False
+
+
+def test_save_does_not_emit_legacy_top_level_claude_keys(tmp_path: Path):
+    """Phase 2 of the backend abstraction dual-wrote model/effort/permissions/
+    session_id/show_thinking at the project entry top level alongside
+    backend_state["claude"]. The mirror was kept one release for downgrade
+    safety; v1.0.0 dropped it. Save must emit ONLY the canonical nested shape.
+    """
+    p = tmp_path / "cfg.json"
+    cfg = Config(
+        projects={
+            "proj": ProjectConfig(
+                path="/x",
+                telegram_bot_token="T",
+                backend_state={
+                    "claude": {
+                        "model": "opus",
+                        "effort": "high",
+                        "permissions": "plan",
+                        "session_id": "sess-1",
+                        "show_thinking": True,
+                    }
+                },
+            )
+        },
+        default_model_claude="sonnet",
+    )
+    save_config(cfg, p)
+    raw = json.loads(p.read_text())
+
+    state = raw["projects"]["proj"]["backend_state"]["claude"]
+    assert state == {
+        "model": "opus",
+        "effort": "high",
+        "permissions": "plan",
+        "session_id": "sess-1",
+        "show_thinking": True,
+    }
+    proj_entry = raw["projects"]["proj"]
+    for legacy_key in ("model", "effort", "permissions", "session_id", "show_thinking"):
+        assert legacy_key not in proj_entry, (
+            f"legacy mirror key {legacy_key!r} should not be re-emitted on save"
+        )
+    assert raw["default_model_claude"] == "sonnet"
+    assert "default_model" not in raw
+
+
+def test_save_strips_lingering_pre_v1_legacy_keys(tmp_path: Path):
+    """A pre-v1.0 on-disk config carrying both shapes (because v0.16 dual-wrote
+    the legacy mirror) must end up with ONLY the canonical shape on first
+    save after upgrade. The top-level legacy keys are stripped, the nested
+    backend_state["claude"] entry is preserved unchanged.
+    """
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({
+        "default_model": "sonnet",
+        "default_model_claude": "sonnet",
+        "projects": {
+            "demo": {
+                "path": "/p",
+                "telegram_bot_token": "T",
+                "model": "opus",
+                "permissions": "plan",
+                "session_id": "sess-1",
+                "show_thinking": True,
+                "backend": "claude",
+                "backend_state": {
+                    "claude": {
+                        "model": "opus",
+                        "permissions": "plan",
+                        "session_id": "sess-1",
+                        "show_thinking": True,
+                    }
+                },
+            }
+        },
+    }))
+    loaded = load_config(p)
+    save_config(loaded, p)
+    raw = json.loads(p.read_text())
+
+    proj_entry = raw["projects"]["demo"]
+    for legacy_key in ("model", "effort", "permissions", "session_id", "show_thinking"):
+        assert legacy_key not in proj_entry
+    assert proj_entry["backend_state"]["claude"]["model"] == "opus"
+    assert proj_entry["backend_state"]["claude"]["session_id"] == "sess-1"
+    assert "default_model" not in raw
+    assert raw["default_model_claude"] == "sonnet"
 
 
 def test_load_config_skips_phantom_project_without_path(tmp_path: Path, caplog):
