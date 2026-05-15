@@ -33,6 +33,21 @@ def _invocation(args: list[str], sender_handle: str = "admin", sender_id: str = 
     return CommandInvocation(chat=chat, sender=sender, name="cmd", args=args, raw_text=" ".join(args), message=msg)
 
 
+def _attach_running_pm(bot, running_names: list[str]):
+    """Attach a mock ProcessManager to `bot` reporting the given names as
+    running so user-mutation commands can record stop+start calls.
+
+    Returns the mock so assertions can inspect call arguments.
+    """
+    pm = MagicMock()
+    pm.list_all = MagicMock(return_value=[(n, "running") for n in running_names])
+    pm.stop = MagicMock(return_value=True)
+    pm.start = MagicMock(return_value=True)
+    pm.status = MagicMock(side_effect=lambda n: "running" if n in running_names else "stopped")
+    bot._pm = pm
+    return pm
+
+
 @pytest.mark.asyncio
 async def test_users_lists_current_state(tmp_path):
     bot = _make_manager(tmp_path, [
@@ -364,3 +379,90 @@ async def test_user_commands_work_without_explicit_config_path(monkeypatch, tmp_
     # this line. Reaching here proves the fallback to DEFAULT_CONFIG worked.
     written = json.loads(cfg_path.read_text())
     assert any(u["username"] == "bob" for u in written.get("allowed_users", []))
+
+
+# --- Restart-on-mutation regressions ---------------------------------------
+# Without these, a running project bot keeps its startup _allowed_users
+# snapshot — so /demote_user / /remove_user / /reset_user_identity are
+# ineffective until the operator manually restarts the bot.
+
+
+@pytest.mark.asyncio
+async def test_add_user_restarts_running_project_bots(tmp_path):
+    bot = _make_manager(tmp_path)
+    pm = _attach_running_pm(bot, ["proj_a", "proj_b"])
+    await bot._on_add_user(_invocation(["charlie"]))
+    pm.stop.assert_any_call("proj_a")
+    pm.stop.assert_any_call("proj_b")
+    pm.start.assert_any_call("proj_a")
+    pm.start.assert_any_call("proj_b")
+
+
+@pytest.mark.asyncio
+async def test_remove_user_restarts_running_project_bots(tmp_path):
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+        AllowedUser(username="alice", role="executor"),
+    ])
+    pm = _attach_running_pm(bot, ["proj_a"])
+    await bot._on_remove_user(_invocation(["alice"]))
+    pm.stop.assert_called_once_with("proj_a")
+    pm.start.assert_called_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_promote_user_restarts_running_project_bots(tmp_path):
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+        AllowedUser(username="alice", role="viewer"),
+    ])
+    pm = _attach_running_pm(bot, ["proj_a"])
+    await bot._on_promote_user(_invocation(["alice"]))
+    pm.stop.assert_called_once_with("proj_a")
+    pm.start.assert_called_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_demote_user_restarts_running_project_bots(tmp_path):
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+        AllowedUser(username="alice", role="executor"),
+    ])
+    pm = _attach_running_pm(bot, ["proj_a"])
+    await bot._on_demote_user(_invocation(["alice"]))
+    pm.stop.assert_called_once_with("proj_a")
+    pm.start.assert_called_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_reset_user_identity_restarts_running_project_bots(tmp_path):
+    bot = _make_manager(tmp_path, [
+        AllowedUser(username="admin", role="executor", locked_identities=["telegram:1"]),
+        AllowedUser(username="alice", role="executor", locked_identities=["telegram:9", "web:abc"]),
+    ])
+    pm = _attach_running_pm(bot, ["proj_a"])
+    await bot._on_reset_user_identity(_invocation(["alice"]))
+    pm.stop.assert_called_once_with("proj_a")
+    pm.start.assert_called_once_with("proj_a")
+
+
+@pytest.mark.asyncio
+async def test_user_mutation_skips_restart_when_no_bots_running(tmp_path):
+    """If nothing is running there's nothing to restart — and we must NOT
+    spawn a stopped bot just because a user mutation happened."""
+    bot = _make_manager(tmp_path)
+    pm = _attach_running_pm(bot, [])  # nothing running
+    await bot._on_add_user(_invocation(["charlie"]))
+    pm.stop.assert_not_called()
+    pm.start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_user_mutation_no_op_does_not_restart(tmp_path):
+    """A failed-validation path (invalid role) must NOT trigger a restart —
+    nothing was persisted, so there's nothing for project bots to pick up."""
+    bot = _make_manager(tmp_path)
+    pm = _attach_running_pm(bot, ["proj_a"])
+    await bot._on_add_user(_invocation(["charlie", "godmode"]))
+    pm.stop.assert_not_called()
+    pm.start.assert_not_called()

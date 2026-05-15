@@ -900,6 +900,31 @@ class ManagerBot(AuthMixin):
         finally:
             await self._persist_auth_if_dirty()
 
+    def _restart_running_bots_for_user_mutation(self) -> list[str]:
+        """Stop+start every currently-running bot under this manager.
+
+        Project bots cache `_allowed_users` at startup, so a /demote_user,
+        /remove_user, /promote_user, /add_user, or /reset_user_identity does
+        not change a running bot's authorization view until a restart. This
+        helper, invoked at the tail of every user-mutation command, makes the
+        change effective immediately. Transport-agnostic (Telegram bots have
+        the same staleness as web bots) and team-bot-aware (covers entries
+        keyed `team:NAME:ROLE`).
+
+        Returns the list of bot keys actually restarted so callers can surface
+        the count in the operator reply.
+        """
+        restarted: list[str] = []
+        if getattr(self, "_pm", None) is None:
+            return restarted
+        for name, status in list(self._pm.list_all()):
+            if status != "running":
+                continue
+            self._pm.stop(name)
+            if self._pm.start(name):
+                restarted.append(name)
+        return restarted
+
     async def _on_add_user(self, ci: "CommandInvocation") -> None:
         """/add_user <username> [viewer|executor] — default executor."""
         if not await self._require_executor_or_reply(ci):
@@ -927,8 +952,12 @@ class ManagerBot(AuthMixin):
         else:
             cfg.allowed_users.append(AllowedUser(username=username, role=role))
         self._save_config_for_users(cfg)
+        restarted = self._restart_running_bots_for_user_mutation()
         await self._transport.send_text(
-            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+            ci.chat,
+            self._format_users_list(cfg.allowed_users)
+            + (f"\n\nRestarted {len(restarted)} running bot(s) to apply." if restarted else ""),
+            reply_to=ci.message,
         )
 
     async def _on_remove_user(self, ci: "CommandInvocation") -> None:
@@ -944,8 +973,12 @@ class ManagerBot(AuthMixin):
         cfg = self._load_config_for_users()
         cfg.allowed_users = [u for u in cfg.allowed_users if u.username != username]
         self._save_config_for_users(cfg)
+        restarted = self._restart_running_bots_for_user_mutation()
         await self._transport.send_text(
-            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+            ci.chat,
+            self._format_users_list(cfg.allowed_users)
+            + (f"\n\nRestarted {len(restarted)} running bot(s) to apply." if restarted else ""),
+            reply_to=ci.message,
         )
 
     async def _set_role(self, ci: "CommandInvocation", new_role: str) -> None:
@@ -974,8 +1007,12 @@ class ManagerBot(AuthMixin):
             return
         u.role = new_role
         self._save_config_for_users(cfg)
+        restarted = self._restart_running_bots_for_user_mutation()
         await self._transport.send_text(
-            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+            ci.chat,
+            self._format_users_list(cfg.allowed_users)
+            + (f"\n\nRestarted {len(restarted)} running bot(s) to apply." if restarted else ""),
+            reply_to=ci.message,
         )
 
     async def _on_promote_user(self, ci: "CommandInvocation") -> None:
@@ -1014,8 +1051,12 @@ class ManagerBot(AuthMixin):
         else:
             u.locked_identities = []
         self._save_config_for_users(cfg)
+        restarted = self._restart_running_bots_for_user_mutation()
         await self._transport.send_text(
-            ci.chat, self._format_users_list(cfg.allowed_users), reply_to=ci.message,
+            ci.chat,
+            self._format_users_list(cfg.allowed_users)
+            + (f"\n\nRestarted {len(restarted)} running bot(s) to apply." if restarted else ""),
+            reply_to=ci.message,
         )
 
     async def _on_setup_from_transport(self, invocation: "CommandInvocation") -> None:
