@@ -1916,7 +1916,22 @@ class ManagerBot(AuthMixin):
         legacy _on_callback(update, ctx) PTB handler. Wizard-internal callbacks
         (inside ConversationHandler.states) remain PTB-typed; this handler owns
         the GLOBAL ladder previously served by app.add_handler(CallbackQueryHandler).
+
+        The outer try/finally fires ``_persist_auth_if_dirty`` on every exit
+        path. ``_auth_identity`` → ``_get_user_role`` may append a first-contact
+        identity to ``AllowedUser.locked_identities`` and flip ``_auth_dirty``;
+        missing the persist tail would lose that lock on restart — letting a
+        spoofer who lands first after restart bind their own native_id.
         """
+        try:
+            await self._dispatch_button_click(click)
+        finally:
+            await self._persist_auth_if_dirty()
+
+    async def _dispatch_button_click(self, click: "ButtonClick") -> None:
+        """Inner body of _on_button_from_transport. Extracted so the public
+        entry point can wrap the dispatch ladder with the persist-tail
+        try/finally without indenting the whole 300-line body."""
         if not self._auth_identity(click.sender):
             return  # silent for unauthorized callbacks (don't reveal handler structure)
 
@@ -2211,6 +2226,56 @@ class ManagerBot(AuthMixin):
         elif value == "setup_done":
             await self._transport.edit_text(click.message, "Setup complete.")
 
+    def _register_transport_commands(self, app=None) -> None:
+        """Register the manager's transport-native command handlers.
+
+        Wraps every handler with a try/finally that calls
+        ``_persist_auth_if_dirty`` on every exit path (success, deny,
+        rate-limited, exception). Without this, first-contact identity
+        locks appended by ``_auth_identity`` → ``_get_user_role`` inside
+        the handler would be lost on restart — letting a spoofer who
+        lands first after restart bind their own native_id to the
+        username. Mirrors ProjectBot.build()'s ``_wrap_with_persist``
+        pattern (commit b396b1e).
+
+        ``app`` is optional: ``build()`` passes the PTB Application so the
+        bridge handlers also register, but tests can call this method
+        with the Application omitted to exercise the wrapping in
+        isolation against a ``FakeTransport``.
+
+        TODO(spec #1): Underscore-method access needed because the manager
+        can't use attach_telegram_routing (conflicts with
+        ConversationHandler CallbackQueryHandlers). Consider elevating
+        _dispatch_{command,button} to public API in the
+        Conversation-primitive spec.
+        """
+        ported_commands = {
+            "projects": self._on_projects_from_transport,
+            "teams": self._on_teams_from_transport,
+            "version": self._on_version_from_transport,
+            "help": self._on_help_from_transport,
+            "users": self._on_users_from_transport,
+            "start_all": self._on_start_all_from_transport,
+            "stop_all": self._on_stop_all_from_transport,
+            "model": self._on_model_from_transport,
+            "add_user": self._on_add_user_from_transport,
+            "remove_user": self._on_remove_user_from_transport,
+            "setup": self._on_setup_from_transport,
+        }
+
+        def _wrap_with_persist(handler):
+            async def _wrapped(arg):
+                try:
+                    await handler(arg)
+                finally:
+                    await self._persist_auth_if_dirty()
+            return _wrapped
+
+        for name, handler in ported_commands.items():
+            self._transport.on_command(name, _wrap_with_persist(handler))
+            if app is not None:
+                app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))
+
     async def _post_init(self, app) -> None:
         await app.bot.delete_webhook(drop_pending_updates=True)
         await app.bot.set_my_commands(COMMANDS)
@@ -2313,29 +2378,9 @@ class ManagerBot(AuthMixin):
         self._app.post_stop = self._post_stop
         app = self._app
 
-        # Fully-ported commands (spec #0c Tasks 8-9) — consume CommandInvocation
-        # directly. Registered on the transport; PTB is bridged via
-        # _dispatch_command so the existing app.add_handler pathway still works.
-        # TODO(spec #1): Underscore-method access needed because the manager
-        # can't use attach_telegram_routing (conflicts with ConversationHandler
-        # CallbackQueryHandlers). Consider elevating _dispatch_{command,button}
-        # to public API in the Conversation-primitive spec.
-        ported_commands = {
-            "projects": self._on_projects_from_transport,
-            "teams": self._on_teams_from_transport,
-            "version": self._on_version_from_transport,
-            "help": self._on_help_from_transport,
-            "users": self._on_users_from_transport,
-            "start_all": self._on_start_all_from_transport,
-            "stop_all": self._on_stop_all_from_transport,
-            "model": self._on_model_from_transport,
-            "add_user": self._on_add_user_from_transport,
-            "remove_user": self._on_remove_user_from_transport,
-            "setup": self._on_setup_from_transport,
-        }
-        for name, handler in ported_commands.items():
-            self._transport.on_command(name, handler)
-            app.add_handler(CommandHandler(name, self._transport.bridge_command(name)))
+        # Fully-ported commands (spec #0c Tasks 8-9). Registered via the
+        # helper below so the persist-tail wrap fires on every exit path.
+        self._register_transport_commands(app)
 
         # Legacy commands — still use Update/ctx internals; bridged to PTB
         # directly until their respective tasks port them.

@@ -150,3 +150,139 @@ async def test_edit_field_save_persists_on_auth_deny(monkeypatch):
     await bot._edit_field_save(update, ctx)
     assert persisted == [True]
     assert "pending_edit" in ctx.user_data
+
+
+# ─── Critical follow-up: persist on transport-native command + button paths ───
+#
+# Regression for two Critical bugs identified by code review on Task 5 commit
+# ab6c4fc. The Task 5 rewrite makes _auth_identity → _get_user_role append a
+# first-contact identity to AllowedUser.locked_identities and set
+# _auth_dirty=True. The transport-native command handlers (registered via
+# _transport.on_command) and the button dispatcher
+# (_on_button_from_transport) both call _auth_identity but did not persist
+# the dirty flag — so a first-contact lock created mid-session would be lost
+# on restart, letting a spoofer who lands first after restart bind their own
+# native_id to the username.
+
+async def test_command_registration_wraps_with_persist(monkeypatch, tmp_path):
+    """Manager's transport-native commands must be wrapped at registration
+    so EVERY exit path (allow / deny / rate-limited / exception) fires
+    _persist_auth_if_dirty. _guard_invocation alone does not — it's called
+    from inside each handler, and historically had no try/finally tail."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from link_project_to_chat.manager.process import ProcessManager
+    from link_project_to_chat.transport import (
+        ChatKind,
+        CommandInvocation,
+        MessageRef,
+    )
+    from link_project_to_chat.transport.base import ChatRef, Identity
+
+    proj_cfg = tmp_path / "projects.json"
+    proj_cfg.write_text(json.dumps({"projects": {}}))
+    pm = ProcessManager(project_config_path=proj_cfg)
+    bot = ManagerBot(
+        "TOKEN", pm,
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+        project_config_path=proj_cfg,
+    )
+
+    # Use a FakeTransport (build() would require Telegram). Mirror what
+    # build() does for command registration so the wrap path runs.
+    fake = FakeTransport()
+    bot._transport = fake
+
+    persisted: list[bool] = []
+
+    async def _track() -> None:
+        persisted.append(True)
+
+    monkeypatch.setattr(bot, "_persist_auth_if_dirty", _track)
+    monkeypatch.setattr(bot, "_auth_identity", lambda identity: True)
+    monkeypatch.setattr(bot, "_rate_limited", lambda key: False)
+
+    # Re-run the manager's command registration block. We exercise the
+    # public wrapper helper rather than call build() (which needs telegram).
+    bot._register_transport_commands()
+
+    chat = ChatRef(transport_id="fake", native_id="42", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="98765",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    invocation = CommandInvocation(
+        chat=chat,
+        sender=sender,
+        name="version",
+        args=[],
+        raw_text="/version",
+        message=MessageRef(transport_id="fake", native_id="1", chat=chat),
+    )
+    # _track is async no-op; send_text on FakeTransport already does nothing
+    # destructive. Run the wrapped handler that was registered with the fake.
+    wrapped = fake._command_handlers["version"]
+    await wrapped(invocation)
+
+    # Even on the success path, the wrapper must fire persist.
+    assert persisted == [True]
+
+
+async def test_on_button_from_transport_persists_first_contact(monkeypatch):
+    """_on_button_from_transport calls _auth_identity which may append a
+    first-contact identity. Must call _persist_auth_if_dirty afterwards or
+    the lock is lost on restart."""
+    from unittest.mock import AsyncMock
+    from link_project_to_chat.transport import ButtonClick, MessageRef
+    from link_project_to_chat.transport.base import ChatRef, ChatKind, Identity
+
+    bot = _make_bot()
+    persisted: list[bool] = []
+
+    async def _track() -> None:
+        persisted.append(True)
+
+    monkeypatch.setattr(bot, "_persist_auth_if_dirty", _track)
+    monkeypatch.setattr(bot, "_auth_identity", lambda identity: True)
+
+    chat = ChatRef(transport_id="fake", native_id="42", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="98765",
+        display_name="Alice", handle="alice", is_bot=False,
+    )
+    msg = MessageRef(transport_id="fake", native_id="100", chat=chat)
+    # value="noop" — doesn't match any prefix in the dispatch ladder, so
+    # the body completes the auth check and exits without raising. The
+    # try/finally must fire persist regardless.
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="noop")
+
+    await bot._on_button_from_transport(click)
+    assert persisted == [True]
+
+
+async def test_on_button_from_transport_persists_on_unauth(monkeypatch):
+    """Even the unauthorized branch (silent return) must fire persist —
+    _auth_identity may have appended a first-contact identity before
+    returning False (e.g. role lookup raced with a config change)."""
+    from link_project_to_chat.transport import ButtonClick, MessageRef
+    from link_project_to_chat.transport.base import ChatRef, ChatKind, Identity
+
+    bot = _make_bot()
+    persisted: list[bool] = []
+
+    async def _track() -> None:
+        persisted.append(True)
+
+    monkeypatch.setattr(bot, "_persist_auth_if_dirty", _track)
+    monkeypatch.setattr(bot, "_auth_identity", lambda identity: False)
+
+    chat = ChatRef(transport_id="fake", native_id="42", kind=ChatKind.DM)
+    sender = Identity(
+        transport_id="fake", native_id="98765",
+        display_name="Eve", handle="eve", is_bot=False,
+    )
+    msg = MessageRef(transport_id="fake", native_id="100", chat=chat)
+    click = ButtonClick(chat=chat, message=msg, sender=sender, value="proj_back")
+
+    await bot._on_button_from_transport(click)
+    assert persisted == [True]
