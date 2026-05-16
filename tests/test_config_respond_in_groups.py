@@ -103,3 +103,48 @@ def test_respond_in_groups_non_bool_input_coerces_to_false(tmp_path: Path, caplo
         "respond_in_groups" in r.message.lower()
         for r in caplog.records
     )
+
+
+def test_respond_in_groups_int_one_coerces_to_true(tmp_path: Path, caplog):
+    """A hand-edited config that uses int 1 (some operators / editors emit
+    plain ints) silently coerces to True — Python ``bool(1) is True``. No
+    WARNING; this is a documented tolerant path."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "respond_in_groups": 1,
+            }
+        }
+    })
+    with caplog.at_level("WARNING"):
+        loaded = load_config(cfg_file)
+    assert loaded.projects["p"].respond_in_groups is True
+    # int-coercion path is tolerant — no warning for valid 0/1.
+    assert not any(
+        "respond_in_groups" in r.message.lower()
+        for r in caplog.records
+    )
+
+
+def test_respond_in_groups_int_zero_coerces_to_false(tmp_path: Path, caplog):
+    """Symmetric: int 0 coerces to False without warning."""
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {
+        "projects": {
+            "p": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "respond_in_groups": 0,
+            }
+        }
+    })
+    with caplog.at_level("WARNING"):
+        loaded = load_config(cfg_file)
+    assert loaded.projects["p"].respond_in_groups is False
+    assert not any(
+        "respond_in_groups" in r.message.lower()
+        for r in caplog.records
+    )

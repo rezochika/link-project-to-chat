@@ -273,6 +273,32 @@ async def test_group_empty_text_after_strip_does_not_reach_on_text():
 
 
 @pytest.mark.asyncio
+async def test_group_edited_message_newly_including_mention_reaches_on_text():
+    """When a user edits a previously plain group message to add `@MyBot`,
+    PTB delivers it via the EDITED_MESSAGE filter, the transport adapter
+    converts it into a normal IncomingMessage (no edited-vs-fresh marker),
+    and the bot's gate processes it exactly like a fresh @mention.
+
+    Pins the design-doc Edge cases row: "Edited message that newly
+    includes @MyBot → Processed". From the bot's perspective an edited
+    message is indistinguishable from a fresh one — both arrive as the
+    same IncomingMessage shape — so the gate behavior is identical.
+    """
+    bot = _make_bot(respond_in_groups=True)
+    # Simulate the IncomingMessage we'd get from `_dispatch_message` after
+    # a user edits "hi all" → "hi all @MyBot do X". Same shape as a fresh
+    # mention; the transport doesn't surface an is_edited flag.
+    incoming = _make_group_incoming(
+        "hi all @MyBot do X",
+        mentions=[_bot_mention("MyBot")],
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    assert forwarded.text == "hi all  do X"  # @MyBot stripped
+
+
+@pytest.mark.asyncio
 async def test_group_voice_with_caption_mention_routes_to_voice_dispatch():
     """Voice notes in groups with @mention (via caption surfaced as text)
     route through _on_voice_from_transport, NOT _on_text. Same gate logic
