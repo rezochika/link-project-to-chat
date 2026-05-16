@@ -287,9 +287,11 @@ class ClaudeBackend(BaseBackend):
         if effective_disallowed:
             cmd.extend(["--disallowedTools", ",".join(effective_disallowed)])
 
-        # Combine Telegram awareness, AskUserQuestion hint, team context (if any),
-        # and any user/skill prompt.
+        # Combine: telegram awareness, ask-dismissed hint, safety prompt (new),
+        # team context (if any), operator-supplied append_system_prompt.
         parts = [_build_telegram_awareness(self.capabilities), _ASK_DISMISSED_HINT]
+        if self.safety_system_prompt:
+            parts.append(self.safety_system_prompt)
         if self.team_system_note:
             parts.append(self.team_system_note)
         if self.append_system_prompt:
