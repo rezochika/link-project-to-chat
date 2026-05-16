@@ -178,3 +178,36 @@ def test_project_scope_falls_back_to_global_when_project_users_empty(tmp_path: P
     stub = _Stub(cfg, project_name="p")
     stub._reload_allowed_users_if_stale()
     assert any(u.username == "global_alice" for u in stub._allowed_users)
+
+
+def test_reload_missing_file_keeps_state(tmp_path: Path):
+    """Pointing at a non-existent config preserves the in-memory ctor seed.
+
+    Production wiring sets ``_project_config_path = config_path or
+    DEFAULT_CONFIG`` so the field is never None, but the file itself may not
+    exist yet (one-shot ``--path/--token`` start, tests with a tmp_path
+    config that wasn't written to disk). The reload must NOT drop the
+    in-memory users in that case.
+    """
+    cfg = tmp_path / "missing.json"
+    assert not cfg.exists()
+    stub = _Stub(cfg, project_name="p")
+    stub._allowed_users = [AllowedUser(username="alice", role="executor")]
+    stub._reload_allowed_users_if_stale()
+    assert any(u.username == "alice" for u in stub._allowed_users)
+
+
+def test_reload_empty_disk_keeps_in_memory(tmp_path: Path):
+    """Disk resolves to zero users + memory has users → keep memory.
+
+    The operator hasn't expressed intent to lock the bot out (no global, no
+    project entries). Clobbering would drop the ctor-synthesized
+    ``allowed_username`` set that the bot was started with.
+    """
+    cfg = tmp_path / "config.json"
+    # File exists but resolves to zero users at every scope.
+    cfg.write_text('{"projects": {"p": {"path": "/tmp", "telegram_bot_token": "t"}}}')
+    stub = _Stub(cfg, project_name="p")
+    stub._allowed_users = [AllowedUser(username="alice", role="executor")]
+    stub._reload_allowed_users_if_stale()
+    assert any(u.username == "alice" for u in stub._allowed_users)

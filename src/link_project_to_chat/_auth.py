@@ -36,6 +36,18 @@ class AuthMixin:
         # First-contact lock APPENDS to locked_identities in-memory; this flag
         # tells the bot's message-handling tail to call save_config once.
         self._auth_dirty: bool = False
+        # Hot-reload companion state (see _reload_allowed_users_if_stale).
+        # ``setdefault``-style assignment so subclasses that assigned the
+        # path/name BEFORE calling _init_auth() are not clobbered. A None
+        # path keeps the reload a safe no-op for AuthMixin-only consumers
+        # and test stubs. _last_allowed_users_reload is always set so the
+        # debounce arithmetic never raises AttributeError on opt-in
+        # subclasses.
+        if not hasattr(self, "_project_config_path"):
+            self._project_config_path = None
+        if not hasattr(self, "_project_name"):
+            self._project_name: str | None = None
+        self._last_allowed_users_reload: float = 0.0
 
     @staticmethod
     def _normalize_username(handle) -> str:
@@ -122,6 +134,10 @@ class AuthMixin:
 
     def _auth_identity(self, identity) -> bool:
         """True iff identity resolves to any role. Fail-closed on empty."""
+        # Pick up manager-bot writes to allowed_users without a restart.
+        # The reload is a no-op on subclasses that don't set the state
+        # (guarded by hasattr inside _reload_allowed_users_if_stale).
+        self._reload_allowed_users_if_stale()
         if not self._allowed_users:
             return False
         key = self._identity_key(identity)
@@ -154,6 +170,10 @@ class AuthMixin:
         Skips when:
           - self._auth_dirty is True (unsaved changes; would clobber)
           - <5 s have elapsed since last reload (debounce)
+          - the resolved disk scope has zero users while memory is non-empty
+            (operator hasn't expressed intent to lock the bot out; this also
+            preserves the legacy ``allowed_username`` startup path where the
+            bot's auth state lives only in memory until first persist)
 
         On reload, merges by username:
           - disk role wins
@@ -164,7 +184,7 @@ class AuthMixin:
         Failures (missing file, parse error) log + keep current state +
         update the timestamp so we retry in 5 s.
         """
-        if not hasattr(self, "_project_config_path"):
+        if getattr(self, "_project_config_path", None) is None:
             return  # Subclass doesn't participate in hot-reload.
         if self._auth_dirty:
             return
@@ -172,6 +192,13 @@ class AuthMixin:
         if now - self._last_allowed_users_reload < self._RELOAD_DEBOUNCE_SECONDS:
             return
         self._last_allowed_users_reload = now
+        # Missing config file → treat as "no disk state to merge from" and
+        # keep current in-memory users. ``load_config`` quietly returns an
+        # empty Config when the file is missing, which would otherwise let the
+        # merge below drop every in-memory user (the ctor-synthesized
+        # ``allowed_username`` set is the common case here).
+        if not self._project_config_path.exists():
+            return
         try:
             from .config import load_config, resolve_project_allowed_users
             config = load_config(self._project_config_path)
@@ -188,6 +215,13 @@ class AuthMixin:
             logger.warning(
                 "hot-reload of allowed_users failed", exc_info=True,
             )
+            return
+
+        # Empty disk + non-empty memory → keep memory. The operator hasn't
+        # written a list yet (or the file fragment is incomplete during a
+        # multi-step manager edit); clobbering would lock the bot out for
+        # state that was injected at startup but isn't yet persisted.
+        if not disk_users and self._allowed_users:
             return
 
         # Merge by username, preserving locked_identities union.

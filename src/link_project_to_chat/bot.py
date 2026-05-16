@@ -216,6 +216,14 @@ class ProjectBot(AuthMixin):
         self._thinking_buf: dict[int, str] = {}   # task_id → accumulated thinking (toggle-off path OR live fallback)
         self._thinking_store: dict[int, str] = {}  # task_id → thinking text
         self._init_auth()
+        # Hot-reload state for AuthMixin._reload_allowed_users_if_stale —
+        # _auth_identity polls these on each authentication so manager-bot
+        # writes to allowed_users land in this process within 5 s without a
+        # restart. Falls back to DEFAULT_CONFIG when the caller didn't pass an
+        # explicit config_path (matches _effective_config_path()).
+        self._project_config_path: Path = config_path or DEFAULT_CONFIG
+        self._project_name: str = self.name
+        self._last_allowed_users_reload: float = 0.0
         self._active_skill: str | None = None
         self._active_persona = active_persona
         # Pending skill/persona capture — set by /create_skill + scope-button click,
