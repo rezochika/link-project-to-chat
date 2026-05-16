@@ -183,8 +183,17 @@ class CodexBackend(BaseBackend):
     async def chat_stream(
         self,
         user_message: str,
+        *,
+        recent_discussion: str = "",
         on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream events for one Codex turn.
+
+        ``recent_discussion`` is accepted for Protocol compatibility (v1.2.0
+        sub-feature 3). Native rendering as a ``<system-reminder>`` block is
+        a follow-up task; for now the value is ignored so existing callers
+        remain unaffected.
+        """
         cmd = self._build_cmd(user_message)
         proc = self._popen(cmd)
         self._proc = proc

@@ -161,8 +161,18 @@ class AgentBackend(Protocol):
     async def chat_stream(
         self,
         user_message: str,
+        *,
+        recent_discussion: str = "",
         on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream events for one agent turn.
+
+        ``recent_discussion``, when non-empty, is per-call system-prompt
+        content the backend must render in its native style (Claude:
+        injected into ``--append-system-prompt``; Codex: emitted as a
+        ``<system-reminder>`` block). Backends that don't render it should
+        accept the kwarg and ignore it for forward compatibility.
+        """
         pass
 
     async def chat(

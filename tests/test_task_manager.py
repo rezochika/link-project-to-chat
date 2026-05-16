@@ -364,7 +364,7 @@ class _FakeClaude:
         self.inputs = []
         self.closed = 0
 
-    def chat_stream(self, user_message, on_proc=None):
+    def chat_stream(self, user_message, *, recent_discussion="", on_proc=None):
         self.inputs.append(user_message)
         events = self._turns.pop(0) if self._turns else [Result(text="", session_id=None, model=None)]
 
@@ -515,7 +515,7 @@ class _BlockingClaude:
         self.inputs = []
         self.closed = 0
 
-    def chat_stream(self, user_message, on_proc=None):
+    def chat_stream(self, user_message, *, recent_discussion="", on_proc=None):
         self.inputs.append(user_message)
 
         async def _gen():
@@ -562,7 +562,7 @@ class _SlowCloseClaude:
         self.close_delay = close_delay
         self.session_id = None
 
-    def chat_stream(self, user_message, on_proc=None):
+    def chat_stream(self, user_message, *, recent_discussion="", on_proc=None):
         async def _gen():
             yield Result(text="done", session_id="s1", model=None)
 

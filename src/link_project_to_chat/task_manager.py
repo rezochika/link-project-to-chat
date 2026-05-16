@@ -99,6 +99,11 @@ class Task:
     started_at: float | None = None
     finished_at: float | None = None
     pending_questions: list[Question] = field(default_factory=list)
+    # Per-call "[Recent discussion]" group-context payload (v1.2.0 sub-feature 3).
+    # Lives on Task (per-execution), not on the shared backend instance — required
+    # because PTB's concurrent_updates schedules _run_agent_turn asynchronously
+    # after submit_agent returns. Threaded into backend.chat_stream as a kwarg.
+    recent_discussion: str = ""
     _compact: bool = field(default=False, repr=False)
     _backend: AgentBackend | None = field(default=None, repr=False)
     _proc: subprocess.Popen | None = field(default=None, repr=False)
@@ -224,7 +229,14 @@ class TaskManager:
         task._asyncio_task = asyncio.create_task(self._exec_agent(task))
         return task
 
-    def submit_agent(self, chat: ChatRef, message: MessageRef, prompt: str) -> Task:
+    def submit_agent(
+        self,
+        chat: ChatRef,
+        message: MessageRef,
+        prompt: str,
+        *,
+        recent_discussion: str = "",
+    ) -> Task:
         task = Task(
             id=self._next_id,
             chat=chat,
@@ -232,6 +244,7 @@ class TaskManager:
             type=TaskType.AGENT,
             input=prompt,
             name=prompt[:40],
+            recent_discussion=recent_discussion,
         )
         self._next_id += 1
         return self._submit(task)
@@ -323,6 +336,7 @@ class TaskManager:
 
         async for event in active_backend.chat_stream(
             task.input,
+            recent_discussion=task.recent_discussion,
             on_proc=lambda p: setattr(task, "_proc", p),
         ):
             if self._on_stream_event:

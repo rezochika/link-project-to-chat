@@ -43,6 +43,8 @@ class FakeBackend:
     async def chat_stream(
         self,
         user_message: str,
+        *,
+        recent_discussion: str = "",
         on_proc: Callable[[object], None] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         self.inputs.append(user_message)

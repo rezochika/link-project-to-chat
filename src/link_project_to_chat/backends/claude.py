@@ -310,6 +310,8 @@ class ClaudeBackend(BaseBackend):
     async def chat_stream(
         self,
         user_message: str,
+        *,
+        recent_discussion: str = "",
         on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Send a message and yield stream events.
@@ -317,6 +319,11 @@ class ClaudeBackend(BaseBackend):
         If there is already a live interactive process (from a previous turn
         that ended with an AskQuestion), the message is sent on its stdin.
         Otherwise a new subprocess is spawned.
+
+        ``recent_discussion`` is accepted for Protocol compatibility (v1.2.0
+        sub-feature 3). Native rendering into ``--append-system-prompt`` is
+        a follow-up task; for now the value is ignored so existing callers
+        remain unaffected.
         """
         reuse = self._proc is not None and self._proc.poll() is None
 
