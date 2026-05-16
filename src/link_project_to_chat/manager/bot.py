@@ -19,7 +19,7 @@ from telegram.ext import (
 
 from .config import load_project_configs, save_project_configs
 from .process import ProcessManager
-from ..config import AllowedUser, DEFAULT_CONFIG, patch_backend_state
+from ..config import AllowedUser, DEFAULT_CONFIG, parse_user_bool, patch_backend_state
 from .._auth import AuthMixin
 from ..transport import Button, Buttons, ChatRef, MessageRef
 
@@ -1178,16 +1178,14 @@ class ManagerBot(AuthMixin):
             )
             await self._transport.send_text(chat, f"Updated '{name}' {field} to {value}.")
         elif field == "respond_in_groups":
-            truthy = {"true", "1", "yes", "on"}
-            falsy = {"false", "0", "no", "off"}
-            lowered = value.strip().lower()
-            if lowered in truthy:
+            parsed = parse_user_bool(value)
+            if parsed is True:
                 projects[name]["respond_in_groups"] = True
                 self._save_projects(projects)
                 await self._transport.send_text(
                     chat, f"Updated '{name}' respond_in_groups to True.",
                 )
-            elif lowered in falsy:
+            elif parsed is False:
                 projects[name].pop("respond_in_groups", None)
                 self._save_projects(projects)
                 await self._transport.send_text(
