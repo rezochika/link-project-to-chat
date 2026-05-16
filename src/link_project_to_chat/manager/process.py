@@ -424,6 +424,20 @@ class ProcessManager:
         return True
 
     def stop(self, project_name: str) -> bool:
+        """Stop a running project / team-bot subprocess.
+
+        Does NOT mutate the project's ``autostart`` flag. The flag is a
+        sticky user preference; ``stop()`` semantically means "stop this
+        process now", not "never start again automatically".
+
+        Previously this method flipped ``autostart`` to ``False``, which
+        meant the PTB shutdown lifecycle (``ManagerBot._post_stop`` →
+        ``pm.stop_all()`` → ``stop()`` per project) silently disabled
+        autostart on every systemd restart. Operators then had to manually
+        click Start in ``/projects`` after every restart. A dedicated
+        manager command (or direct config edit) is the right place to
+        disable autostart when that's what the operator wants.
+        """
         proc = self._processes.get(project_name)
         if not proc or proc.poll() is not None:
             self._processes.pop(project_name, None)
@@ -434,11 +448,6 @@ class ProcessManager:
         self._log_threads.pop(project_name, None)
         self._delete_pidfile(project_name)
         logger.info("Stopped %s", project_name)
-        if project_name.startswith("team:"):
-            _, team_name, role = project_name.split(":", 2)
-            self._set_team_bot_autostart(team_name, role, False)
-        else:
-            self._set_autostart(project_name, False)
         return True
 
     def reap_orphans(self) -> list[str]:

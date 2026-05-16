@@ -167,7 +167,20 @@ def test_start_team_persists_autostart_true(tmp_path):
     assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is True
 
 
-def test_stop_team_key_persists_autostart_false(tmp_path, monkeypatch):
+def test_stop_team_key_preserves_autostart(tmp_path, monkeypatch):
+    """stop() must NOT mutate the autostart flag.
+
+    The flag is a sticky user preference — flipping it to False on stop()
+    meant that systemd / PTB lifecycle shutdowns (which fan stop_all() out
+    over every running bot) silently disabled autostart for every project,
+    so the next manager start would skip all of them. The user then had to
+    manually click Start in /projects after every restart.
+
+    See manager/process.py: stop() previously called
+    _set_team_bot_autostart(False) here; we removed it. Autostart is now
+    controlled exclusively by /enable_autostart / /disable_autostart (or
+    direct config edits).
+    """
     cfg_path = tmp_path / "config.json"
     config = Config(
         teams={
@@ -195,7 +208,85 @@ def test_stop_team_key_persists_autostart_false(tmp_path, monkeypatch):
         assert pm.stop("team:acme:manager") is True
 
     raw = json.loads(cfg_path.read_text())
-    assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is False
+    assert raw["teams"]["acme"]["bots"]["manager"]["autostart"] is True
+
+
+def test_stop_project_preserves_autostart(tmp_path, monkeypatch):
+    """Same contract as the team-bot test — for non-team projects.
+
+    Regression test for the bug where every systemd restart silently
+    flipped a project's autostart to False (via PTB shutdown ->
+    pm.stop_all() -> stop() -> _set_autostart(name, False)), forcing
+    operators to manually start every autostart-true project after every
+    restart.
+    """
+    cfg_path = tmp_path / "config.json"
+    raw = {
+        "projects": {
+            "demo": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "autostart": True,
+            }
+        }
+    }
+    cfg_path.write_text(json.dumps(raw))
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.process._terminate_process_tree",
+        lambda p: None,
+    )
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _running_proc(7)
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        assert pm.start("demo") is True
+        assert pm.stop("demo") is True
+
+    written = json.loads(cfg_path.read_text())
+    assert written["projects"]["demo"]["autostart"] is True
+
+
+def test_stop_all_then_start_autostart_round_trip_keeps_project_running(tmp_path, monkeypatch):
+    """End-to-end regression: simulate a systemd restart.
+
+    stop_all() (called from ManagerBot._post_stop on shutdown) followed by
+    start_autostart() (called from cli.start_manager on the next boot)
+    must leave the project running. The bug was that stop_all() flipped
+    autostart=False on disk, so start_autostart() skipped the project.
+    """
+    cfg_path = tmp_path / "config.json"
+    raw = {
+        "projects": {
+            "demo": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "autostart": True,
+            }
+        }
+    }
+    cfg_path.write_text(json.dumps(raw))
+
+    monkeypatch.setattr(
+        "link_project_to_chat.manager.process._terminate_process_tree",
+        lambda p: None,
+    )
+
+    with patch("link_project_to_chat.manager.process.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = _running_proc(11)
+
+        pm = ProcessManager(project_config_path=cfg_path)
+        assert pm.start("demo") is True
+
+        # Simulate the systemd-restart fan-out.
+        assert pm.stop_all() == 1
+
+        # Fresh ProcessManager instance — simulates the new manager process.
+        mock_popen.return_value = _running_proc(12)
+        pm2 = ProcessManager(project_config_path=cfg_path)
+        assert pm2.start_autostart() == 1
+        assert "demo" in pm2._processes
 
 
 def test_start_autostart_starts_team_bots_with_autostart(tmp_path):
