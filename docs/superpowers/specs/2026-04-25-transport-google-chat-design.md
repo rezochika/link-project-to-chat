@@ -1,9 +1,9 @@
 # Transport - Google Chat - Design Spec
 
-**Status:** Ready for implementation planning. Designed 2026-04-25; refreshed 2026-05-16 against current repo state and current Google Chat docs.
-**Date:** 2026-04-25; refreshed 2026-05-16
+**Status:** Ready for implementation planning. Designed 2026-04-25; refreshed 2026-05-16 against current repo state and current Google Chat docs; refined 2026-05-17 (sequencing prereqs resolved; callback-token, fast-ack, and threading decisions pinned).
+**Date:** 2026-04-25; refreshed 2026-05-16; refined 2026-05-17
 **Depends on:** [2026-04-20-transport-abstraction-design.md](2026-04-20-transport-abstraction-design.md) (spec #0), [2026-04-20-transport-voice-port-design.md](2026-04-20-transport-voice-port-design.md) (spec #0b), [2026-04-21-transport-group-team-port-design.md](2026-04-21-transport-group-team-port-design.md) (spec #0a), [2026-04-21-transport-manager-port-design.md](2026-04-21-transport-manager-port-design.md) (spec #0c), [2026-04-21-transport-web-ui-design.md](2026-04-21-transport-web-ui-design.md) (spec #1)
-**Part of:** Fourth additive non-Telegram transport. This follows Web, Discord, and Slack and validates HTTPS event delivery plus card/dialog UI.
+**Part of:** Second non-Telegram transport to actually ship code, after Web (spec #1). Discord (spec #2) and Slack (spec #3) are designed but unimplemented as of 2026-05-17; this spec does not block on them. Validates HTTPS event delivery plus card/dialog UI for the first time in the codebase.
 
 **Current repo assumptions (2026-05-16):**
 - `Transport`, `ChatRef`, `MessageRef`, `Identity`, `IncomingMessage`, `CommandInvocation`, `ButtonClick`, `PromptSpec`, and `PromptSubmission` are the only bot-facing integration surface.
@@ -61,13 +61,15 @@ Outcomes of brainstorming on 2026-04-25:
 
 ### 3.1 Sequencing prerequisite
 
-Implementation starts only after these prerequisites are landed in the target branch:
+All sequencing prerequisites are satisfied as of 2026-05-17 (`main`):
 
-- spec #0a group/team transport port, so team room routing no longer depends on Telegram-only group IDs
-- spec #0c manager transport port, so manager flows can run through transport primitives
-- at least one HTTP-receiver sibling, specifically Web transport, so Google Chat can reuse the repo's proven ASGI lifecycle, dispatch queue, and test patterns
+- ✅ spec #0a group/team transport port — shipped in v0.15.0, so team room routing uses `RoomBinding`/`BotPeerRef` rather than Telegram-only group IDs
+- ✅ spec #0c manager transport port — shipped in v0.16.0, so manager flows run through transport primitives
+- ✅ at least one HTTP-receiver sibling — Web transport (spec #1) shipped, so Google Chat can reuse the repo's proven ASGI lifecycle, dispatch queue, and test patterns
 
-Google Chat should consume these primitives rather than reintroducing platform-native state into project or manager bot code.
+Implementation may proceed. Google Chat should consume these primitives rather than reintroducing platform-native state into project or manager bot code. Steps 9 and 10 in §5 reference these prerequisites for context only; no remaining gate.
+
+Discord (spec #2) and Slack (spec #3) are **not** prerequisites. Where this spec discusses shared decisions with Discord/Slack (e.g., the reply-fallback timeout in §4.5), Google Chat owns the decision if it ships first; later transports adopt it.
 
 ## 4. Architecture
 
@@ -157,7 +159,7 @@ HTTP flow:
 1. Google Chat POSTs an interaction event to the configured endpoint.
 2. The route verifies the `Authorization: Bearer ...` token before queueing or normalizing the event.
 3. The route normalizes the event into an internal queue item only after platform auth succeeds.
-4. The route returns quickly with either an empty/small acknowledgement or a synchronous response message.
+4. The route returns quickly. **Default v1 acknowledgement is an HTTP 200 with an empty JSON body (`{}`)** for `MESSAGE` and `CARD_CLICKED` events, which Google Chat treats as "no synchronous response, dispatch will post asynchronously." Dialog events (`DIALOG`) return a dialog-action body inline because Google requires it; see §4.5. A user-visible "Working…" text response is opt-in per command, not the default, to keep streams from posting a transient message that later edits never replace.
 5. The dispatch task invokes registered transport handlers.
 6. Long-running handler output posts/edits asynchronously through the Chat API.
 
@@ -212,11 +214,10 @@ The card builder should be isolated in `google_chat/cards.py` so tests can verif
 Callback integrity:
 - Every card action includes `kind`, `callback_token`, and the minimal display-safe parameters needed by Google Chat.
 - The transport must not trust a raw `Button.value` returned by Google Chat unless the callback token verifies.
-- `callback_token` is either:
-  - an HMAC-signed envelope using a process secret, or
-  - an opaque server-side token stored in a bounded TTL map.
-- In both designs, the token binds at least: transport ID, space native ID, originating message/dialog ID when available, sender native ID when user-specific, callback kind, and callback value.
-- Callback tokens expire after `callback_token_ttl_seconds`.
+- `callback_token` is an **HMAC-signed envelope using a per-process secret** (`secrets.token_bytes(32)` at transport startup; never persisted). Chosen over a server-side TTL map so callback validity survives in-process restarts of a single transport instance without coordinating shared state, and so memory usage stays bounded regardless of issuance rate. The envelope serializes as `base64url(payload).base64url(hmac_sha256(secret, payload))` where `payload` is a compact JSON object.
+- The signed payload binds at least: transport ID, space native ID, originating message/dialog ID when available, sender native ID when user-specific, callback kind, callback value, and an `expires_at` unix timestamp.
+- Callback tokens expire after `callback_token_ttl_seconds` (enforced by reading `expires_at` from the verified payload; no separate store).
+- Rotating the process secret on restart invalidates any in-flight cards; this is the intended trade-off — users see the standard "This action expired" message and re-run the command.
 - Expired or unknown callbacks send a short "This action expired. Run the command again." message when a response surface is available, and otherwise log at info/debug level without raising out of the dispatch loop.
 - Prompt and wizard callbacks are sender-bound. Generic informational buttons may be app-auth-only if the upper-layer command is not user-specific.
 
@@ -244,7 +245,7 @@ Dialog caveat:
   - treat the next plain text message from that exact sender in that space as the `PromptSubmission`
   - ignore messages from other senders for the purpose of this prompt; they still flow through `on_message` normally
   - expire the pending reply on the same timeout the dialog path uses (configurable, with a sane default), and emit a cancel/timeout submission so app state does not leak
-- This same pattern will likely apply to Discord's design-only fallback. Whichever transport ships first owns settling the concrete timeout value and any helper extracted to shared code; the second transport must adopt that decision rather than re-litigating it.
+- **Default reply-fallback timeout is `pending_prompt_ttl_seconds` (900s).** Google Chat ships before Discord/Slack per current sequencing, so this spec owns the value. Discord/Slack adopt the same default unless their platform constraints demand otherwise; any extracted shared helper lives under `src/link_project_to_chat/transport/` and is introduced when the second transport actually needs it (do not pre-extract for a single caller).
 
 Secret prompt handling:
 - Do not log raw `PromptSubmission.value` for `PromptKind.SECRET`.
@@ -394,6 +395,7 @@ Threading:
 - `send_text(..., reply_to=msg)` must post into `msg`'s Google Chat thread when `msg.native` contains thread metadata
 - `edit_text(msg, ...)` must update the referenced message only; it must not create a sibling thread reply as an edit fallback
 - if `reply_to` lacks thread metadata, send in the same space without pretending to quote
+- **`StreamingMessage` overflow rotation must pin every rotated child message to the same thread as the originating message.** When `StreamingMessage` calls `send_text` to create an overflow child, `GoogleChatTransport.send_text` reads thread metadata from the parent `MessageRef.native` and forwards it via Chat API `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD` with the parent's `thread.name`. Streams that begin in a thread stay in that thread; streams that begin outside a thread create top-level messages in the same space.
 - do not add a new `ChatKind` for threads unless multiple transports need it
 
 ### 4.9 Files, attachments, and voice
@@ -401,7 +403,7 @@ Threading:
 Google Chat attachment support has more constraints than Telegram/Web. V1 behavior should be conservative:
 
 - inbound attachments become `IncomingFile` only if the transport can download them with configured credentials and the attachment is inside the configured size cap
-- use a 25 MiB default inbound size cap to match the Web upload hardening unless Google Chat imposes a lower effective limit during implementation
+- use a 25 MiB default inbound size cap to match the Web upload hardening; **Step 8 must verify Google Chat's actual current limit against the [attachments reference](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.attachments) and lower the default if Google imposes a smaller effective cap.** Document the verified ceiling in the PR description.
 - attachment downloads must stream to a temp file and clean up after dispatch, including auth rejection and handler failure paths
 - unsupported attachments set `has_unsupported_media=True`
 - outbound `send_file` uses Chat API attachment support where practical
@@ -496,11 +498,11 @@ Compose with `StreamingMessage`, implement Google-specific edit/final-only degra
 
 ### Step 9 - Validate project/team room behavior
 
-Run project bot and two team bots in Google Chat spaces, verifying stable IDs, mentions, thread behavior, and no Telegram relay assumptions. Requires spec #0a per [§3.1](#31-sequencing-prerequisite); do not start until that port is merged.
+Run project bot and two team bots in Google Chat spaces, verifying stable IDs, mentions, thread behavior, and no Telegram relay assumptions. Builds on the shipped spec #0a primitives (`RoomBinding`/`BotPeerRef`).
 
 ### Step 10 - Run manager flows and update docs
 
-Exercise manager commands and prompt-backed wizards end-to-end through Google Chat, with no Google payloads leaking into manager business logic. Requires spec #0c per [§3.1](#31-sequencing-prerequisite); do not start until that port is merged. Update README, changelog, TODO, and setup notes with the final supported/deferred behavior.
+Exercise manager commands and prompt-backed wizards end-to-end through Google Chat, with no Google payloads leaking into manager business logic. Builds on the shipped spec #0c manager transport port. Update README, changelog, TODO, and setup notes with the final supported/deferred behavior.
 
 ## 6. Testing approach
 
