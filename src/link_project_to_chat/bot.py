@@ -180,6 +180,7 @@ class ProjectBot(AuthMixin):
         plugins: list[dict] | None = None,
         allowed_users: list | None = None,
         auth_source: str = "project",
+        respond_in_groups: bool = False,
     ):
         self.name = name
         self.path = path.resolve()
@@ -316,6 +317,11 @@ class ProjectBot(AuthMixin):
         # writes back to the right place. "project" for per-project lists,
         # "global" when run_bots used the Config.allowed_users fallback.
         self._auth_source: str = auth_source if auth_source in ("project", "global") else "project"
+        # Solo-mode group-routing flag (spec respond_in_groups v1.1.0). When
+        # True and chat.kind == ROOM, _on_text_from_transport requires the
+        # message to be addressed-at-me (@mention or reply-to-bot, from a
+        # human, not self). Default False — DM-only pre-v1.1.0 behavior.
+        self._respond_in_groups: bool = bool(respond_in_groups)
 
     @property
     def _claude(self) -> ClaudeBackend:
@@ -959,11 +965,37 @@ class ProjectBot(AuthMixin):
         """Unified entry point for inbound messages from the Transport.
 
         Branch order:
+          0. Solo respond_in_groups gate (when chat.kind == ROOM and not team)
           1. Voice (audio mime) → _on_voice_from_transport
           2. Non-audio files → _on_file_from_transport
           3. Plain text → _on_text (legacy shim)
           4. Nothing actionable → generic unsupported reply
         """
+        # 0. Solo project bot in a Telegram group (spec respond_in_groups
+        # v1.1.0). Runs BEFORE voice/file/text routing so files and voice
+        # in groups are gated identically. Team mode (group_mode) keeps its
+        # own routing path below — this branch is mutually exclusive with it.
+        # When the gate passes, route directly to ``_on_text`` regardless of
+        # payload type — caption / @-mention triggers the same auth/dispatch
+        # path as a plain text message, and files ride on ``incoming.files``.
+        if not self.group_mode and incoming.chat.kind == ChatKind.ROOM:
+            if not self._respond_in_groups:
+                # Defensive bot-side filter: production PTB filter already
+                # blocks group messages here, but if a transport ever bypasses
+                # the filter (tests, alternate non-Telegram transports), drop
+                # silently rather than treating it as a DM.
+                return
+            from .group_filters import is_from_self, is_directed_at_me
+            if is_from_self(incoming, self.bot_username):
+                return
+            if incoming.sender.is_bot:
+                return  # peer-bot defense: solo mode never accepts other bots
+            if not is_directed_at_me(incoming, self.bot_username):
+                return
+            incoming = self._strip_self_mention(incoming)
+            await self._on_text(incoming)
+            return
+
         # 1. Voice (audio mime).
         if incoming.files and any(
             (f.mime_type or "").startswith("audio/") for f in incoming.files
