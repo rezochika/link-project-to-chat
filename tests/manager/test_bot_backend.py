@@ -123,16 +123,15 @@ async def test_proj_model_button_writes_backend_state(bot_env, tmp_path: Path):
 
     raw = json.loads(proj_cfg.read_text())
     assert raw["projects"]["demo"]["backend_state"]["claude"]["model"] == "opus"
-    # Legacy mirror persists for downgrade safety.
-    assert raw["projects"]["demo"]["model"] == "opus"
+    # v1.0.0 dropped the top-level mirror; canonical home is backend_state.
+    assert "model" not in raw["projects"]["demo"]
 
 
 @pytest.mark.asyncio
 async def test_apply_edit_model_routes_through_backend_state(bot_env, tmp_path: Path):
-    """`/edit_project demo model opus` must write backend_state, not just the
-    legacy flat key. Otherwise on the next save_config round-trip the legacy
-    mirror would override backend_state and reset Claude-specific state on
-    other backends."""
+    """`/edit_project demo model opus` must write backend_state. Pre-v1.0
+    also wrote a legacy top-level mirror for downgrade safety; v1.0.0 dropped
+    that mirror so the entry only carries the canonical nested shape."""
     bot, _pm, proj_cfg = bot_env
     proj_cfg.write_text(json.dumps({"projects": {"demo": {"path": str(tmp_path)}}}))
     _swap_fake_transport(bot)
@@ -142,7 +141,7 @@ async def test_apply_edit_model_routes_through_backend_state(bot_env, tmp_path: 
 
     raw = json.loads(proj_cfg.read_text())
     assert raw["projects"]["demo"]["backend_state"]["claude"]["model"] == "opus"
-    assert raw["projects"]["demo"]["model"] == "opus"
+    assert "model" not in raw["projects"]["demo"]
 
 
 @pytest.mark.asyncio
@@ -156,7 +155,7 @@ async def test_apply_edit_permissions_routes_through_backend_state(bot_env, tmp_
 
     raw = json.loads(proj_cfg.read_text())
     assert raw["projects"]["demo"]["backend_state"]["claude"]["permissions"] == "acceptEdits"
-    assert raw["projects"]["demo"]["permissions"] == "acceptEdits"
+    assert "permissions" not in raw["projects"]["demo"]
 
 
 @pytest.mark.asyncio
@@ -194,15 +193,15 @@ async def test_add_project_wizard_writes_backend_state(bot_env, tmp_path: Path):
     proj = raw["projects"]["newproj"]
     assert proj["backend"] == "claude"
     assert proj["backend_state"]["claude"]["model"] == "opus"
-    # Downgrade-safety mirror.
-    assert proj["model"] == "opus"
+    # v1.0.0 dropped the top-level mirror; canonical home is backend_state.
+    assert "model" not in proj
 
 
 @pytest.mark.asyncio
 async def test_global_model_callback_writes_default_model_claude(bot_env, tmp_path: Path):
-    """The manager's global /model picker writes the new
-    ``default_model_claude`` field (with the legacy mirror still emitted by
-    save_config for downgrade safety)."""
+    """The manager's global /model picker writes the canonical
+    ``default_model_claude`` field. The legacy ``default_model`` mirror was
+    kept one release for downgrade safety; v1.0.0 stopped emitting it."""
     bot, _pm, proj_cfg = bot_env
     _swap_fake_transport(bot)
 
@@ -211,5 +210,4 @@ async def test_global_model_callback_writes_default_model_claude(bot_env, tmp_pa
 
     raw = json.loads(proj_cfg.read_text())
     assert raw["default_model_claude"] == "haiku"
-    # Legacy mirror is emitted by save_config for downgrade safety.
-    assert raw["default_model"] == "haiku"
+    assert "default_model" not in raw

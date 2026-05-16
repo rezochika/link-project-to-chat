@@ -790,13 +790,12 @@ class ManagerBot(AuthMixin):
         if not name:
             await self._transport.send_text(incoming.chat, "Something went wrong. Try again.")
             return ConversationHandler.END
-        # Phase 2: write new shape (backend + backend_state). Mirror the legacy
-        # flat ``model`` for downgrade safety, matching what cli.py:projects_add
-        # and patch_backend_state already do.
+        # Canonical post-v1.0 shape: backend + backend_state["claude"][*].
+        # The pre-v1.0 top-level ``model`` mirror was kept one release for
+        # downgrade safety; v1.0.0 stopped emitting it.
         data["backend"] = "claude"
         if model_value:
             data["backend_state"] = {"claude": {"model": model_value}}
-            data["model"] = model_value  # legacy mirror for downgrade safety
         else:
             data["backend_state"] = {}
         projects = self._load_projects()

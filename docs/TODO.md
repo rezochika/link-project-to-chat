@@ -378,6 +378,14 @@ Pre-fix: running bots cached `_allowed_users` at startup; mutating commands pers
 |---|---|---|
 | `d68d5c4` | Em-dashes in CLI help/error strings replaced with ASCII hyphens; parametrized canary test asserts `--help`, `configure --help`, `migrate-config --help` output is ASCII-encodable. Fixes `UnicodeEncodeError` on default Windows console codepage (cp1252 / cp437) on a fresh install before any configuration. | ✅ closed |
 
+#### Config cleanup — drop legacy save-side mirror
+
+Pre-v1.0 dual-wrote `model` / `effort` / `permissions` / `session_id` / `show_thinking` at the project + team-bot entry top level alongside `backend_state["claude"]`, and `default_model` alongside `default_model_claude`, for downgrade safety. v1.0.0 shipped — the save-side mirror is now dropped so on-disk configs carry only the canonical nested shape. Load-side `_legacy_backend_state` stays one more release (marked for v1.1 removal) so any pre-v1.0 config that still hasn't been touched still migrates cleanly on first load.
+
+| Commit | Item | Status |
+|---|---|---|
+| _(this commit)_ | Replace `_mirror_legacy_claude_fields` with `_strip_legacy_claude_fields`; loader pulls Claude-shaped fields from `backend_state["claude"]` first then falls back to top-level; CLI `projects add` and manager `_add_model` stop writing the legacy mirror; `save_config` always strips legacy top-level keys (idempotent — existing-on-disk duplicates clear on next save). | ✅ closed |
+
 #### Notes
 
 - The v1.0.1 follow-up list in §1.4 is orthogonal to this sweep and remains open.

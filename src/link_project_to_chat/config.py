@@ -382,7 +382,7 @@ class Config:
     tts_backend: str = ""            # "openai" or "" (disabled)
     tts_model: str = "tts-1"        # OpenAI TTS model
     tts_voice: str = "alloy"        # OpenAI TTS voice
-    default_model: str = ""          # legacy; mirrored from default_model_claude (kept for one release for downgrade safety)
+    default_model: str = ""          # legacy load-side fallback only; never written on save (v1.1 removal candidate)
     default_backend: str = "claude"
     default_model_claude: str = ""
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
@@ -446,7 +446,16 @@ def _normalize_username(username: str) -> str:
 
 
 def _load_permissions(proj: dict) -> str | None:
-    """Read permissions from a project dict, with backward compat for old keys."""
+    """Read permissions from a project dict, with backward compat for old keys.
+
+    Source-of-truth order: ``backend_state["claude"]["permissions"]`` first
+    (canonical post-v1.0 shape), then the legacy top-level ``permissions``
+    key, then the pre-v1.0 ``dangerously_skip_permissions`` flag, then the
+    even-older ``permission_mode`` field.
+    """
+    claude_state = (proj.get("backend_state") or {}).get("claude") or {}
+    if "permissions" in claude_state and claude_state["permissions"] is not None:
+        return claude_state["permissions"] or None
     if "permissions" in proj:
         return proj["permissions"] or None
     if proj.get("dangerously_skip_permissions"):
@@ -454,6 +463,25 @@ def _load_permissions(proj: dict) -> str | None:
     return proj.get("permission_mode") or None
 
 
+def _load_claude_field(proj: dict, key: str, default=None):
+    """Read a Claude-shaped legacy field from a project / team-bot entry.
+
+    Source-of-truth order: ``backend_state["claude"][key]`` first (canonical
+    post-v1.0 shape), then the legacy top-level ``key`` (pre-v1.0 mirror).
+    Used to populate the dataclass mirror fields (model, effort, session_id,
+    show_thinking) on load so a save->load roundtrip preserves them.
+    """
+    claude_state = (proj.get("backend_state") or {}).get("claude") or {}
+    if key in claude_state and claude_state[key] is not None:
+        return claude_state[key]
+    return proj.get(key, default)
+
+
+# TODO v1.1: remove this helper and its callers. It exists to fold pre-v1.0
+# on-disk configs (top-level model / effort / permissions / session_id /
+# show_thinking) into backend_state["claude"] on load. v1.0.0 stopped
+# writing the legacy mirror, so by v1.1 every on-disk config has already
+# been rewritten in the new shape.
 def _legacy_backend_state(
     model: str | None,
     effort: str | None,
@@ -479,23 +507,24 @@ def _legacy_backend_state(
     return state
 
 
-def _mirror_legacy_claude_fields(target: dict, backend_state: dict[str, dict]) -> None:
-    """Mirror Claude-shaped legacy flat keys onto *target* from backend_state.
+_LEGACY_CLAUDE_KEYS = ("model", "effort", "permissions", "session_id", "show_thinking")
 
-    The new shape is the source of truth; this only emits the legacy mirror
-    so old code reading raw JSON still finds the keys it expects (downgrade
-    safety). Keys absent from backend_state["claude"] are removed from target.
+
+def _strip_legacy_claude_fields(target: dict) -> None:
+    """Remove the legacy top-level Claude-shaped flat keys from *target*.
+
+    Phase 2 of the backend abstraction dual-wrote these keys at the project /
+    team-bot entry top level alongside ``backend_state["claude"]`` as a
+    one-release downgrade-safety mirror. v1.0.0 shipped — the mirror is now
+    dropped on save. Existing on-disk duplicates are stripped on first save
+    after upgrade.
+
+    The load-side ``_legacy_backend_state`` helper still folds these keys into
+    ``backend_state["claude"]`` for one more release so pre-v1.0 configs
+    upgrade cleanly; it's marked for v1.1 removal.
     """
-    claude_state = backend_state.get("claude", {})
-    for key in ("model", "effort", "permissions", "session_id"):
-        if claude_state.get(key) is not None:
-            target[key] = claude_state[key]
-        else:
-            target.pop(key, None)
-    if claude_state.get("show_thinking"):
-        target["show_thinking"] = True
-    else:
-        target.pop("show_thinking", None)
+    for key in _LEGACY_CLAUDE_KEYS:
+        target.pop(key, None)
 
 
 def _effective_backend_state(
@@ -672,12 +701,17 @@ def _make_room_binding(raw: dict | None) -> RoomBinding | None:
 
 
 def _make_team_bot_config(b: dict) -> TeamBotConfig:
-    """Build a TeamBotConfig from a raw dict, folding legacy fields into backend_state."""
-    bot_model = b.get("model")
-    bot_effort = b.get("effort")
-    bot_permissions = b.get("permissions")
-    bot_session_id = b.get("session_id")
-    bot_show_thinking = b.get("show_thinking", False)
+    """Build a TeamBotConfig from a raw dict, folding legacy fields into backend_state.
+
+    Reads each Claude-shaped legacy field from ``backend_state["claude"]``
+    first (canonical post-v1.0 shape); pre-v1.0 on-disk configs fall back
+    to the top-level keys.
+    """
+    bot_model = _load_claude_field(b, "model")
+    bot_effort = _load_claude_field(b, "effort")
+    bot_permissions = _load_permissions(b)
+    bot_session_id = _load_claude_field(b, "session_id")
+    bot_show_thinking = bool(_load_claude_field(b, "show_thinking", False))
     backend_state = b.get("backend_state") or _legacy_backend_state(
         bot_model,
         bot_effort,
@@ -782,11 +816,14 @@ def _load_config_unlocked(
             _malformed_projects.extend(malformed_projects)
 
         for name, proj in valid_projects.items():
-            proj_model = proj.get("model")
-            proj_effort = proj.get("effort")
+            # Source-of-truth for the legacy mirror fields is
+            # ``backend_state["claude"]`` first; the top-level keys are only
+            # consulted for pre-v1.0 configs that predate the new shape.
+            proj_model = _load_claude_field(proj, "model")
+            proj_effort = _load_claude_field(proj, "effort")
             proj_permissions = _load_permissions(proj)
-            proj_session_id = proj.get("session_id")
-            proj_show_thinking = proj.get("show_thinking", False)
+            proj_session_id = _load_claude_field(proj, "session_id")
+            proj_show_thinking = bool(_load_claude_field(proj, "show_thinking", False))
             backend_state = proj.get("backend_state") or _legacy_backend_state(
                 proj_model,
                 proj_effort,
@@ -870,7 +907,12 @@ def _load_config_unlocked(
 
 
 def _serialize_team_bot(b: "TeamBotConfig") -> dict:
-    """Build the raw JSON dict for a team bot, dual-writing new + mirrored legacy."""
+    """Build the raw JSON dict for a team bot.
+
+    The canonical home for Claude-shaped state is ``backend_state["claude"]``;
+    any leftover legacy top-level keys (model / effort / permissions /
+    session_id / show_thinking) from a pre-v1.0 on-disk shape are stripped.
+    """
     backend_state = _effective_backend_state(
         b.backend_state,
         model=b.model,
@@ -894,7 +936,7 @@ def _serialize_team_bot(b: "TeamBotConfig") -> dict:
         entry["context_enabled"] = False
     if b.context_history_limit != 10:
         entry["context_history_limit"] = b.context_history_limit
-    _mirror_legacy_claude_fields(entry, backend_state)
+    _strip_legacy_claude_fields(entry)
     return entry
 
 
@@ -997,18 +1039,16 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     else:
         raw.pop("tts_voice", None)
     raw["default_backend"] = config.default_backend
-    # Phase 2: ``default_model_claude`` is the source of truth. After Task 4
-    # migrated the manager's global /model callback to write the new field,
-    # no caller mutates the legacy ``default_model`` directly any more, so
-    # the new field wins on save and the legacy mirror is purely a
-    # downgrade-safety artifact.
+    # ``default_model_claude`` is the canonical field. The legacy
+    # ``default_model`` mirror was kept one release for downgrade safety;
+    # v1.0.0 shipped, so save now writes only the new field and always
+    # strips the legacy key from the raw entry.
     effective_default_model_claude = config.default_model_claude or config.default_model
     if effective_default_model_claude:
         raw["default_model_claude"] = effective_default_model_claude
-        raw["default_model"] = effective_default_model_claude
     else:
         raw.pop("default_model_claude", None)
-        raw.pop("default_model", None)
+    raw.pop("default_model", None)
     # Merge per-project data, preserving unknown keys already in the file
     existing_projects: dict = raw.get("projects", {})
     for name, p in config.projects.items():
@@ -1040,7 +1080,7 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         )
         proj["backend"] = p.backend
         proj["backend_state"] = backend_state
-        _mirror_legacy_claude_fields(proj, backend_state)
+        _strip_legacy_claude_fields(proj)
         proj.pop("permission_mode", None)
         proj.pop("dangerously_skip_permissions", None)
         proj["autostart"] = p.autostart
@@ -1274,7 +1314,12 @@ def save_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> None:
-    """Persist session_id into backend_state[<active_backend>] and mirror legacy when claude."""
+    """Persist session_id into backend_state[<active_backend>].
+
+    Always strips any leftover legacy top-level Claude-shaped keys from the
+    entry on save — those keys belong to the pre-v1.0 mirror and are no
+    longer written by any code path.
+    """
     def _patch(raw: dict) -> None:
         if team_name and role:
             if not _team_is_configured(raw, team_name):
@@ -1295,8 +1340,7 @@ def save_session(
         backend_state = _ensure_backend_state_seeded(entry)
         state = backend_state.setdefault(backend_name, {})
         state["session_id"] = session_id
-        if backend_name == "claude":
-            _mirror_legacy_claude_fields(entry, backend_state)
+        _strip_legacy_claude_fields(entry)
 
     _patch_json(_patch, path)
 
@@ -1308,7 +1352,8 @@ def clear_session(
     team_name: str | None = None,
     role: str | None = None,
 ) -> None:
-    """Drop session_id from backend_state[<active_backend>] and the legacy mirror."""
+    """Drop session_id from backend_state[<active_backend>] and strip any
+    leftover legacy top-level Claude-shaped keys."""
     def _patch(raw: dict) -> None:
         if team_name and role:
             if not _team_is_configured(raw, team_name):
@@ -1329,9 +1374,7 @@ def clear_session(
         backend_state = _ensure_backend_state_seeded(entry)
         state = backend_state.setdefault(backend_name, {})
         state.pop("session_id", None)
-        entry.pop("session_id", None)
-        if backend_name == "claude":
-            _mirror_legacy_claude_fields(entry, backend_state)
+        _strip_legacy_claude_fields(entry)
 
     _patch_json(_patch, path)
 
@@ -1344,11 +1387,11 @@ def patch_backend_state(
 ) -> None:
     """Update backend_state[<backend_name>] for a project entry.
 
-    None values remove the key. When ``backend_name == "claude"`` the legacy
-    flat fields on the project entry are re-mirrored from backend_state for
-    downgrade safety. If the on-disk entry only has legacy flat fields, they
-    are folded into ``backend_state["claude"]`` first so unrelated fields are
-    not lost during the partial update.
+    None values remove the key. If the on-disk entry only has legacy flat
+    fields, they are folded into ``backend_state["claude"]`` first so
+    unrelated fields are not lost during the partial update. For
+    ``backend_name == "claude"`` any leftover legacy top-level keys are
+    stripped from the entry on save.
     """
     def _patch(raw: dict) -> None:
         proj = raw.setdefault("projects", {}).setdefault(project_name, {})
@@ -1359,8 +1402,7 @@ def patch_backend_state(
                 state.pop(key, None)
             else:
                 state[key] = value
-        if backend_name == "claude":
-            _mirror_legacy_claude_fields(proj, backend_state)
+        _strip_legacy_claude_fields(proj)
 
     _patch_json(_patch, path)
 
@@ -1374,10 +1416,10 @@ def patch_team_bot_backend_state(
 ) -> None:
     """Update backend_state[<backend_name>] for a team-bot entry.
 
-    None values remove the key. When ``backend_name == "claude"`` the legacy
-    flat fields on the team-bot entry are re-mirrored from backend_state for
-    downgrade safety. Legacy flat fields are folded into ``backend_state["claude"]``
-    first when the on-disk entry only has the legacy shape.
+    None values remove the key. Legacy flat fields are folded into
+    ``backend_state["claude"]`` first when the on-disk entry only has the
+    legacy shape. For ``backend_name == "claude"`` any leftover legacy
+    top-level keys are stripped from the entry on save.
 
     Refuses to materialize a team that hasn't been configured (no ``path`` /
     ``group_chat_id``). Without this guard a stray write from a team-bot
@@ -1404,8 +1446,7 @@ def patch_team_bot_backend_state(
                 state.pop(key, None)
             else:
                 state[key] = value
-        if backend_name == "claude":
-            _mirror_legacy_claude_fields(bot, backend_state)
+        _strip_legacy_claude_fields(bot)
 
     _patch_json(_patch, path)
 

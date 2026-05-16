@@ -182,8 +182,11 @@ def test_add_project_optional_fields(runner, cfg):
     # allowed_users list on next load).
     assert "username" not in proj
     assert proj["allowed_users"] == [{"username": "bob", "role": "executor"}]
-    assert proj["model"] == "sonnet"
-    assert proj["permissions"] == "default"
+    # v1.0.0 dropped the legacy top-level mirror; canonical home is backend_state.
+    assert proj["backend_state"]["claude"]["model"] == "sonnet"
+    assert proj["backend_state"]["claude"]["permissions"] == "default"
+    assert "model" not in proj
+    assert "permissions" not in proj
 
 
 # --- projects remove ---
@@ -274,7 +277,9 @@ def test_edit_project_permission_mode_updates_unified_permissions_field(runner, 
 
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["existing"]
-    assert proj["permissions"] == "plan"
+    # v1.0.0 dropped the legacy top-level mirror.
+    assert proj["backend_state"]["claude"]["permissions"] == "plan"
+    assert "permissions" not in proj
     assert "permission_mode" not in proj
     assert "dangerously_skip_permissions" not in proj
 
@@ -288,7 +293,8 @@ def test_edit_project_permissions_field_supported(runner, cfg):
 
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["existing"]
-    assert proj["permissions"] == "dangerously-skip-permissions"
+    assert proj["backend_state"]["claude"]["permissions"] == "dangerously-skip-permissions"
+    assert "permissions" not in proj
 
 
 def test_edit_project_dangerously_skip_permissions_boolean_alias(runner, cfg):
@@ -300,7 +306,8 @@ def test_edit_project_dangerously_skip_permissions_boolean_alias(runner, cfg):
 
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["existing"]
-    assert proj["permissions"] == "dangerously-skip-permissions"
+    assert proj["backend_state"]["claude"]["permissions"] == "dangerously-skip-permissions"
+    assert "permissions" not in proj
 
 
 def test_edit_project_dangerously_skip_permissions_false_resets_to_default(runner, cfg):
@@ -316,7 +323,8 @@ def test_edit_project_dangerously_skip_permissions_false_resets_to_default(runne
 
     assert result.exit_code == 0
     proj = json.loads(p.read_text())["projects"]["existing"]
-    assert proj["permissions"] == "default"
+    assert proj["backend_state"]["claude"]["permissions"] == "default"
+    assert "permissions" not in proj
 
 
 def test_edit_project_invalid_permissions_value_fails(runner, cfg):
