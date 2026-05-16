@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.transport.base import Identity
 
 if TYPE_CHECKING:
+    from .auth import VerifiedGoogleChatRequest
     from .client import GoogleChatClient
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleChatTransport:
@@ -36,3 +41,31 @@ class GoogleChatTransport:
             handle=None,
             is_bot=True,
         )
+        self._pending_events: asyncio.Queue = asyncio.Queue()
+        self._fast_ack_timeouts: int = 0
+
+    @property
+    def pending_event_count(self) -> int:
+        return self._pending_events.qsize()
+
+    def verify_request(self, headers) -> "VerifiedGoogleChatRequest":
+        from .auth import verify_google_chat_request  # noqa: PLC0415
+
+        return verify_google_chat_request(
+            headers=headers,
+            mode=self.config.auth_audience_type,
+            audiences=self.config.allowed_audiences,
+        )
+
+    async def enqueue_verified_event(
+        self,
+        payload: dict,
+        verified: "VerifiedGoogleChatRequest",
+        *,
+        headers: dict,
+    ) -> None:
+        self._pending_events.put_nowait({"payload": payload, "verified": verified, "headers": headers})
+
+    def note_fast_ack_timeout(self) -> None:
+        self._fast_ack_timeouts += 1
+        logger.warning("Google Chat fast-ack budget exceeded; event dropped (total=%d)", self._fast_ack_timeouts)
