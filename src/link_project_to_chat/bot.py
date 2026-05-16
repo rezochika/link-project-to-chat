@@ -975,9 +975,11 @@ class ProjectBot(AuthMixin):
         # v1.1.0). Runs BEFORE voice/file/text routing so files and voice
         # in groups are gated identically. Team mode (group_mode) keeps its
         # own routing path below — this branch is mutually exclusive with it.
-        # When the gate passes, route directly to ``_on_text`` regardless of
-        # payload type — caption / @-mention triggers the same auth/dispatch
-        # path as a plain text message, and files ride on ``incoming.files``.
+        # When the gate passes, fall through to the existing payload-type
+        # dispatch below so @-mentioned voice / captioned-file / text get
+        # the same treatment as in DM. Calling ``_on_text`` directly here
+        # would silently discard ``incoming.files`` (photos, voice notes,
+        # documents), since ``_on_text`` only reads ``incoming.text``.
         if not self.group_mode and incoming.chat.kind == ChatKind.ROOM:
             if not self._respond_in_groups:
                 # Defensive bot-side filter: production PTB filter already
@@ -993,8 +995,11 @@ class ProjectBot(AuthMixin):
             if not is_directed_at_me(incoming, self.bot_username):
                 return
             incoming = self._strip_self_mention(incoming)
-            await self._on_text(incoming)
-            return
+            # Fall through to the existing payload-type dispatch below
+            # (voice / file / text). Don't call _on_text directly here —
+            # _on_text only handles text+prompt; it doesn't transcribe voice
+            # or copy captioned files into the prompt. The fall-through gives
+            # @-mentioned media the same treatment as DM media.
 
         # 1. Voice (audio mime).
         if incoming.files and any(

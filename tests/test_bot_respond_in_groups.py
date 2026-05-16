@@ -160,10 +160,13 @@ async def test_group_message_from_peer_bot_with_mention_is_silent():
 
 
 @pytest.mark.asyncio
-async def test_group_captioned_file_with_mention_reaches_on_text():
-    """Captioned files: caption rides on incoming.text per
-    TelegramTransport._dispatch_message. Same @mention gate applies."""
+async def test_group_captioned_file_with_mention_reaches_file_dispatch():
+    """Captioned files in groups route through the existing file
+    dispatch path (NOT directly to _on_text). Mention is stripped from
+    the caption (which carries on incoming.text) so the agent sees the
+    cleaned caption alongside the uploaded file payload."""
     bot = _make_bot(respond_in_groups=True)
+    bot._on_file_from_transport = AsyncMock()  # mock the file path too
     files = [IncomingFile(
         path=Path("/tmp/x.png"),
         original_name="x.png",
@@ -176,10 +179,12 @@ async def test_group_captioned_file_with_mention_reaches_on_text():
         files=files,
     )
     await bot._on_text_from_transport(incoming)
-    assert bot._on_text.await_count == 1
-    forwarded = bot._on_text.await_args.args[0]
+    # Files route to _on_file_from_transport, NOT _on_text.
+    assert bot._on_file_from_transport.await_count == 1
+    forwarded = bot._on_file_from_transport.await_args.args[0]
     assert forwarded.files == files
     assert forwarded.text == " analyze this"
+    bot._on_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -227,18 +232,42 @@ async def test_group_reply_to_bot_with_other_mention_is_silent():
 
 
 @pytest.mark.asyncio
-async def test_group_empty_text_after_strip_falls_through_silently():
-    """User types just '@MyBot' with nothing else. After stripping the bot
-    is responsible for whatever _on_text does with empty text — typically
-    early-returns. Verify _on_text receives the empty-text incoming and
-    handles it (early-return semantics are owned by _on_text itself)."""
+async def test_group_empty_text_after_strip_does_not_reach_on_text():
+    """User types just '@MyBot' with nothing else. After stripping, the
+    incoming has empty text and no files. The gate's fall-through routes
+    to the existing 'Nothing actionable — unsupported' branch (which
+    sends 'This message type is not supported.'). It does NOT call
+    _on_text. (We don't tightly assert the unsupported reply text here —
+    that's existing behavior under test elsewhere.)"""
     bot = _make_bot(respond_in_groups=True)
+    # Stub _auth_identity so the unsupported-branch auth check doesn't
+    # explode on missing brute-force-counter state we didn't set up.
+    bot._auth_identity = lambda _identity: True
     incoming = _make_group_incoming(
         "@MyBot", mentions=[_bot_mention("MyBot")],
     )
     await bot._on_text_from_transport(incoming)
-    # _on_text IS called — it's _on_text's responsibility to early-return
-    # on empty text. The gate's job is only to filter not-addressed-at-me.
-    assert bot._on_text.await_count == 1
-    forwarded = bot._on_text.await_args.args[0]
-    assert forwarded.text == ""
+    bot._on_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_voice_with_caption_mention_routes_to_voice_dispatch():
+    """Voice notes in groups with @mention (via caption surfaced as text)
+    route through _on_voice_from_transport, NOT _on_text. Same gate logic
+    as captioned files."""
+    bot = _make_bot(respond_in_groups=True)
+    bot._on_voice_from_transport = AsyncMock()
+    voice = [IncomingFile(
+        path=Path("/tmp/v.ogg"),
+        original_name="v.ogg",
+        mime_type="audio/ogg",
+        size_bytes=4096,
+    )]
+    incoming = _make_group_incoming(
+        "@MyBot transcribe",
+        mentions=[_bot_mention("MyBot")],
+        files=voice,
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_voice_from_transport.await_count == 1
+    bot._on_text.assert_not_awaited()
