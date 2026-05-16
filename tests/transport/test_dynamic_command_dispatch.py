@@ -151,6 +151,41 @@ def test_telegram_transport_filter_groups_only_when_team_mode():
     assert "ChatType.PRIVATE" not in filter_repr
 
 
+def test_telegram_transport_filter_includes_edited_message_in_all_modes():
+    """The PTB MessageHandler filter must include EDITED_MESSAGE in every
+    routing mode (default DM, respond_in_groups, team). Otherwise an edited
+    message that newly includes `@MyBot` would be silently dropped at the
+    filter level before it ever reaches the bot's routing gate.
+
+    This pins the edge-case row in the design doc: "Edited message that
+    newly includes @MyBot → Processed (PTB EDITED_MESSAGE filter delivers
+    it; gate runs)."
+    """
+    pytest.importorskip("telegram")
+
+    from telegram.ext import MessageHandler
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    for kwargs in (
+        dict(group_mode=False, respond_in_groups=False),
+        dict(group_mode=False, respond_in_groups=True),
+        dict(group_mode=True, respond_in_groups=False),
+    ):
+        transport = TelegramTransport.build("123:fake-token", menu=[])
+        transport.attach_telegram_routing(command_names=["help"], **kwargs)
+        handler = next(
+            h
+            for group in transport.app.handlers.values()
+            for h in group
+            if isinstance(h, MessageHandler)
+        )
+        filter_repr = repr(handler.filters)
+        assert "EDITED_MESSAGE" in filter_repr or "edited_message" in filter_repr.lower(), (
+            f"EDITED_MESSAGE missing from filter for kwargs={kwargs}: {filter_repr}"
+        )
+
+
 def test_telegram_transport_late_on_command_picks_widened_filter():
     """When routing was attached with respond_in_groups=True, late on_command
     registrations also pick up the wider filter (so plugin commands work in

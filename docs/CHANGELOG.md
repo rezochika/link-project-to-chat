@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.1.1 — 2026-05-16
+
+### Changed
+- **Manager bot: respond_in_groups now uses an On/Off button picker**
+  instead of a free-form text input. Tap to flip; current state shown
+  with the ● glyph next to the active label. Same UX as the model
+  picker that sits beside it. Existing `/edit_project NAME respond_in_groups true`
+  text path still works.
+- **`parse_user_bool(value)` helper** in `config.py`, shared by `cli.py`
+  and `manager/bot.py`. Replaces three independent copies of the
+  truthy/falsy literal sets (`{true,1,yes,on}` / `{false,0,no,off}`).
+  Returns ``True`` / ``False`` / ``None`` so callers keep their own
+  error-reporting idiom (`SystemExit` vs `send_text`).
+
+### Fixed
+- **Design-doc Edge cases table row 4** was incorrect: it claimed
+  `@MyBot + @SomeoneElse` → silent. Actual behavior (and now-pinned
+  test): an explicit `@MyBot` mention always wins in `is_directed_at_me`
+  regardless of other mentions; only `@MyBot` is stripped from the
+  prompt so the agent still sees who else was tagged.
+
+### Tests
+- Edited-message routing: PTB MessageHandler filter includes
+  `EDITED_MESSAGE` in every routing mode (default DM, respond_in_groups,
+  team). Without this an edit that newly includes `@MyBot` would be
+  dropped at the filter layer.
+- Bot-level: edited message with newly-added `@MyBot` passes the gate
+  identically to a fresh mention (the bot doesn't distinguish edited
+  from fresh).
+- Config loader: int `0` and int `1` coerce to bool without WARNING (we
+  already had a tolerant path; this pins it so we don't regress).
+- 8 picker tests covering render, on/off flip, persist, role-gating.
+- 26 vocabulary tests for `parse_user_bool`.
+
 ## 1.1.0 — 2026-05-16
 
 ### Added

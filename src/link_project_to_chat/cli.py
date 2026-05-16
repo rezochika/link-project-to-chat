@@ -9,6 +9,7 @@ from .backends.claude import PERMISSION_MODES
 from .config import (
     DEFAULT_CONFIG,
     load_config,
+    parse_user_bool,
     patch_backend_state,
     resolve_permissions,
     resolve_start_model,
@@ -17,16 +18,14 @@ from .config import (
 
 
 _PERMISSION_VALUES = set(PERMISSION_MODES) | {"dangerously-skip-permissions"}
-_TRUTHY = {"1", "true", "yes", "on"}
-_FALSEY = {"0", "false", "no", "off"}
 
 
 def _normalize_permissions_edit(field: str, value: str) -> str:
     if field == "dangerously_skip_permissions":
-        lowered = value.strip().lower()
-        if lowered in _TRUTHY:
+        parsed = parse_user_bool(value)
+        if parsed is True:
             return "dangerously-skip-permissions"
-        if lowered in _FALSEY:
+        if parsed is False:
             return "default"
         raise SystemExit(
             "dangerously_skip_permissions expects one of: true, false, yes, no, on, off, 1, 0."
@@ -258,12 +257,10 @@ def projects_edit(ctx, name: str, field: str, value: str):
             save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' permissions to {normalized}.")
     elif field == "respond_in_groups":
-        truthy = {"true", "1", "yes", "on"}
-        falsy = {"false", "0", "no", "off"}
-        lowered = value.strip().lower()
-        if lowered in truthy:
+        parsed = parse_user_bool(value)
+        if parsed is True:
             projects[name]["respond_in_groups"] = True
-        elif lowered in falsy:
+        elif parsed is False:
             # Emit-only-when-True policy: strip the key on false rather than
             # writing an explicit `false`, so on-disk shape stays minimal and
             # round-trips through save_config without noise.

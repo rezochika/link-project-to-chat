@@ -26,6 +26,31 @@ class ConfigError(Exception):
 
 _VALID_ROLES = ("viewer", "executor")
 
+# Canonical truthy/falsy literals for user-supplied bool fields (CLI flags,
+# manager-bot edit inputs, config-string overrides). Kept here so CLI and
+# manager paths share a single vocabulary — avoids drift if we ever extend
+# the accepted set.
+_USER_BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
+_USER_BOOL_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def parse_user_bool(value: str) -> bool | None:
+    """Parse a user-supplied bool string. Returns None for unrecognized input.
+
+    Accepts (case-insensitive, stripped): true/false, yes/no, on/off, 1/0.
+    Callers decide how to report unrecognized input — this function never
+    raises, so it works in both ``raise SystemExit`` (CLI) and
+    ``send_text(...)`` (manager-bot) contexts.
+    """
+    if not isinstance(value, str):
+        return None
+    lowered = value.strip().lower()
+    if lowered in _USER_BOOL_TRUE:
+        return True
+    if lowered in _USER_BOOL_FALSE:
+        return False
+    return None
+
 
 def _is_web_native_id(native_id: str) -> bool:
     return (

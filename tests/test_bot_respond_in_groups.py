@@ -214,6 +214,28 @@ async def test_dm_message_unaffected_by_flag():
 
 
 @pytest.mark.asyncio
+async def test_group_explicit_mention_alongside_other_mention_reaches_on_text():
+    """`@MyBot @SomeoneElse do X` → processed. An explicit `@MyBot` mention
+    always wins in is_directed_at_me, regardless of other handles mentioned
+    in the same message. Pins design-doc Edge cases table row 4."""
+    bot = _make_bot(respond_in_groups=True)
+    other = Identity(
+        transport_id="fake", native_id="999",
+        display_name="SomeoneElse", handle="SomeoneElse", is_bot=False,
+    )
+    incoming = _make_group_incoming(
+        "@MyBot @SomeoneElse do X",
+        mentions=[_bot_mention("MyBot"), other],
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    # Only @MyBot is stripped; @SomeoneElse survives verbatim so the agent
+    # sees who else was tagged in the prompt.
+    assert forwarded.text == " @SomeoneElse do X"
+
+
+@pytest.mark.asyncio
 async def test_group_reply_to_bot_with_other_mention_is_silent():
     """Reply to bot + simultaneously @-mentions someone else → silent.
     Matches team-mode semantics in is_directed_at_me."""
@@ -248,6 +270,32 @@ async def test_group_empty_text_after_strip_does_not_reach_on_text():
     )
     await bot._on_text_from_transport(incoming)
     bot._on_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_edited_message_newly_including_mention_reaches_on_text():
+    """When a user edits a previously plain group message to add `@MyBot`,
+    PTB delivers it via the EDITED_MESSAGE filter, the transport adapter
+    converts it into a normal IncomingMessage (no edited-vs-fresh marker),
+    and the bot's gate processes it exactly like a fresh @mention.
+
+    Pins the design-doc Edge cases row: "Edited message that newly
+    includes @MyBot → Processed". From the bot's perspective an edited
+    message is indistinguishable from a fresh one — both arrive as the
+    same IncomingMessage shape — so the gate behavior is identical.
+    """
+    bot = _make_bot(respond_in_groups=True)
+    # Simulate the IncomingMessage we'd get from `_dispatch_message` after
+    # a user edits "hi all" → "hi all @MyBot do X". Same shape as a fresh
+    # mention; the transport doesn't surface an is_edited flag.
+    incoming = _make_group_incoming(
+        "hi all @MyBot do X",
+        mentions=[_bot_mention("MyBot")],
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    assert forwarded.text == "hi all  do X"  # @MyBot stripped
 
 
 @pytest.mark.asyncio

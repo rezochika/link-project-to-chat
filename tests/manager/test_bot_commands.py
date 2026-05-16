@@ -1243,3 +1243,107 @@ async def test_apply_edit_respond_in_groups_invalid_value_replies_error(bot_env,
     assert "respond_in_groups" not in raw["projects"]["myproj"]
     text = fake.sent_messages[-1].text.lower()
     assert "invalid" in text or "true" in text  # error mentions accepted values
+
+
+@pytest.mark.asyncio
+async def test_edit_respond_in_groups_button_renders_on_off_picker(
+    bot_env, tmp_path: Path,
+):
+    """Clicking the respond_in_groups field button shows an On/Off picker
+    (not a text-input prompt). Default state Off → 'Off' shows the ● glyph.
+    """
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": str(tmp_path)}}
+    }))
+    fake = _swap_fake_transport(bot)
+    click, state = _make_button_click("proj_efld_respond_in_groups_myproj")
+    await bot._on_button_from_transport(click)
+    # No pending_edit armed — picker is button-driven, not text-driven.
+    assert "pending_edit" not in state
+    edited = fake.edited_messages[-1]
+    assert "Respond in groups" in edited.text
+    assert "Off" in edited.text  # current state shown
+    assert edited.buttons is not None
+    button_values = [btn.value for row in edited.buttons.rows for btn in row]
+    assert "proj_rig_on_myproj" in button_values
+    assert "proj_rig_off_myproj" in button_values
+    # Off is default state → ● glyph appears on the Off label.
+    labels = [btn.label for row in edited.buttons.rows for btn in row]
+    assert any("● Off" in l for l in labels)
+    assert all("● On" not in l for l in labels)
+
+
+@pytest.mark.asyncio
+async def test_proj_rig_on_button_flips_field_true_and_persists(
+    bot_env, tmp_path: Path,
+):
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": str(tmp_path)}}
+    }))
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_rig_on_myproj")
+    await bot._on_button_from_transport(click)
+    raw = json.loads(proj_cfg.read_text())
+    assert raw["projects"]["myproj"]["respond_in_groups"] is True
+    # Picker re-rendered with ● On.
+    edited = fake.edited_messages[-1]
+    labels = [btn.label for row in edited.buttons.rows for btn in row]
+    assert any("● On" in l for l in labels)
+    assert "Restart" in edited.text
+
+
+@pytest.mark.asyncio
+async def test_proj_rig_off_button_strips_key_from_config(
+    bot_env, tmp_path: Path,
+):
+    """Off click drops the key (emit-only-when-True policy) rather than
+    writing an explicit false, keeping on-disk configs tidy."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "respond_in_groups": True,
+            }
+        }
+    }))
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_rig_off_myproj")
+    await bot._on_button_from_transport(click)
+    raw = json.loads(proj_cfg.read_text())
+    assert "respond_in_groups" not in raw["projects"]["myproj"]
+    edited = fake.edited_messages[-1]
+    labels = [btn.label for row in edited.buttons.rows for btn in row]
+    assert any("● Off" in l for l in labels)
+
+
+@pytest.mark.asyncio
+async def test_proj_rig_buttons_gated_to_executor(bot_env, tmp_path: Path):
+    """Viewer-role users can't toggle the picker — same role gate that
+    protects every other state-changing button.
+
+    Uses the same handle as bot_env's default AllowedUser ("testuser") so
+    auth succeeds via username fallback; the role check then trips.
+    """
+    from link_project_to_chat.config import AllowedUser
+
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": str(tmp_path)}}
+    }))
+    # Demote the bot_env user to viewer (handle/identity unchanged so auth
+    # still succeeds; only role gate trips).
+    bot._allowed_users = [
+        AllowedUser(username="testuser", role="viewer", locked_identities=["fake:1"]),
+    ]
+    fake = _swap_fake_transport(bot)
+    click, _ = _make_button_click("proj_rig_on_myproj")
+    await bot._on_button_from_transport(click)
+    # Field on disk unchanged.
+    raw = json.loads(proj_cfg.read_text())
+    assert "respond_in_groups" not in raw["projects"]["myproj"]
+    # User informed it's read-only.
+    text = (fake.sent_messages[-1].text if fake.sent_messages else "").lower()
+    assert "read-only" in text or "executor" in text
