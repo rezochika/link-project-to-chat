@@ -349,7 +349,9 @@ When `respond_in_groups=True` and the bot answers in a group, it sees
 the chatter that happened between its previous LLM call and the
 current one — `[Recent discussion]` is prepended to the prompt. Buffer
 is per-chat, 200-message ring, in-memory only (cleared on restart).
-Works for any room-kind chat across transports.
+Works for any room-kind chat across transports. The current local Web
+UI is direct browser-to-bot chat and emits DM-kind messages, so room
+context does not apply there until a multi-user Web room model exists.
 
 ### `meta_dir` config field (v1.2.0+)
 

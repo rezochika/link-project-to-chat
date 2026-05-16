@@ -170,7 +170,7 @@ def test_record_idempotent_on_same_msg_id():
 
 
 def test_record_different_msg_id_after_dup_still_appends():
-    """Idempotency only skips the LATEST msg_id; subsequent records work."""
+    """Idempotency skips duplicates without blocking later distinct messages."""
     h = ChatHistory()
     chat = _room()
     h.record(chat, "100", "alice", "first")
@@ -179,6 +179,18 @@ def test_record_different_msg_id_after_dup_still_appends():
     result = h.since_last_llm(chat, "999")
     assert "first" in result
     assert "second" in result
+
+
+def test_record_idempotent_on_msg_id_even_when_duplicate_not_tail():
+    """Re-recording a prior msg_id remains a no-op after newer messages."""
+    h = ChatHistory()
+    chat = _room()
+    h.record(chat, "100", "alice", "first")
+    h.record(chat, "101", "bob", "second")
+    h.record(chat, "100", "alice", "first")
+    result = h.since_last_llm(chat, "999")
+    assert result.count("alice: first") == 1
+    assert "bob: second" in result
 
 
 def test_last_msg_id_returns_tail():

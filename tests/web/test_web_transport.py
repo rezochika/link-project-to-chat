@@ -85,6 +85,35 @@ async def test_inbound_message_dispatched(transport: WebTransport):
     assert received[0].text == "ping"
 
 
+async def test_browser_form_dispatch_uses_dm_chat_kind(transport: WebTransport):
+    """The production Web form path is a direct browser-to-bot chat today.
+
+    v1.2.0 group context applies to ChatKind.ROOM transports. WebTransport's
+    HTTP form dispatch intentionally remains DM-kind until the Web UI grows a
+    real multi-user room model.
+    """
+    received: list[IncomingMessage] = []
+
+    async def handler(msg: IncomingMessage) -> None:
+        received.append(msg)
+
+    transport.on_message(handler)
+    await transport._dispatch_event({
+        "event_type": "inbound_message",
+        "chat_id": "default",
+        "payload": {
+            "text": "ping",
+            "sender_native_id": "browser_user",
+            "sender_display_name": "You",
+            "sender_handle": None,
+            "files": [],
+        },
+    })
+
+    assert len(received) == 1
+    assert received[0].chat.kind == ChatKind.DM
+
+
 async def test_inbound_command_dispatched(transport: WebTransport):
     seen: list[str] = []
 

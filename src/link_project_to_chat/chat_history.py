@@ -1,7 +1,7 @@
 """In-memory chat history per ROOM. Process-local; not persisted.
 
 Keyed on transport-portable ChatRef so the same class works for
-Telegram groups, Web rooms, Slack channels, Google Chat rooms.
+Telegram groups, future Web rooms, Slack channels, Google Chat rooms.
 
 Zero telegram imports. Zero backend imports. Verified by
 tests/test_transport_lockout.py.
@@ -63,8 +63,8 @@ class ChatHistory:
         if not text or not text.strip():
             return
         dq = self._history.setdefault(chat, collections.deque(maxlen=self._maxlen))
-        if dq and dq[-1]["msg_id"] == msg_id:
-            return  # idempotent: same msg already at tail
+        if any(entry["msg_id"] == msg_id for entry in dq):
+            return  # idempotent: same msg already recorded for this chat
         dq.append({"msg_id": msg_id, "sender": sender or "unknown", "text": text})
 
     def since_last_llm(self, chat: ChatRef, before_msg_id: str) -> str:

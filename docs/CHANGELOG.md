@@ -24,7 +24,9 @@
   since its last call is prepended as `[Recent discussion]`. Always on
   for groups; DMs continue to use `conversation_log`. Cross-backend
   rendering via a per-call `recent_discussion` kwarg through
-  `submit_agent → Task → chat_stream`.
+  `submit_agent → Task → chat_stream`. The current local Web UI remains
+  direct browser-to-bot DM-kind chat; Web room context is deferred until
+  WebTransport has a real multi-user ROOM surface.
 - **`Config.meta_dir`** top-level field. Operators can put per-bot /
   per-plugin persistent storage on a different volume from
   `config.json`. Default unchanged (`~/.link-project-to-chat/meta/`).
