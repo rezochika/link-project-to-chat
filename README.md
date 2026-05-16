@@ -70,6 +70,19 @@ link-project-to-chat start --project myproject --transport web --port 8080
 
 The web UI is local-only — bind to `127.0.0.1` and never expose it to the public internet without your own auth in front, since the same `/run` shell-execution surface is exposed.
 
+### Google Chat transport
+
+Google Chat support runs as an HTTPS event receiver. Configure a Google Chat app
+with an HTTP endpoint, set `google_chat.public_url`, `google_chat.endpoint_path`,
+and Google request-verification audience settings, then start with:
+
+```bash
+link-project-to-chat start --project NAME --transport google_chat
+```
+
+Google Chat v1 supports text, commands, card buttons, prompt dialogs/reply
+fallbacks, thread-aware replies, and conservative file fallback behavior.
+
 ## Example session
 
 ```
@@ -479,7 +492,6 @@ sudo systemctl enable --now link-project-to-chat
 **Planned (designed, not yet implemented):**
 - Discord transport
 - Slack transport
-- Google Chat transport
 
 Contributions welcome.
 

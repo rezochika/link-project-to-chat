@@ -71,6 +71,7 @@ def _has_unsupported_attachment(message_data: dict) -> bool:
 
 
 class GoogleChatTransport:
+    TRANSPORT_ID = "google_chat"
     transport_id = "google_chat"
     # 8 000 is the conservative *character* budget surfaced to callers
     # via the `max_text_length` capability. The hard *byte* ceiling is
@@ -101,6 +102,9 @@ class GoogleChatTransport:
         self._fast_ack_timeouts: int = 0
         self._message_handlers: list = []
         self._command_handlers: dict[str, object] = {}
+        self._button_handlers: list = []
+        self._stop_callbacks: list = []
+        self._authorizer = None
         self._pending_prompts: dict[str, PendingPrompt] = {}
         self._prompt_submit_handlers: list = []
         self._prompt_seq: int = 0
@@ -131,6 +135,34 @@ class GoogleChatTransport:
         self._fast_ack_timeouts += 1
         logger.warning("Google Chat fast-ack budget exceeded; event dropped (total=%d)", self._fast_ack_timeouts)
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """No-op in v1; real HTTP server startup is wired in the app layer."""
+
+    async def stop(self) -> None:
+        """Fire registered on_stop callbacks then clean up state."""
+        for cb in self._stop_callbacks:
+            try:
+                result = cb()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("GoogleChatTransport: on_stop callback raised")
+
+    def run(self) -> None:
+        """Synchronous entry point. Google Chat uses HTTP push (no polling loop).
+
+        Production deployments call `start()` directly from the ASGI runner;
+        this method is a protocol stub that satisfies the Transport contract and
+        is used only in test/CLI contexts where the caller needs a blocking call.
+        """
+        import asyncio as _asyncio  # noqa: PLC0415
+        _asyncio.run(self.start())
+
+    def on_stop(self, callback) -> None:
+        self._stop_callbacks.append(callback)
+
     # ── Inbound registration ──────────────────────────────────────────────
 
     def on_message(self, handler) -> None:
@@ -138,6 +170,12 @@ class GoogleChatTransport:
 
     def on_command(self, name: str, handler) -> None:
         self._command_handlers[name] = handler
+
+    def on_button(self, handler) -> None:
+        self._button_handlers.append(handler)
+
+    def set_authorizer(self, authorizer) -> None:
+        self._authorizer = authorizer
 
     # ── Event dispatch ────────────────────────────────────────────────────
 
@@ -153,6 +191,12 @@ class GoogleChatTransport:
     async def _dispatch_message(self, payload: dict) -> None:
         chat = _chat_from_space(payload["space"])
         sender = _identity_from_user(payload["user"])
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
         message_data = payload["message"]
         text = message_data.get("text", "")
         thread_name = message_data.get("thread", {}).get("name")
@@ -348,5 +392,87 @@ class GoogleChatTransport:
         )
         for handler in self._prompt_submit_handlers:
             result = handler(submission)
+            if inspect.isawaitable(result):
+                await result
+
+    async def inject_prompt_submit(
+        self,
+        prompt: PromptRef,
+        sender: Identity,
+        *,
+        text: str | None = None,
+        option: str | None = None,
+    ) -> None:
+        """Contract-test alias for inject_prompt_reply (same semantics)."""
+        await self.inject_prompt_reply(prompt, sender=sender, text=text, option=option)
+
+    async def inject_message(
+        self,
+        chat: "ChatRef",
+        sender: "Identity",
+        text: str,
+        *,
+        files=None,
+        reply_to=None,
+        mentions=None,
+    ) -> None:
+        """Test helper: synthesize an IncomingMessage and dispatch to handlers.
+
+        Bypasses HTTP auth — for use in contract tests only. Respects the
+        registered authorizer so the authorizer contract tests work correctly.
+        """
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
+        msg_ref = MessageRef(
+            transport_id="google_chat",
+            native_id="test-msg-001",
+            chat=chat,
+        )
+        msg = IncomingMessage(
+            chat=chat,
+            sender=sender,
+            text=text,
+            files=files or [],
+            reply_to=reply_to,
+            message=msg_ref,
+            has_unsupported_media=False,
+            mentions=mentions or [],
+        )
+        for handler in self._message_handlers:
+            result = handler(msg)
+            if inspect.isawaitable(result):
+                await result
+
+    async def inject_command(
+        self,
+        chat: "ChatRef",
+        sender: "Identity",
+        name: str,
+        *,
+        args: list,
+        raw_text: str,
+    ) -> None:
+        """Test helper: synthesize a CommandInvocation and dispatch to handlers."""
+        from link_project_to_chat.transport.base import CommandInvocation as _CI  # noqa: PLC0415
+        msg_ref = MessageRef(
+            transport_id="google_chat",
+            native_id="test-cmd-001",
+            chat=chat,
+        )
+        ci = _CI(
+            chat=chat,
+            sender=sender,
+            name=name,
+            args=args,
+            raw_text=raw_text,
+            message=msg_ref,
+        )
+        handler = self._command_handlers.get(name)
+        if handler is not None:
+            result = handler(ci)
             if inspect.isawaitable(result):
                 await result

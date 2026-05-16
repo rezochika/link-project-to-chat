@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Google Chat transport (v1)** — third platform after Telegram and Web. Runs
+  as an HTTPS event receiver using Google Chat's HTTP endpoint delivery model
+  (Pub/Sub delivery deferred). Supports: text messages, slash commands, prompt
+  dialog/reply fallbacks, thread-aware replies, and `max_text_length = 8000`
+  (conservative character budget safe under the 32 000-byte hard limit).
+  Start with `--transport google_chat`.
+- **Conservative attachment handling** — Drive attachments and uploaded-content
+  attachments are flagged as `has_unsupported_media=True` so the bot can reply
+  with a "media type not supported" message instead of treating the caption as a
+  normal prompt. Actual upload/download support is deferred to a future task.
+
+### Notes — v1 limitations
+- No attachment upload/download (`NotImplementedError` stubs in client).
+- No `project_number` JWT verification (`NotImplementedError`); `endpoint_url`
+  audience mode is supported.
+- No Pub/Sub or Marketplace polish (HTTP endpoint delivery only).
+- No persisted callback secret (in-memory only; lost on restart).
+- No shared prompt-status primitive (per-transport in-memory state).
+- Card button clicks (interactive Cards v2) not yet routed through the
+  Transport's `on_button` path (`inject_button_click` not implemented).
+
 ## 1.2.0 — 2026-05-16
 
 ### Added

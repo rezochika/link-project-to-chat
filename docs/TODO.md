@@ -47,7 +47,7 @@ Status tracker: [2026-04-25-spec0-followups.md](2026-04-25-spec0-followups.md)
 | #1 Web UI | [spec](superpowers/specs/2026-04-21-transport-web-ui-design.md) | [plan](superpowers/plans/2026-04-21-web-transport.md) · [review-fix plan](superpowers/plans/2026-04-25-transport-spec1-review-fixes.md) | ✅ | Shipped 2026-04-25 (commits `6c12b39`..`d24ef52`); review-fix landed same day (commits `77abcff`..`7b73b8d`) closing P1.1/P1.2/P1.3/P1.4/P2. First non-Telegram transport. FastAPI + HTMX + SSE + SQLite. Closed A1, partially closed A2 (schema only). |
 | #2 Discord | [spec](superpowers/specs/2026-04-21-transport-discord-design.md) | [plan](superpowers/plans/2026-04-21-discord-transport.md) | 📋 | Uses discord.py 2.x, depends on #1 primitives. |
 | #3 Slack | [spec](superpowers/specs/2026-04-21-transport-slack-design.md) | [plan](superpowers/plans/2026-04-21-slack-transport.md) | 📋 | slack_bolt + Socket Mode; final cross-platform validation. |
-| #4 Google Chat | [spec](superpowers/specs/2026-04-25-transport-google-chat-design.md) | — | 📋 | HTTP Chat app events + Google Chat REST API; Cards v2/dialogs map to `Buttons`/`PromptSpec`; depends on public HTTPS endpoint or future Pub/Sub delivery. |
+| #4 Google Chat | [spec](superpowers/specs/2026-04-25-transport-google-chat-design.md) | [plan](superpowers/plans/2026-04-25-transport-google-chat.md) | ✅ | HTTP Chat app events + Google Chat REST API; Cards v2/dialogs map to `Buttons`/`PromptSpec`; HTTP endpoint delivery. v1 limitations: no attachment upload/download (NotImplementedError stubs in client), no project_number JWT verification (endpoint_url mode supported), no Pub/Sub or Marketplace polish, no persisted callback secret (in-memory only), no shared prompt-status primitive (per-transport state), card button clicks not yet routed through on_button path. |
 
 ### 1.4 Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)
 
@@ -398,9 +398,9 @@ Pre-v1.0 dual-wrote `model` / `effort` / `permissions` / `session_id` / `show_th
 
 | Status | Count |
 |---|---|
-| ✅ Shipped | 6 transport specs (#0/#0a/#0b/#0c/#1) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path + **Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)** + **Post-v1.0.0 integration hardening on `dev` (16 commits, see §8) — not yet merged to `main`** |
+| ✅ Shipped | 7 transport specs (#0/#0a/#0b/#0c/#1/#4) + Backend Phases 1–4 + 6 earlier features + security/quality audit fixes + Phase 4 post-completion hardening + Web UI security/buttons + non-Telegram room binding restart path + **Plugin system port + `AllowedUser` auth model rewrite (v1.0.0)** + **Post-v1.0.0 integration hardening on `dev` (16 commits, see §8) — not yet merged to `main`** + **Google Chat transport v1** |
 | 🟡 Partial / intermittent | 2 intermittent flaky tests (F1, F2 in §4.4) |
-| 📋 Designed, not started | 3 transport specs (Discord #2, Slack #3, Google Chat #4), Backend Phase 5 (Gemini adapter), sandbox |
+| 📋 Designed, not started | 2 transport specs (Discord #2, Slack #3), Backend Phase 5 (Gemini adapter), sandbox |
 | ⏳ Small pending fixes | 1 deferred follow-up (A3 — future Conversation primitive spec). 6 non-blocking follow-ups from v1.0.0 final review queued for v1.0.1 (§1.4). Direct code-audit findings CA-1..CA-5 are closed with regression coverage. `dev` sweep (§8) awaiting merge to `main` + end-to-end `pytest -q` re-verification; untracked `link-project-to-chat/` run-state dir needs gitignore-add or relocation. |
 
 ---
