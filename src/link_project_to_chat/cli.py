@@ -111,6 +111,11 @@ def projects_list(ctx):
     default=False,
     help="Respond in Telegram groups when @mentioned or replied to (default off)",
 )
+@click.option(
+    "--safety-prompt", "safety_prompt", default=None,
+    help='Custom safety guardrail text. Empty string disables safety. '
+         'Default (omit flag) uses the built-in GitLab guardrail.',
+)
 @click.pass_context
 def projects_add(
     ctx,
@@ -122,6 +127,7 @@ def projects_add(
     permission_mode: str | None,
     skip_permissions: bool,
     respond_in_groups: bool,
+    safety_prompt: str | None,
 ):
     """Add a project."""
     from .manager.config import load_project_configs, save_project_configs
@@ -155,6 +161,8 @@ def projects_add(
     # case from polluting on-disk entries with a redundant `false`.
     if respond_in_groups:
         entry["respond_in_groups"] = True
+    if safety_prompt is not None:
+        entry["safety_prompt"] = safety_prompt
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")
 
@@ -198,6 +206,7 @@ def projects_edit(ctx, name: str, field: str, value: str):
         "permission_mode",
         "dangerously_skip_permissions",
         "respond_in_groups",
+        "safety_prompt",
     )
     cfg_path = ctx.obj["config_path"]
     projects = load_project_configs(cfg_path)
@@ -272,6 +281,16 @@ def projects_edit(ctx, name: str, field: str, value: str):
             )
         save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' respond_in_groups to {value}.")
+    elif field == "safety_prompt":
+        # "default" is the operator-friendly way to strip the key (back to
+        # DEFAULT_SAFETY_SYSTEM_PROMPT on next bot start). Empty string is
+        # the explicit-disable signal. Any other value is a custom prompt.
+        if value == "default":
+            projects[name].pop("safety_prompt", None)
+        else:
+            projects[name]["safety_prompt"] = value
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' safety_prompt.")
     else:
         raise SystemExit(f"Unknown field. Use: {', '.join(_EDITABLE)}")
 

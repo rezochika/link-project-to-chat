@@ -1543,3 +1543,64 @@ def test_projects_edit_respond_in_groups_invalid_input_errors(tmp_path):
     # File unchanged.
     on_disk = json.loads(cfg.read_text())
     assert "respond_in_groups" not in on_disk["projects"]["myproj"]
+
+
+def test_projects_add_safety_prompt_flag_writes_custom_string(tmp_path):
+    """--safety-prompt flag stores a custom guardrail."""
+    from click.testing import CliRunner
+    from link_project_to_chat.cli import main
+    proj_path = tmp_path / "proj"
+    proj_path.mkdir()
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text('{"projects": {}}')
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "add",
+        "--name", "p", "--path", str(proj_path),
+        "--token", "t",
+        "--safety-prompt", "custom guardrail text",
+    ])
+    assert result.exit_code == 0, result.output
+    import json
+    raw = json.loads(cfg_file.read_text())
+    assert raw["projects"]["p"]["safety_prompt"] == "custom guardrail text"
+
+
+def test_projects_edit_safety_prompt_to_empty_string_disables(tmp_path):
+    """`projects edit p safety_prompt ""` writes empty string (disable signal)."""
+    from click.testing import CliRunner
+    from link_project_to_chat.cli import main
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        '{"projects": {"p": {"path": "' + str(tmp_path) + '", "telegram_bot_token": "t"}}}'
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "p", "safety_prompt", "",
+    ])
+    assert result.exit_code == 0, result.output
+    import json
+    raw = json.loads(cfg_file.read_text())
+    assert raw["projects"]["p"]["safety_prompt"] == ""
+
+
+def test_projects_edit_safety_prompt_to_default_strips_key(tmp_path):
+    """`projects edit p safety_prompt default` strips the key (back to None state)."""
+    from click.testing import CliRunner
+    from link_project_to_chat.cli import main
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(
+        '{"projects": {"p": {"path": "' + str(tmp_path) + '", '
+        '"telegram_bot_token": "t", "safety_prompt": "old"}}}'
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg_file),
+        "projects", "edit", "p", "safety_prompt", "default",
+    ])
+    assert result.exit_code == 0, result.output
+    import json
+    raw = json.loads(cfg_file.read_text())
+    assert "safety_prompt" not in raw["projects"]["p"]

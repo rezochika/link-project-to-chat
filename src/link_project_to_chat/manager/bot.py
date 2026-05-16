@@ -50,8 +50,8 @@ COMMANDS = [
     ("help", "Show commands"),
 ]
 
-_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups")
-_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups")
+_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups", "safety_prompt")
+_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups", "safety_prompt")
 
 MODEL_OPTIONS = [
     ("opus[1m]", "Opus 4.7 1M"),
@@ -1197,6 +1197,26 @@ class ManagerBot(AuthMixin):
                     f"Invalid bool for respond_in_groups: {value!r}. "
                     f"Use one of: true, false, 1, 0, yes, no, on, off.",
                 )
+        elif field == "safety_prompt":
+            if value == "default":
+                projects[name].pop("safety_prompt", None)
+                self._save_projects(projects)
+                await self._transport.send_text(
+                    chat, f"Updated '{name}' safety_prompt → default (built-in guardrail).",
+                )
+            else:
+                # Empty string and any non-"default" string are both written verbatim.
+                projects[name]["safety_prompt"] = value
+                self._save_projects(projects)
+                if value == "":
+                    await self._transport.send_text(
+                        chat, f"Updated '{name}' safety_prompt → disabled.",
+                    )
+                else:
+                    await self._transport.send_text(
+                        chat, f"Updated '{name}' safety_prompt to custom text "
+                        f"({len(value)} chars).",
+                    )
         else:
             await self._transport.send_text(
                 chat, f"Unknown field. Use: {', '.join(_EDITABLE_FIELDS)}",

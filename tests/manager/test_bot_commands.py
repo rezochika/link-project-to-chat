@@ -1347,3 +1347,56 @@ async def test_proj_rig_buttons_gated_to_executor(bot_env, tmp_path: Path):
     # User informed it's read-only.
     text = (fake.sent_messages[-1].text if fake.sent_messages else "").lower()
     assert "read-only" in text or "executor" in text
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_safety_prompt_custom_string(bot_env, tmp_path):
+    """Manager wizard: setting safety_prompt to a custom string persists it."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": str(tmp_path), "telegram_bot_token": "t"}}
+    }))
+    fake = _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "safety_prompt", "custom guardrail")
+    raw = json.loads(proj_cfg.read_text())
+    assert raw["projects"]["myproj"]["safety_prompt"] == "custom guardrail"
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_safety_prompt_default_strips_key(bot_env, tmp_path):
+    """Manager wizard: 'default' restores the built-in safety prompt by
+    stripping the key from disk."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {
+            "path": str(tmp_path),
+            "telegram_bot_token": "t",
+            "safety_prompt": "old custom",
+        }}
+    }))
+    _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "safety_prompt", "default")
+    raw = json.loads(proj_cfg.read_text())
+    assert "safety_prompt" not in raw["projects"]["myproj"]
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_safety_prompt_empty_disables(bot_env, tmp_path):
+    """Manager wizard: empty string writes the explicit-disable signal."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {"myproj": {"path": str(tmp_path), "telegram_bot_token": "t"}}
+    }))
+    _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "safety_prompt", "")
+    raw = json.loads(proj_cfg.read_text())
+    assert raw["projects"]["myproj"]["safety_prompt"] == ""
+
+
+def test_editable_fields_include_safety_prompt():
+    from link_project_to_chat.manager.bot import _BUTTON_EDIT_FIELDS, _EDITABLE_FIELDS
+    assert "safety_prompt" in _EDITABLE_FIELDS
+    assert "safety_prompt" in _BUTTON_EDIT_FIELDS
