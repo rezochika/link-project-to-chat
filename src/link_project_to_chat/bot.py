@@ -3347,7 +3347,7 @@ class ProjectBot(AuthMixin):
             )
             self._app = None  # WebTransport has no PTB Application
         elif self.transport_kind == "google_chat":
-            from link_project_to_chat.google_chat.transport import GoogleChatTransport
+            from .google_chat.transport import GoogleChatTransport
 
             transport = GoogleChatTransport(config=self._config.google_chat)
             self._transport = transport
