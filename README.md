@@ -316,6 +316,49 @@ When enabled:
 Restart the project bot for the flag change to take effect (the
 `python-telegram-bot` filter is set once at startup).
 
+### Safety prompt (v1.2.0+)
+
+By default, the bot is given a guardrail asking it to **describe-and-ask
+before destructive action** — no kills, no restarts, no `rm` without
+your explicit go-ahead in the current message. This is the same
+guardrail that ships with the GitLab fork.
+
+Per-project knobs (`projects edit <name> safety_prompt <value>`):
+
+| Value | Effect |
+|---|---|
+| `default` (or omit the key) | Use the built-in guardrail |
+| Empty string `""` | Disable safety entirely — agent acts without asking |
+| Any other string | Replace the built-in with your custom text |
+
+CLI: `link-project-to-chat projects add ... --safety-prompt "..."`.
+Manager bot: the field appears in the project-edit text wizard.
+
+### Hot-reload of `allowed_users` (v1.2.0+)
+
+When you `/add_user`, `/remove_user`, `/promote_user`, or
+`/demote_user` from the manager bot, the running project bots pick up
+the change within 5 s — no restart required. The reload is debounced
+and clobber-safe; it never wipes in-flight first-contact identity
+locks. Other config fields (token, model, `respond_in_groups`) still
+need a bot restart to apply.
+
+### Inter-message group context (v1.2.0+)
+
+When `respond_in_groups=True` and the bot answers in a group, it sees
+the chatter that happened between its previous LLM call and the
+current one — `[Recent discussion]` is prepended to the prompt. Buffer
+is per-chat, 200-message ring, in-memory only (cleared on restart).
+Works for any room-kind chat across transports.
+
+### `meta_dir` config field (v1.2.0+)
+
+Top-level `meta_dir` in `config.json` redirects per-bot / per-plugin
+storage to a different filesystem volume. Default is
+`~/.link-project-to-chat/meta/`. Operators upgrading to v1.2.0+ don't
+need to migrate existing data; the field is only consulted when bots
+start.
+
 ## Manager bot
 
 The manager bot controls multiple project bots from a single Telegram chat — start, stop, view logs, add/remove projects, and create new projects automatically.

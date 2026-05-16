@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.2.0 — 2026-05-16
+
+### Added
+- **Safety system prompt** (`ProjectConfig.safety_prompt`). Cross-backend
+  guardrail asking the agent to describe-and-ask before destructive
+  action. Per-project opt-out (set to `""` to disable, custom string to
+  replace, omit/null to use the built-in default). Rendered natively by
+  each backend (Claude: `--append-system-prompt`, Codex:
+  `<system-reminder>` block). New CLI flag `--safety-prompt` on
+  `projects add`; manager bot exposes the field via the project-edit
+  wizard.
+- **Hot-reload of `allowed_users`**. Project and manager bots pick up
+  `allowed_users` changes from disk within 5 s of the manager writing
+  them — no restart required. Debounced polling triggered on each
+  auth-identity check; skipped while `_auth_dirty=True` so in-flight
+  first-contact locks are never clobbered. Merge preserves the union
+  of disk + memory `locked_identities` so cross-transport locks
+  survive role changes.
+- **Inter-message group context.** New `ChatHistory` module records the
+  last 200 messages per ROOM-kind chat (transport-portable via
+  `ChatRef`). When the bot makes an LLM call in a group, the chatter
+  since its last call is prepended as `[Recent discussion]`. Always on
+  for groups; DMs continue to use `conversation_log`. Cross-backend
+  rendering via a per-call `recent_discussion` kwarg through
+  `submit_agent → Task → chat_stream`.
+- **`Config.meta_dir`** top-level field. Operators can put per-bot /
+  per-plugin persistent storage on a different volume from
+  `config.json`. Default unchanged (`~/.link-project-to-chat/meta/`).
+  `resolve_project_meta_dir(meta_dir, project_name)` helper for plugin-
+  scaffolding callers.
+
+### Changed
+- `BaseBackend` gains a `safety_system_prompt: str | None` class
+  attribute (per-bot). `AgentBackend.chat_stream` gains a
+  `recent_discussion: str = ""` per-call kwarg. Both default to no-op so
+  existing third-party backends remain compatible.
+- `Task` dataclass gains `recent_discussion: str = ""`.
+  `TaskManager.submit_agent` accepts the matching kwarg and threads it
+  to `chat_stream`.
+- `tests/test_transport_lockout.py` extends its zero-`telegram.*`-import
+  guarantee to `chat_history.py` (also covers `telethon.*`).
+
+### Notes
+- Cross-backend: each backend renders `safety_system_prompt` and
+  `recent_discussion` in its native style. Future Gemini / other
+  backends inherit the fields/kwargs; only need to implement rendering.
+- Cross-transport: every new structure keys on `ChatRef` / `Identity`,
+  not platform-native IDs. Future Slack and Google Chat transports
+  inherit the behaviors with zero code changes outside their own
+  transport adapter.
+- Backwards compatibility: omitting `safety_prompt` from `config.json`
+  enables the default safety guardrail on next bot restart — this is a
+  **behavior change** for power users who relied on the bot acting
+  without confirmation. Set `safety_prompt: ""` to restore pre-1.2.0
+  behavior for any affected project.
+
 ## 1.1.1 — 2026-05-16
 
 ### Changed
