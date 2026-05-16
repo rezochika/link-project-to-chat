@@ -78,3 +78,60 @@ def test_invalid_allowed_audiences_is_config_error(tmp_path: Path):
 
     with pytest.raises(ConfigError):
         load_config(cfg_file)
+
+
+def test_google_room_only_team_is_not_cleaned_up(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(
+        cfg_file,
+        {
+            "teams": {
+                "alpha": {
+                    "path": str(project),
+                    "room": {"transport_id": "google_chat", "native_id": "spaces/AAA"},
+                    "bots": {},
+                }
+            }
+        },
+    )
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert raw["teams"]["alpha"]["room"]["transport_id"] == "google_chat"
+
+
+def test_google_bot_peer_round_trips(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(
+        cfg_file,
+        {
+            "teams": {
+                "alpha": {
+                    "path": str(project),
+                    "room": {"transport_id": "google_chat", "native_id": "spaces/AAA"},
+                    "bots": {
+                        "worker": {
+                            "bot_peer": {
+                                "transport_id": "google_chat",
+                                "native_id": "users/app-worker",
+                                "handle": None,
+                                "display_name": "Worker",
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert raw["teams"]["alpha"]["bots"]["worker"]["bot_peer"]["native_id"] == "users/app-worker"

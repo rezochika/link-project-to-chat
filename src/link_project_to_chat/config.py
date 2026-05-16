@@ -712,6 +712,20 @@ def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
         pass
 
 
+def _team_has_room(team: dict) -> bool:
+    """Return True if the team dict has a structured room binding with valid shape."""
+    room = team.get("room")
+    if not isinstance(room, dict):
+        return False
+    transport_id = room.get("transport_id")
+    native_id = room.get("native_id")
+    if not isinstance(transport_id, str) or not isinstance(native_id, str):
+        return False
+    if transport_id == "google_chat" and not native_id.startswith("spaces/"):
+        return False
+    return bool(transport_id and native_id)
+
+
 def _split_team_entries(
     teams: object,
 ) -> tuple[dict[str, dict], list[tuple[str, list[str]]]]:
@@ -719,7 +733,8 @@ def _split_team_entries(
 
     Returns ``(valid, malformed)`` where ``malformed`` is a list of
     ``(team_name, missing_fields)`` tuples. A team is valid when its raw
-    entry is a dict and contains both ``path`` and ``group_chat_id``.
+    entry is a dict and contains ``path`` AND either ``group_chat_id`` or
+    a structured ``room`` block (transport-portable alternative).
     """
     if not isinstance(teams, dict):
         return {}, []
@@ -730,7 +745,9 @@ def _split_team_entries(
         if not isinstance(team, dict):
             malformed.append((name, ["entry-not-dict"]))
             continue
-        missing = [r for r in ("path", "group_chat_id") if r not in team]
+        has_path = "path" in team
+        has_room_id = "group_chat_id" in team or _team_has_room(team)
+        missing = (["path"] if not has_path else []) + (["group_chat_id or room"] if not has_room_id else [])
         if missing:
             malformed.append((name, missing))
         else:
@@ -766,19 +783,54 @@ def _team_is_configured(raw: dict, team_name: str) -> bool:
     return (
         isinstance(team, dict)
         and "path" in team
-        and "group_chat_id" in team
+        and ("group_chat_id" in team or _team_has_room(team))
     )
 
 
 def _make_room_binding(raw: dict | None) -> RoomBinding | None:
-    """Build a structured room binding from raw config, ignoring malformed rows."""
+    """Build a structured room binding from raw config, ignoring malformed rows.
+
+    For Google Chat entries, the native_id must start with ``spaces/`` — any
+    other shape is silently dropped so the manager can re-derive it.
+    """
     if not raw:
         return None
     transport_id = raw.get("transport_id")
     native_id = raw.get("native_id")
     if not transport_id or not native_id:
         return None
+    if transport_id == "google_chat" and not str(native_id).startswith("spaces/"):
+        return None
     return RoomBinding(transport_id=str(transport_id), native_id=str(native_id))
+
+
+def _parse_bot_peer(raw: object) -> "BotPeerRef | None":
+    """Build a BotPeerRef from raw config, with Google Chat shape validation.
+
+    For Google Chat entries, the native_id must start with ``users/`` — any
+    other shape is silently dropped so the manager can re-derive the peer
+    from the next addition response.
+    """
+    if not isinstance(raw, dict):
+        return None
+    transport_id = raw.get("transport_id")
+    native_id = raw.get("native_id")
+    if not isinstance(transport_id, str) or not isinstance(native_id, str):
+        return None
+    if transport_id == "google_chat" and not native_id.startswith("users/"):
+        # Google Chat REST identifies app/bot peers as `users/<id>`.
+        # A malformed entry would cause downstream API calls to 4xx,
+        # so we drop it here and let the manager re-derive the peer
+        # from the next addition response.
+        return None
+    handle = raw.get("handle")
+    display_name = raw.get("display_name")
+    return BotPeerRef(
+        transport_id=transport_id,
+        native_id=native_id,
+        handle=handle if isinstance(handle, str) else None,
+        display_name=display_name if isinstance(display_name, str) else "",
+    )
 
 
 def _make_team_bot_config(b: dict) -> TeamBotConfig:
@@ -810,6 +862,7 @@ def _make_team_bot_config(b: dict) -> TeamBotConfig:
         model=bot_model,
         effort=bot_effort,
         show_thinking=bot_show_thinking,
+        bot_peer=_parse_bot_peer(b.get("bot_peer")),
         backend=b.get("backend", "claude"),
         backend_state=backend_state,
         context_enabled=bool(b.get("context_enabled", True)),
@@ -1045,7 +1098,7 @@ def _load_config_unlocked(
         for name, team in valid_teams.items():
             team_cfg = TeamConfig(
                 path=team["path"],
-                group_chat_id=team["group_chat_id"],
+                group_chat_id=int(team.get("group_chat_id", 0)),
                 room=_make_room_binding(team.get("room")),
                 bots={
                     role: _make_team_bot_config(b)
@@ -1102,6 +1155,13 @@ def _serialize_team_bot(b: "TeamBotConfig") -> dict:
         entry["autostart"] = True
     if b.bot_username:
         entry["bot_username"] = b.bot_username
+    if b.bot_peer is not None:
+        entry["bot_peer"] = {
+            "transport_id": b.bot_peer.transport_id,
+            "native_id": b.bot_peer.native_id,
+            "handle": b.bot_peer.handle,
+            "display_name": b.bot_peer.display_name,
+        }
     if not b.context_enabled:
         entry["context_enabled"] = False
     if b.context_history_limit != 10:
