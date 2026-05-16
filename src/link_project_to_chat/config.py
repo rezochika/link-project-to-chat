@@ -334,6 +334,13 @@ class ProjectConfig:
     # stay through Task 4 as transitional read-only inputs.
     allowed_users: list[AllowedUser] = field(default_factory=list)
     plugins: list[dict] = field(default_factory=list)
+    respond_in_groups: bool = False
+    # When True, the project bot responds in Telegram groups to messages that
+    # @mention `@<bot_username>` OR reply to a prior bot message. All other
+    # group messages are silently ignored. Default False (pre-v1.1.0 behavior:
+    # DM-only). Independent of team mode: a team bot's group routing is
+    # governed by team_name + role, not this flag. The PTB filter is set
+    # once at startup, so toggling this field requires a bot restart.
 
 
 @dataclass
@@ -838,6 +845,18 @@ def _load_config_unlocked(
             effective = explicit_proj or migrated_proj
             if did_migrate_proj:
                 config.migration_pending = True
+            raw_rig = proj.get("respond_in_groups", False)
+            if isinstance(raw_rig, bool):
+                respond_in_groups = raw_rig
+            elif isinstance(raw_rig, int) and not isinstance(raw_rig, bool):
+                # Python: bool is subclass of int. Treat int 0/1 as bool via bool().
+                respond_in_groups = bool(raw_rig)
+            else:
+                logger.warning(
+                    "project %r: respond_in_groups must be a bool; got %r (treating as False)",
+                    name, raw_rig,
+                )
+                respond_in_groups = False
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
@@ -854,6 +873,7 @@ def _load_config_unlocked(
                 context_history_limit=int(proj.get("context_history_limit", 10)),
                 allowed_users=effective,
                 plugins=_parse_plugins(proj.get("plugins", [])),
+                respond_in_groups=respond_in_groups,
             )
             if not effective and not config.allowed_users:
                 # Only warn when BOTH scopes are empty - global fallback would
@@ -1064,6 +1084,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             proj["plugins"] = p.plugins
         else:
             proj.pop("plugins", None)
+        if p.respond_in_groups:
+            proj["respond_in_groups"] = True
+        else:
+            proj.pop("respond_in_groups", None)
         # Strip any legacy keys lingering on the raw entry.
         proj.pop("allowed_usernames", None)
         proj.pop("username", None)
