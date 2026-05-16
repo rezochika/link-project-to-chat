@@ -66,3 +66,118 @@ def test_telegram_transport_late_on_command_registers_ptb_handler():
     )
     # And the dispatch dict reflects it.
     assert "late_cmd" in transport._command_handlers
+
+
+def test_telegram_transport_filter_widened_when_respond_in_groups_true():
+    """When respond_in_groups=True, the MessageHandler filter accepts both
+    private DMs AND groups. Matches the GitLab fork's behavior for solo
+    bots; isolated from team mode (group_mode=True still narrows to GROUPS).
+    """
+    pytest.importorskip("telegram")
+
+    from telegram.ext import MessageHandler
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    transport = TelegramTransport.build("123:fake-token", menu=[])
+    transport.attach_telegram_routing(
+        group_mode=False,
+        command_names=["help"],
+        respond_in_groups=True,
+    )
+    # Inspect the filter expression on the registered MessageHandler.
+    handler = next(
+        h
+        for group in transport.app.handlers.values()
+        for h in group
+        if isinstance(h, MessageHandler)
+    )
+    filter_repr = repr(handler.filters)
+    # ChatType.PRIVATE | ChatType.GROUPS — verify both present.
+    assert "ChatType.PRIVATE" in filter_repr or "private" in filter_repr.lower()
+    assert "ChatType.GROUPS" in filter_repr or "group" in filter_repr.lower()
+
+
+def test_telegram_transport_filter_private_only_when_respond_in_groups_false():
+    """Default behavior unchanged: solo bots see only PRIVATE messages."""
+    pytest.importorskip("telegram")
+
+    from telegram.ext import MessageHandler
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    transport = TelegramTransport.build("123:fake-token", menu=[])
+    transport.attach_telegram_routing(
+        group_mode=False,
+        command_names=["help"],
+        respond_in_groups=False,
+    )
+    handler = next(
+        h
+        for group in transport.app.handlers.values()
+        for h in group
+        if isinstance(h, MessageHandler)
+    )
+    filter_repr = repr(handler.filters)
+    assert "ChatType.PRIVATE" in filter_repr or "private" in filter_repr.lower()
+    # GROUPS should NOT be in the filter for solo+respond_in_groups=False.
+    assert "ChatType.GROUPS" not in filter_repr
+
+
+def test_telegram_transport_filter_groups_only_when_team_mode():
+    """Team-mode behavior unchanged: group_mode=True narrows to GROUPS,
+    regardless of respond_in_groups (which is a solo-only concern)."""
+    pytest.importorskip("telegram")
+
+    from telegram.ext import MessageHandler
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    transport = TelegramTransport.build("123:fake-token", menu=[])
+    transport.attach_telegram_routing(
+        group_mode=True,
+        command_names=["help"],
+        respond_in_groups=True,  # ignored when group_mode=True
+    )
+    handler = next(
+        h
+        for group in transport.app.handlers.values()
+        for h in group
+        if isinstance(h, MessageHandler)
+    )
+    filter_repr = repr(handler.filters)
+    assert "ChatType.GROUPS" in filter_repr or "group" in filter_repr.lower()
+    # PRIVATE should NOT be in the team-mode filter.
+    assert "ChatType.PRIVATE" not in filter_repr
+
+
+def test_telegram_transport_late_on_command_picks_widened_filter():
+    """When routing was attached with respond_in_groups=True, late on_command
+    registrations also pick up the wider filter (so plugin commands work in
+    both DMs and groups, not just one)."""
+    pytest.importorskip("telegram")
+
+    from telegram.ext import CommandHandler
+
+    from link_project_to_chat.transport.telegram import TelegramTransport
+
+    transport = TelegramTransport.build("123:fake-token", menu=[])
+    transport.attach_telegram_routing(
+        group_mode=False,
+        command_names=["help"],
+        respond_in_groups=True,
+    )
+
+    async def late_handler(ci):
+        return None
+
+    transport.on_command("late_cmd", late_handler)
+    late_ptb_handler = next(
+        h
+        for group in transport.app.handlers.values()
+        for h in group
+        if isinstance(h, CommandHandler) and "late_cmd" in h.commands
+    )
+    filter_repr = repr(late_ptb_handler.filters)
+    assert "ChatType.PRIVATE" in filter_repr or "private" in filter_repr.lower()
+    assert "ChatType.GROUPS" in filter_repr or "group" in filter_repr.lower()
