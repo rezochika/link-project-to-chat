@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+
+from link_project_to_chat.transport.base import Buttons
+
+
+class CallbackTokenError(Exception):
+    """Invalid or expired Google Chat callback token."""
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _unb64(data: str) -> bytes:
+    padded = data + ("=" * (-len(data) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def make_callback_token(*, secret: bytes, payload: dict, ttl_seconds: int, now: int) -> str:
+    body = dict(payload)
+    body["expires_at"] = now + ttl_seconds
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(secret, raw, hashlib.sha256).digest()
+    return f"{_b64(raw)}.{_b64(signature)}"
+
+
+def verify_callback_token(*, secret: bytes, token: str, now: int) -> dict:
+    try:
+        raw_b64, sig_b64 = token.split(".", 1)
+        raw = _unb64(raw_b64)
+        supplied = _unb64(sig_b64)
+    except Exception as exc:
+        raise CallbackTokenError("malformed callback token") from exc
+    expected = hmac.new(secret, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, supplied):
+        raise CallbackTokenError("invalid callback token")
+    payload = json.loads(raw.decode("utf-8"))
+    if int(payload["expires_at"]) < now:
+        raise CallbackTokenError("expired callback token")
+    return payload
+
+
+def build_buttons_card(
+    buttons: Buttons,
+    *,
+    secret: bytes,
+    space: str,
+    sender: str,
+    message: str,
+    now: int,
+    ttl_seconds: int,
+) -> dict:
+    """Build a Cards v2 dict with HMAC-signed callback tokens for each button."""
+    widgets = []
+    for row in buttons.rows:
+        button_list = []
+        for button in row:
+            token = make_callback_token(
+                secret=secret,
+                payload={
+                    "space": space,
+                    "sender": sender,
+                    "kind": "button",
+                    "value": button.value,
+                    "message": message,
+                },
+                ttl_seconds=ttl_seconds,
+                now=now,
+            )
+            button_list.append(
+                {
+                    "text": button.label,
+                    "onClick": {
+                        "action": {
+                            "function": "lp2c_button_click",
+                            "parameters": [
+                                {"key": "callback_token", "value": token},
+                            ],
+                        },
+                    },
+                }
+            )
+        widgets.append({"buttonList": {"buttons": button_list}})
+
+    return {
+        "cardsV2": [
+            {
+                "cardId": "lp2c-buttons",
+                "card": {
+                    "sections": [
+                        {
+                            "widgets": widgets,
+                        }
+                    ],
+                },
+            }
+        ],
+    }
