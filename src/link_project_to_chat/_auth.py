@@ -26,6 +26,7 @@ class AuthMixin:
     _auth_source: str = "project"  # "project" | "global"; set by ProjectBot.__init__
     _MAX_MESSAGES_PER_MINUTE: int = 30
     _MAX_FAILED_AUTH: int = 5
+    _RELOAD_DEBOUNCE_SECONDS: float = 5.0
 
     def _init_auth(self) -> None:
         # Both dicts keyed on `_identity_key(identity)` = "transport_id:native_id"
@@ -146,3 +147,64 @@ class AuthMixin:
             return True
         timestamps.append(now)
         return False
+
+    def _reload_allowed_users_if_stale(self) -> None:
+        """Refresh self._allowed_users from disk, debounced to 5 s.
+
+        Skips when:
+          - self._auth_dirty is True (unsaved changes; would clobber)
+          - <5 s have elapsed since last reload (debounce)
+
+        On reload, merges by username:
+          - disk role wins
+          - locked_identities = union(disk, memory)
+          - users in memory but not disk → dropped (operator removed them)
+          - users on disk but not memory → appended (new users)
+
+        Failures (missing file, parse error) log + keep current state +
+        update the timestamp so we retry in 5 s.
+        """
+        if not hasattr(self, "_project_config_path"):
+            return  # Subclass doesn't participate in hot-reload.
+        if self._auth_dirty:
+            return
+        now = time.monotonic()
+        if now - self._last_allowed_users_reload < self._RELOAD_DEBOUNCE_SECONDS:
+            return
+        self._last_allowed_users_reload = now
+        try:
+            from .config import load_config, resolve_project_allowed_users
+            config = load_config(self._project_config_path)
+            if self._project_name is not None:
+                project = config.projects.get(self._project_name)
+                if project is not None:
+                    disk_users, _src = resolve_project_allowed_users(project, config)
+                else:
+                    disk_users = []
+            else:
+                # Manager-scope: global allowed_users.
+                disk_users = list(config.allowed_users)
+        except Exception:
+            logger.warning(
+                "hot-reload of allowed_users failed", exc_info=True,
+            )
+            return
+
+        # Merge by username, preserving locked_identities union.
+        from .config import AllowedUser
+        disk_by_username = {u.username: u for u in disk_users}
+        merged: list[AllowedUser] = []
+        for mem_u in self._allowed_users:
+            if mem_u.username in disk_by_username:
+                d = disk_by_username.pop(mem_u.username)
+                merged.append(AllowedUser(
+                    username=d.username,
+                    role=d.role,
+                    locked_identities=list(
+                        set(d.locked_identities) | set(mem_u.locked_identities)
+                    ),
+                ))
+            # else: user removed on disk → drop
+        # New users on disk that weren't in memory.
+        merged.extend(disk_by_username.values())
+        self._allowed_users = merged
