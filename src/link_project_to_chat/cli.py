@@ -106,8 +106,24 @@ def projects_list(ctx):
     default=False,
     help="Allow Claude to skip all permission checks",
 )
+@click.option(
+    "--respond-in-groups/--no-respond-in-groups",
+    "respond_in_groups",
+    default=False,
+    help="Respond in Telegram groups when @mentioned or replied to (default off)",
+)
 @click.pass_context
-def projects_add(ctx, name: str, project_path: str, token: str, username: str | None, model: str | None, permission_mode: str | None, skip_permissions: bool):
+def projects_add(
+    ctx,
+    name: str,
+    project_path: str,
+    token: str,
+    username: str | None,
+    model: str | None,
+    permission_mode: str | None,
+    skip_permissions: bool,
+    respond_in_groups: bool,
+):
     """Add a project."""
     from .manager.config import load_project_configs, save_project_configs
 
@@ -136,6 +152,10 @@ def projects_add(ctx, name: str, project_path: str, token: str, username: str | 
     elif permission_mode:
         claude_state["permissions"] = permission_mode
     entry["backend_state"] = {"claude": claude_state} if claude_state else {}
+    # Emit-only-when-True policy: matches save_config, keeps the default-off
+    # case from polluting on-disk entries with a redundant `false`.
+    if respond_in_groups:
+        entry["respond_in_groups"] = True
     save_project_configs(projects | {name: entry}, cfg_path)
     click.echo(f"Added '{name}' -> {project_path}")
 
@@ -178,6 +198,7 @@ def projects_edit(ctx, name: str, field: str, value: str):
         "permissions",
         "permission_mode",
         "dangerously_skip_permissions",
+        "respond_in_groups",
     )
     cfg_path = ctx.obj["config_path"]
     projects = load_project_configs(cfg_path)
@@ -236,6 +257,24 @@ def projects_edit(ctx, name: str, field: str, value: str):
             projects[name].pop("dangerously_skip_permissions", None)
             save_project_configs(projects, cfg_path)
         click.echo(f"Updated '{name}' permissions to {normalized}.")
+    elif field == "respond_in_groups":
+        truthy = {"true", "1", "yes", "on"}
+        falsy = {"false", "0", "no", "off"}
+        lowered = value.strip().lower()
+        if lowered in truthy:
+            projects[name]["respond_in_groups"] = True
+        elif lowered in falsy:
+            # Emit-only-when-True policy: strip the key on false rather than
+            # writing an explicit `false`, so on-disk shape stays minimal and
+            # round-trips through save_config without noise.
+            projects[name].pop("respond_in_groups", None)
+        else:
+            raise SystemExit(
+                f"Invalid bool for respond_in_groups: {value!r}. "
+                f"Use one of: true, false, 1, 0, yes, no, on, off."
+            )
+        save_project_configs(projects, cfg_path)
+        click.echo(f"Updated '{name}' respond_in_groups to {value}.")
     else:
         raise SystemExit(f"Unknown field. Use: {', '.join(_EDITABLE)}")
 
