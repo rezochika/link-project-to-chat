@@ -14,6 +14,21 @@ if TYPE_CHECKING:
     from ..team_safety import TeamAuthority
 
 
+# Verbatim port of the GitLab fork's claude_client.py:21 SYSTEM_PROMPT.
+# Each backend renders this in its native style (Claude:
+# --append-system-prompt parts list; Codex: <system-reminder> block).
+DEFAULT_SAFETY_SYSTEM_PROMPT = (
+    "<important>Only make changes or run commands when explicitly asked "
+    "to modify a specific file or perform a specific task. For questions, "
+    "analysis, or discussion — answer only, do not act. If you identify "
+    "something that could be fixed or improved, describe what and why, "
+    "then ask for approval before doing anything. Do not run, start, "
+    "stop, or restart anything unless explicitly asked. Do not install "
+    "packages, run scripts, or restart services unless explicitly asked "
+    "in the current message.</important>"
+)
+
+
 @dataclass(frozen=True)
 class BackendCapabilities:
     models: Sequence[str]
@@ -86,6 +101,14 @@ class BaseBackend:
     )
     _env_keep_patterns: Sequence[str] = ()
     _env_scrub_patterns: Sequence[str] = ()
+
+    def __init__(self) -> None:
+        # Per-bot system-prompt layer, set once at startup. Sits alongside
+        # ``team_system_note`` (initialized in each subclass __init__) — both
+        # are system-prompt layers that each backend renders in its native
+        # style. ``None`` means "use the backend's default"; the bot resolves
+        # ``None`` → ``DEFAULT_SAFETY_SYSTEM_PROMPT`` in ``_build_backend``.
+        self.safety_system_prompt: str | None = None
 
     def _matches(self, key: str, patterns: Sequence[str]) -> bool:
         return any(fnmatch.fnmatch(key, pattern) for pattern in patterns)
