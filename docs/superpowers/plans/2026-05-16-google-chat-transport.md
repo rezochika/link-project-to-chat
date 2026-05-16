@@ -451,6 +451,12 @@ def _parse_bot_peer(raw: object) -> BotPeerRef | None:
     native_id = raw.get("native_id")
     if not isinstance(transport_id, str) or not isinstance(native_id, str):
         return None
+    if transport_id == "google_chat" and not native_id.startswith("users/"):
+        # Google Chat REST identifies app/bot peers as `users/<id>`.
+        # A malformed entry would cause downstream API calls to 4xx,
+        # so we drop it here and let the manager re-derive the peer
+        # from the next addition response.
+        return None
     return BotPeerRef(
         transport_id=transport_id,
         native_id=native_id,
@@ -458,6 +464,8 @@ def _parse_bot_peer(raw: object) -> BotPeerRef | None:
         display_name=raw.get("display_name") if isinstance(raw.get("display_name"), str) else None,
     )
 ```
+
+Apply the analogous shape check to the room block: when `transport_id == "google_chat"`, the room's `native_id` must start with `spaces/`; otherwise treat the team entry as malformed and skip it during the validity pass (the manager will re-create the room on the next `/add_team` flow).
 
 Save `bot_peer` only when non-`None`, preserving Telegram legacy synthesis from `bot_username`.
 
@@ -553,21 +561,40 @@ from .transport import GoogleChatTransport
 __all__ = ["GoogleChatTransport"]
 ```
 
-Create minimal `src/link_project_to_chat/google_chat/transport.py`:
+Create minimal `src/link_project_to_chat/google_chat/transport.py`. The `__init__` exposes a `client` keyword-only parameter (default `None`) so that Task 9 can wire a real `GoogleChatClient` and Task 12's contract fixture can inject a fake; concrete typing is tightened once Task 9 introduces the client class:
 
 ```python
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.transport.base import Identity
+
+if TYPE_CHECKING:
+    from .client import GoogleChatClient
 
 
 class GoogleChatTransport:
     transport_id = "google_chat"
+    # 8 000 is the conservative *character* budget surfaced to callers
+    # via the `max_text_length` capability. The hard *byte* ceiling is
+    # `config.max_message_bytes` (default 32 000), enforced at send time
+    # by `_check_message_bytes()`. 8 000 characters stays under 32 000
+    # bytes even for 4-byte UTF-8 graphemes (emoji / non-BMP), so the
+    # character cap can never produce an over-byte payload.
     max_text_length = 8000
 
-    def __init__(self, *, config: GoogleChatConfig) -> None:
+    def __init__(
+        self,
+        *,
+        config: GoogleChatConfig,
+        client: "GoogleChatClient | None" = None,
+    ) -> None:
         self.config = config
+        # Tests pass a fake here; production wiring constructs the real
+        # `GoogleChatClient` in `start()` once Task 9 lands.
+        self.client = client
         self.self_identity = Identity(
             transport_id="google_chat",
             native_id="google_chat:app",
@@ -578,6 +605,8 @@ class GoogleChatTransport:
 ```
 
 - [ ] **Step 5: Make `ProjectBot.build()` transport selection explicit**
+
+This step depends on Step 4 having created the `google_chat` package, so the lazy import below resolves. The import is intentionally local to the `elif` branch — keeping the import lazy ensures the existing `telegram`/`web` installs continue to work without the `google-chat` extra installed.
 
 In `bot.py`, replace the silent `else: TelegramTransport` shape with explicit branches. Keep the existing Web and Telegram construction bodies unchanged, insert a `google_chat` branch between them, and end with a `ValueError` for unknown transports:
 
@@ -606,6 +635,8 @@ In `cli.py`, add `google_chat` to the `--transport` choice and add:
 ```
 
 Apply overrides to `cfg.google_chat` before building the project bot.
+
+The `--transport google_chat` choice must be accepted unconditionally by Click — installation of the `google-chat` extra is checked only inside the Step 5 `elif` branch when `ProjectBot.build()` actually constructs the transport. This keeps CLI help text useful on a default install while surfacing a clear `ImportError` at start time when the extra is missing.
 
 - [ ] **Step 7: Verify**
 
@@ -768,6 +799,52 @@ def verify_google_chat_request(
 
 Add `_verify_one()` in the same file with exact issuer/email checks described in the spec. The production implementation may wrap `google.oauth2.id_token.verify_oauth2_token` for endpoint URL mode and a Google Chat cert-based JWT verifier for project-number mode; tests pass injected verifiers to avoid network.
 
+Reference pseudocode (adapt during implementation):
+
+```python
+def _verify_one(
+    token: str,
+    mode: Literal["endpoint_url", "project_number"],
+    audience: str,
+    oidc_verifier: Callable[[str, str], dict] | None,
+    jwt_verifier: Callable[[str, str], dict] | None,
+) -> VerifiedGoogleChatRequest | None:
+    try:
+        if mode == "endpoint_url":
+            verify = oidc_verifier or _default_oidc_verifier
+            claims = verify(token, audience)
+            issuer = claims.get("iss")
+            if issuer not in {"https://accounts.google.com", "accounts.google.com"}:
+                return None
+            if claims.get("email") != "chat@system.gserviceaccount.com":
+                return None
+            if not claims.get("email_verified", False):
+                return None
+        else:  # mode == "project_number"
+            verify = jwt_verifier or _default_chat_jwt_verifier
+            claims = verify(token, audience)
+            if claims.get("iss") != "chat@system.gserviceaccount.com":
+                return None
+        if claims.get("aud") != audience:
+            return None
+        return VerifiedGoogleChatRequest(
+            issuer=claims.get("iss"),
+            audience=audience,
+            subject=claims.get("sub"),
+            email=claims.get("email"),
+            expires_at=claims.get("exp"),
+            auth_mode=mode,
+        )
+    except Exception:
+        # Any verifier exception or claim shape mismatch yields a soft
+        # miss so the caller can try the next allowed audience. The
+        # outer `verify_google_chat_request()` raises `GoogleChatAuthError`
+        # only when every audience has been exhausted.
+        return None
+```
+
+`_default_oidc_verifier` and `_default_chat_jwt_verifier` are private module-level callables that wrap the relevant Google libraries; both must be replaceable from tests through the injected `oidc_verifier` / `jwt_verifier` parameters.
+
 - [ ] **Step 4: Verify**
 
 ```bash
@@ -911,6 +988,8 @@ def verify_callback_token(*, secret: bytes, token: str, now: int) -> dict:
 
 Add `build_buttons_card()` using the Cards v2 JSON shape selected during implementation. The function must include one action parameter named `callback_token` per button and no secret material.
 
+Before merging, validate the produced JSON against the current Google Cards v2 reference (https://developers.google.com/workspace/chat/api/reference/rest/v1/cards). Keep one snapshot test that pins the exact emitted shape (`cardsV2[0].card.sections[*].widgets[*].buttonList.buttons[*]`) so any Google-side schema drift surfaces as a single failing snapshot rather than scattered field errors.
+
 - [ ] **Step 4: Verify**
 
 ```bash
@@ -999,17 +1078,20 @@ Expected: fails because `google_chat.app` does not exist.
 
 - [ ] **Step 3: Implement app factory and queue**
 
-Create `src/link_project_to_chat/google_chat/app.py`:
+Create `src/link_project_to_chat/google_chat/app.py`. The route must fit inside Google Chat's 2-second fast-ack budget; `verify_request()` is in-memory (no network when verifiers are injected, one signing-cert lookup otherwise) and `enqueue_verified_event()` is required to be a *non-blocking* put onto an `asyncio.Queue` — all real handler work (dispatch, send, render) happens later in a background consumer task. The whole route should comfortably return in tens of milliseconds; a hard `asyncio.timeout` is applied as a defence-in-depth guard:
 
 ```python
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .auth import GoogleChatAuthError
+
+FAST_ACK_BUDGET_SECONDS = 2.0
 
 
 def create_google_chat_app(transport, request_verifier: Callable | None = None) -> FastAPI:
@@ -1019,17 +1101,25 @@ def create_google_chat_app(transport, request_verifier: Callable | None = None) 
     async def google_chat_events(request: Request):
         verifier = request_verifier or transport.verify_request
         try:
-            verified = verifier(request.headers)
-        except GoogleChatAuthError:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        payload = await request.json()
-        accepted = await transport.enqueue_verified_event(payload, verified, headers=dict(request.headers))
-        return JSONResponse({} if accepted else {}, status_code=200)
+            async with asyncio.timeout(FAST_ACK_BUDGET_SECONDS):
+                try:
+                    verified = verifier(request.headers)
+                except GoogleChatAuthError:
+                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+                payload = await request.json()
+                await transport.enqueue_verified_event(payload, verified, headers=dict(request.headers))
+        except TimeoutError:
+            # The fast-ack budget was missed. Return 200 so Google Chat
+            # does not retry the event (which would risk dupes); the
+            # dropped event is logged and surfaced as a metric.
+            transport.note_fast_ack_timeout()
+            return JSONResponse({}, status_code=200)
+        return JSONResponse({}, status_code=200)
 
     return app
 ```
 
-In `transport.py`, add an `asyncio.Queue`, `pending_event_count`, `verify_request()`, and `enqueue_verified_event()`.
+In `transport.py`, add an `asyncio.Queue`, `pending_event_count`, `verify_request()`, `enqueue_verified_event()` (non-blocking — must not await any I/O), and `note_fast_ack_timeout()` (counter / log line). The actual dispatch loop is a `start()`-owned background task that drains the queue and calls `dispatch_event()`, so heavy work never blocks the HTTP route.
 
 - [ ] **Step 4: Verify**
 
@@ -1297,7 +1387,11 @@ async def edit_text(self, msg, text, *, buttons=None, html=False):
     await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
 ```
 
-- [ ] **Step 5: Verify**
+- [ ] **Step 5: Cover thread preservation across overflow rotation**
+
+Append to `tests/google_chat/test_transport.py` a test that exercises the rotation path: send a message long enough to require splitting at `max_text_length`, supply a `reply_to` whose `native["thread_name"]` is set, and assert *every* rotated `create_message` call receives the same `thread_name` argument (or `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD` on the first chunk, then `thread_name` on subsequent chunks — whichever the spec selects). This guards against thread context being lost on the second-and-later overflow segments, which would surface to users as a broken multi-bubble reply.
+
+- [ ] **Step 6: Verify**
 
 ```bash
 pytest tests/google_chat/test_client.py tests/google_chat/test_transport.py -q
@@ -1305,7 +1399,7 @@ pytest tests/google_chat/test_client.py tests/google_chat/test_transport.py -q
 
 Expected: selected tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/link_project_to_chat/google_chat/client.py src/link_project_to_chat/google_chat/transport.py tests/google_chat/test_client.py tests/google_chat/test_transport.py
@@ -1499,7 +1593,9 @@ git commit -m "feat(google-chat): add attachment fallbacks"
 
 - [ ] **Step 1: Add Google Chat contract fixture**
 
-In `tests/transport/test_contract.py`, add a Google Chat transport factory using the injection helpers from `GoogleChatTransport`.
+In `tests/transport/test_contract.py`, add a Google Chat transport factory using the injection helpers from `GoogleChatTransport`. This step depends on Task 4 Step 4 having declared `GoogleChatTransport.__init__(*, config, client=None)` and Task 9 Step 3 having defined a `GoogleChatClient` shape; the contract fixture passes a duck-typed fake in for `client`. This matches the spec §4.12 requirement that the transport accept injected I/O collaborators so the contract suite never makes a real Google REST call.
+
+The fake client must expose the same async methods Task 9 wires (`create_message`, `update_message`, `upload_attachment`, `download_attachment`); a small in-test class is acceptable and preferable to a shared fixture for v1.
 
 The fixture must construct:
 
