@@ -490,8 +490,8 @@ class ManagerBot(AuthMixin):
         under the original keyboard via ``reply_to=click.message``) if the
         caller is a viewer. Use at the top of every button branch that mutates
         state (proj_start_*, proj_stop_*, proj_remove_*, proj_edit_*,
-        proj_efld_*, proj_model_*, global_model_*, team_start_*, team_stop_*,
-        setup_*, proj_ptog_*).
+        proj_efld_*, proj_model_*, proj_rig_*, global_model_*, team_start_*,
+        team_stop_*, setup_*, proj_ptog_*).
         """
         if not self._require_executor(click.sender):
             assert self._transport is not None
@@ -2442,6 +2442,31 @@ class ManagerBot(AuthMixin):
                         f"Select model for '{name}':\nCurrent: {current or 'default'}",
                         buttons=Buttons(rows=rows),
                     )
+                elif field == "respond_in_groups":
+                    # Bool field — render an explicit On/Off picker rather than
+                    # asking for free-form text. Same UX as the model picker:
+                    # show current state with the ● glyph, single tap toggles.
+                    projects = self._load_projects()
+                    current = bool(projects.get(name, {}).get("respond_in_groups", False))
+                    rows = [
+                        [Button(
+                            label=("● On" if current else "On"),
+                            value=f"proj_rig_on_{name}",
+                        )],
+                        [Button(
+                            label=("● Off" if not current else "Off"),
+                            value=f"proj_rig_off_{name}",
+                        )],
+                        [Button(label="« Back", value=f"proj_edit_{name}")],
+                    ]
+                    await self._transport.edit_text(
+                        click.message,
+                        f"Respond in groups for '{name}':\n"
+                        f"Current: {'On' if current else 'Off'}\n\n"
+                        "When On, this bot responds in Telegram groups to "
+                        "@mentions or replies to its own messages.",
+                        buttons=Buttons(rows=rows),
+                    )
                 else:
                     if ctx_user_data is not None:
                         ctx_user_data["pending_edit"] = {"name": name, "field": field}
@@ -2485,6 +2510,43 @@ class ManagerBot(AuthMixin):
                 await self._transport.edit_text(
                     click.message,
                     f"Model for '{name}' set to: {label}\nRestart the project to apply.",
+                    buttons=Buttons(rows=rows),
+                )
+
+        elif value.startswith("proj_rig_on_") or value.startswith("proj_rig_off_"):
+            if not await self._require_executor_button(click):
+                return
+            if value.startswith("proj_rig_on_"):
+                new_state = True
+                name = value[len("proj_rig_on_"):]
+            else:
+                new_state = False
+                name = value[len("proj_rig_off_"):]
+            projects = self._load_projects()
+            if name in projects:
+                if new_state:
+                    projects[name]["respond_in_groups"] = True
+                else:
+                    # Emit-only-when-True policy: drop the key on Off so
+                    # configs round-trip cleanly through save_config.
+                    projects[name].pop("respond_in_groups", None)
+                self._save_projects(projects)
+                rows = [
+                    [Button(
+                        label=("● On" if new_state else "On"),
+                        value=f"proj_rig_on_{name}",
+                    )],
+                    [Button(
+                        label=("● Off" if not new_state else "Off"),
+                        value=f"proj_rig_off_{name}",
+                    )],
+                    [Button(label="« Back", value=f"proj_edit_{name}")],
+                ]
+                await self._transport.edit_text(
+                    click.message,
+                    f"Respond in groups for '{name}' set to: "
+                    f"{'On' if new_state else 'Off'}\n"
+                    "Restart the project to apply.",
                     buttons=Buttons(rows=rows),
                 )
 
