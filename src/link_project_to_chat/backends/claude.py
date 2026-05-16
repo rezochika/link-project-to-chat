@@ -249,7 +249,7 @@ class ClaudeBackend(BaseBackend):
     # Command building
     # ------------------------------------------------------------------
 
-    def _build_cmd(self) -> list[str]:
+    def _build_cmd(self, recent_discussion: str = "") -> list[str]:
         cmd = [
             "claude",
             "-p",
@@ -287,11 +287,14 @@ class ClaudeBackend(BaseBackend):
         if effective_disallowed:
             cmd.extend(["--disallowedTools", ",".join(effective_disallowed)])
 
-        # Combine: telegram awareness, ask-dismissed hint, safety prompt (new),
-        # team context (if any), operator-supplied append_system_prompt.
+        # Combine: telegram awareness, ask-dismissed hint, safety prompt,
+        # recent_discussion (chat history snippet), team context (if any),
+        # operator-supplied append_system_prompt.
         parts = [_build_telegram_awareness(self.capabilities), _ASK_DISMISSED_HINT]
         if self.safety_system_prompt:
             parts.append(self.safety_system_prompt)
+        if recent_discussion:
+            parts.append(recent_discussion)
         if self.team_system_note:
             parts.append(self.team_system_note)
         if self.append_system_prompt:
@@ -320,10 +323,10 @@ class ClaudeBackend(BaseBackend):
         that ended with an AskQuestion), the message is sent on its stdin.
         Otherwise a new subprocess is spawned.
 
-        ``recent_discussion`` is accepted for Protocol compatibility (v1.2.0
-        sub-feature 3). Native rendering into ``--append-system-prompt`` is
-        a follow-up task; for now the value is ignored so existing callers
-        remain unaffected.
+        ``recent_discussion`` (when non-empty) is rendered as a system-prompt
+        block in the ``--append-system-prompt`` payload via ``_build_cmd``.
+        Default ``""`` preserves backward compatibility for callers that do
+        not supply the kwarg.
         """
         reuse = self._proc is not None and self._proc.poll() is None
 
@@ -331,7 +334,7 @@ class ClaudeBackend(BaseBackend):
             proc = self._proc
             self._send_stdin(proc, user_message)
         else:
-            proc = self._start_proc(user_message, on_proc)
+            proc = self._start_proc(user_message, on_proc, recent_discussion=recent_discussion)
 
         self._last_message = user_message[:80]
         started_at = time.monotonic()
@@ -395,8 +398,10 @@ class ClaudeBackend(BaseBackend):
         self,
         user_message: str,
         on_proc: Callable[[subprocess.Popen[bytes]], None] | None = None,
+        *,
+        recent_discussion: str = "",
     ) -> subprocess.Popen:
-        cmd = self._build_cmd()
+        cmd = self._build_cmd(recent_discussion=recent_discussion)
 
         env = self._prepare_env()
 
