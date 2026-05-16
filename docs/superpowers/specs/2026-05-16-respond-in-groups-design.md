@@ -182,9 +182,9 @@ Same as Path A except `incoming.files` is non-empty and `incoming.text` carries 
 |---|---|---|
 | `@MyBot` in different case (`@MYBOT`, `@mybot`) | Match | `mentions_bot` lowercases both sides |
 | `@MyBotIsCool` (longer handle starting with `MyBot`) | No match | Regex captures the full word; equality is exact |
-| `@MyBot` + `@SomeoneElse` in the same message | Silent | `is_directed_at_me` returns False when any non-self mention is present alongside (consistent with team mode) |
+| `@MyBot` + `@SomeoneElse` in the same message | Processed | An explicit `@MyBot` mention always wins in `is_directed_at_me`, regardless of other mentions. `_strip_self_mention` removes only `@MyBot`; `@SomeoneElse` survives in the prompt verbatim so the agent sees who else was tagged |
 | Reply to a now-deleted bot message | Silent unless mention also present | `reply_to_sender` is None; falls through to mention check |
-| Reply to bot + simultaneously @-mentions another user | Silent | `is_directed_at_me` semantics (matches team mode) |
+| Reply to bot + simultaneously @-mentions another user | Silent | Reply-to-bot wakes the bot only when no other handles are mentioned in the same message — prevents waking bot A while pinging bot B. Explicit `@MyBot` co-mention overrides this and processes (row above) |
 | Edited message that newly includes `@MyBot` | Processed | PTB `EDITED_MESSAGE` filter delivers it; gate runs; same risk shape as DM today |
 | `self.bot_username == ""` (before `_after_ready`) | All group messages silent | `is_directed_at_me("")` returns False; fail-closed |
 | Caption-only file with `@MyBot` | Processed | `incoming.text` carries the caption |
