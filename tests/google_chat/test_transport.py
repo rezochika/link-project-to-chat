@@ -7,7 +7,7 @@ import pytest
 
 from link_project_to_chat.config import Config, GoogleChatConfig
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
-from link_project_to_chat.transport.base import ChatKind, ChatRef, Identity
+from link_project_to_chat.transport.base import ChatKind, ChatRef, Identity, MessageRef
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -57,3 +57,39 @@ async def test_command_event_uses_configured_root_command_id():
 
     assert seen[0].name == "help"
     assert seen[0].args == []
+
+
+class _FakeClient:
+    def __init__(self):
+        self.calls = []
+        self._counter = 0
+
+    async def create_message(self, space, body, *, thread_name=None, request_id=None, message_reply_option=None):
+        self._counter += 1
+        self.calls.append({"space": space, "body": body, "thread_name": thread_name, "request_id": request_id})
+        return {"name": f"{space}/messages/{self._counter}"}
+
+    async def update_message(self, message_name, body, *, update_mask, allow_missing=False):
+        self.calls.append({"message_name": message_name, "body": body, "update_mask": update_mask})
+        return {"name": message_name}
+
+
+@pytest.mark.asyncio
+async def test_send_text_preserves_thread_name_in_reply_to_native():
+    fake = _FakeClient()
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=fake,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    reply_to = MessageRef(
+        "google_chat",
+        "spaces/AAA/messages/0",
+        chat,
+        native={"thread_name": "spaces/AAA/threads/T1"},
+    )
+
+    result = await transport.send_text(chat, "hello", reply_to=reply_to)
+
+    assert fake.calls[0]["thread_name"] == "spaces/AAA/threads/T1"
+    assert result.native["thread_name"] == "spaces/AAA/threads/T1"

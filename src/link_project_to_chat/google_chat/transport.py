@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import logging
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.transport.base import (
@@ -69,6 +70,7 @@ class GoogleChatTransport:
         self._fast_ack_timeouts: int = 0
         self._message_handlers: list = []
         self._command_handlers: dict[str, object] = {}
+        self._request_seq: int = 0
 
     @property
     def pending_event_count(self) -> int:
@@ -180,3 +182,61 @@ class GoogleChatTransport:
             result = handler(ci)
             if inspect.isawaitable(result):
                 await result
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _new_request_id(self) -> str:
+        return f"lp2c-{uuid4().hex}"
+
+    def _check_message_bytes(self, text: str) -> None:
+        byte_len = len(text.encode("utf-8"))
+        if byte_len > self.config.max_message_bytes:
+            raise ValueError(
+                f"Message exceeds max_message_bytes limit: {byte_len} > {self.config.max_message_bytes}"
+            )
+
+    def render_markdown(self, text: str) -> str:
+        return text
+
+    # ── Outbound ──────────────────────────────────────────────────────────
+
+    async def send_text(
+        self,
+        chat: ChatRef,
+        text: str,
+        *,
+        buttons=None,
+        html: bool = False,
+        reply_to: MessageRef | None = None,
+    ) -> MessageRef:
+        rendered = self.render_markdown(text) if html else text
+        self._check_message_bytes(rendered)
+        request_id = self._new_request_id()
+        body = {"text": rendered}
+        native: dict[str, object] = {}
+        if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
+            native["thread_name"] = reply_to.native["thread_name"]
+        result = await self.client.create_message(
+            chat.native_id,
+            body,
+            thread_name=native.get("thread_name"),
+            request_id=request_id,
+        )
+        native["request_id"] = request_id
+        native["message_name"] = result["name"]
+        native["is_app_created"] = True
+        return MessageRef("google_chat", result["name"], chat, native=native)
+
+    async def edit_text(
+        self,
+        msg: MessageRef,
+        text: str,
+        *,
+        buttons=None,
+        html: bool = False,
+    ) -> None:
+        rendered = self.render_markdown(text) if html else text
+        self._check_message_bytes(rendered)
+        if isinstance(msg.native, dict) and msg.native.get("is_app_created") is False:
+            return
+        await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
