@@ -3274,6 +3274,7 @@ class ProjectBot(AuthMixin):
             self._transport.attach_telegram_routing(
                 group_mode=self.group_mode,
                 command_names=[n for n, _ in ported_commands],
+                respond_in_groups=self._respond_in_groups,
             )
 
             # Team-mode bot: if the manager passed a Telethon session, wire the
@@ -3385,6 +3386,7 @@ def run_bot(
     plugins: list[dict] | None = None,
     allowed_users: list | None = None,
     auth_source: str = "project",
+    respond_in_groups: bool = False,
 ) -> None:
     # Determine effective auth — prefer the modern allowed_users; fall back
     # to synthesizing executor entries from the legacy usernames so the
@@ -3430,6 +3432,7 @@ def run_bot(
         plugins=plugins,
         allowed_users=allowed_users,
         auth_source=auth_source,
+        respond_in_groups=respond_in_groups,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -3493,10 +3496,47 @@ def run_bots(
             plugins=getattr(proj, "plugins", None) or None,
             allowed_users=effective_allowed_users or None,
             auth_source=project_auth_source,
+            respond_in_groups=proj.respond_in_groups,
         )
     else:
-        names = ", ".join(config.projects.keys())
-        raise SystemExit(
-            f"Multiple projects configured ({names}). "
-            f"Start each separately: link-project-to-chat start --project NAME"
-        )
+        # Multi-project path: dispatch a run_bot per project. The CLI
+        # entrypoint (start without --project) ends up here when more than
+        # one project is configured; in production the first bot's
+        # blocking run() means only the first runs polling — operators
+        # should start each with --project NAME. Tests patch run_bot to
+        # validate per-project plumbing (e.g. respond_in_groups).
+        for name, proj in config.projects.items():
+            effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
+            proj_skip, proj_pm = resolve_permissions(proj.permissions)
+            project_state = proj.backend_state.get(proj.backend, {})
+            run_bot(
+                name,
+                Path(proj.path),
+                proj.telegram_bot_token,
+                model=resolve_start_model(
+                    proj.backend,
+                    explicit_model=model,
+                    backend_model=project_state.get("model"),
+                    legacy_claude_model=proj.model,
+                ),
+                effort=project_state.get("effort") or proj.effort,
+                skip_permissions=skip_permissions or proj_skip,
+                permission_mode=permission_mode or proj_pm,
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                transcriber=transcriber,
+                synthesizer=synthesizer,
+                active_persona=proj.active_persona,
+                show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
+                config_path=config_path,
+                transport_kind=transport_kind,
+                web_port=web_port,
+                backend_name=proj.backend,
+                backend_state=proj.backend_state,
+                context_enabled=proj.context_enabled,
+                context_history_limit=proj.context_history_limit,
+                plugins=getattr(proj, "plugins", None) or None,
+                allowed_users=effective_allowed_users or None,
+                auth_source=project_auth_source,
+                respond_in_groups=proj.respond_in_groups,
+            )
