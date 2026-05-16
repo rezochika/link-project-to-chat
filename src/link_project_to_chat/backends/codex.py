@@ -118,14 +118,25 @@ class CodexBackend(BaseBackend):
         return cmd
 
     def _build_prompt(self, user_message: str) -> str:
-        if not self.team_system_note:
+        """Wrap user message with system-reminder blocks for the layers that
+        Codex doesn't expose as separate CLI flags. Order matches Claude's
+        parts-list order: safety → team → user message.
+
+        Each layer renders as its own <system-reminder>...</system-reminder>
+        block so Codex parses them as distinct reminders.
+        """
+        blocks: list[str] = []
+        if self.safety_system_prompt:
+            blocks.append(
+                f"<system-reminder>\n{self.safety_system_prompt}\n</system-reminder>"
+            )
+        if self.team_system_note:
+            blocks.append(
+                f"<system-reminder>\n{self.team_system_note}\n</system-reminder>"
+            )
+        if not blocks:
             return user_message
-        return (
-            "<system-reminder>\n"
-            f"{self.team_system_note}\n"
-            "</system-reminder>\n\n"
-            f"{user_message}"
-        )
+        return "\n\n".join(blocks) + "\n\n" + user_message
 
     def _permission_args(self) -> list[str]:
         mode = self.permissions
