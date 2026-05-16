@@ -3346,10 +3346,18 @@ class ProjectBot(AuthMixin):
                 revocation_check=self._make_web_revocation_check(),
             )
             self._app = None  # WebTransport has no PTB Application
-        else:
+        elif self.transport_kind == "google_chat":
+            from link_project_to_chat.google_chat.transport import GoogleChatTransport
+
+            transport = GoogleChatTransport(config=self._config.google_chat)
+            self._transport = transport
+            self._app = None  # GoogleChatTransport has no PTB Application
+        elif self.transport_kind == "telegram":
             from .transport.telegram import TelegramTransport
             self._transport = TelegramTransport.build(self.token, menu=COMMANDS)
             self._app = self._transport.app  # PTB Application
+        else:
+            raise ValueError(f"unknown transport: {self.transport_kind}")
         self._transport.on_ready(self._after_ready)
         self._transport.on_stop(self._shutdown_plugins)
 
