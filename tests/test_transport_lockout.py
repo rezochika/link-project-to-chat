@@ -41,8 +41,9 @@ def test_bot_py_does_not_reference_ptb_application_internals():
 
 
 def test_chat_history_has_zero_telegram_imports():
-    """ChatHistory must not import from telegram.* — it's transport-portable
-    and used by future non-Telegram transports (Web, Slack, Google Chat)."""
+    """ChatHistory must not import from telegram.* or telethon.* — it's
+    transport-portable and used by future non-Telegram transports
+    (Web, Slack, Google Chat)."""
     import ast
     from pathlib import Path
 
@@ -51,12 +52,14 @@ def test_chat_history_has_zero_telegram_imports():
     forbidden = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            if node.module and node.module.startswith("telegram"):
+            if node.module and (
+                node.module.startswith("telegram") or node.module.startswith("telethon")
+            ):
                 forbidden.append(f"from {node.module} import ...")
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith("telegram"):
+                if alias.name.startswith("telegram") or alias.name.startswith("telethon"):
                     forbidden.append(f"import {alias.name}")
     assert not forbidden, (
-        f"chat_history.py must not import from telegram.*; found: {forbidden}"
+        f"chat_history.py must not import from telegram.* or telethon.*; found: {forbidden}"
     )
