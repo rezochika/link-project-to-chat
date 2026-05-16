@@ -40,6 +40,7 @@ class MessageRef:
     transport_id: str
     native_id: str
     chat: ChatRef
+    native: Any = field(default=None, compare=False, hash=False, repr=False)
 
 
 class ButtonStyle(Enum):
