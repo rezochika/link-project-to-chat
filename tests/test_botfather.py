@@ -9,29 +9,31 @@ from link_project_to_chat.botfather import BotFatherClient, sanitize_bot_usernam
 
 
 def test_sanitize_bot_username():
-    assert sanitize_bot_username("My Project") == "my_project_claude_bot"
-    assert sanitize_bot_username("test-repo-123") == "test_repo_123_claude_bot"
-    assert sanitize_bot_username("a!@#$b") == "a_b_claude_bot"
+    # v1.0+: backend-agnostic "_bot" suffix (previously "_claude_bot",
+    # which baked the Claude backend into the public handle).
+    assert sanitize_bot_username("My Project") == "my_project_bot"
+    assert sanitize_bot_username("test-repo-123") == "test_repo_123_bot"
+    assert sanitize_bot_username("a!@#$b") == "a_b_bot"
 
 
 def test_sanitize_bot_username_already_ends_with_bot():
-    assert sanitize_bot_username("mybot") == "mybot_claude_bot"
+    assert sanitize_bot_username("mybot") == "mybot_bot"
 
 
 def test_sanitize_bot_username_starts_with_letter():
     """Telegram bot usernames must start with a letter — names beginning
-    with a digit (e.g. '2024-foo') would otherwise yield '2024_foo_claude_bot',
+    with a digit (e.g. '2024-foo') would otherwise yield '2024_foo_bot',
     which BotFather rejects with 'Sorry, this username is invalid.'
     """
     result = sanitize_bot_username("2024-foo")
     assert result[0].isalpha()
-    assert result.endswith("_claude_bot")
-    assert result == "p_2024_foo_claude_bot"
+    assert result.endswith("_bot")
+    assert result == "p_2024_foo_bot"
 
     # A name that sanitizes to a single digit also starts with a letter.
     result = sanitize_bot_username("1")
     assert result[0].isalpha()
-    assert result == "p_1_claude_bot"
+    assert result == "p_1_bot"
 
 
 def test_sanitize_bot_username_fits_telegram_length_cap():
@@ -41,7 +43,7 @@ def test_sanitize_bot_username_fits_telegram_length_cap():
     long_name = "very-long-project-name-with-many-words-that-exceeds-the-cap"
     result = sanitize_bot_username(long_name)
     assert len(result) <= 32
-    assert result.endswith("_claude_bot")
+    assert result.endswith("_bot")
     assert result[0].isalpha()
 
 

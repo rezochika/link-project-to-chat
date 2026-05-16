@@ -96,29 +96,33 @@ def test_preflight_passes_when_all_good(tmp_path):
     assert err is None
 
 
-def test_preflight_rejects_prefix_over_15_chars(tmp_path):
-    """Prefix + '_{role}_{N}_claude_bot' must fit Telegram's 32-char username cap."""
+def test_preflight_rejects_prefix_over_22_chars(tmp_path):
+    """Prefix + '_{role}_{N}_bot' must fit Telegram's 32-char username cap.
+
+    v1.0+: the suffix dropped from '_claude_bot' to backend-agnostic '_bot',
+    freeing 7 chars of prefix budget (15 → 22).
+    """
     from link_project_to_chat.manager.bot import _create_team_preflight
 
     cfg_path = tmp_path / "config.json"
     save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
     (cfg_path.parent / "telethon.session").write_text("x")
 
-    err = _create_team_preflight(cfg_path, "metaflow_modules_team")  # 21 chars
+    err = _create_team_preflight(cfg_path, "a_very_long_team_prefix_xx")  # 26 chars
     assert err is not None
     assert "too long" in err
-    assert "metaflow_modules_team" in err
+    assert "a_very_long_team_prefix_xx" in err
 
 
-def test_preflight_accepts_15_char_prefix(tmp_path):
+def test_preflight_accepts_22_char_prefix(tmp_path):
     from link_project_to_chat.manager.bot import _create_team_preflight
 
     cfg_path = tmp_path / "config.json"
     save_config(Config(telegram_api_id=1, telegram_api_hash="x", github_pat="ghp_x"), cfg_path)
     (cfg_path.parent / "telethon.session").write_text("x")
 
-    # Exactly 15 chars — should pass.
-    err = _create_team_preflight(cfg_path, "abcdefghijklmno")
+    # Exactly 22 chars — should pass.
+    err = _create_team_preflight(cfg_path, "abcdefghijklmnopqrstuv")
     assert err is None
 
 
@@ -184,10 +188,10 @@ async def test_create_bot_with_retry_tries_suffixes(monkeypatch):
     bfc = MagicMock()
     bfc.create_bot = fake_create_bot
 
-    token, username = await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_claude_bot")
+    token, username = await _create_bot_with_retry(bfc, "Acme Manager", "acme_mgr_bot")
     assert token == "FAKE_TOKEN"
-    assert username == "acme_mgr_2_claude_bot"
-    assert attempts == ["acme_mgr_claude_bot", "acme_mgr_1_claude_bot", "acme_mgr_2_claude_bot"]
+    assert username == "acme_mgr_2_bot"
+    assert attempts == ["acme_mgr_bot", "acme_mgr_1_bot", "acme_mgr_2_bot"]
 
 
 @pytest.mark.asyncio

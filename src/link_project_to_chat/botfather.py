@@ -56,7 +56,13 @@ def _parse_rate_limit(text: str) -> float | None:
     return float(n)
 
 
-_BOT_USERNAME_SUFFIX = "_claude_bot"
+# Telegram requires bot usernames end in "bot". Pre-v1.0 used "_claude_bot",
+# which baked the backend into the public handle — wrong now that the backend
+# is abstracted (Claude / Codex / Gemini are interchangeable behind /backend).
+# Newly-created bots get the generic "_bot" suffix; existing bots keep their
+# BotFather-registered handles (Telegram doesn't let us rename bot usernames
+# without recreating).
+_BOT_USERNAME_SUFFIX = "_bot"
 _BOT_USERNAME_MAX = 32  # Telegram cap
 
 
@@ -66,8 +72,8 @@ def sanitize_bot_username(name: str) -> str:
     Telegram requires the username to start with a letter, be 5–32 chars,
     contain only Latin letters/digits/underscores, and end with "bot".
     Without the leading-letter guard, digit-leading project names like
-    "2024-foo" produce "2024_foo_claude_bot" which BotFather rejects with
-    "Sorry, this username is invalid."
+    "2024-foo" produce "2024_foo_bot" which BotFather rejects with
+    "Sorry, this username is invalid." — we prefix "p_" to keep it valid.
     """
     clean = re.sub(r"[^a-z0-9_]", "_", name.lower().replace("-", "_"))
     clean = re.sub(r"_+", "_", clean).strip("_")

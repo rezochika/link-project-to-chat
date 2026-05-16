@@ -151,15 +151,16 @@ def _create_team_preflight(cfg_path: Path, prefix: str | None = None) -> str | N
         return None
 
     # Telegram bot usernames max out at 32 chars. The orchestrator generates
-    # `{prefix}_{role}_claude_bot` (15 chars overhead) and may append `_N` on
-    # collision retries (2 chars). A prefix > 15 would produce invalid
-    # usernames and BotFather would silently reject every retry. Fail fast.
-    _MAX_PREFIX_LEN = 15
+    # `{prefix}_{role}_bot` (8 chars overhead for 3-char roles like "mgr" /
+    # "dev") and may append `_N` on collision retries (2 chars). A prefix
+    # > 22 would produce invalid usernames and BotFather would silently
+    # reject every retry. Fail fast.
+    _MAX_PREFIX_LEN = 22
     if len(prefix) > _MAX_PREFIX_LEN:
         return (
             f"Prefix `{prefix}` is too long ({len(prefix)} chars, max {_MAX_PREFIX_LEN}). "
             f"Telegram caps bot usernames at 32 chars and we generate "
-            f"`<prefix>_<role>_<N>_claude_bot`. Pick something shorter."
+            f"`<prefix>_<role>_<N>_bot`. Pick something shorter."
         )
 
     if prefix in config.teams:
@@ -198,9 +199,13 @@ async def _create_bot_with_retry(
     the throttle immediately (user-actionable) rather than sleeping through it.
     """
     import asyncio
-    from ..botfather import BotFatherRateLimit
+    from ..botfather import _BOT_USERNAME_SUFFIX, BotFatherRateLimit
 
-    suffix_insert_at = base_username.rfind("_claude_bot")
+    # Find where the bot-suffix starts so collision-retry inserts "_N"
+    # BEFORE the trailing "_bot" (Telegram requires names to end in "bot").
+    # Falls back to end-of-string for callers that pass a base without the
+    # suffix (e.g., older tests, hand-typed names).
+    suffix_insert_at = base_username.rfind(_BOT_USERNAME_SUFFIX)
     if suffix_insert_at == -1:
         suffix_insert_at = len(base_username)
 
