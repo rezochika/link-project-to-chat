@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from typing import Any
@@ -105,9 +106,16 @@ def _make_bot(plugins=None, backend_name="claude"):
     bot._get_user_role = lambda _identity: None
     # _init_plugins resolves PluginContext.data_dir via
     # resolve_project_meta_dir(self._config.meta_dir, self.name) — supply a
-    # default Config so the lookup succeeds without touching the operator's
-    # real meta_dir.
-    bot._config = Config()
+    # Config whose meta_dir points at a tmp subdir.
+    # NOTE: Config()'s `meta_dir` default_factory returns the module-level
+    # `DEFAULT_META_DIR` constant, which is computed at import time using
+    # the REAL `Path.home()` — BEFORE conftest's autouse HOME-isolation
+    # fixture runs (see conftest.py lines 9-12). So leaving the default
+    # would make _init_plugins create `~/.link-project-to-chat/meta/p/`
+    # in the developer's real home. Pin to a tmp subdir to avoid the leak.
+    cfg = Config()
+    cfg.meta_dir = Path(tempfile.mkdtemp(prefix="lptc-test-meta-"))
+    bot._config = cfg
     return bot
 
 
