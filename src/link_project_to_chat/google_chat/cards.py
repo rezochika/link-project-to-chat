@@ -40,7 +40,14 @@ def verify_callback_token(*, secret: bytes, token: str, now: int) -> dict:
     if not hmac.compare_digest(expected, supplied):
         raise CallbackTokenError("invalid callback token")
     payload = json.loads(raw.decode("utf-8"))
-    if int(payload["expires_at"]) < now:
+    try:
+        expires_at = int(payload["expires_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        # An attacker who can produce a valid HMAC already owns the secret,
+        # but a uniform exception type keeps the public surface predictable
+        # for callers and avoids leaking parse internals.
+        raise CallbackTokenError("malformed callback token: missing expires_at") from exc
+    if expires_at < now:
         raise CallbackTokenError("expired callback token")
     return payload
 
