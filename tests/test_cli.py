@@ -1431,3 +1431,115 @@ def test_version_is_consistent_across_pyproject_and_init():
         f"Version drift: pyproject.toml={pyproject_version!r} vs "
         f"__init__.py={link_project_to_chat.__version__!r}"
     )
+
+
+def test_projects_add_with_respond_in_groups_writes_field(tmp_path):
+    """`projects add --respond-in-groups` writes respond_in_groups=True
+    into the project entry on disk."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    runner = CliRunner()
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    result = runner.invoke(main, [
+        "--config", str(cfg),
+        "projects", "add",
+        "--name", "myproj",
+        "--path", str(proj_dir),
+        "--token", "t",
+        "--respond-in-groups",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg.read_text())
+    proj = on_disk["projects"]["myproj"]
+    assert proj["respond_in_groups"] is True
+
+
+def test_projects_add_without_flag_omits_field(tmp_path):
+    """Default off: the field is not written when the flag is absent."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"projects": {}}))
+    runner = CliRunner()
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    result = runner.invoke(main, [
+        "--config", str(cfg),
+        "projects", "add",
+        "--name", "myproj",
+        "--path", str(proj_dir),
+        "--token", "t",
+    ])
+    assert result.exit_code == 0, result.output
+    on_disk = json.loads(cfg.read_text())
+    proj = on_disk["projects"]["myproj"]
+    assert "respond_in_groups" not in proj
+
+
+def test_projects_edit_respond_in_groups_true(tmp_path):
+    """`projects edit myproj respond_in_groups true` flips the flag on."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg),
+        "projects", "edit", "myproj", "respond_in_groups", "true",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg.read_text())
+    assert on_disk["projects"]["myproj"]["respond_in_groups"] is True
+
+
+def test_projects_edit_respond_in_groups_false_strips_field(tmp_path):
+    """`projects edit myproj respond_in_groups false` flips the flag off,
+    and the on-disk emit-only-when-True policy strips the key."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "respond_in_groups": True,
+            }
+        }
+    }))
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg),
+        "projects", "edit", "myproj", "respond_in_groups", "false",
+    ])
+    assert result.exit_code == 0, result.output
+
+    on_disk = json.loads(cfg.read_text())
+    proj = on_disk["projects"]["myproj"]
+    assert "respond_in_groups" not in proj
+
+
+def test_projects_edit_respond_in_groups_invalid_input_errors(tmp_path):
+    """Garbage values produce a non-zero exit and don't mutate the file."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "--config", str(cfg),
+        "projects", "edit", "myproj", "respond_in_groups", "maybe",
+    ])
+    assert result.exit_code != 0
+    # File unchanged.
+    on_disk = json.loads(cfg.read_text())
+    assert "respond_in_groups" not in on_disk["projects"]["myproj"]

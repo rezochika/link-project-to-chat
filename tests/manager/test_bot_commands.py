@@ -1162,3 +1162,84 @@ async def test_remove_user_revokes_trusted_binding_immediately(bot_env):
         is_bot=False,
     )
     assert bot._auth_identity(revoked) is False
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_respond_in_groups_true(bot_env, tmp_path: Path):
+    """Manager wizard: setting respond_in_groups to a truthy string flips
+    the per-project flag on, persists to disk."""
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    fake = _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "respond_in_groups", "true")
+    raw = json.loads(proj_cfg.read_text())
+    assert raw["projects"]["myproj"]["respond_in_groups"] is True
+    text = fake.sent_messages[-1].text.lower()
+    assert "respond_in_groups" in text or "updated" in text
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_respond_in_groups_false_strips_key(bot_env, tmp_path: Path):
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+                "respond_in_groups": True,
+            }
+        }
+    }))
+    _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "respond_in_groups", "false")
+    raw = json.loads(proj_cfg.read_text())
+    assert "respond_in_groups" not in raw["projects"]["myproj"]
+
+
+def test_editable_fields_include_respond_in_groups():
+    """Manager has TWO related tuples (verified at manager/bot.py:53-54):
+    - _EDITABLE_FIELDS: consumed by /edit_project's help text + unknown-field
+      error path, plus the project-edit text wizard.
+    - _BUTTON_EDIT_FIELDS: consumed by the project-detail keyboard generator
+      that auto-creates the per-field edit button.
+
+    Both must include the new field so respond_in_groups is reachable from
+    BOTH the CommandHandler (/edit_project NAME respond_in_groups VALUE) AND
+    the inline keyboard.
+    """
+    from link_project_to_chat.manager.bot import (  # type: ignore[attr-defined]
+        _BUTTON_EDIT_FIELDS,
+        _EDITABLE_FIELDS,
+    )
+    assert "respond_in_groups" in _EDITABLE_FIELDS
+    assert "respond_in_groups" in _BUTTON_EDIT_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_apply_edit_respond_in_groups_invalid_value_replies_error(bot_env, tmp_path: Path):
+    bot, _pm, proj_cfg = bot_env
+    proj_cfg.write_text(json.dumps({
+        "projects": {
+            "myproj": {
+                "path": str(tmp_path),
+                "telegram_bot_token": "t",
+            }
+        }
+    }))
+    fake = _swap_fake_transport(bot)
+    chat = ChatRef(transport_id="fake", native_id="1", kind=ChatKind.DM)
+    await bot._apply_edit(chat, "myproj", "respond_in_groups", "maybe")
+    raw = json.loads(proj_cfg.read_text())
+    # File unchanged.
+    assert "respond_in_groups" not in raw["projects"]["myproj"]
+    text = fake.sent_messages[-1].text.lower()
+    assert "invalid" in text or "true" in text  # error mentions accepted values

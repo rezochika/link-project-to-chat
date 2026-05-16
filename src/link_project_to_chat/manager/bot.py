@@ -50,8 +50,8 @@ COMMANDS = [
     ("help", "Show commands"),
 ]
 
-_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions")
-_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions")
+_EDITABLE_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups")
+_BUTTON_EDIT_FIELDS = ("name", "path", "token", "username", "model", "permissions", "respond_in_groups")
 
 MODEL_OPTIONS = [
     ("opus[1m]", "Opus 4.7 1M"),
@@ -1177,6 +1177,28 @@ class ManagerBot(AuthMixin):
                 self._project_config_path or DEFAULT_CONFIG,
             )
             await self._transport.send_text(chat, f"Updated '{name}' {field} to {value}.")
+        elif field == "respond_in_groups":
+            truthy = {"true", "1", "yes", "on"}
+            falsy = {"false", "0", "no", "off"}
+            lowered = value.strip().lower()
+            if lowered in truthy:
+                projects[name]["respond_in_groups"] = True
+                self._save_projects(projects)
+                await self._transport.send_text(
+                    chat, f"Updated '{name}' respond_in_groups to True.",
+                )
+            elif lowered in falsy:
+                projects[name].pop("respond_in_groups", None)
+                self._save_projects(projects)
+                await self._transport.send_text(
+                    chat, f"Updated '{name}' respond_in_groups to False.",
+                )
+            else:
+                await self._transport.send_text(
+                    chat,
+                    f"Invalid bool for respond_in_groups: {value!r}. "
+                    f"Use one of: true, false, 1, 0, yes, no, on, off.",
+                )
         else:
             await self._transport.send_text(
                 chat, f"Unknown field. Use: {', '.join(_EDITABLE_FIELDS)}",

@@ -134,6 +134,7 @@ class TelegramTransport:
         self._post_init_ran: bool = False
         self._routing_attached: bool = False
         self._group_mode_attached: bool = False
+        self._respond_in_groups_attached: bool = False
 
     @property
     def team_relay_consecutive_bot_turns(self) -> int:
@@ -265,12 +266,15 @@ class TelegramTransport:
         *,
         group_mode: bool,
         command_names: list[str],
+        respond_in_groups: bool = False,
     ) -> None:
         """Wire telegram's MessageHandler/CommandHandler/CallbackQueryHandler
         so all incoming updates route through our _dispatch_* methods.
 
-        Called by the bot once during setup. Encapsulates every remaining
-        telegram import (filters, handler types) inside this module.
+        ``group_mode``: team-mode bot — restrict to GROUPS only.
+        ``respond_in_groups``: solo-mode bot that wants to also answer in groups.
+        The two flags are mutually exclusive at the filter level: when both are
+        True, group_mode wins (team workflow takes precedence).
         """
         from telegram.ext import (
             CallbackQueryHandler,
@@ -285,6 +289,25 @@ class TelegramTransport:
                 chat_filter
                 & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
                 & filters.TEXT
+                & ~filters.COMMAND
+            )
+        elif respond_in_groups:
+            chat_filter = filters.ChatType.PRIVATE | filters.ChatType.GROUPS
+            incoming_filter = (
+                chat_filter
+                & (filters.UpdateType.MESSAGE | filters.UpdateType.EDITED_MESSAGE)
+                & (
+                    filters.TEXT
+                    | filters.Document.ALL
+                    | filters.PHOTO
+                    | filters.VOICE
+                    | filters.AUDIO
+                    | filters.VIDEO_NOTE
+                    | filters.Sticker.ALL
+                    | filters.VIDEO
+                    | filters.LOCATION
+                    | filters.CONTACT
+                )
                 & ~filters.COMMAND
             )
         else:
@@ -321,6 +344,7 @@ class TelegramTransport:
 
         self._routing_attached = True
         self._group_mode_attached = group_mode
+        self._respond_in_groups_attached = respond_in_groups
 
     @property
     def app(self) -> Any:
@@ -833,10 +857,12 @@ class TelegramTransport:
             from telegram.ext import CommandHandler as _PTBCommandHandler
             from telegram.ext import filters as _filters
 
-            chat_filter = (
-                _filters.ChatType.GROUPS if self._group_mode_attached
-                else _filters.ChatType.PRIVATE
-            )
+            if self._group_mode_attached:
+                chat_filter = _filters.ChatType.GROUPS
+            elif self._respond_in_groups_attached:
+                chat_filter = _filters.ChatType.PRIVATE | _filters.ChatType.GROUPS
+            else:
+                chat_filter = _filters.ChatType.PRIVATE
             self._app.add_handler(_PTBCommandHandler(
                 name,
                 lambda u, c, _n=name: self._dispatch_command(_n, u, c),

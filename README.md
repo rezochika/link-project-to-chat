@@ -288,6 +288,34 @@ their identity to `locked_identities` and writes it back to the config so
 subsequent requests validate by native ID rather than username (preserves the
 username-spoof protection from the pre-v1.0 model).
 
+### Group support (Telegram)
+
+By default a project bot only responds in private DMs. To let a project
+bot respond in Telegram groups when explicitly addressed:
+
+```bash
+link-project-to-chat projects edit myproj respond_in_groups true
+```
+
+or, in the manager bot, open the project's detail keyboard and tap
+"Respond in groups."
+
+When enabled:
+
+- The bot responds when `@<bot_username>` appears in a group message
+  OR the message replies to one of the bot's prior messages.
+- All other group messages are silently ignored — no auth check runs,
+  nothing is logged.
+- The `@<bot_username>` mention is stripped from the prompt before the
+  agent sees it.
+- `/commands` work in groups with the same role gate as DM. Telegram
+  routes `/cmd@MyBot` only to the addressed bot in multi-bot rooms.
+- The bot ignores all other bots' messages, including `@<bot_username>`
+  from a peer bot (loop defense).
+
+Restart the project bot for the flag change to take effect (the
+`python-telegram-bot` filter is set once at startup).
+
 ## Manager bot
 
 The manager bot controls multiple project bots from a single Telegram chat — start, stop, view logs, add/remove projects, and create new projects automatically.

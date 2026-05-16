@@ -180,6 +180,7 @@ class ProjectBot(AuthMixin):
         plugins: list[dict] | None = None,
         allowed_users: list | None = None,
         auth_source: str = "project",
+        respond_in_groups: bool = False,
     ):
         self.name = name
         self.path = path.resolve()
@@ -316,6 +317,11 @@ class ProjectBot(AuthMixin):
         # writes back to the right place. "project" for per-project lists,
         # "global" when run_bots used the Config.allowed_users fallback.
         self._auth_source: str = auth_source if auth_source in ("project", "global") else "project"
+        # Solo-mode group-routing flag (spec respond_in_groups v1.1.0). When
+        # True and chat.kind == ROOM, _on_text_from_transport requires the
+        # message to be addressed-at-me (@mention or reply-to-bot, from a
+        # human, not self). Default False — DM-only pre-v1.1.0 behavior.
+        self._respond_in_groups: bool = bool(respond_in_groups)
 
     @property
     def _claude(self) -> ClaudeBackend:
@@ -925,15 +931,76 @@ class ProjectBot(AuthMixin):
             reply_to=ci.message,
         )
 
+    def _strip_self_mention(self, incoming: "IncomingMessage") -> "IncomingMessage":
+        """Remove case-insensitive ``@<bot_username>`` from incoming.text.
+
+        Word-bounded: only strips when the mention is bounded by non-word
+        characters (or start/end of string). Handles like ``@MyBotIsCool`` or
+        embedded sequences like ``user@MyBot.example`` are left intact.
+
+        Returns a new ``IncomingMessage`` via ``dataclasses.replace`` since
+        ``IncomingMessage`` is frozen. When ``self.bot_username`` is empty
+        (typical before ``_after_ready`` fires), the helper is a no-op and
+        returns the original incoming unchanged.
+
+        Used by the ``respond_in_groups`` routing gate in
+        ``_on_text_from_transport``; captions ride on ``incoming.text`` per
+        ``TelegramTransport._dispatch_message`` so this helper also cleans
+        captioned files / voice / photo messages.
+        """
+        if not self.bot_username:
+            return incoming
+        import dataclasses
+        import re
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_@])@{re.escape(self.bot_username)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        cleaned = pattern.sub("", incoming.text)
+        if cleaned == incoming.text:
+            return incoming
+        return dataclasses.replace(incoming, text=cleaned)
+
     async def _on_text_from_transport(self, incoming) -> None:
         """Unified entry point for inbound messages from the Transport.
 
         Branch order:
+          0. Solo respond_in_groups gate (when chat.kind == ROOM and not team)
           1. Voice (audio mime) → _on_voice_from_transport
           2. Non-audio files → _on_file_from_transport
           3. Plain text → _on_text (legacy shim)
           4. Nothing actionable → generic unsupported reply
         """
+        # 0. Solo project bot in a Telegram group (spec respond_in_groups
+        # v1.1.0). Runs BEFORE voice/file/text routing so files and voice
+        # in groups are gated identically. Team mode (group_mode) keeps its
+        # own routing path below — this branch is mutually exclusive with it.
+        # When the gate passes, fall through to the existing payload-type
+        # dispatch below so @-mentioned voice / captioned-file / text get
+        # the same treatment as in DM. Calling ``_on_text`` directly here
+        # would silently discard ``incoming.files`` (photos, voice notes,
+        # documents), since ``_on_text`` only reads ``incoming.text``.
+        if not self.group_mode and incoming.chat.kind == ChatKind.ROOM:
+            if not self._respond_in_groups:
+                # Defensive bot-side filter: production PTB filter already
+                # blocks group messages here, but if a transport ever bypasses
+                # the filter (tests, alternate non-Telegram transports), drop
+                # silently rather than treating it as a DM.
+                return
+            from .group_filters import is_from_self, is_directed_at_me
+            if is_from_self(incoming, self.bot_username):
+                return
+            if incoming.sender.is_bot:
+                return  # peer-bot defense: solo mode never accepts other bots
+            if not is_directed_at_me(incoming, self.bot_username):
+                return
+            incoming = self._strip_self_mention(incoming)
+            # Fall through to the existing payload-type dispatch below
+            # (voice / file / text). Don't call _on_text directly here —
+            # _on_text only handles text+prompt; it doesn't transcribe voice
+            # or copy captioned files into the prompt. The fall-through gives
+            # @-mentioned media the same treatment as DM media.
+
         # 1. Voice (audio mime).
         if incoming.files and any(
             (f.mime_type or "").startswith("audio/") for f in incoming.files
@@ -3207,6 +3274,7 @@ class ProjectBot(AuthMixin):
             self._transport.attach_telegram_routing(
                 group_mode=self.group_mode,
                 command_names=[n for n, _ in ported_commands],
+                respond_in_groups=self._respond_in_groups,
             )
 
             # Team-mode bot: if the manager passed a Telethon session, wire the
@@ -3318,6 +3386,7 @@ def run_bot(
     plugins: list[dict] | None = None,
     allowed_users: list | None = None,
     auth_source: str = "project",
+    respond_in_groups: bool = False,
 ) -> None:
     # Determine effective auth — prefer the modern allowed_users; fall back
     # to synthesizing executor entries from the legacy usernames so the
@@ -3363,6 +3432,7 @@ def run_bot(
         plugins=plugins,
         allowed_users=allowed_users,
         auth_source=auth_source,
+        respond_in_groups=respond_in_groups,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -3426,6 +3496,7 @@ def run_bots(
             plugins=getattr(proj, "plugins", None) or None,
             allowed_users=effective_allowed_users or None,
             auth_source=project_auth_source,
+            respond_in_groups=proj.respond_in_groups,
         )
     else:
         names = ", ".join(config.projects.keys())

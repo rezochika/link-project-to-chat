@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0 — 2026-05-16
+
+### Added
+- **`ProjectConfig.respond_in_groups`** (default False). When True, a
+  standard project bot responds in Telegram groups to `@bot_username`
+  mentions and replies to its own prior messages; ignores everything
+  else. CLI surface: `projects add --respond-in-groups`,
+  `projects edit NAME respond_in_groups true|false`. Manager bot
+  exposes the field via the project-edit keyboard. The PTB filter is
+  set once at startup, so flipping the flag requires a bot restart.
+  Restores the GitLab fork's solo-bot-in-group behavior that was
+  scoped out during the transport-abstraction track.
+- **`TelegramTransport.attach_telegram_routing(..., respond_in_groups=False)`**
+  kwarg. 3-way chat-type filter: team-mode (GROUPS only),
+  solo+respond_in_groups (PRIVATE | GROUPS), default (PRIVATE only).
+- **`ProjectBot._strip_self_mention`** helper. Pure function;
+  word-bounded case-insensitive `@bot_username` removal via regex.
+
+### Notes
+- Default off — pre-v1.1.0 deployments behave identically until the
+  flag is flipped.
+- Peer-bot loop defense: solo project bots in groups ignore all other
+  bots' messages, including `@<bot_username>` from a peer bot.
+- Plugins still only see addressed-at-me group messages (consistent
+  with the existing "plugins see authorized + rate-limit-passing
+  messages" pattern). Differs from the GitLab fork; future opt-in
+  `Plugin.observe_unfiltered_group_messages` could change this.
+
 ## 1.0.0 — 2026-05-14
 
 ### BREAKING CHANGES
