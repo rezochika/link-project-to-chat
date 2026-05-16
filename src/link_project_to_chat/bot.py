@@ -3499,44 +3499,8 @@ def run_bots(
             respond_in_groups=proj.respond_in_groups,
         )
     else:
-        # Multi-project path: dispatch a run_bot per project. The CLI
-        # entrypoint (start without --project) ends up here when more than
-        # one project is configured; in production the first bot's
-        # blocking run() means only the first runs polling — operators
-        # should start each with --project NAME. Tests patch run_bot to
-        # validate per-project plumbing (e.g. respond_in_groups).
-        for name, proj in config.projects.items():
-            effective_allowed_users, project_auth_source = resolve_project_allowed_users(proj, config)
-            proj_skip, proj_pm = resolve_permissions(proj.permissions)
-            project_state = proj.backend_state.get(proj.backend, {})
-            run_bot(
-                name,
-                Path(proj.path),
-                proj.telegram_bot_token,
-                model=resolve_start_model(
-                    proj.backend,
-                    explicit_model=model,
-                    backend_model=project_state.get("model"),
-                    legacy_claude_model=proj.model,
-                ),
-                effort=project_state.get("effort") or proj.effort,
-                skip_permissions=skip_permissions or proj_skip,
-                permission_mode=permission_mode or proj_pm,
-                allowed_tools=allowed_tools,
-                disallowed_tools=disallowed_tools,
-                transcriber=transcriber,
-                synthesizer=synthesizer,
-                active_persona=proj.active_persona,
-                show_thinking=bool(project_state.get("show_thinking", proj.show_thinking)),
-                config_path=config_path,
-                transport_kind=transport_kind,
-                web_port=web_port,
-                backend_name=proj.backend,
-                backend_state=proj.backend_state,
-                context_enabled=proj.context_enabled,
-                context_history_limit=proj.context_history_limit,
-                plugins=getattr(proj, "plugins", None) or None,
-                allowed_users=effective_allowed_users or None,
-                auth_source=project_auth_source,
-                respond_in_groups=proj.respond_in_groups,
-            )
+        names = ", ".join(config.projects.keys())
+        raise SystemExit(
+            f"Multiple projects configured ({names}). "
+            f"Start each separately: link-project-to-chat start --project NAME"
+        )

@@ -64,9 +64,11 @@ def test_run_bot_defaults_to_false(tmp_path: Path):
     assert captured["respond_in_groups"] is False
 
 
-def test_run_bots_pulls_respond_in_groups_from_project_config(tmp_path: Path):
-    """run_bots iterates Config.projects and constructs a ProjectBot per
-    entry; the per-project respond_in_groups field must flow through."""
+def test_run_bots_single_project_pulls_respond_in_groups_from_project_config(tmp_path: Path):
+    """run_bots' single-project branch reads ProjectConfig.respond_in_groups
+    and forwards it into run_bot. (Multi-project configs go through cli.py's
+    'start --project NAME' flow per project; run_bots' multi-project branch
+    raises SystemExit with a usage hint.)"""
     from link_project_to_chat.bot import run_bots
     from link_project_to_chat.config import (
         AllowedUser,
@@ -84,18 +86,11 @@ def test_run_bots_pulls_respond_in_groups_from_project_config(tmp_path: Path):
         telegram_bot_token="t1",
         respond_in_groups=True,
     )
-    cfg.projects["p2"] = ProjectConfig(
-        path=str(tmp_path),
-        telegram_bot_token="t2",
-        respond_in_groups=False,
-    )
     save_config(cfg, cfg_path)
 
     captured: list[dict] = []
 
     def _record_run_bot(*args, **kwargs):
-        # run_bot's positional args are (name, path, token); we accept
-        # either positional or keyword for `name` and `respond_in_groups`.
         name = kwargs.get("name") or (args[0] if args else None)
         captured.append({
             "name": name,
@@ -105,6 +100,32 @@ def test_run_bots_pulls_respond_in_groups_from_project_config(tmp_path: Path):
     with patch("link_project_to_chat.bot.run_bot", _record_run_bot):
         run_bots(cfg, config_path=cfg_path)
 
-    by_name = {c["name"]: c for c in captured}
-    assert by_name["p1"]["respond_in_groups"] is True
-    assert by_name["p2"]["respond_in_groups"] is False
+    assert len(captured) == 1
+    assert captured[0]["respond_in_groups"] is True
+
+
+def test_run_bots_multi_project_raises_system_exit(tmp_path: Path):
+    """Regression for the fail-fast multi-project guard. Operators with
+    multiple projects must use `start --project NAME`; running `start`
+    bare with multi-project config is a configuration error."""
+    from link_project_to_chat.bot import run_bots
+    from link_project_to_chat.config import (
+        AllowedUser,
+        Config,
+        ProjectConfig,
+    )
+
+    cfg = Config(
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    cfg.projects["p1"] = ProjectConfig(
+        path=str(tmp_path),
+        telegram_bot_token="t1",
+    )
+    cfg.projects["p2"] = ProjectConfig(
+        path=str(tmp_path),
+        telegram_bot_token="t2",
+    )
+
+    with pytest.raises(SystemExit):
+        run_bots(cfg)
