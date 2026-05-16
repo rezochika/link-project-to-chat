@@ -7,7 +7,7 @@ import pytest
 
 from link_project_to_chat.config import Config, GoogleChatConfig
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
-from link_project_to_chat.transport.base import ChatKind, ChatRef, Identity, MessageRef
+from link_project_to_chat.transport.base import ChatKind, ChatRef, Identity, MessageRef, PromptKind, PromptSpec
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -93,3 +93,18 @@ async def test_send_text_preserves_thread_name_in_reply_to_native():
 
     assert fake.calls[0]["thread_name"] == "spaces/AAA/threads/T1"
     assert result.native["thread_name"] == "spaces/AAA/threads/T1"
+
+
+@pytest.mark.asyncio
+async def test_text_prompt_reply_fallback_accepts_expected_sender_only():
+    transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    sender = Identity("google_chat", "users/1", "R", "r@example.test", False)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission))
+
+    prompt = await transport.open_prompt(chat, PromptSpec(key="name", title="Name", body="Your name", kind=PromptKind.TEXT))
+    await transport.inject_prompt_reply(prompt, sender=sender, text="R")
+
+    assert seen[0].text == "R"
+    assert seen[0].option is None

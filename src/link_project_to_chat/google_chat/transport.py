@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -14,6 +16,10 @@ from link_project_to_chat.transport.base import (
     Identity,
     IncomingMessage,
     MessageRef,
+    PromptKind,
+    PromptRef,
+    PromptSpec,
+    PromptSubmission,
 )
 
 if TYPE_CHECKING:
@@ -21,6 +27,18 @@ if TYPE_CHECKING:
     from .client import GoogleChatClient
 
 logger = logging.getLogger(__name__)
+
+PROMPT_CANCEL_OPTION = "__cancel__"
+PROMPT_TIMEOUT_OPTION = "__timeout__"
+
+
+@dataclass
+class PendingPrompt:
+    prompt: PromptRef
+    chat: ChatRef
+    sender: Identity | None
+    kind: PromptKind
+    expires_at: float
 
 
 def _chat_from_space(space: dict) -> ChatRef:
@@ -70,6 +88,9 @@ class GoogleChatTransport:
         self._fast_ack_timeouts: int = 0
         self._message_handlers: list = []
         self._command_handlers: dict[str, object] = {}
+        self._pending_prompts: dict[str, PendingPrompt] = {}
+        self._prompt_submit_handlers: list = []
+        self._prompt_seq: int = 0
 
     @property
     def pending_event_count(self) -> int:
@@ -239,3 +260,68 @@ class GoogleChatTransport:
         if isinstance(msg.native, dict) and msg.native.get("is_app_created") is False:
             return
         await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
+
+    # ── Prompt support ────────────────────────────────────────────────────
+
+    def on_prompt_submit(self, handler) -> None:
+        self._prompt_submit_handlers.append(handler)
+
+    async def open_prompt(
+        self,
+        chat: ChatRef,
+        spec: PromptSpec,
+        *,
+        reply_to: MessageRef | None = None,
+    ) -> PromptRef:
+        prompt_id = f"p-{self._prompt_seq}"
+        self._prompt_seq += 1
+        ref = PromptRef(
+            transport_id="google_chat",
+            native_id=prompt_id,
+            chat=chat,
+            key=spec.key,
+        )
+        expires_at = time.monotonic() + self.config.pending_prompt_ttl_seconds
+        self._pending_prompts[prompt_id] = PendingPrompt(
+            prompt=ref,
+            chat=chat,
+            sender=None,
+            kind=spec.kind,
+            expires_at=expires_at,
+        )
+        # Post the question as a plain message when a client is available.
+        if self.client is not None:
+            await self.send_text(chat, spec.body, reply_to=reply_to)
+        return ref
+
+    async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
+        raise NotImplementedError("update_prompt not yet implemented for GoogleChatTransport")
+
+    async def close_prompt(
+        self,
+        prompt: PromptRef,
+        *,
+        final_text: str | None = None,
+    ) -> None:
+        self._pending_prompts.pop(prompt.native_id, None)
+
+    async def inject_prompt_reply(
+        self,
+        prompt: PromptRef,
+        *,
+        sender: Identity,
+        text: str | None = None,
+        option: str | None = None,
+    ) -> None:
+        """Test helper: synthesize a PromptSubmission and dispatch to handlers."""
+        submission = PromptSubmission(
+            chat=prompt.chat,
+            sender=sender,
+            prompt=prompt,
+            text=text,
+            option=option,
+        )
+        for handler in self._prompt_submit_handlers:
+            result = handler(submission)
+            if inspect.isawaitable(result):
+                await result
