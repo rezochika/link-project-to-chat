@@ -108,3 +108,20 @@ async def test_text_prompt_reply_fallback_accepts_expected_sender_only():
 
     assert seen[0].text == "R"
     assert seen[0].option is None
+
+
+@pytest.mark.asyncio
+async def test_unsupported_drive_attachment_sets_unsupported_media():
+    transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg))
+    payload = {
+        "type": "MESSAGE",
+        "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+        "message": {"name": "spaces/AAA/messages/4", "attachment": [{"driveDataRef": {"driveFileId": "1"}}]},
+        "user": {"name": "users/111", "displayName": "R"},
+    }
+
+    await transport.dispatch_event(payload)
+
+    assert seen[0].has_unsupported_media is True

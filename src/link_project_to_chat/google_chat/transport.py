@@ -57,6 +57,19 @@ def _identity_from_user(user: dict) -> Identity:
     )
 
 
+def _has_unsupported_attachment(message_data: dict) -> bool:
+    """Return True if any attachment in the message cannot be delivered in v1.
+
+    - driveDataRef: requires OAuth Drive scopes not provisioned in v1.
+    - attachmentDataRef: download_attachment is NotImplementedError in v1.
+    Any non-empty attachment list is conservatively flagged as unsupported.
+    """
+    for attachment in message_data.get("attachment", []):
+        if "driveDataRef" in attachment or "attachmentDataRef" in attachment:
+            return True
+    return False
+
+
 class GoogleChatTransport:
     transport_id = "google_chat"
     # 8 000 is the conservative *character* budget surfaced to callers
@@ -149,6 +162,7 @@ class GoogleChatTransport:
             chat,
             native={"thread_name": thread_name} if thread_name else {},
         )
+        has_unsupported_media = _has_unsupported_attachment(message_data)
         msg = IncomingMessage(
             chat=chat,
             sender=sender,
@@ -156,6 +170,7 @@ class GoogleChatTransport:
             files=[],
             reply_to=None,
             message=message,
+            has_unsupported_media=has_unsupported_media,
         )
         for handler in self._message_handlers:
             result = handler(msg)
@@ -260,6 +275,16 @@ class GoogleChatTransport:
         if isinstance(msg.native, dict) and msg.native.get("is_app_created") is False:
             return
         await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
+
+    async def send_file(self, chat, path, *, caption=None, display_name=None):
+        label = display_name or path.name
+        text = f"File upload is not supported for Google Chat yet: {label}"
+        if caption:
+            text = f"{caption}\n\n{text}"
+        return await self.send_text(chat, text)
+
+    async def send_voice(self, chat, path, *, reply_to=None):
+        return await self.send_text(chat, f"Voice upload is not supported for Google Chat yet: {path.name}", reply_to=reply_to)
 
     # ── Prompt support ────────────────────────────────────────────────────
 
