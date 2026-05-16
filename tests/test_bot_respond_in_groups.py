@@ -60,6 +60,7 @@ def _make_group_incoming(
     sender_is_bot: bool = False,
     mentions: list[Identity] | None = None,
     reply_to_sender: Identity | None = None,
+    reply_to_text: str | None = None,
     files: list[IncomingFile] | None = None,
 ) -> IncomingMessage:
     chat = ChatRef(transport_id="fake", native_id="100", kind=ChatKind.ROOM)
@@ -72,6 +73,7 @@ def _make_group_incoming(
         chat=chat, sender=sender, text=text, files=files or [],
         reply_to=None, message=msg,
         reply_to_sender=reply_to_sender,
+        reply_to_text=reply_to_text,
         mentions=mentions or [],
     )
 
@@ -255,12 +257,12 @@ async def test_group_reply_to_bot_with_other_mention_is_silent():
 
 @pytest.mark.asyncio
 async def test_group_empty_text_after_strip_does_not_reach_on_text():
-    """User types just '@MyBot' with nothing else. After stripping, the
-    incoming has empty text and no files. The gate's fall-through routes
-    to the existing 'Nothing actionable — unsupported' branch (which
-    sends 'This message type is not supported.'). It does NOT call
-    _on_text. (We don't tightly assert the unsupported reply text here —
-    that's existing behavior under test elsewhere.)"""
+    """User types just '@MyBot' with nothing else AND no reply context.
+    After stripping, the incoming has empty text and no files. The gate's
+    fall-through routes to the existing 'Nothing actionable — unsupported'
+    branch (which sends 'This message type is not supported.'). It does
+    NOT call _on_text. (We don't tightly assert the unsupported reply
+    text here — that's existing behavior under test elsewhere.)"""
     bot = _make_bot(respond_in_groups=True)
     # Stub _auth_identity so the unsupported-branch auth check doesn't
     # explode on missing brute-force-counter state we didn't set up.
@@ -270,6 +272,92 @@ async def test_group_empty_text_after_strip_does_not_reach_on_text():
     )
     await bot._on_text_from_transport(incoming)
     bot._on_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_bare_mention_as_reply_uses_replied_to_text_as_prompt():
+    """User replies to someone else's message with just '@MyBot' and no
+    other text. Without this fix the bot bails out with 'unsupported
+    media' because the stripped text is empty. With the fix, the bot
+    treats the replied-to message content as the user's prompt and
+    forwards it to _on_text.
+
+    Validates the design call: when @bot has no payload after strip but
+    the message is a reply to something else, the user's intent is
+    'look at the replied-to message and respond to it.' The replied-to
+    text becomes the prompt; reply_to_text is cleared on the forwarded
+    IncomingMessage so _build_user_prompt doesn't double-prepend the
+    same content under a '[Replying to: ...]' header.
+    """
+    bot = _make_bot(respond_in_groups=True)
+    bot._auth_identity = lambda _identity: True
+    incoming = _make_group_incoming(
+        "@MyBot",
+        mentions=[_bot_mention("MyBot")],
+        reply_to_text="what's the meaning of life?",
+        reply_to_sender=Identity(
+            transport_id="fake", native_id="99",
+            display_name="Alice", handle="alice_other",
+            is_bot=False,
+        ),
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    assert forwarded.text == "what's the meaning of life?"
+    # reply_to_text cleared so _build_user_prompt doesn't double-prepend.
+    assert forwarded.reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_group_bare_mention_as_reply_to_bot_uses_replied_to_text():
+    """Same lift as the previous test but the replied-to message is from
+    the bot itself. is_directed_at_me already returned True via the
+    mentions_bot path (top of the function); the reply-context promotion
+    must also fire here so the user can answer their own ping-pong style
+    flow with bare @mentions.
+    """
+    bot = _make_bot(respond_in_groups=True)
+    bot._auth_identity = lambda _identity: True
+    incoming = _make_group_incoming(
+        "@MyBot",
+        mentions=[_bot_mention("MyBot")],
+        reply_to_text="pong",
+        reply_to_sender=_bot_mention("MyBot"),
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    assert forwarded.text == "pong"
+    assert forwarded.reply_to_text is None
+
+
+@pytest.mark.asyncio
+async def test_group_mention_with_text_in_reply_preserves_reply_to_text():
+    """When the user DOES write something after @MyBot in a reply, the
+    promotion-to-prompt path must NOT fire — the user-supplied text is
+    the prompt, and reply_to_text stays populated so _build_user_prompt
+    can prepend the '[Replying to: ...]' header (existing behavior).
+    """
+    bot = _make_bot(respond_in_groups=True)
+    bot._auth_identity = lambda _identity: True
+    incoming = _make_group_incoming(
+        "@MyBot can you help with this?",
+        mentions=[_bot_mention("MyBot")],
+        reply_to_text="some earlier message",
+        reply_to_sender=Identity(
+            transport_id="fake", native_id="99",
+            display_name="Alice", handle="alice_other",
+            is_bot=False,
+        ),
+    )
+    await bot._on_text_from_transport(incoming)
+    assert bot._on_text.await_count == 1
+    forwarded = bot._on_text.await_args.args[0]
+    # @MyBot stripped; user-supplied text preserved.
+    assert "can you help with this?" in forwarded.text
+    # reply_to_text untouched — _build_user_prompt will prepend it.
+    assert forwarded.reply_to_text == "some earlier message"
 
 
 @pytest.mark.asyncio

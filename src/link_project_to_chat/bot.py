@@ -995,6 +995,28 @@ class ProjectBot(AuthMixin):
             if not is_directed_at_me(incoming, self.bot_username):
                 return
             incoming = self._strip_self_mention(incoming)
+            # Reply-context promotion: when the user @-mentioned the bot
+            # in a reply to another message and wrote nothing else (so the
+            # stripped text is empty), treat the replied-to content as the
+            # user's intent and forward it as the prompt. Without this the
+            # bot falls through to "Nothing actionable" and replies "This
+            # message type is not supported" — confusing UX when the user
+            # clearly meant "@bot, look at this message". Cleared
+            # reply_to_text on the forwarded message so _build_user_prompt
+            # doesn't double-prepend a "[Replying to: ...]" header
+            # containing the same content we just promoted.
+            if (
+                not incoming.text.strip()
+                and not incoming.files
+                and not incoming.has_unsupported_media
+                and incoming.reply_to_text
+            ):
+                import dataclasses
+                incoming = dataclasses.replace(
+                    incoming,
+                    text=incoming.reply_to_text,
+                    reply_to_text=None,
+                )
             # Fall through to the existing payload-type dispatch below
             # (voice / file / text). Don't call _on_text directly here —
             # _on_text only handles text+prompt; it doesn't transcribe voice
