@@ -87,6 +87,8 @@ class _RecordingPlugin(Plugin):
 
 
 def _make_bot(plugins=None, backend_name="claude"):
+    from link_project_to_chat.config import Config
+
     bot = ProjectBot.__new__(ProjectBot)
     bot.name = "p"
     bot.path = Path("/tmp/p")
@@ -101,6 +103,11 @@ def _make_bot(plugins=None, backend_name="claude"):
     # a no-op so PluginContext can stash the reference at registration time.
     bot.bot_username = ""
     bot._get_user_role = lambda _identity: None
+    # _init_plugins resolves PluginContext.data_dir via
+    # resolve_project_meta_dir(self._config.meta_dir, self.name) — supply a
+    # default Config so the lookup succeeds without touching the operator's
+    # real meta_dir.
+    bot._config = Config()
     return bot
 
 

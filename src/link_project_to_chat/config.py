@@ -19,6 +19,19 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = Path.home() / ".link-project-to-chat" / "config.json"
 
+DEFAULT_META_DIR = DEFAULT_CONFIG.parent / "meta"
+
+
+def resolve_project_meta_dir(meta_dir: Path, project_name: str) -> Path:
+    """Return <meta_dir>/<project_name>/, creating parents idempotently.
+
+    Used by `bot._init_plugins` to give each project its own storage root
+    under the operator-chosen meta_dir.
+    """
+    path = meta_dir / project_name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 class ConfigError(Exception):
     """Raised when config.json contains structurally invalid data."""
@@ -421,6 +434,13 @@ class Config:
     teams: dict[str, TeamConfig] = field(default_factory=dict)
     # New (Task 3) - identity-keyed auth at the global scope.
     allowed_users: list[AllowedUser] = field(default_factory=list)
+    # Operator-chosen storage root for per-bot/per-plugin persistent state.
+    # Defaults to ``~/.link-project-to-chat/meta`` (computed at import time).
+    # Each project gets a ``<meta_dir>/<project_name>/`` subdir resolved via
+    # ``resolve_project_meta_dir``; plugins receive it as
+    # ``PluginContext.data_dir``. Operators set ``meta_dir`` in config.json
+    # to relocate storage to a different volume (e.g. ``/var/lib/lptc/data``).
+    meta_dir: Path = field(default_factory=lambda: DEFAULT_META_DIR)
     # Runtime flag set by load_config when legacy auth fields were read; CLI
     # start uses it to force a save before serving traffic. ``save_config``
     # does not emit this key; ``repr=False, compare=False`` keeps it out of
@@ -817,6 +837,17 @@ def _load_config_unlocked(
         config.allowed_users = explicit_global or migrated_global
         if did_migrate_global:
             config.migration_pending = True
+        raw_meta = raw.get("meta_dir")
+        if raw_meta is None:
+            config.meta_dir = DEFAULT_META_DIR
+        elif isinstance(raw_meta, str):
+            config.meta_dir = Path(raw_meta).expanduser()
+        else:
+            logger.warning(
+                "meta_dir must be a string path; got %r (treating as default)",
+                raw_meta,
+            )
+            config.meta_dir = DEFAULT_META_DIR
         config.github_pat = raw.get("github_pat", "")
         config.telegram_api_id = raw.get("telegram_api_id", 0)
         config.telegram_api_hash = raw.get("telegram_api_hash", "")
@@ -1040,6 +1071,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
     raw.pop("trusted_users", None)
     raw.pop("trusted_user_ids", None)
     raw.pop("trusted_user_id", None)
+    if config.meta_dir != DEFAULT_META_DIR:
+        raw["meta_dir"] = str(config.meta_dir)
+    else:
+        raw.pop("meta_dir", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.github_pat:

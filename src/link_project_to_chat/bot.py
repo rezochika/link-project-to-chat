@@ -17,6 +17,7 @@ from .config import (
     AllowedUser,
     Config,
     DEFAULT_CONFIG,
+    DEFAULT_META_DIR,
     RoomBinding,
     clear_session,
     load_config,
@@ -29,6 +30,7 @@ from .config import (
     patch_team_bot_backend_state,
     resolve_permissions,
     resolve_project_allowed_users,
+    resolve_project_meta_dir,
     resolve_start_model,
     save_session,
 )
@@ -181,11 +183,19 @@ class ProjectBot(AuthMixin):
         allowed_users: list | None = None,
         auth_source: str = "project",
         respond_in_groups: bool = False,
+        config: Config | None = None,
     ):
         self.name = name
         self.path = path.resolve()
         self.token = token
         self._config_path = config_path
+        # Source of operator-tuned settings (currently used for ``meta_dir``;
+        # other knobs still flow via individual ctor kwargs). When the caller
+        # didn't supply a Config (e.g. legacy ``run_bot`` callers, tests that
+        # only need the bot's transport surface) we fall back to a default
+        # Config so ``self._config.meta_dir`` is always usable in
+        # ``_init_plugins`` without a None-check.
+        self._config: Config = config if config is not None else Config()
         self.transport_kind = transport_kind
         self.web_port = web_port
         # Legacy ``allowed_usernames`` is the only pre-v1.0 kwarg still accepted
@@ -2983,8 +2993,10 @@ class ProjectBot(AuthMixin):
         # PluginContext field provenance:
         #   bot_name / project_path / bot_username / backend_name / transport
         #     — sourced from ProjectBot state (set in __init__ / _after_ready).
-        #   data_dir — fixed convention `~/.link-project-to-chat/meta/<bot_name>`;
-        #     created with mkdir below.
+        #   data_dir — resolved via ``resolve_project_meta_dir`` against
+        #     ``self._config.meta_dir`` so operators can relocate storage to
+        #     a different volume by setting ``meta_dir`` in config.json.
+        #     Defaults to ``~/.link-project-to-chat/meta/<bot_name>``.
         #   _identity_resolver — live bound method (see comment inline).
         #   web_port / public_url / register_in_app_web_handler — INTENTIONALLY
         #     left at their None defaults in v1.0.0. They're API surface
@@ -2993,11 +3005,12 @@ class ProjectBot(AuthMixin):
         #     Web transport's port / public URL and registers an HTTP-route
         #     callback. Plugins that need them must check for None and
         #     degrade gracefully (documented in PluginContext's docstring).
+        plugin_data_root = resolve_project_meta_dir(self._config.meta_dir, self.name)
         self._shared_ctx = PluginContext(
             bot_name=self.name,
             project_path=self.path,
             bot_username=self.bot_username,
-            data_dir=Path.home() / ".link-project-to-chat" / "meta" / self.name,
+            data_dir=plugin_data_root,
             backend_name=self._backend_name,
             transport=self._transport,
             # LIVE identity resolver. Plugins call ctx.is_allowed(identity) /
@@ -3008,7 +3021,6 @@ class ProjectBot(AuthMixin):
             # executor_identities as flat lists here — that went stale.
             _identity_resolver=self._get_user_role,
         )
-        self._shared_ctx.data_dir.mkdir(parents=True, exist_ok=True)
 
         for cfg in self._plugin_configs:
             pname = cfg.get("name")
@@ -3409,6 +3421,7 @@ def run_bot(
     allowed_users: list | None = None,
     auth_source: str = "project",
     respond_in_groups: bool = False,
+    config: Config | None = None,
 ) -> None:
     # Determine effective auth — prefer the modern allowed_users; fall back
     # to synthesizing executor entries from the legacy usernames so the
@@ -3455,6 +3468,7 @@ def run_bot(
         allowed_users=allowed_users,
         auth_source=auth_source,
         respond_in_groups=respond_in_groups,
+        config=config,
     )
     bot.task_manager.backend.session_id = session_id or load_session(
         name,
@@ -3519,6 +3533,7 @@ def run_bots(
             allowed_users=effective_allowed_users or None,
             auth_source=project_auth_source,
             respond_in_groups=proj.respond_in_groups,
+            config=config,
         )
     else:
         names = ", ".join(config.projects.keys())
