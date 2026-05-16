@@ -1,8 +1,8 @@
 # Transport - Google Chat - Design Spec
 
-**Status:** Ready for implementation planning after the contract/config cleanup in Step 0. Designed 2026-04-25; refreshed 2026-05-16 against current repo state and current Google Chat docs; refined 2026-05-17 to address contract-amendment blockers (`MessageRef.native`, `PromptSubmission.text`/`option`, `BotPeerRef` persistence, explicit transport selection), pin callback-token/fast-ack/threading decisions, and mark §3.1 prerequisites satisfied.
+**Status:** Ready for implementation planning after the contract/config cleanup in Step 0. Designed 2026-04-25; refreshed 2026-05-16 against current repo state and current Google Chat docs; refined 2026-05-17 to address contract-amendment blockers (`MessageRef.native`, `PromptSubmission.text`/`option`, `BotPeerRef` persistence, explicit transport selection), pin callback-token/fast-ack/threading decisions, and mark §3.1 prerequisites satisfied; refined again 2026-05-17 (v2) to add typed Google native metadata, non-Telegram team-room validity, UTF-8 byte-limit handling, outbound `requestId` idempotency, and `edit_text` no-create-on-missing semantics.
 
-**Date:** 2026-04-25; refreshed 2026-05-16; refined 2026-05-17.
+**Date:** 2026-04-25; refreshed 2026-05-16; refined 2026-05-17; refined v2 2026-05-17.
 
 **Depends on:**
 - `2026-04-20-transport-abstraction-design.md` (spec #0)
@@ -31,6 +31,16 @@ This refinement keeps the original architecture but fixes implementation blocker
 10. Shared transport contract tests must include Google Chat through fixture/injection helpers.
 11. Fast-acknowledgement default body is locked to HTTP 200 `{}` for non-dialog events; a user-visible "Working…" message is opt-in per command to avoid stranded transient messages that later stream edits cannot cleanly replace.
 12. §3.1 prerequisites are marked satisfied (spec #0a shipped in v0.15.0, spec #0c in v0.16.0, spec #1 in main); Steps 10 and 11 in §6 no longer gate on those ports.
+
+v2 (2026-05-17) additions:
+
+13. **Typed Google Chat native metadata.** A `GoogleChatMessageNative` TypedDict pins the key set so `send_text`, `edit_text`, streaming overflow rotation, and tests do not drift on dict keys.
+14. **Non-Telegram team-room validity.** Team config parsing currently requires both `path` AND legacy `group_chat_id` (verified at `config.py:712`), which silently drops `room`-only Google Chat team configs as malformed and cleans them up on disk. Step 0 widens the validity rule to `path` AND (`group_chat_id` OR structured `room`).
+15. **UTF-8 byte-limit handling.** Google Chat enforces UTF-8 byte limits while shared helpers count characters; `GoogleChatConfig` gains `max_message_bytes` and the transport validates rendered UTF-8 byte length before each REST call.
+16. **Outbound create idempotency.** `spaces.messages.create` accepts `requestId` to deduplicate retried creates. The client surfaces the parameter and the chosen ID is stored in `MessageRef.native`.
+17. **`edit_text` no-create-on-missing semantics.** Update/patch calls require an explicit `updateMask` and must not silently create a new message; if the API cannot update the target, `GoogleChatTransport` degrades inside the transport to final-only or a clearly marked replacement.
+
+`MessageRef.native` is additionally specified as `field(default=None, compare=False, hash=False, repr=False)` so that the field can carry an unhashable dict (`GoogleChatMessageNative`) without breaking equality or hashing for any future code that puts `MessageRef` into a set or dict. Current `src` has no such use; this is forward-looking defense.
 
 ---
 
@@ -99,6 +109,9 @@ That means Google Chat should not be a separate plugin API, a `TelegramBot` para
 | 7 | Callback integrity? | HMAC-signed callback envelope with a per-process secret and TTL. Restart invalidates old cards (intentional trade-off). |
 | 8 | Threading? | Carry thread metadata through `MessageRef.native`; do not model threads as a new `ChatKind` in v1. |
 | 9 | Fast-ack default body? | HTTP 200 `{}` for `MESSAGE`/`APP_COMMAND`/normal `CARD_CLICKED`. Dialog events return required inline dialog actions. "Working…" message is opt-in per command. |
+| 10 | Edit semantics? | `edit_text` edits only an app-created message via explicit `updateMask`. It must not silently create a new message; degrade inside the transport if update is unsupported. |
+| 11 | Outbound create idempotency? | Use Chat API `requestId` where currently supported to avoid duplicate creates on retry; store the chosen ID in `MessageRef.native["request_id"]`. |
+| 12 | Message-size handling? | Treat Google Chat limits as UTF-8 byte limits; keep `max_text_length` conservative and validate `len(rendered.encode("utf-8"))` before REST calls. |
 
 ### 3.1 Sequencing prerequisites
 
@@ -135,20 +148,24 @@ class MessageRef:
 Required refined shape:
 
 ```python
+from dataclasses import dataclass, field
+from typing import Any
+
 @dataclass(frozen=True)
 class MessageRef:
     transport_id: str
     native_id: str
     chat: ChatRef
-    native: Any = None
+    native: Any = field(default=None, compare=False, hash=False, repr=False)
 ```
 
 Rules:
 
 - `native` is optional, opaque, and transport-owned.
 - Existing transports may leave it as `None`.
-- Bot logic may read only platform-neutral fields. Google-specific data remains behind transport methods, except generic routing helpers may pass `MessageRef` through unchanged.
-- `GoogleChatTransport` stores at least: `space.name`, `message.name`, `thread.name` when present, event timestamp, and event idempotency key.
+- `native` must not participate in equality, hashing, or normal repr output. Reason: `native` may hold an unhashable dict (`GoogleChatMessageNative`) and may differ in richness for refs to the same platform message. Message identity remains `transport_id + native_id + chat`.
+- Bot logic may read only platform-neutral fields. Google-specific data remains behind transport methods; bot code may pass `MessageRef` through unchanged.
+- `GoogleChatTransport` stores thread/message/idempotency metadata in `native` using the `GoogleChatMessageNative` shape (§4.0.2).
 - `send_text(..., reply_to=msg)` uses `reply_to.native` to preserve Google Chat thread placement.
 - `edit_text(msg, ...)` uses `msg.native_id` / `msg.native` to update the referenced app-created message only.
 
@@ -158,7 +175,32 @@ Fallback if maintainers reject the contract amendment:
 - This fallback is weaker because metadata can be lost across process restarts and when external code constructs `MessageRef` manually.
 - If using the side table, document that thread preservation is best-effort and only guaranteed for messages seen/sent during the same process lifetime.
 
-#### 4.0.2 Prompt submission semantics
+#### 4.0.2 Define Google Chat native metadata shape
+
+Use one typed metadata shape so implementation and tests do not drift on key names:
+
+```python
+from typing import TypedDict
+
+class GoogleChatMessageNative(TypedDict, total=False):
+    space_name: str                  # e.g. "spaces/..."
+    message_name: str                # e.g. "spaces/.../messages/..."
+    thread_name: str                 # e.g. "spaces/.../threads/..."
+    event_time: str                  # raw Google event timestamp where available
+    event_idempotency_key: str       # chosen inbound duplicate key
+    request_id: str                  # outbound create idempotency key when used
+    message_reply_option: str        # reply option used for create calls
+    is_app_created: bool             # True for messages created by this app/client
+```
+
+Rules:
+
+- Store only JSON-serializable, display-safe values.
+- Do not store bearer tokens, access tokens, service-account JSON, callback-token secrets, or secret prompt text.
+- `MessageRef.native_id` remains the canonical message resource name; `native["message_name"]` is a redundant convenience only when useful.
+- Tests should assert exact key names for thread propagation, outbound `request_id` idempotency, and reply-option propagation.
+
+#### 4.0.3 Prompt submission semantics
 
 `PromptSubmission` currently has `text` and `option`, not `value` (verified at `transport/base.py:156-163`).
 
@@ -184,7 +226,7 @@ PROMPT_TIMEOUT_OPTION = "__timeout__"
 - These reserved values are transport-level sentinels. If a future shared primitive gains an explicit status field, migrate away from sentinel options.
 - User-provided choice values equal to these reserved strings must be rejected or escaped when rendering prompt options.
 
-#### 4.0.3 Persist non-Telegram `BotPeerRef`
+#### 4.0.4 Persist non-Telegram `BotPeerRef`
 
 The `BotPeerRef` dataclass is already transport-agnostic, but Google team routing needs persisted peer app/user IDs. Verified gap: `config.py:_parse_team_bot` ignores `bot_peer`; `_serialize_team_bot` never writes it; only Telegram synthesis from `bot_username` works today.
 
@@ -216,7 +258,40 @@ Expected on-disk shape:
 }
 ```
 
-#### 4.0.4 Make transport selection explicit
+#### 4.0.5 Accept non-Telegram room bindings in team config validation
+
+Team config parsing currently requires both `path` AND `group_chat_id` (verified at `config.py:712` in `_split_team_entries`; `room`-only entries are dropped as malformed and cleaned up on disk by `_cleanup_malformed_teams`). This silently breaks Google Chat team configs.
+
+Required validity rule:
+
+```text
+A team entry is valid when it has:
+- path, and
+- either group_chat_id or a structured room binding
+```
+
+Rules:
+
+- `group_chat_id: 0` may remain as the legacy Telegram sentinel.
+- For non-Telegram transports, a structured `room` binding is sufficient.
+- Saving may keep `group_chat_id: 0` for downgrade compatibility, but loading must not reject `room`-only Google team configs.
+- `_cleanup_malformed_teams` must not delete a valid non-Telegram `room`-only entry.
+
+Expected on-disk shape for a Google Chat team:
+
+```json
+{
+  "teams": {
+    "alpha": {
+      "path": "/path/to/project",
+      "room": {"transport_id": "google_chat", "native_id": "spaces/..."},
+      "bots": { "...": "..." }
+    }
+  }
+}
+```
+
+#### 4.0.6 Make transport selection explicit
 
 `ProjectBot.build()` must not use `else: TelegramTransport` after adding Google Chat. Verified gap: `bot.py:3349-3351` currently has the silent fall-through.
 
@@ -255,7 +330,7 @@ Field mapping:
 - `Identity.display_name`: human-readable display name from event payload
 - `Identity.is_bot`: true for app/bot-originated events where Google exposes bot identity
 - `MessageRef.native_id`: Google Chat message resource name, for example `spaces/.../messages/...`
-- `MessageRef.native`: Google-specific metadata required for thread/reply/idempotency preservation
+- `MessageRef.native`: `GoogleChatMessageNative` metadata required for thread/reply/idempotency preservation (§4.0.2)
 
 Outbound primitives:
 
@@ -319,6 +394,7 @@ class GoogleChatConfig:
     root_command_id: int | None = None
     callback_token_ttl_seconds: int = 900
     pending_prompt_ttl_seconds: int = 900
+    max_message_bytes: int = 32_000
 ```
 
 Expose as:
@@ -345,7 +421,7 @@ Load behavior:
 - Non-dict `google_chat` -> `ConfigError` or warning + default; choose one and test it. Startup must fail if Google Chat is selected and required fields are absent.
 - `allowed_audiences` must be a list of strings.
 - Unknown `auth_audience_type` fails at config load or transport startup; startup failure is mandatory.
-- `port`, `callback_token_ttl_seconds`, and `pending_prompt_ttl_seconds` must be positive integers.
+- `port`, `callback_token_ttl_seconds`, `pending_prompt_ttl_seconds`, and `max_message_bytes` must be positive integers.
 - `endpoint_path` must start with `/`.
 
 Save behavior:
@@ -360,6 +436,7 @@ Startup validation:
 - `auth_audience_type == "project_number"` requires non-empty `project_number`.
 - `service_account_file` is required and must be readable before enabling outbound Chat API support.
 - `callback_token_ttl_seconds` and `pending_prompt_ttl_seconds` must be positive.
+- `max_message_bytes` must be positive and no greater than the currently documented Chat API message-size ceiling. Step 4 must verify the current ceiling against Google docs before implementation.
 - Startup errors must name the missing field without exposing credential contents.
 
 CLI wiring:
@@ -629,7 +706,7 @@ Prompt tests:
 
 ---
 
-### 4.8 Async responses and streaming
+### 4.8 Async responses, byte limits, and streaming
 
 Google Chat interaction handlers must return quickly. Backend responses can take much longer, so streaming uses a split path:
 
@@ -639,6 +716,14 @@ Google Chat interaction handlers must return quickly. Backend responses can take
 - `edit_text` updates app-created messages where permitted.
 - `StreamingMessage` remains transport-agnostic and owns time-based throttling, overflow rotation, and `TransportRetryAfter` backoff (see [`transport/streaming.py`](../../../src/link_project_to_chat/transport/streaming.py)).
 - Google Chat composes with `StreamingMessage(transport, chat, throttle=2.0, ...)` and layers Google-specific caps inside `GoogleChatTransport.edit_text`, not inside `StreamingMessage`.
+
+Byte-limit handling:
+
+- Google Chat message size is treated as a **UTF-8 byte limit**, not a Python character limit.
+- `GoogleChatConfig.max_message_bytes` stores the verified current byte ceiling.
+- `GoogleChatTransport.max_text_length` (the shared helper's character ceiling) must be set conservatively below the byte ceiling because the helper counts characters; one Unicode character can encode to up to 4 UTF-8 bytes.
+- Before each `send_text`/`edit_text`, compute `len(rendered.encode("utf-8"))`. If the byte length exceeds `max_message_bytes`, split/rotate/final-only-degrade before issuing the REST call. Do not rely on the API to reject oversized payloads.
+- Step 4 must verify the current Chat API message-size ceiling against Google docs and update the default `max_message_bytes` if needed.
 
 V1 streaming budget:
 
@@ -653,6 +738,7 @@ Threading for streamed responses:
 - Streams started from an inbound threaded message stay in that thread.
 - `StreamingMessage` overflow rotation calls `send_text(..., reply_to=original_reply_to)`.
 - `GoogleChatTransport.send_text` reads `reply_to.native["thread_name"]` and creates the rotated child in the same Google Chat thread, using Chat API `messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD` with the parent's `thread.name`.
+- Store the reply option actually used in the resulting `MessageRef.native["message_reply_option"]` so downstream code does not re-derive it.
 - Streams that begin outside a thread create top-level messages in the same space.
 - If `reply_to` lacks thread metadata, send in the same space without pretending to quote.
 
@@ -754,8 +840,8 @@ Attachment tests:
 
 Responsibilities:
 
-- create message
-- update message
+- create message (with optional `requestId` idempotency)
+- update/patch message with explicit `updateMask`
 - upload/attach file where supported
 - download uploaded-content attachment where supported
 - redact secrets from structured errors
@@ -766,15 +852,47 @@ Client methods:
 
 ```python
 class GoogleChatClient:
-    async def create_message(self, space: str, body: dict, *, thread_name: str | None = None) -> dict: ...
-    async def update_message(self, message_name: str, body: dict, *, update_mask: str) -> dict: ...
+    async def create_message(
+        self,
+        space: str,
+        body: dict,
+        *,
+        thread_name: str | None = None,
+        request_id: str | None = None,
+        message_reply_option: str | None = None,
+    ) -> dict: ...
+
+    async def update_message(
+        self,
+        message_name: str,
+        body: dict,
+        *,
+        update_mask: str,
+        allow_missing: bool = False,
+    ) -> dict: ...
+
     async def upload_attachment(self, space: str, path: Path, *, mime_type: str | None) -> dict: ...
     async def download_attachment(self, resource_name: str, destination: Path) -> None: ...
 ```
 
+Outbound create idempotency:
+
+- Use `requestId` where supported by the current `spaces.messages.create` API.
+- Generate deterministic-but-unique request IDs for retryable create calls (e.g., a UUID stamped once per `send_text` call, reused across retries).
+- Store the chosen request ID in `MessageRef.native["request_id"]`.
+- If a network timeout occurs after a successful server create, retrying with the same `request_id` must not duplicate the message.
+- Step 4 must verify current `requestId` support and document any TTL or scoping constraints (e.g., per-space, per-app).
+
+Update/edit semantics:
+
+- Use update/patch semantics with an **explicit `updateMask`** for the fields being changed (e.g., `text`, `cards`, `accessoryWidgets` as applicable).
+- `edit_text` must **never** silently create a new message. Do not use create-on-missing behavior for normal edits — call sites pass `allow_missing=False`.
+- If the API cannot update the target message (e.g., the message was not created by this app, or the message was deleted), surface a structured transport error and let `GoogleChatTransport` degrade inside the transport to final-only or a clearly marked replacement/final message. Do not paper over the failure by posting a new message that looks like an edit.
+- App authentication may only be able to update messages created by the same app; treat non-app-created `MessageRef`s (where `native.get("is_app_created") is False`) as unsupported for edit.
+
 Rules:
 
-- `GoogleChatTransport` constructs `MessageRef` from returned message resource names and native metadata.
+- `GoogleChatTransport` constructs `MessageRef` from returned message resource names and `GoogleChatMessageNative` metadata, including `request_id` and `message_reply_option` when set.
 - Client never logs bearer tokens, access tokens, credential JSON, callback tokens, or secret prompt values.
 - Tests mock the client; no live Google Workspace integration suite is required for v1.
 
@@ -826,14 +944,19 @@ These helpers must honor the same authorizer and normalization rules as real eve
 
 ### Acceptance criteria
 
-- `MessageRef.native` contract amendment is in place or documented side-table fallback is implemented.
-- `GoogleChatConfig` loads, saves, omits defaults, and validates startup fields correctly.
+- `MessageRef.native` contract amendment is in place with `field(default=None, compare=False, hash=False, repr=False)`, or the documented side-table fallback is implemented.
+- `GoogleChatMessageNative` keys are defined and used consistently across send/edit/streaming/tests.
+- `GoogleChatConfig` loads, saves, omits defaults, and validates startup fields correctly, including `max_message_bytes`.
+- Team config validation accepts `path + room` for non-Telegram teams without requiring legacy `group_chat_id`; `_cleanup_malformed_teams` does not delete `room`-only entries.
 - `BotPeerRef` parses from and saves to disk for non-Telegram peers; Telegram synthesis remains intact for legacy configs.
 - `ProjectBot.build()` has explicit branches for `web`, `google_chat`, and `telegram`, and raises on unknown values.
 - `GoogleChatTransport` passes shared transport contract tests for supported capabilities.
 - HTTP route rejects invalid Google tokens before queueing or normalizing events.
 - HTTP route acknowledges long-running interactions before handler completion, returning HTTP 200 `{}` for non-dialog events by default.
 - Duplicate Google event deliveries do not dispatch handlers twice.
+- Outbound create retries with the same `request_id` do not produce duplicate messages in the fake client.
+- `edit_text` never silently creates a new message; unsupported-edit cases degrade to final-only or a clearly marked replacement.
+- `send_text`/`edit_text` validate UTF-8 byte size against `max_message_bytes` before issuing the REST call.
 - `/lp2c help` command events become `CommandInvocation(name="help")`.
 - Google command metadata ID is honored when configured.
 - Card button clicks become `ButtonClick` only after callback-token verification.
@@ -856,7 +979,7 @@ Twelve independently landable steps. Step 0 should ship as its own PR ahead of t
 
 ### Step 0 - Contract and config prerequisites
 
-Add `MessageRef.native`, parse/save `BotPeerRef`, add `GoogleChatConfig` with load/save/default-omission/startup-validation helpers, and make `ProjectBot.build()` transport selection explicit (raise on unknown values).
+Add `MessageRef.native` with `compare=False, hash=False, repr=False` semantics, define `GoogleChatMessageNative`, parse/save `BotPeerRef`, widen team config validity to accept `path + room` without `group_chat_id`, add `GoogleChatConfig` (with `max_message_bytes`) and its load/save/default-omission/startup-validation helpers, and make `ProjectBot.build()` transport selection explicit (raise on unknown values).
 
 ### Step 1 - Add package skeleton and optional dependencies
 
@@ -872,7 +995,7 @@ Add FastAPI route, verified-event queueing, duplicate/retry suppression, lifecyc
 
 ### Step 4 - Implement outbound REST client
 
-Support text create, best-effort edit/update, retry mapping, service-account/app authentication, and redacted errors.
+Support text create with `requestId` idempotency where supported, best-effort update/patch with explicit `updateMask` and `allow_missing=False`, UTF-8 byte-limit validation against `max_message_bytes`, retry mapping, service-account/app authentication, and redacted errors. Verify the current Chat API message-byte ceiling and `requestId` semantics against Google docs and document findings in the PR description.
 
 ### Step 5 - Implement message and command normalization
 
@@ -888,7 +1011,7 @@ Map `PromptSpec` to dialog/card/reply-fallback flows and dispatch `PromptSubmiss
 
 ### Step 8 - Implement streaming/edit degradation
 
-Compose with `StreamingMessage`, implement Google-specific edit budget/final-only degradation, and preserve thread metadata across overflow rotation.
+Compose with `StreamingMessage`, implement Google-specific edit budget/final-only degradation, validate UTF-8 byte size before each `edit_text`/`send_text` call, and preserve thread metadata (`thread_name`, `message_reply_option`) across overflow rotation.
 
 ### Step 9 - Implement file/attachment/voice fallbacks
 
@@ -920,6 +1043,8 @@ Exercise manager commands and prompt-backed wizards end-to-end through Google Ch
   - removed from space
   - attachment
   - duplicate/retry delivery
+  - threaded message
+  - oversized multibyte UTF-8 message
 - Add auth verifier tests with monkeypatched verification; no live cert/network calls.
 - Add pure unit tests for Cards v2 builders:
   - button rows
@@ -927,12 +1052,20 @@ Exercise manager commands and prompt-backed wizards end-to-end through Google Ch
   - confirm prompt
   - text/secret dialog card
   - dialog-safe subset only
+  - callback-token worst-case payload-size budget
 - Add HTTP route tests:
   - missing token -> 401
   - bad token -> 401
   - valid token queues once
   - duplicate valid event queues once
   - slow handler does not delay HTTP response
+  - default no-op acknowledgement produces no synchronous user-visible response
+- Add client tests:
+  - create uses `request_id` when provided
+  - retry with the same `request_id` does not create a duplicate in the fake client
+  - update requires explicit `update_mask`
+  - update with `allow_missing=False` refuses create-on-missing behavior
+  - byte-limit guard triggers before the REST call for oversized rendered text
 - Add callback-token tests:
   - valid token
   - expired token
@@ -948,6 +1081,7 @@ Exercise manager commands and prompt-backed wizards end-to-end through Google Ch
   - reply fallback exact sender/space
   - cancel/timeout sentinels
 - Add identity tests proving auth/team routing uses native IDs, not display names.
+- Add team config tests proving `path + room` (without `group_chat_id`) is valid, is not cleaned up as malformed, and `bot_peer` round-trips for non-Telegram peers.
 - Add temp-file cleanup tests for attachment download rejection and handler failure.
 - Mock Google REST boundaries; no live Workspace integration suite required for v1.
 
@@ -963,6 +1097,8 @@ Manual smoke checklist:
 - threaded message receives threaded async reply
 - service-account REST posting works with configured scopes
 - unsupported attachment degrades safely
+- outbound create retry with reused `requestId` does not duplicate the message
+- long multibyte message does not exceed the Chat API byte limit
 
 ---
 
@@ -978,6 +1114,7 @@ Manual smoke checklist:
 | Future | Multi-workspace or multi-domain federation |
 | Future | Shared prompt-status primitive replacing cancel/timeout sentinel options |
 | Future | Persisted/shared callback-token secret for multi-process deployments |
+| Future | Drive attachment download support unless Drive scopes are explicitly added |
 
 ---
 
@@ -992,7 +1129,9 @@ Manual smoke checklist:
 - **Identity confusion:** display names and emails can change or be hidden. Mitigation: trust and routing use stable native IDs.
 - **Thread metadata dependency:** without `MessageRef.native`, thread preservation is fragile. Mitigation: Step 0 contract amendment.
 - **Attachment limitations:** Drive and uploaded content have different download paths/scopes. Mitigation: uploaded-content support first, Drive fallback to unsupported unless scopes are configured.
-- **Step 0 cross-transport blast radius:** adding `MessageRef.native` and `BotPeerRef` persistence touches the shared contract. Mitigation: ship Step 0 as a standalone PR, audit existing transports for any code that constructs `MessageRef` manually, confirm `bot_peer` round-trips for both Telegram (legacy synthesis) and Google Chat paths.
+- **Byte-limit mismatch:** shared streaming helpers count characters while the Chat API enforces UTF-8 bytes; multibyte content can silently exceed the platform cap. Mitigation: conservative `max_text_length` plus a UTF-8 byte guard immediately before each REST call.
+- **Outbound retry duplication:** retried create calls without idempotency keys can post the same message twice. Mitigation: use `requestId` on `spaces.messages.create` where the current API supports it; verify TTL/scope in Step 4.
+- **Step 0 cross-transport blast radius:** adding `MessageRef.native`, widening team-room validity, and `BotPeerRef` persistence touches the shared contract and config parsing. Mitigation: ship Step 0 as a standalone PR, audit existing transports for any code that constructs `MessageRef` manually, confirm `bot_peer` round-trips for both Telegram (legacy synthesis) and Google Chat paths, and confirm that legacy Telegram team entries still load after the validity widening.
 
 ---
 
@@ -1003,6 +1142,8 @@ Manual smoke checklist:
 - Google Chat request verification: https://developers.google.com/workspace/chat/verify-requests-from-chat
 - Google Chat authentication and authorization: https://developers.google.com/workspace/chat/authenticate-authorize
 - Google Chat messages create/update: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages
+- Google Chat message create: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create
+- Google Chat message update: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/update
 - Google Chat attachments: https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages.attachments
 - Cards v2 reference: https://developers.google.com/workspace/chat/api/reference/rest/v1/cards
 
@@ -1012,6 +1153,7 @@ Manual smoke checklist:
 
 1. Land Step 0 as a small prerequisite PR.
 2. Write the implementation plan using Sections 5 and 6 as the task skeleton.
-3. Confirm product priority relative to Discord/Slack before execution begins.
-4. Revisit whether Pub/Sub delivery should move from future option to v1 if HTTP+tunnel proves too brittle.
-5. If Google Chat exposes prompt needs that `PromptSpec` cannot express, update the shared transport primitive rather than adding a Google-only workflow layer.
+3. Verify current Google Chat docs for message byte ceiling, create `requestId` semantics, update/patch behavior, and attachment ceiling before coding Steps 4 and 9; record findings in those step PRs.
+4. Confirm product priority relative to Discord/Slack before execution begins.
+5. Revisit whether Pub/Sub delivery should move from future option to v1 if HTTP+tunnel proves too brittle.
+6. If Google Chat exposes prompt needs that `PromptSpec` cannot express, update the shared transport primitive rather than adding a Google-only workflow layer.
