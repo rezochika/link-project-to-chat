@@ -38,3 +38,25 @@ def test_bot_py_does_not_reference_ptb_application_internals():
     forbidden = ["run_polling", ".post_init", ".post_stop", "ApplicationBuilder"]
     found = [tok for tok in forbidden if tok in src]
     assert not found, f"bot.py references PTB internals: {found}"
+
+
+def test_chat_history_has_zero_telegram_imports():
+    """ChatHistory must not import from telegram.* — it's transport-portable
+    and used by future non-Telegram transports (Web, Slack, Google Chat)."""
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).parent.parent / "src" / "link_project_to_chat" / "chat_history.py"
+    tree = ast.parse(src.read_text())
+    forbidden = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module and node.module.startswith("telegram"):
+                forbidden.append(f"from {node.module} import ...")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("telegram"):
+                    forbidden.append(f"import {alias.name}")
+    assert not forbidden, (
+        f"chat_history.py must not import from telegram.*; found: {forbidden}"
+    )
