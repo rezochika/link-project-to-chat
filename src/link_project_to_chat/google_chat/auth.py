@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleChatAuthError(Exception):
@@ -80,11 +83,20 @@ def _verify_one(
             expires_at=claims.get("exp"),
             auth_mode=mode,
         )
-    except Exception:
+    except NotImplementedError:
+        # A misconfigured project_number deployment with no injected
+        # `jwt_verifier` must surface loudly, not be misreported as
+        # "audience mismatch". Programming bugs (NameError, AttributeError)
+        # are likewise re-raised so they don't hide behind a silent miss.
+        raise
+    except (NameError, AttributeError):
+        raise
+    except Exception as exc:
         # Any verifier exception or claim shape mismatch yields a soft
         # miss so the caller can try the next allowed audience. The
         # outer `verify_google_chat_request()` raises `GoogleChatAuthError`
         # only when every audience has been exhausted.
+        logger.debug("_verify_one soft miss for audience %r: %s", audience, exc)
         return None
 
 
