@@ -125,3 +125,15 @@ async def test_unsupported_drive_attachment_sets_unsupported_media():
     await transport.dispatch_event(payload)
 
     assert seen[0].has_unsupported_media is True
+
+
+@pytest.mark.asyncio
+async def test_uploaded_content_attachment_also_sets_unsupported_media():
+    transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg))
+    payload = json.loads((FIXTURES / "attachment_uploaded_content.json").read_text())
+
+    await transport.dispatch_event(payload)
+
+    assert seen[0].has_unsupported_media is True
