@@ -839,7 +839,7 @@ def _parse_google_chat(raw: object) -> GoogleChatConfig:
         host=str(raw.get("host", "127.0.0.1")),
         port=int(raw.get("port", 8090)),
         root_command_name=str(raw.get("root_command_name", "lp2c")),
-        root_command_id=raw.get("root_command_id"),
+        root_command_id=None if raw.get("root_command_id") is None else int(raw.get("root_command_id")),
         callback_token_ttl_seconds=int(raw.get("callback_token_ttl_seconds", 900)),
         pending_prompt_ttl_seconds=int(raw.get("pending_prompt_ttl_seconds", 900)),
         max_message_bytes=int(raw.get("max_message_bytes", 32_000)),
