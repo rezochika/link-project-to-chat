@@ -102,13 +102,20 @@ class BaseBackend:
     _env_keep_patterns: Sequence[str] = ()
     _env_scrub_patterns: Sequence[str] = ()
 
-    def __init__(self) -> None:
-        # Per-bot system-prompt layer, set once at startup. Sits alongside
-        # ``team_system_note`` (initialized in each subclass __init__) — both
-        # are system-prompt layers that each backend renders in its native
-        # style. ``None`` means "use the backend's default"; the bot resolves
-        # ``None`` → ``DEFAULT_SAFETY_SYSTEM_PROMPT`` in ``_build_backend``.
-        self.safety_system_prompt: str | None = None
+    # Per-bot system-prompt layer, set once at startup. Sits alongside
+    # ``team_system_note`` (also a per-instance field on each subclass) —
+    # both are system-prompt layers that each backend renders in its native
+    # style. The bot resolves ``cfg.safety_prompt`` → this field in
+    # ``_build_backend``:
+    #   * ``None`` / absent  → ``DEFAULT_SAFETY_SYSTEM_PROMPT`` (safety on,
+    #     default)
+    #   * ``""`` (empty)     → ``""`` (safety off — explicit operator opt-out)
+    #   * non-empty string   → custom text replaces the default
+    # Each backend's rendering uses ``if self.safety_system_prompt:`` so both
+    # ``None`` and ``""`` produce no safety block. Declared as a class
+    # attribute (not in ``__init__``) so subclasses inherit the slot for
+    # free, even when their own ``__init__`` doesn't call ``super().__init__()``.
+    safety_system_prompt: str | None = None
 
     def _matches(self, key: str, patterns: Sequence[str]) -> bool:
         return any(fnmatch.fnmatch(key, pattern) for pattern in patterns)

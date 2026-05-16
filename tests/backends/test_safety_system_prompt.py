@@ -41,3 +41,27 @@ def test_safety_system_prompt_field_assignable():
     assert t.safety_system_prompt == ""
     t.safety_system_prompt = None
     assert t.safety_system_prompt is None
+
+
+def test_safety_system_prompt_inherited_by_real_backends():
+    """Class attribute means every subclass — including ClaudeBackend and
+    CodexBackend that don't call super().__init__() — sees the field.
+
+    Pre-fix regression: the field was set in BaseBackend.__init__, but real
+    backends override __init__ without super(), so the field never existed
+    on their instances. Class attribute eliminates that footgun.
+    """
+    from pathlib import Path
+
+    from link_project_to_chat.backends.claude import ClaudeBackend
+    from link_project_to_chat.backends.codex import CodexBackend
+
+    c = ClaudeBackend(project_path=Path("/tmp/proj"), model="opus")
+    assert c.safety_system_prompt is None
+    c.safety_system_prompt = "custom"
+    assert c.safety_system_prompt == "custom"
+
+    x = CodexBackend(project_path=Path("/tmp/proj"), state={})
+    assert x.safety_system_prompt is None
+    x.safety_system_prompt = "custom"
+    assert x.safety_system_prompt == "custom"
