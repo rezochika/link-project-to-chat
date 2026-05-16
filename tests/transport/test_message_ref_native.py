@@ -16,4 +16,5 @@ def test_message_ref_native_does_not_affect_equality_hash_or_repr():
 
     assert left == right
     assert hash(left) == hash(right)
+    assert "native=" not in repr(left)
     assert "thread" not in repr(left)
