@@ -712,6 +712,19 @@ def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
         pass
 
 
+def _is_valid_room_id(transport_id: str, native_id: str) -> bool:
+    """Per-transport shape check for a room binding's native_id.
+
+    Centralises the prefix rules so adding Discord/Slack later updates one
+    place instead of every call site.
+    """
+    if not transport_id or not native_id:
+        return False
+    if transport_id == "google_chat":
+        return native_id.startswith("spaces/")
+    return True
+
+
 def _team_has_room(team: dict) -> bool:
     """Return True if the team dict has a structured room binding with valid shape."""
     room = team.get("room")
@@ -721,9 +734,7 @@ def _team_has_room(team: dict) -> bool:
     native_id = room.get("native_id")
     if not isinstance(transport_id, str) or not isinstance(native_id, str):
         return False
-    if transport_id == "google_chat" and not native_id.startswith("spaces/"):
-        return False
-    return bool(transport_id and native_id)
+    return _is_valid_room_id(transport_id, native_id)
 
 
 def _split_team_entries(
@@ -799,7 +810,7 @@ def _make_room_binding(raw: dict | None) -> RoomBinding | None:
     native_id = raw.get("native_id")
     if not transport_id or not native_id:
         return None
-    if transport_id == "google_chat" and not str(native_id).startswith("spaces/"):
+    if not _is_valid_room_id(str(transport_id), str(native_id)):
         return None
     return RoomBinding(transport_id=str(transport_id), native_id=str(native_id))
 
@@ -822,6 +833,11 @@ def _parse_bot_peer(raw: object) -> "BotPeerRef | None":
         # A malformed entry would cause downstream API calls to 4xx,
         # so we drop it here and let the manager re-derive the peer
         # from the next addition response.
+        logger.warning(
+            "dropping malformed bot_peer for transport %r: native_id %r is not a 'users/' path",
+            transport_id,
+            native_id,
+        )
         return None
     handle = raw.get("handle")
     display_name = raw.get("display_name")
@@ -1537,7 +1553,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
             return {
                 name: TeamConfig(
                     path=team["path"],
-                    group_chat_id=team["group_chat_id"],
+                    group_chat_id=int(team.get("group_chat_id", 0)),
                     room=_make_room_binding(team.get("room")),
                     bots={
                         role: _make_team_bot_config(b)
