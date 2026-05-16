@@ -1513,6 +1513,7 @@ async def test_telegram_text_dispatch_preserves_context_and_submits_agent(tmp_pa
         chat=expected_chat,
         message=MessageRef(transport_id="telegram", native_id="100", chat=expected_chat),
         prompt="hello from telegram",
+        recent_discussion="",
     )
 
 

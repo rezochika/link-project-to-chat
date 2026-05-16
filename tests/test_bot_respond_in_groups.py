@@ -49,6 +49,8 @@ def _make_bot(*, respond_in_groups: bool, bot_username: str = "MyBot"):
     bot._auth_dirty = False
     bot._on_text = AsyncMock()
     bot._transport = FakeTransport()
+    from link_project_to_chat.chat_history import ChatHistory
+    bot._chat_history = ChatHistory()
     return bot
 
 

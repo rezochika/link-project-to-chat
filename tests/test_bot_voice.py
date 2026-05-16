@@ -19,6 +19,7 @@ from link_project_to_chat.transport.fake import FakeTransport
 def _make_project_bot_stub(with_synthesizer: bool = False):
     """Minimal ProjectBot stub with FakeTransport + mock transcriber."""
     from link_project_to_chat.bot import ProjectBot
+    from link_project_to_chat.chat_history import ChatHistory
     from link_project_to_chat.config import AllowedUser
     bot = ProjectBot.__new__(ProjectBot)
     bot._transport = FakeTransport()
@@ -38,6 +39,7 @@ def _make_project_bot_stub(with_synthesizer: bool = False):
     bot._transcriber = AsyncMock()
     bot._transcriber.transcribe = AsyncMock(return_value="transcribed text")
     bot._synthesizer = object() if with_synthesizer else None
+    bot._chat_history = ChatHistory()
     # task_manager stub — submit_agent is sync in the real TaskManager,
     # so we use MagicMock here (AsyncMock would return a coroutine that
     # breaks ``task.id`` access in the synthesizer path).

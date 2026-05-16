@@ -35,6 +35,7 @@ from .config import (
     save_session,
 )
 from ._auth import AuthMixin
+from .chat_history import ChatHistory
 from .conversation_log import (
     ASSISTANT_ROLE,
     USER_ROLE,
@@ -253,6 +254,10 @@ class ProjectBot(AuthMixin):
             on_stream_event=self._on_stream_event,
             on_waiting_input=self._on_waiting_input,
         )
+        # Per-room chatter history for "[Recent discussion]" injection on
+        # each LLM call. Process-local; skipped for DMs (those use
+        # conversation_log for prior-turn context).
+        self._chat_history: ChatHistory = ChatHistory()
         # Per-chat conversation log. Bot-level (not backend-level) so a
         # ``/backend codex`` swap doesn't lose Claude-era context. When the
         # caller supplied ``config_path`` (typically tests with a tmp_path
@@ -975,6 +980,27 @@ class ProjectBot(AuthMixin):
             return incoming
         return dataclasses.replace(incoming, text=cleaned)
 
+    def _resolve_recent_discussion(self, incoming) -> str:
+        """For ROOM-kind chats: serialize chatter since last LLM call,
+        mark the boundary so subsequent calls don't re-include the same
+        messages. DMs always return "".
+
+        The mark is set on the last msg_id currently in the buffer when
+        one exists — that way the mark is always findable by future
+        ``since_last_llm`` calls, even if the incoming message wasn't
+        recorded into chat_history (e.g., direct-unit-test callers).
+        Falls back to the incoming msg_id when the buffer is empty.
+        """
+        if incoming.chat.kind != ChatKind.ROOM:
+            return ""
+        text = self._chat_history.since_last_llm(
+            incoming.chat, incoming.message.native_id,
+        )
+        dq = self._chat_history._history.get(incoming.chat)
+        mark_id = dq[-1]["msg_id"] if dq else incoming.message.native_id
+        self._chat_history.mark_llm_call(incoming.chat, mark_id)
+        return text
+
     async def _on_text_from_transport(self, incoming) -> None:
         """Unified entry point for inbound messages from the Transport.
 
@@ -1031,6 +1057,21 @@ class ProjectBot(AuthMixin):
                     text=incoming.reply_to_text,
                     reply_to_text=None,
                 )
+            # Record cleaned text for group chat-history (idempotent: no-op
+            # for DMs since the record() side gates on chat.kind == ROOM).
+            # Placed after mention-strip + reply-promotion so the stored
+            # text matches what the human typed and what the bot sees.
+            self._chat_history.record(
+                chat=incoming.chat,
+                msg_id=incoming.message.native_id,
+                sender=(
+                    incoming.sender.handle
+                    or incoming.sender.display_name
+                    or "unknown"
+                ),
+                text=incoming.text,
+                is_own_bot=False,  # incoming gate already filters self-messages
+            )
             # Fall through to the existing payload-type dispatch below
             # (voice / file / text). Don't call _on_text directly here —
             # _on_text only handles text+prompt; it doesn't transcribe voice
@@ -1137,6 +1178,7 @@ class ProjectBot(AuthMixin):
                 chat=incoming.chat,
                 message=incoming.message,
                 prompt=prompt,
+                recent_discussion=self._resolve_recent_discussion(incoming),
             )
 
     def _team_session_active(self) -> bool:
@@ -1388,6 +1430,7 @@ class ProjectBot(AuthMixin):
                 chat=incoming.chat,
                 message=message_ref,
                 prompt=prompt,
+                recent_discussion=self._resolve_recent_discussion(incoming),
             )
 
     async def _on_run(self, ci) -> None:
@@ -2720,6 +2763,18 @@ class ProjectBot(AuthMixin):
             return
         if not incoming.files:
             return
+        # Record the caption (if any) into per-room history. No-op for DMs.
+        self._chat_history.record(
+            chat=incoming.chat,
+            msg_id=incoming.message.native_id,
+            sender=(
+                incoming.sender.handle
+                or incoming.sender.display_name
+                or "unknown"
+            ),
+            text=incoming.text,
+            is_own_bot=False,
+        )
 
         uploads_dir = (
             Path(tempfile.gettempdir())
@@ -2764,6 +2819,7 @@ class ProjectBot(AuthMixin):
             chat=incoming.chat,
             message=incoming.message,
             prompt=prompt,
+            recent_discussion=self._resolve_recent_discussion(incoming),
         )
 
     async def _on_voice_from_transport(self, incoming) -> None:
@@ -2775,6 +2831,20 @@ class ProjectBot(AuthMixin):
             assert self._transport is not None
             await self._transport.send_text(incoming.chat, "Rate limited. Try again shortly.")
             return
+        # Record the caption (if any) for per-room history. The transcribed
+        # voice text isn't available yet — only what the user typed alongside
+        # the audio. No-op for DMs.
+        self._chat_history.record(
+            chat=incoming.chat,
+            msg_id=incoming.message.native_id,
+            sender=(
+                incoming.sender.handle
+                or incoming.sender.display_name
+                or "unknown"
+            ),
+            text=incoming.text,
+            is_own_bot=False,
+        )
         assert self._transport is not None
 
         if not self._transcriber:
@@ -2828,6 +2898,7 @@ class ProjectBot(AuthMixin):
                     chat=incoming.chat,
                     message=incoming.message,
                     prompt=prompt,
+                    recent_discussion=self._resolve_recent_discussion(incoming),
                 )
             if self._synthesizer:
                 self._voice_tasks.add(task.id)
