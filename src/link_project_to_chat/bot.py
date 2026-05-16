@@ -925,6 +925,36 @@ class ProjectBot(AuthMixin):
             reply_to=ci.message,
         )
 
+    def _strip_self_mention(self, incoming: "IncomingMessage") -> "IncomingMessage":
+        """Remove case-insensitive ``@<bot_username>`` from incoming.text.
+
+        Word-bounded: only strips when the mention is bounded by non-word
+        characters (or start/end of string). Handles like ``@MyBotIsCool`` or
+        embedded sequences like ``user@MyBot.example`` are left intact.
+
+        Returns a new ``IncomingMessage`` via ``dataclasses.replace`` since
+        ``IncomingMessage`` is frozen. When ``self.bot_username`` is empty
+        (typical before ``_after_ready`` fires), the helper is a no-op and
+        returns the original incoming unchanged.
+
+        Used by the ``respond_in_groups`` routing gate in
+        ``_on_text_from_transport``; captions ride on ``incoming.text`` per
+        ``TelegramTransport._dispatch_message`` so this helper also cleans
+        captioned files / voice / photo messages.
+        """
+        if not self.bot_username:
+            return incoming
+        import dataclasses
+        import re
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_@])@{re.escape(self.bot_username)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        cleaned = pattern.sub("", incoming.text)
+        if cleaned == incoming.text:
+            return incoming
+        return dataclasses.replace(incoming, text=cleaned)
+
     async def _on_text_from_transport(self, incoming) -> None:
         """Unified entry point for inbound messages from the Transport.
 
