@@ -286,6 +286,10 @@ class ProjectBot(AuthMixin):
         self.peer_bot_username = peer_bot_username
         self.bot_username: str = ""  # populated in _after_ready via transport.on_ready
         self._team_authority: TeamAuthority | None = None
+        # Resolve cfg.safety_prompt → backend.safety_system_prompt once at
+        # startup. The backend renders this on every prompt; see
+        # _resolve_safety_prompt() for the three-state semantics.
+        self._resolve_safety_prompt()
         # Tell Claude about its own + peer @handle so it uses the correct
         # usernames instead of placeholders ("@developer") or hallucinating a
         # pre-suffix-bump name it remembers from the persona. Called once here
@@ -1923,6 +1927,24 @@ class ProjectBot(AuthMixin):
         )
 
     # --- Persona handlers ---
+
+    def _resolve_safety_prompt(self) -> None:
+        """Resolve cfg.safety_prompt → backend.safety_system_prompt.
+
+        None  → DEFAULT_SAFETY_SYSTEM_PROMPT (safety on, default text)
+        ""    → "" (safety off — explicit operator opt-out)
+        "..." → "..." (safety on, custom text)
+
+        Called once from __init__ after the backend is constructed. Each
+        backend renders the resolved field in its native style (Claude:
+        --append-system-prompt parts list; Codex: <system-reminder> block).
+        """
+        from .backends.base import DEFAULT_SAFETY_SYSTEM_PROMPT
+        project_cfg = self._config.projects.get(self.name) if self._config else None
+        if project_cfg is None or project_cfg.safety_prompt is None:
+            self.task_manager.backend.safety_system_prompt = DEFAULT_SAFETY_SYSTEM_PROMPT
+        else:
+            self.task_manager.backend.safety_system_prompt = project_cfg.safety_prompt
 
     def _refresh_team_system_note(self) -> None:
         """(Re)build the team system note that pins own + peer @handle.

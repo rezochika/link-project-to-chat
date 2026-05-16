@@ -379,6 +379,14 @@ class ProjectConfig:
     # DM-only). Independent of team mode: a team bot's group routing is
     # governed by team_name + role, not this flag. The PTB filter is set
     # once at startup, so toggling this field requires a bot restart.
+    safety_prompt: str | None = None
+    # None  → use DEFAULT_SAFETY_SYSTEM_PROMPT (safety on, default text)
+    # ""    → safety off (explicit operator decision)
+    # "..." → custom safety text replaces the default
+    # Resolved into backend.safety_system_prompt once at ProjectBot.__init__
+    # via _resolve_safety_prompt(). Each backend renders the field in its
+    # native style (Claude: --append-system-prompt parts list;
+    # Codex: <system-reminder> block).
 
 
 @dataclass
@@ -913,6 +921,17 @@ def _load_config_unlocked(
                     name, raw_rig,
                 )
                 respond_in_groups = False
+            raw_sp = proj.get("safety_prompt", None)
+            if raw_sp is None:
+                safety_prompt = None
+            elif isinstance(raw_sp, str):
+                safety_prompt = raw_sp  # string (possibly empty)
+            else:
+                logger.warning(
+                    "project %r: safety_prompt must be a string or absent; got %r (treating as default)",
+                    name, raw_sp,
+                )
+                safety_prompt = None
             config.projects[name] = ProjectConfig(
                 path=proj["path"],
                 telegram_bot_token=proj.get("telegram_bot_token", ""),
@@ -930,6 +949,7 @@ def _load_config_unlocked(
                 allowed_users=effective,
                 plugins=_parse_plugins(proj.get("plugins", [])),
                 respond_in_groups=respond_in_groups,
+                safety_prompt=safety_prompt,
             )
             if not effective and not config.allowed_users:
                 # Only warn when BOTH scopes are empty - global fallback would
@@ -1148,6 +1168,11 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
             proj["respond_in_groups"] = True
         else:
             proj.pop("respond_in_groups", None)
+        if p.safety_prompt is None:
+            proj.pop("safety_prompt", None)
+        else:
+            # Empty string is a meaningful "explicit disable"; write it through.
+            proj["safety_prompt"] = p.safety_prompt
         # Strip any legacy keys lingering on the raw entry.
         proj.pop("allowed_usernames", None)
         proj.pop("username", None)
