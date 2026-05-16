@@ -70,7 +70,6 @@ class GoogleChatTransport:
         self._fast_ack_timeouts: int = 0
         self._message_handlers: list = []
         self._command_handlers: dict[str, object] = {}
-        self._request_seq: int = 0
 
     @property
     def pending_event_count(self) -> int:
