@@ -104,6 +104,55 @@ def test_run_bots_single_project_pulls_respond_in_groups_from_project_config(tmp
     assert captured[0]["respond_in_groups"] is True
 
 
+def test_cli_start_project_pulls_respond_in_groups_from_project_config(tmp_path: Path, monkeypatch):
+    """The manager starts bots via `start --project NAME`.
+
+    That explicit-project CLI branch must forward ProjectConfig.respond_in_groups
+    just like run_bots' single-project branch, otherwise manager-started bots
+    keep the default DM-only Telegram filter.
+    """
+    from click.testing import CliRunner
+
+    from link_project_to_chat.cli import main
+    from link_project_to_chat.config import (
+        AllowedUser,
+        Config,
+        ProjectConfig,
+        save_config,
+    )
+
+    cfg_path = tmp_path / "config.json"
+    cfg = Config(
+        allowed_users=[AllowedUser(username="alice", role="executor")],
+    )
+    cfg.projects["p1"] = ProjectConfig(
+        path=str(tmp_path),
+        telegram_bot_token="t1",
+        respond_in_groups=True,
+    )
+    save_config(cfg, cfg_path)
+
+    captured: list[dict] = []
+
+    def _record_run_bot(*args, **kwargs):
+        name = kwargs.get("name") or (args[0] if args else None)
+        captured.append({
+            "name": name,
+            "respond_in_groups": kwargs.get("respond_in_groups", False),
+        })
+
+    monkeypatch.setattr("link_project_to_chat.bot.run_bot", _record_run_bot)
+
+    result = CliRunner().invoke(
+        main,
+        ["--config", str(cfg_path), "start", "--project", "p1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    assert captured[0] == {"name": "p1", "respond_in_groups": True}
+
+
 def test_run_bots_multi_project_raises_system_exit(tmp_path: Path):
     """Regression for the fail-fast multi-project guard. Operators with
     multiple projects must use `start --project NAME`; running `start`
