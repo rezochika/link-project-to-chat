@@ -101,12 +101,12 @@ class CodexBackend(BaseBackend):
     # Command building
     # ------------------------------------------------------------------
 
-    def _build_cmd(self, user_message: str) -> list[str]:
+    def _build_cmd(self, user_message: str, recent_discussion: str = "") -> list[str]:
         cmd = ["codex", "exec"]
         if self.session_id:
             cmd.append("resume")
         cmd.append("--json")
-        prompt = self._build_prompt(user_message)
+        prompt = self._build_prompt(user_message, recent_discussion=recent_discussion)
         if self.model:
             cmd.extend(["--model", self.model])
         if self.effort:
@@ -117,10 +117,10 @@ class CodexBackend(BaseBackend):
         cmd.append(prompt)
         return cmd
 
-    def _build_prompt(self, user_message: str) -> str:
+    def _build_prompt(self, user_message: str, recent_discussion: str = "") -> str:
         """Wrap user message with system-reminder blocks for the layers that
         Codex doesn't expose as separate CLI flags. Order matches Claude's
-        parts-list order: safety → team → user message.
+        parts-list order: safety → recent_discussion → team → user message.
 
         Each layer renders as its own <system-reminder>...</system-reminder>
         block so Codex parses them as distinct reminders.
@@ -129,6 +129,10 @@ class CodexBackend(BaseBackend):
         if self.safety_system_prompt:
             blocks.append(
                 f"<system-reminder>\n{self.safety_system_prompt}\n</system-reminder>"
+            )
+        if recent_discussion:
+            blocks.append(
+                f"<system-reminder>\n{recent_discussion}\n</system-reminder>"
             )
         if self.team_system_note:
             blocks.append(
@@ -189,12 +193,12 @@ class CodexBackend(BaseBackend):
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream events for one Codex turn.
 
-        ``recent_discussion`` is accepted for Protocol compatibility (v1.2.0
-        sub-feature 3). Native rendering as a ``<system-reminder>`` block is
-        a follow-up task; for now the value is ignored so existing callers
-        remain unaffected.
+        ``recent_discussion`` (when non-empty) is rendered as a
+        ``<system-reminder>`` block in the user prompt via
+        ``_build_cmd`` → ``_build_prompt``. Order is safety →
+        recent_discussion → team → user message.
         """
-        cmd = self._build_cmd(user_message)
+        cmd = self._build_cmd(user_message, recent_discussion=recent_discussion)
         proc = self._popen(cmd)
         self._proc = proc
         if on_proc:
