@@ -351,6 +351,24 @@ class RoomBinding:
 
 
 @dataclass
+class GoogleChatConfig:
+    service_account_file: str = ""
+    app_id: str = ""
+    project_number: str = ""
+    auth_audience_type: str = "endpoint_url"
+    allowed_audiences: list[str] = field(default_factory=list)
+    endpoint_path: str = "/google-chat/events"
+    public_url: str = ""
+    host: str = "127.0.0.1"
+    port: int = 8090
+    root_command_name: str = "lp2c"
+    root_command_id: int | None = None
+    callback_token_ttl_seconds: int = 900
+    pending_prompt_ttl_seconds: int = 900
+    max_message_bytes: int = 32_000
+
+
+@dataclass
 class ProjectConfig:
     path: str
     telegram_bot_token: str
@@ -449,6 +467,9 @@ class Config:
     # ``PluginContext.data_dir``. Operators set ``meta_dir`` in config.json
     # to relocate storage to a different volume (e.g. ``/var/lib/lptc/data``).
     meta_dir: Path = field(default_factory=lambda: DEFAULT_META_DIR)
+    # Google Chat transport configuration. Omitted from saved JSON when equal
+    # to the default (all fields at their zero/default values).
+    google_chat: GoogleChatConfig = field(default_factory=GoogleChatConfig)
     # Runtime flag set by load_config when legacy auth fields were read; CLI
     # start uses it to force a save before serving traffic. ``save_config``
     # does not emit this key; ``repr=False, compare=False`` keeps it out of
@@ -796,6 +817,58 @@ def _make_team_bot_config(b: dict) -> TeamBotConfig:
     )
 
 
+def _parse_google_chat(raw: object) -> GoogleChatConfig:
+    if raw is None:
+        return GoogleChatConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("google_chat must be an object")
+    allowed = raw.get("allowed_audiences", [])
+    if not isinstance(allowed, list) or not all(isinstance(v, str) for v in allowed):
+        raise ConfigError("google_chat.allowed_audiences must be a list of strings")
+    auth_type = str(raw.get("auth_audience_type", "endpoint_url"))
+    if auth_type not in {"endpoint_url", "project_number"}:
+        raise ConfigError("google_chat.auth_audience_type must be endpoint_url or project_number")
+    return GoogleChatConfig(
+        service_account_file=str(raw.get("service_account_file", "")),
+        app_id=str(raw.get("app_id", "")),
+        project_number=str(raw.get("project_number", "")),
+        auth_audience_type=auth_type,
+        allowed_audiences=allowed,
+        endpoint_path=str(raw.get("endpoint_path", "/google-chat/events")),
+        public_url=str(raw.get("public_url", "")),
+        host=str(raw.get("host", "127.0.0.1")),
+        port=int(raw.get("port", 8090)),
+        root_command_name=str(raw.get("root_command_name", "lp2c")),
+        root_command_id=raw.get("root_command_id"),
+        callback_token_ttl_seconds=int(raw.get("callback_token_ttl_seconds", 900)),
+        pending_prompt_ttl_seconds=int(raw.get("pending_prompt_ttl_seconds", 900)),
+        max_message_bytes=int(raw.get("max_message_bytes", 32_000)),
+    )
+
+
+def _serialize_google_chat(cfg: GoogleChatConfig) -> dict:
+    return {
+        "service_account_file": cfg.service_account_file,
+        "app_id": cfg.app_id,
+        "project_number": cfg.project_number,
+        "auth_audience_type": cfg.auth_audience_type,
+        "allowed_audiences": list(cfg.allowed_audiences),
+        "endpoint_path": cfg.endpoint_path,
+        "public_url": cfg.public_url,
+        "host": cfg.host,
+        "port": cfg.port,
+        "root_command_name": cfg.root_command_name,
+        "root_command_id": cfg.root_command_id,
+        "callback_token_ttl_seconds": cfg.callback_token_ttl_seconds,
+        "pending_prompt_ttl_seconds": cfg.pending_prompt_ttl_seconds,
+        "max_message_bytes": cfg.max_message_bytes,
+    }
+
+
+def _google_chat_is_default(cfg: GoogleChatConfig) -> bool:
+    return cfg == GoogleChatConfig()
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
     """Public API: acquires _config_lock for the read.
 
@@ -870,6 +943,7 @@ def _load_config_unlocked(
         config.tts_backend = raw.get("tts_backend", "")
         config.tts_model = raw.get("tts_model", "tts-1")
         config.tts_voice = raw.get("tts_voice", "alloy")
+        config.google_chat = _parse_google_chat(raw.get("google_chat"))
         config.default_backend = raw.get("default_backend", "claude")
         config.default_model_claude = raw.get(
             "default_model_claude", raw.get("default_model", "")
@@ -1095,6 +1169,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw["meta_dir"] = str(config.meta_dir)
     else:
         raw.pop("meta_dir", None)
+    if not _google_chat_is_default(config.google_chat):
+        raw["google_chat"] = _serialize_google_chat(config.google_chat)
+    else:
+        raw.pop("google_chat", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.github_pat:
