@@ -17,7 +17,6 @@ from .config import (
     AllowedUser,
     Config,
     DEFAULT_CONFIG,
-    DEFAULT_META_DIR,
     RoomBinding,
     clear_session,
     load_config,
@@ -1794,6 +1793,10 @@ class ProjectBot(AuthMixin):
             self._backend_name = requested
             self._backend_state.setdefault(requested, {})
             self._refresh_team_system_note()
+            # Re-apply safety guardrail to the new backend — class default is
+            # None (safety off), so without this the operator's configured
+            # cfg.safety_prompt silently drops on every /backend swap.
+            self._resolve_safety_prompt()
 
             cfg = self._effective_config_path()
             if self.team_name and self.role:

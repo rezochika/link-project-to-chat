@@ -34,8 +34,10 @@
 ### Changed
 - `BaseBackend` gains a `safety_system_prompt: str | None` class
   attribute (per-bot). `AgentBackend.chat_stream` gains a
-  `recent_discussion: str = ""` per-call kwarg. Both default to no-op so
-  existing third-party backends remain compatible.
+  `recent_discussion: str = ""` per-call kwarg. Both layers default to
+  no-op rendering, so existing third-party backends only need to accept
+  the new kwarg in their `chat_stream` signature (no rendering change
+  required).
 - `Task` dataclass gains `recent_discussion: str = ""`.
   `TaskManager.submit_agent` accepts the matching kwarg and threads it
   to `chat_stream`.

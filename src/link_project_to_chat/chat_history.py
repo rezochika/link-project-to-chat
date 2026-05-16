@@ -9,12 +9,9 @@ tests/test_transport_lockout.py.
 from __future__ import annotations
 
 import collections
-import logging
 from typing import Iterable
 
 from .transport.base import ChatKind, ChatRef
-
-logger = logging.getLogger(__name__)
 
 _DEFAULT_MAXLEN = 200                   # Per-chat ring buffer; matches GitLab fork.
 _DEFAULT_MAX_SERIALIZED_CHARS = 4000    # Defensive cap on injected text.

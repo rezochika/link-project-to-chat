@@ -37,12 +37,17 @@ class AuthMixin:
         # tells the bot's message-handling tail to call save_config once.
         self._auth_dirty: bool = False
         # Hot-reload companion state (see _reload_allowed_users_if_stale).
-        # ``setdefault``-style assignment so subclasses that assigned the
-        # path/name BEFORE calling _init_auth() are not clobbered. A None
-        # path keeps the reload a safe no-op for AuthMixin-only consumers
-        # and test stubs. _last_allowed_users_reload is always set so the
-        # debounce arithmetic never raises AttributeError on opt-in
-        # subclasses.
+        # ``hasattr``-guarded assignment so either init ordering works:
+        #   (a) ManagerBot assigns ``_project_config_path`` BEFORE calling
+        #       ``_init_auth()`` — the guard preserves the caller value.
+        #   (b) ProjectBot calls ``_init_auth()`` FIRST and then overwrites
+        #       ``_project_config_path`` / ``_project_name`` with the real
+        #       values — the guard seeds a safe None default that the
+        #       caller then replaces.
+        # A None path keeps the reload a safe no-op for AuthMixin-only
+        # consumers and test stubs. ``_last_allowed_users_reload`` is
+        # always set so the debounce arithmetic never raises
+        # AttributeError on opt-in subclasses.
         if not hasattr(self, "_project_config_path"):
             self._project_config_path = None
         if not hasattr(self, "_project_name"):
