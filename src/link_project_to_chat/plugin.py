@@ -59,8 +59,9 @@ class PluginContext:
     they're populated only when a follow-up spec wires them through from
     the Web transport — until then plugins MUST check for None and degrade
     gracefully. `data_dir` is the per-bot meta directory
-    (`~/.link-project-to-chat/meta/<bot_name>/`) wired by `ProjectBot._init_plugins`;
-    each `Plugin` builds its per-plugin subdirectory via the `data_dir` property.
+    (`<Config.meta_dir>/<bot_name>/`, default `~/.link-project-to-chat/meta/<bot_name>/`)
+    wired by `ProjectBot._init_plugins`; each `Plugin` builds its per-plugin
+    subdirectory via the `data_dir` property.
     """
     bot_name: str
     project_path: Path
