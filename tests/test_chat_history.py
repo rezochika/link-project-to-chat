@@ -155,3 +155,43 @@ def test_serialized_format_matches_gitlab():
     h.record(chat, "2", "bob", "there")
     result = h.since_last_llm(chat, "999")
     assert result == "[Recent discussion]\nalice: hi\nbob: there\n\n"
+
+
+def test_record_idempotent_on_same_msg_id():
+    """Re-recording the same msg_id is a no-op — guards against dispatch
+    chains that record in multiple handlers for the same incoming."""
+    h = ChatHistory()
+    chat = _room()
+    h.record(chat, "100", "alice", "hello")
+    h.record(chat, "100", "alice", "hello")  # duplicate
+    h.record(chat, "100", "alice", "hello")  # triplicate
+    result = h.since_last_llm(chat, "999")
+    assert result.count("alice: hello") == 1
+
+
+def test_record_different_msg_id_after_dup_still_appends():
+    """Idempotency only skips the LATEST msg_id; subsequent records work."""
+    h = ChatHistory()
+    chat = _room()
+    h.record(chat, "100", "alice", "first")
+    h.record(chat, "100", "alice", "first")  # skipped
+    h.record(chat, "101", "bob", "second")
+    result = h.since_last_llm(chat, "999")
+    assert "first" in result
+    assert "second" in result
+
+
+def test_last_msg_id_returns_tail():
+    h = ChatHistory()
+    chat = _room()
+    assert h.last_msg_id(chat) is None
+    h.record(chat, "1", "alice", "hello")
+    assert h.last_msg_id(chat) == "1"
+    h.record(chat, "2", "bob", "world")
+    assert h.last_msg_id(chat) == "2"
+
+
+def test_last_msg_id_returns_none_for_unknown_chat():
+    h = ChatHistory()
+    other = _room(native="999")
+    assert h.last_msg_id(other) is None

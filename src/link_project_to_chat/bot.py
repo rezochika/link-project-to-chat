@@ -996,8 +996,7 @@ class ProjectBot(AuthMixin):
         text = self._chat_history.since_last_llm(
             incoming.chat, incoming.message.native_id,
         )
-        dq = self._chat_history._history.get(incoming.chat)
-        mark_id = dq[-1]["msg_id"] if dq else incoming.message.native_id
+        mark_id = self._chat_history.last_msg_id(incoming.chat) or incoming.message.native_id
         self._chat_history.mark_llm_call(incoming.chat, mark_id)
         return text
 

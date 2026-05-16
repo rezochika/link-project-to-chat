@@ -54,6 +54,10 @@ class ChatHistory:
         Skips when is_own_bot=True (bot's own outbound messages don't count
         as chatter).
         Skips empty or whitespace-only text.
+
+        Idempotent on (chat, msg_id) — re-recording the same message is a
+        no-op. This guards against dispatch chains in ProjectBot that record
+        once in the group-gate and again in the file/voice handler.
         """
         if chat.kind != ChatKind.ROOM:
             return
@@ -62,6 +66,8 @@ class ChatHistory:
         if not text or not text.strip():
             return
         dq = self._history.setdefault(chat, collections.deque(maxlen=self._maxlen))
+        if dq and dq[-1]["msg_id"] == msg_id:
+            return  # idempotent: same msg already at tail
         dq.append({"msg_id": msg_id, "sender": sender or "unknown", "text": text})
 
     def since_last_llm(self, chat: ChatRef, before_msg_id: str) -> str:
@@ -101,6 +107,15 @@ class ChatHistory:
         since_last_llm calls won't include messages at or before this
         msg_id."""
         self._last_llm_msg_id[chat] = msg_id
+
+    def last_msg_id(self, chat: ChatRef) -> str | None:
+        """Most recently recorded msg_id in chat, or None if empty/absent.
+
+        Used by ProjectBot._resolve_recent_discussion to determine the LLM-call
+        boundary — see that helper's docstring for rationale.
+        """
+        dq = self._history.get(chat)
+        return dq[-1]["msg_id"] if dq else None
 
     def _serialize(self, msgs: Iterable[dict]) -> str:
         lines = [f"{m['sender']}: {m['text']}" for m in msgs]

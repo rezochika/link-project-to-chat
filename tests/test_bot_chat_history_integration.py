@@ -116,3 +116,22 @@ async def test_dm_message_does_not_get_recorded():
     await bot._on_text_from_transport(incoming)
     # DM never recorded.
     assert bot._chat_history.since_last_llm(dm_chat, "999") == ""
+
+
+@pytest.mark.asyncio
+async def test_captioned_file_in_group_records_exactly_once():
+    """The bot's dispatch chain calls record() once in the group-gate
+    and again in _on_file_from_transport for the same msg_id. ChatHistory's
+    idempotent record() ensures only one buffer entry exists."""
+    from link_project_to_chat.transport.base import IncomingFile
+    from pathlib import Path
+
+    bot = _make_bot()
+    # _on_file_from_transport requires more setup than _make_bot provides.
+    # Just exercise the two record() calls directly to pin the contract:
+    chat = ChatRef(transport_id="fake", native_id="ROOM-2", kind=ChatKind.ROOM)
+    bot._chat_history.record(chat, "200", "alice", "analyze this", is_own_bot=False)
+    bot._chat_history.record(chat, "200", "alice", "analyze this", is_own_bot=False)
+    result = bot._chat_history.since_last_llm(chat, "999")
+    # Only one occurrence, despite two record() calls with the same msg_id.
+    assert result.count("alice: analyze this") == 1
