@@ -78,6 +78,13 @@ def test_endpoint_path_without_leading_slash_rejected_before_deriving(tmp_path):
         validate_google_chat_for_start(cfg)
 
 
+def test_endpoint_path_without_leading_slash_rejected_with_explicit_audiences(tmp_path):
+    cfg = _good(tmp_path)
+    cfg.endpoint_path = "google-chat/events"
+    with pytest.raises(GoogleChatStartupError, match="endpoint_path"):
+        validate_google_chat_for_start(cfg)
+
+
 def test_empty_audiences_not_derived_in_project_number_mode(tmp_path):
     cfg = _good(tmp_path)
     cfg.allowed_audiences = []

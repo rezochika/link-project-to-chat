@@ -16,8 +16,6 @@ def _derived_audience(cfg: GoogleChatConfig) -> str | None:
         return None
     if not cfg.public_url or not cfg.endpoint_path:
         return None
-    if not cfg.endpoint_path.startswith("/"):
-        raise GoogleChatStartupError("google_chat.endpoint_path must start with '/'")
     return cfg.public_url.rstrip("/") + cfg.endpoint_path
 
 
@@ -35,6 +33,9 @@ def validate_google_chat_for_start(cfg: GoogleChatConfig) -> None:
         raise GoogleChatStartupError(
             f"google_chat.service_account_file is not a readable file: {cfg.service_account_file}",
         )
+
+    if cfg.endpoint_path and not cfg.endpoint_path.startswith("/"):
+        raise GoogleChatStartupError("google_chat.endpoint_path must start with '/'")
 
     if not cfg.allowed_audiences:
         derived = _derived_audience(cfg)
