@@ -439,9 +439,14 @@ class GoogleChatTransport:
             if oldest_seen_at >= cutoff:
                 break
             self._seen_event_cache.pop(oldest_key)
-        if key in self._seen_event_cache:
-            self._seen_event_cache.move_to_end(key)
-            return True
+        seen_at = self._seen_event_cache.get(key)
+        if seen_at is not None:
+            if seen_at < cutoff:
+                self._seen_event_cache.pop(key, None)
+            else:
+                self._seen_event_cache[key] = now
+                self._seen_event_cache.move_to_end(key)
+                return True
         self._seen_event_cache[key] = now
         while len(self._seen_event_cache) > self._seen_event_cache_max:
             self._seen_event_cache.popitem(last=False)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,43 @@ async def test_duplicate_event_dispatches_only_once():
     await transport.dispatch_event(payload)
     await transport.dispatch_event(payload)
     await transport.dispatch_event(payload)
+
+    assert seen == ["hi"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_event_dispatches_again_after_hit_moved_past_ttl(monkeypatch):
+    cfg = GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"])
+    transport = GoogleChatTransport(config=cfg, serve=False)
+    transport._seen_event_ttl_seconds = 10.0
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg.text))
+    payload_a = {
+        "type": "MESSAGE",
+        "eventTime": "2026-05-16T00:00:00Z",
+        "space": {"name": "spaces/AAA", "spaceType": "GROUP_CHAT"},
+        "message": {"name": "spaces/AAA/messages/1", "text": "hi"},
+        "user": {"name": "users/111", "displayName": "R"},
+    }
+    payload_b = {
+        "type": "MESSAGE",
+        "eventTime": "2026-05-16T00:00:01Z",
+        "space": {"name": "spaces/AAA", "spaceType": "GROUP_CHAT"},
+        "message": {"name": "spaces/AAA/messages/2", "text": "there"},
+        "user": {"name": "users/111", "displayName": "R"},
+    }
+    key_a = transport._event_idempotency_key(payload_a)
+    key_b = transport._event_idempotency_key(payload_b)
+    assert key_a is not None
+    assert key_b is not None
+    transport._seen_event_cache = OrderedDict([(key_a, 0.0), (key_b, 15.0)])
+
+    monkeypatch.setattr("link_project_to_chat.google_chat.transport.time.monotonic", lambda: 9.5)
+    assert transport._seen_event(key_a) is True
+    assert list(transport._seen_event_cache) == [key_b, key_a]
+
+    monkeypatch.setattr("link_project_to_chat.google_chat.transport.time.monotonic", lambda: 20.0)
+    await transport.dispatch_event(payload_a)
 
     assert seen == ["hi"]
 
