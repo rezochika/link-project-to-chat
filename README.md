@@ -80,8 +80,25 @@ and Google request-verification audience settings, then start with:
 link-project-to-chat start --project NAME --transport google_chat
 ```
 
-Google Chat v1 supports text, commands, card buttons, prompt dialogs/reply
-fallbacks, thread-aware replies, and conservative file fallback behavior.
+Google Chat v1.1 supports text, slash commands (`/lp2c ...`), card buttons with
+HMAC-signed callbacks, thread-aware replies, attachment download
+(uploaded-content) and upload (capped by `attachment_max_bytes`), prompt
+dialogs with form-input submissions, and both `endpoint_url` and
+`project_number` audience verification modes.
+
+Known v1.1 limitations (carried forward from the v1 design spec):
+
+- The HMAC secret for callback tokens is per-process (`secrets.token_bytes(32)`
+  at start). Any card or prompt posted before a bot restart becomes
+  unverifiable afterward. Re-trigger the prompt on the user's next message.
+- Prompt submissions are space-bound by default. The transport supports
+  sender-binding via `expected_sender_native_id` (`open_prompt` keyword), but
+  bot.py wiring to thread the originating user through is a follow-up.
+- The duplicate-event cache is in-memory only; a restart resets the seen-event
+  set, so a Google retry that arrives across a restart could double-dispatch.
+- Native inline `REQUEST_DIALOG` (where the bot returns a dialog synchronously
+  from the HTTP route) is intentionally deferred because it conflicts with the
+  fast-ack queue model. v1.1 uses card-button + `SUBMIT_DIALOG` instead.
 
 ## Example session
 

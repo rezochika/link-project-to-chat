@@ -2,27 +2,37 @@
 
 ## Unreleased
 
-### Added
-- **Google Chat transport (v1)** — third platform after Telegram and Web. Runs
-  as an HTTPS event receiver using Google Chat's HTTP endpoint delivery model
-  (Pub/Sub delivery deferred). Supports: text messages, slash commands, prompt
-  dialog/reply fallbacks, thread-aware replies, and `max_text_length = 8000`
-  (conservative character budget safe under the 32 000-byte hard limit).
-  Start with `--transport google_chat`.
-- **Conservative attachment handling** — Drive attachments and uploaded-content
-  attachments are flagged as `has_unsupported_media=True` so the bot can reply
-  with a "media type not supported" message instead of treating the caption as a
-  normal prompt. Actual upload/download support is deferred to a future task.
+### Fixed (Google Chat transport)
 
-### Notes — v1 limitations
-- No attachment upload/download (`NotImplementedError` stubs in client).
-- No `project_number` JWT verification (`NotImplementedError`); `endpoint_url`
-  audience mode is supported.
-- No Pub/Sub or Marketplace polish (HTTP endpoint delivery only).
-- No persisted callback secret (in-memory only; lost on restart).
-- No shared prompt-status primitive (per-transport in-memory state).
-- Card button clicks (interactive Cards v2) not yet routed through the
-  Transport's `on_button` path (`inject_button_click` not implemented).
+- `--transport google_chat` now boots end-to-end: `on_ready` is implemented,
+  `start()` constructs a real `GoogleChatClient` from the configured
+  service-account credentials, spawns a queue consumer that drains
+  `_pending_events` into `dispatch_event`, and serves the FastAPI app via
+  uvicorn. `run()` now blocks until the server exits.
+- Startup validation (`validate_google_chat_for_start`) rejects empty/default
+  configs at start time instead of crashing on first event.
+- App-command events (`/lp2c ...`) now run the authorizer and short-circuit
+  with an explicit `root_command_id is None` check. Startup validation rejects
+  that case at boot, so the short-circuit is defense-in-depth for test
+  harnesses.
+- `send_text(..., buttons=...)` now emits `cardsV2`. `CARD_CLICKED` events are
+  routed to `on_button` handlers, with HMAC-signed callback tokens verified
+  before dispatch and the token's bound `space` matched against the event space
+  to block cross-space replay.
+- `update_prompt` edits the originally posted prompt message. `SUBMIT_DIALOG`
+  events are routed to `on_prompt_submit` with the typed `formInputs` value.
+  Native inline `REQUEST_DIALOG` responses are intentionally deferred because
+  they would need to bypass the fast-ack queue and respond synchronously from
+  the HTTP route.
+- New `google_chat.attachment_max_bytes` config field (default 25 MB).
+  Attachment download via `attachmentDataRef.resourceName` writes bytes into a
+  per-message tempdir capped by `attachment_max_bytes` and surfaces them as
+  `IncomingMessage.files` (typed `IncomingFile`, with `original_name`,
+  `mime_type`, and `size_bytes`). Attachment upload posts multipart media to
+  Google Chat, and `send_file`/`send_voice` now deliver real files instead of
+  fallback text.
+- `auth_audience_type="project_number"` now verifies JWTs against
+  `chat@system.gserviceaccount.com`'s public certs (JWKS).
 
 ## 1.2.0 — 2026-05-16
 

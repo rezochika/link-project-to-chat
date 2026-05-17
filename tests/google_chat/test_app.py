@@ -4,6 +4,10 @@ import asyncio
 import time
 
 import pytest
+
+pytest.importorskip("fastapi")
+pytest.importorskip("httpx")
+
 from httpx import ASGITransport, AsyncClient
 
 from link_project_to_chat.config import GoogleChatConfig
