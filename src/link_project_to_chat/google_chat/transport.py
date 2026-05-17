@@ -167,9 +167,22 @@ class GoogleChatTransport:
             self.client = GoogleChatClient(http=self._http)
             self._owns_client = True
         await self._fire_on_ready()
+        if self._consumer_task is None or self._consumer_task.done():
+            self._consumer_task = asyncio.create_task(
+                self._consume_events(),
+                name="google-chat-consumer",
+            )
 
     async def stop(self) -> None:
         """Fire registered on_stop callbacks then clean up state."""
+        if self._consumer_task is not None:
+            consumer_task = self._consumer_task
+            self._consumer_task = None
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
         for cb in self._stop_callbacks:
             try:
                 result = cb()
@@ -233,6 +246,16 @@ class GoogleChatTransport:
             await self._dispatch_app_command(payload)
         else:
             logger.debug("GoogleChatTransport: ignoring unknown event type %r", event_type)
+
+    async def _consume_events(self) -> None:
+        while True:
+            envelope = await self._pending_events.get()
+            try:
+                await self.dispatch_event(envelope["payload"])
+            except Exception:
+                logger.exception("GoogleChatTransport: queued event dispatch failed")
+            finally:
+                self._pending_events.task_done()
 
     async def _dispatch_message(self, payload: dict) -> None:
         chat = _chat_from_space(payload["space"])
