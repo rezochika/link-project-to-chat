@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -31,6 +32,13 @@ class _GoogleAuth(httpx.Auth):
 
     def auth_flow(self, request):
         self._ensure_fresh()
+        token = getattr(self._credentials, "token", None)
+        if token:
+            request.headers["authorization"] = f"Bearer {token}"
+        yield request
+
+    async def async_auth_flow(self, request):
+        await asyncio.to_thread(self._ensure_fresh)
         token = getattr(self._credentials, "token", None)
         if token:
             request.headers["authorization"] = f"Bearer {token}"

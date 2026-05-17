@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 
 import pytest
 
-pytest.importorskip("httpx")
+httpx = pytest.importorskip("httpx")
 pytest.importorskip("google.auth")
 
 from link_project_to_chat.config import GoogleChatConfig
@@ -38,6 +40,68 @@ async def test_build_google_chat_http_client_uses_injected_credentials_factory(t
         assert str(client.base_url).rstrip("/") == "https://chat.googleapis.com"
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_google_auth_injects_header_on_async_client_request_path():
+    from link_project_to_chat.google_chat.credentials import _GoogleAuth
+
+    captured = {}
+
+    class _Creds:
+        token = None
+        valid = False
+
+        def refresh(self, request):
+            self.token = "fresh-token"
+            self.valid = True
+
+    async def handler(request):
+        captured["authorization"] = request.headers["authorization"]
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        auth=_GoogleAuth(_Creds()),
+        transport=httpx.MockTransport(handler),
+        base_url="https://chat.googleapis.com",
+    ) as client:
+        await client.get("/v1/spaces")
+
+    assert captured["authorization"] == "Bearer fresh-token"
+
+
+@pytest.mark.asyncio
+async def test_google_auth_refresh_does_not_block_event_loop_on_async_client_request_path():
+    from link_project_to_chat.google_chat.credentials import _GoogleAuth
+
+    class _Creds:
+        token = None
+        valid = False
+
+        def refresh(self, request):
+            time.sleep(0.2)
+            self.token = "fresh-token"
+            self.valid = True
+
+    async def handler(request):
+        return httpx.Response(200)
+
+    async def ticker():
+        started = time.perf_counter()
+        await asyncio.sleep(0.05)
+        return time.perf_counter() - started
+
+    async with httpx.AsyncClient(
+        auth=_GoogleAuth(_Creds()),
+        transport=httpx.MockTransport(handler),
+        base_url="https://chat.googleapis.com",
+    ) as client:
+        ticker_task = asyncio.create_task(ticker())
+        await asyncio.sleep(0)
+        await client.get("/v1/spaces")
+        ticker_elapsed = await ticker_task
+
+    assert ticker_elapsed < 0.15
 
 
 def test_google_auth_refreshes_when_credentials_not_valid():
