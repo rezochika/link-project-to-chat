@@ -73,6 +73,27 @@ async def test_message_event_normalizes_to_incoming_message():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_event_dispatches_only_once():
+    cfg = GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"])
+    transport = GoogleChatTransport(config=cfg, serve=False)
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg.text))
+    payload = {
+        "type": "MESSAGE",
+        "eventTime": "2026-05-16T00:00:00Z",
+        "space": {"name": "spaces/AAA", "spaceType": "GROUP_CHAT"},
+        "message": {"name": "spaces/AAA/messages/1", "text": "hi"},
+        "user": {"name": "users/111", "displayName": "R"},
+    }
+
+    await transport.dispatch_event(payload)
+    await transport.dispatch_event(payload)
+    await transport.dispatch_event(payload)
+
+    assert seen == ["hi"]
+
+
+@pytest.mark.asyncio
 async def test_command_event_uses_configured_root_command_id():
     transport = GoogleChatTransport(config=GoogleChatConfig(root_command_id=7, allowed_audiences=["https://x.test/google-chat/events"]))
     seen = []

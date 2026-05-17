@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
 import secrets
 import socket
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -131,6 +134,9 @@ class GoogleChatTransport:
         self._prompt_submit_handlers: list = []
         self._prompt_seq: int = 0
         self._callback_secret: bytes = secrets.token_bytes(32)
+        self._seen_event_cache: OrderedDict[str, float] = OrderedDict()
+        self._seen_event_cache_max = 4096
+        self._seen_event_ttl_seconds = 600.0
 
     @property
     def pending_event_count(self) -> int:
@@ -388,6 +394,11 @@ class GoogleChatTransport:
 
     async def dispatch_event(self, payload: dict) -> None:
         event_type = payload.get("type")
+        if event_type in {"MESSAGE", "APP_COMMAND", "CARD_CLICKED"}:
+            key = self._event_idempotency_key(payload)
+            if key is not None and self._seen_event(key):
+                logger.debug("GoogleChatTransport: suppressing duplicate event type=%r", event_type)
+                return
         if event_type == "MESSAGE":
             await self._dispatch_message(payload)
         elif event_type == "APP_COMMAND":
@@ -406,6 +417,35 @@ class GoogleChatTransport:
                 logger.exception("GoogleChatTransport: queued event dispatch failed")
             finally:
                 self._pending_events.task_done()
+
+    def _event_idempotency_key(self, payload: dict) -> str | None:
+        parts = {
+            "type": payload.get("type"),
+            "eventTime": payload.get("eventTime"),
+            "space.name": payload.get("space", {}).get("name"),
+            "message.name": payload.get("message", {}).get("name"),
+            "user.name": payload.get("user", {}).get("name"),
+        }
+        if all(value is None for value in parts.values()):
+            return None
+        encoded = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _seen_event(self, key: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self._seen_event_ttl_seconds
+        while self._seen_event_cache:
+            oldest_key, oldest_seen_at = next(iter(self._seen_event_cache.items()))
+            if oldest_seen_at >= cutoff:
+                break
+            self._seen_event_cache.pop(oldest_key)
+        if key in self._seen_event_cache:
+            self._seen_event_cache.move_to_end(key)
+            return True
+        self._seen_event_cache[key] = now
+        while len(self._seen_event_cache) > self._seen_event_cache_max:
+            self._seen_event_cache.popitem(last=False)
+        return False
 
     async def _dispatch_message(self, payload: dict) -> None:
         chat = _chat_from_space(payload["space"])
