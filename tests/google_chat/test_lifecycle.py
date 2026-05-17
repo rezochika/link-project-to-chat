@@ -85,3 +85,29 @@ async def test_stop_clears_owned_client_and_later_start_rebuilds(tmp_path):
         assert transport.client is not first_client
     finally:
         await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_start_preserves_owned_client_cleanup(tmp_path):
+    transport = GoogleChatTransport(
+        config=_runnable_cfg(tmp_path),
+        credentials_factory=_fake_credentials_factory,
+        serve=False,
+    )
+
+    await transport.start()
+    first_client = transport.client
+    assert isinstance(first_client, GoogleChatClient)
+
+    await transport.start()
+    assert transport.client is first_client
+
+    await transport.stop()
+    assert transport.client is None
+
+    await transport.start()
+    try:
+        assert isinstance(transport.client, GoogleChatClient)
+        assert transport.client is not first_client
+    finally:
+        await transport.stop()

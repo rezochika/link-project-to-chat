@@ -166,8 +166,6 @@ class GoogleChatTransport:
             )
             self.client = GoogleChatClient(http=self._http)
             self._owns_client = True
-        else:
-            self._owns_client = False
         await self._fire_on_ready()
 
     async def stop(self) -> None:
