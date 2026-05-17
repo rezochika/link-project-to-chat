@@ -351,6 +351,10 @@ class _FakeClient:
         self.calls.append({"message_name": message_name, "body": body, "update_mask": update_mask})
         return {"name": message_name}
 
+    async def upload_attachment(self, space, path, *, mime_type=None, max_bytes=25_000_000):
+        self.calls.append({"space": space, "path": path, "mime_type": mime_type, "max_bytes": max_bytes})
+        return {"attachmentDataRef": {"resourceName": f"{space}/attachments/1"}}
+
 
 @pytest.mark.asyncio
 async def test_update_prompt_edits_pending_prompt_message():
@@ -507,6 +511,42 @@ async def test_send_text_preserves_thread_name_in_reply_to_native():
 
     assert fake.calls[0]["thread_name"] == "spaces/AAA/threads/T1"
     assert result.native["thread_name"] == "spaces/AAA/threads/T1"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_preserves_reply_to_thread(tmp_path):
+    fake = _FakeClient()
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            attachment_max_bytes=123,
+        ),
+        client=fake,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    path = tmp_path / "voice.opus"
+    path.write_bytes(b"opus")
+    reply_to = MessageRef(
+        "google_chat",
+        "spaces/AAA/messages/0",
+        chat,
+        native={"thread_name": "spaces/AAA/threads/T1"},
+    )
+
+    result = await transport.send_voice(chat, path, reply_to=reply_to)
+
+    upload_call = fake.calls[0]
+    message_call = fake.calls[1]
+    assert upload_call["space"] == "spaces/AAA"
+    assert upload_call["path"] == path
+    assert upload_call["max_bytes"] == 123
+    assert message_call["thread_name"] == "spaces/AAA/threads/T1"
+    assert message_call["body"] == {
+        "text": "",
+        "attachment": [{"attachmentDataRef": {"resourceName": "spaces/AAA/attachments/1"}}],
+    }
+    assert result.native["thread_name"] == "spaces/AAA/threads/T1"
+    assert result.native["is_app_created"] is True
 
 
 @pytest.mark.asyncio

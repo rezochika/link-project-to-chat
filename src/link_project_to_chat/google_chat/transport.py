@@ -752,15 +752,39 @@ class GoogleChatTransport:
             return
         await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
 
-    async def send_file(self, chat, path, *, caption=None, display_name=None):
-        label = display_name or path.name
-        text = f"File upload is not supported for Google Chat yet: {label}"
-        if caption:
-            text = f"{caption}\n\n{text}"
-        return await self.send_text(chat, text)
+    async def send_file(
+        self,
+        chat,
+        path,
+        *,
+        caption=None,
+        display_name=None,
+        reply_to: MessageRef | None = None,
+    ):
+        request_id = self._new_request_id()
+        uploaded = await self.client.upload_attachment(
+            chat.native_id,
+            path,
+            mime_type=None,
+            max_bytes=self.config.attachment_max_bytes,
+        )
+        body = {"text": caption or "", "attachment": [uploaded]}
+        native: dict[str, object] = {}
+        if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
+            native["thread_name"] = reply_to.native["thread_name"]
+        result = await self.client.create_message(
+            chat.native_id,
+            body,
+            thread_name=native.get("thread_name"),
+            request_id=request_id,
+        )
+        native["request_id"] = request_id
+        native["message_name"] = result["name"]
+        native["is_app_created"] = True
+        return MessageRef("google_chat", result["name"], chat, native=native)
 
     async def send_voice(self, chat, path, *, reply_to=None):
-        return await self.send_text(chat, f"Voice upload is not supported for Google Chat yet: {path.name}", reply_to=reply_to)
+        return await self.send_file(chat, path, display_name=path.name, reply_to=reply_to)
 
     # ── Prompt support ────────────────────────────────────────────────────
 

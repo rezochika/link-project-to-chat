@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -39,8 +40,31 @@ class GoogleChatClient:
         response = await self._http.patch(f"/v1/{message_name}", json=body, params=params)
         return response.json()
 
-    async def upload_attachment(self, space: str, path: Path, *, mime_type: str | None) -> dict:
-        raise NotImplementedError("Google Chat upload support lands in Task 11")
+    async def upload_attachment(
+        self,
+        space: str,
+        path: Path,
+        *,
+        mime_type: str | None,
+        max_bytes: int = 25_000_000,
+    ) -> dict:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be > 0")
+        size_bytes = path.stat().st_size
+        if size_bytes > max_bytes:
+            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+
+        metadata = {"filename": path.name}
+        with path.open("rb") as fh:
+            response = await self._http.post(
+                f"/v1/{space}/attachments:upload",
+                params={"uploadType": "multipart"},
+                files={
+                    "metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),
+                    "file": (path.name, fh, mime_type or "application/octet-stream"),
+                },
+            )
+        return response.json()
 
     async def download_attachment(
         self,

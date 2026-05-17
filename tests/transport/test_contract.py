@@ -36,10 +36,9 @@ class _FakeGoogleChatClient:
 
     Exposes: create_message, update_message, upload_attachment,
     download_attachment (all async). create_message returns a synthetic
-    message dict; update_message echoes the name back. upload_attachment and
-    download_attachment raise NotImplementedError (v1 limitation) — matching
-    the real client's stubs so the contract tests don't inadvertently rely
-    on them succeeding.
+    message dict; update_message echoes the name back. upload_attachment
+    returns a synthetic attachmentDataRef and download_attachment writes
+    fake bytes.
     """
 
     def __init__(self) -> None:
@@ -67,11 +66,16 @@ class _FakeGoogleChatClient:
     ) -> dict:
         return {"name": message_name}
 
-    async def upload_attachment(self, space, path, *, mime_type=None) -> dict:
-        raise NotImplementedError("upload_attachment not supported in v1")
+    async def upload_attachment(self, space, path, *, mime_type=None, max_bytes=25_000_000) -> dict:
+        if Path(path).stat().st_size > max_bytes:
+            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+        return {"attachmentDataRef": {"resourceName": f"{space}/attachments/{self._counter + 1}"}}
 
-    async def download_attachment(self, resource_name, destination) -> None:
-        raise NotImplementedError("download_attachment not supported in v1")
+    async def download_attachment(self, resource_name, destination, *, max_bytes=25_000_000) -> None:
+        data = b"fake google chat attachment"
+        if len(data) > max_bytes:
+            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+        Path(destination).write_bytes(data)
 
 
 def _chat(transport_id: str) -> ChatRef:
