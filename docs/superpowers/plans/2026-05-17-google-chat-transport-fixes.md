@@ -63,14 +63,13 @@ Expected output contains:
 ## fix/google-chat-transport-integration
 ```
 
-- [ ] **Step 2: Run the baseline suite inside the project venv**
+- [ ] **Step 2: Run the baseline suite**
 
 ```bash
-source .venv/bin/activate
 pytest -q
 ```
 
-Record the exact pass/skip count in the empty baseline commit body.
+Use whatever interpreter the agent's environment provides (`pyproject.toml` requires Python `>=3.11`). If a project venv exists at `.venv/`, activate it first (`source .venv/bin/activate`). Record the exact pass/skip count in the empty baseline commit body.
 
 - [ ] **Step 3: Commit the baseline marker**
 
@@ -1059,7 +1058,9 @@ Expected: pass.
 
 - [ ] **Step 5: Verify the final assembled `stop()` body**
 
-After Tasks 4 → 5 → 6, `stop()` should look exactly like this. The order matters: (1) stop accepting new events, (2) drain in-flight events, (3) let plugins finalize while the client is still alive, (4) cut the REST client. Re-open `transport.py` and confirm the ordering matches:
+After Tasks 4 → 5 → 6, `stop()` should look exactly like this. The order matters: (1) stop accepting new events, (2) drain enqueued-but-not-yet-dispatched events with a bounded timeout then cancel, (3) let plugins finalize while the client is still alive, (4) cut the REST client.
+
+Design note on shutdown drain: we try to drain (`asyncio.wait_for(self._pending_events.join(), timeout=5.0)`) before cancelling the consumer. If Google has retried an event but the bot is restarting at the same instant, the drain finishes most of the in-flight work. Anything still queued after 5s is dropped — Google will retry on its side, and the Task 11.5 idempotency cache prevents the post-restart dispatch from double-firing for events that *did* finish before shutdown. Re-open `transport.py` and confirm the ordering matches:
 
 ```python
 async def stop(self) -> None:
@@ -1074,9 +1075,18 @@ async def stop(self) -> None:
         self._uvicorn_server = None
         self._server_task = None
 
-    # 2) Cancel the queue consumer so no in-flight event tries to invoke a
-    #    handler the plugin is about to dispose.
+    # 2) Best-effort drain: let the consumer finish whatever events are
+    #    already in flight, then cancel. Anything still queued after the
+    #    timeout is dropped — Google retries on its side and the seen-event
+    #    cache (Task 11.5) prevents double-dispatch on restart.
     if self._consumer_task is not None:
+        try:
+            await asyncio.wait_for(self._pending_events.join(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "GoogleChatTransport.stop: drain timed out with %d queued events; dropping",
+                self._pending_events.qsize(),
+            )
         self._consumer_task.cancel()
         try:
             await self._consumer_task
@@ -1751,6 +1761,54 @@ async def test_dialog_submit_routes_to_prompt_submit_handler(tmp_path):
 
     await transport.dispatch_event(payload)
     assert submissions and submissions[0].text == "typed-answer"
+
+
+@pytest.mark.asyncio
+async def test_dialog_submit_rejects_wrong_sender_when_bound(tmp_path):
+    """Spec §prompts: wrong-user prompt submissions must be rejected when
+    the prompt was opened with an `expected_sender_native_id`."""
+    sa = tmp_path / "key.json"
+    sa.write_text("{}", encoding="utf-8")
+
+    class _FakeClient:
+        async def create_message(self, space, body, *, thread_name=None, request_id=None, message_reply_option=None):
+            return {"name": f"{space}/messages/PROMPT"}
+
+    cfg = GoogleChatConfig(
+        service_account_file=str(sa),
+        allowed_audiences=["https://x.test/google-chat/events"],
+        callback_token_ttl_seconds=60,
+        root_command_id=1,
+    )
+    transport = GoogleChatTransport(config=cfg, client=_FakeClient(), serve=False)
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="answer", title="Q", body="ask", kind=PromptKind.TEXT),
+        expected_sender_native_id="users/EXPECTED",
+    )
+
+    submissions = []
+    transport.on_prompt_submit(lambda sub: submissions.append(sub))
+
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+            "expected_sender": "users/EXPECTED",
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+    payload = json.loads((FIXTURES / "dialog_submit_text.json").read_text())
+    payload["action"]["parameters"][0]["value"] = token
+    payload["user"]["name"] = "users/IMPOSTOR"  # not the expected sender
+
+    await transport.dispatch_event(payload)
+    assert submissions == []
 ```
 
 - [ ] **Step 3: Verify RED**
@@ -1777,6 +1835,7 @@ def build_prompt_card(
     space: str,
     now: int,
     ttl_seconds: int,
+    expected_sender_native_id: str | None = None,
 ) -> dict:
     """Build a Cards v2 dict that produces a signed kind="prompt" callback.
 
@@ -1788,6 +1847,14 @@ def build_prompt_card(
     widgets: list = []
     if spec.body:
         widgets.append({"textParagraph": {"text": spec.body}})
+
+    def _payload(extra: dict | None = None) -> dict:
+        body = {"space": space, "kind": "prompt", "prompt_id": prompt_id}
+        if expected_sender_native_id:
+            body["expected_sender"] = expected_sender_native_id
+        if extra:
+            body.update(extra)
+        return body
 
     if spec.kind in (PromptKind.TEXT, PromptKind.SECRET):
         widgets.append(
@@ -1801,7 +1868,7 @@ def build_prompt_card(
         )
         token = make_callback_token(
             secret=secret,
-            payload={"space": space, "kind": "prompt", "prompt_id": prompt_id},
+            payload=_payload(),
             ttl_seconds=ttl_seconds,
             now=now,
         )
@@ -1831,7 +1898,7 @@ def build_prompt_card(
         for opt in options:
             token = make_callback_token(
                 secret=secret,
-                payload={"space": space, "kind": "prompt", "prompt_id": prompt_id, "value": opt.value},
+                payload=_payload({"value": opt.value}),
                 ttl_seconds=ttl_seconds,
                 now=now,
             )
@@ -1852,7 +1919,7 @@ def build_prompt_card(
         for label, value in (("Yes", "yes"), ("No", "no")):
             token = make_callback_token(
                 secret=secret,
-                payload={"space": space, "kind": "prompt", "prompt_id": prompt_id, "value": value},
+                payload=_payload({"value": value}),
                 ttl_seconds=ttl_seconds,
                 now=now,
             )
@@ -1914,7 +1981,14 @@ async def open_prompt(
     spec: PromptSpec,
     *,
     reply_to: MessageRef | None = None,
+    expected_sender_native_id: str | None = None,
 ) -> PromptRef:
+    """Open a prompt. The optional `expected_sender_native_id` is a Google
+    Chat-specific extension over the base Transport protocol: when set, the
+    callback token binds to that user and `_dispatch_card_clicked` rejects
+    submissions whose `sender.native_id` does not match. When None (the
+    current bot.py call shape), the prompt is space-bound only — anyone in
+    the space may submit. Threading bot.py to populate this is a follow-up."""
     from .cards import build_prompt_card  # noqa: PLC0415
 
     prompt_id = f"p-{self._prompt_seq}"
@@ -1929,7 +2003,13 @@ async def open_prompt(
     self._pending_prompts[prompt_id] = PendingPrompt(
         prompt=ref,
         chat=chat,
-        sender=None,
+        sender=Identity(
+            transport_id="google_chat",
+            native_id=expected_sender_native_id,
+            display_name="",
+            handle=None,
+            is_bot=False,
+        ) if expected_sender_native_id else None,
         kind=spec.kind,
         expires_at=expires_at,
     )
@@ -1949,6 +2029,7 @@ async def open_prompt(
         space=chat.native_id,
         now=int(time.time()),
         ttl_seconds=self.config.pending_prompt_ttl_seconds,
+        expected_sender_native_id=expected_sender_native_id,
     )
     body: dict = {"text": ""}
     body.update(card_payload)
@@ -1987,6 +2068,8 @@ async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
         await self.edit_text(posted, spec.body)
         return
 
+    pending = self._pending_prompts.get(prompt.native_id)
+    expected = pending.sender.native_id if pending and pending.sender else None
     card_payload = build_prompt_card(
         spec,
         prompt_id=prompt.native_id,
@@ -1994,6 +2077,7 @@ async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
         space=posted.chat.native_id,
         now=int(time.time()),
         ttl_seconds=self.config.pending_prompt_ttl_seconds,
+        expected_sender_native_id=expected,
     )
     body: dict = {"text": ""}
     body.update(card_payload)
@@ -2070,6 +2154,18 @@ elif kind == "prompt":
     if pending is None:
         logger.debug("CARD_CLICKED prompt_id=%r not pending; dropping", prompt_id)
         return
+    # Spec §prompts: wrong-user prompt submissions must be rejected. When
+    # the token carries `expected_sender`, only that native_id may submit.
+    # When absent (default v1.1 path with no bot.py wiring), the prompt is
+    # space-bound only and any space member may submit.
+    expected_sender = verified.get("expected_sender")
+    if expected_sender and sender.native_id != expected_sender:
+        logger.warning(
+            "CARD_CLICKED prompt submission from unexpected sender (got %r, expected %r); dropping",
+            sender.native_id,
+            expected_sender,
+        )
+        return
     form_field = params.get("form_field")
     text = None
     if form_field:
@@ -2097,6 +2193,147 @@ Expected: pass.
 ```bash
 git add src/link_project_to_chat/google_chat/transport.py tests/google_chat/fixtures/dialog_submit_text.json tests/google_chat/test_transport.py
 git commit -m "fix(google-chat): real update_prompt and dialog submit routing"
+```
+
+---
+
+## Task 11.5: Inbound Event Idempotency
+
+**Why:** Spec §544-558 requires that "duplicate verified event -> no second dispatch" — Google Chat may retry deliveries (network blips, our fast-ack timeout, etc.) and the bot must not double-fire handlers. The plan so far has no idempotency cache; a retried MESSAGE event would invoke `on_message` twice and a retried CARD_CLICKED would charge a prompt submission twice. Add a per-process LRU+TTL set of seen event keys, deduped on enqueue.
+
+**Files:**
+- Modify: `src/link_project_to_chat/google_chat/transport.py`
+- Modify: `tests/google_chat/test_transport.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/google_chat/test_transport.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_duplicate_event_dispatches_only_once(tmp_path):
+    sa = tmp_path / "key.json"
+    sa.write_text("{}", encoding="utf-8")
+    cfg = GoogleChatConfig(
+        service_account_file=str(sa),
+        allowed_audiences=["https://x.test/google-chat/events"],
+        root_command_id=1,
+    )
+    transport = GoogleChatTransport(config=cfg, serve=False)
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg.text))
+
+    payload = {
+        "type": "MESSAGE",
+        "eventTime": "2026-05-17T12:00:00Z",
+        "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+        "message": {"name": "spaces/AAA/messages/ID-1", "text": "hi"},
+        "user": {"name": "users/111", "displayName": "R"},
+    }
+
+    await transport.dispatch_event(payload)
+    await transport.dispatch_event(payload)  # exact duplicate
+    await transport.dispatch_event(payload)  # third retry
+
+    assert seen == ["hi"]
+```
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+pytest tests/google_chat/test_transport.py::test_duplicate_event_dispatches_only_once -q
+```
+
+Expected: fails — handler fires three times.
+
+- [ ] **Step 3: Implement seen-event cache**
+
+In `transport.py` `__init__`, add an ordered cache:
+
+```python
+from collections import OrderedDict  # at top of file if missing
+# ...
+self._seen_event_cache: "OrderedDict[str, float]" = OrderedDict()
+self._seen_event_cache_max: int = 4096  # bounded LRU eviction
+self._seen_event_ttl_seconds: float = 600.0
+```
+
+Add a helper and dedup check at the top of `dispatch_event`:
+
+```python
+def _event_idempotency_key(self, payload: dict) -> str | None:
+    """Derive a deterministic dedup key from a Google Chat event payload.
+
+    Google Chat does not always include a top-level event ID, so we hash
+    the platform-stable shape: type + eventTime + space + message name +
+    user name. Two identical retries of the same delivery hash the same.
+    """
+    parts = [
+        payload.get("type", ""),
+        payload.get("eventTime", ""),
+        payload.get("space", {}).get("name", ""),
+        payload.get("message", {}).get("name", ""),
+        payload.get("user", {}).get("name", ""),
+    ]
+    if not any(parts):
+        return None
+    raw = "|".join(parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _seen_event(self, key: str) -> bool:
+    now = time.monotonic()
+    # Drop expired entries opportunistically.
+    while self._seen_event_cache:
+        oldest_key, ts = next(iter(self._seen_event_cache.items()))
+        if now - ts > self._seen_event_ttl_seconds:
+            self._seen_event_cache.popitem(last=False)
+        else:
+            break
+    if key in self._seen_event_cache:
+        # Move-to-end keeps LRU semantics for the bounded cache.
+        self._seen_event_cache.move_to_end(key)
+        return True
+    self._seen_event_cache[key] = now
+    if len(self._seen_event_cache) > self._seen_event_cache_max:
+        self._seen_event_cache.popitem(last=False)
+    return False
+```
+
+Add `import hashlib` to the top of `transport.py` if missing.
+
+In `dispatch_event`, dedup before routing:
+
+```python
+async def dispatch_event(self, payload: dict) -> None:
+    key = self._event_idempotency_key(payload)
+    if key is not None and self._seen_event(key):
+        logger.debug("GoogleChatTransport: duplicate event suppressed key=%s", key)
+        return
+    event_type = payload.get("type")
+    if event_type == "MESSAGE":
+        await self._dispatch_message(payload)
+    elif event_type == "APP_COMMAND":
+        await self._dispatch_app_command(payload)
+    elif event_type == "CARD_CLICKED":
+        await self._dispatch_card_clicked(payload)
+    else:
+        logger.debug("GoogleChatTransport: ignoring unknown event type %r", event_type)
+```
+
+- [ ] **Step 4: Verify GREEN**
+
+```bash
+pytest tests/google_chat/test_transport.py::test_duplicate_event_dispatches_only_once -q
+```
+
+Expected: pass — handler fires exactly once.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/link_project_to_chat/google_chat/transport.py tests/google_chat/test_transport.py
+git commit -m "fix(google-chat): dedup duplicate inbound events"
 ```
 
 ---
@@ -2475,22 +2712,62 @@ Expected: fails with `NotImplementedError`.
 In `client.py`:
 
 ```python
-async def upload_attachment(self, space: str, path: Path, *, mime_type: str | None) -> dict:
+async def upload_attachment(
+    self,
+    space: str,
+    path: Path,
+    *,
+    mime_type: str | None,
+    max_bytes: int = 25_000_000,
+) -> dict:
+    # Stat first — refuse oversize files without reading them into memory.
+    # The default 25 MB matches GoogleChatConfig.attachment_max_bytes; the
+    # transport passes `self.config.attachment_max_bytes` explicitly when
+    # wiring send_file/send_voice.
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(
+            f"upload {path.name} is {size} bytes; exceeds max_bytes={max_bytes}"
+        )
     metadata = {"filename": path.name}
-    data = path.read_bytes()
-    files = {
-        "metadata": (None, json.dumps(metadata), "application/json"),
-        "data": (path.name, data, mime_type or "application/octet-stream"),
-    }
-    response = await self._http.post(
-        f"/v1/{space}/attachments:upload?uploadType=multipart",
-        files=files,
-    )
+    # Stream the bytes via a file handle. httpx accepts either bytes or a
+    # file-like object in the `files` tuple; the open-file path keeps the
+    # peak memory footprint at the multipart chunk size, not the file size.
+    with path.open("rb") as fh:
+        files = {
+            "metadata": (None, json.dumps(metadata), "application/json"),
+            "data": (path.name, fh, mime_type or "application/octet-stream"),
+        }
+        response = await self._http.post(
+            f"/v1/{space}/attachments:upload?uploadType=multipart",
+            files=files,
+        )
     response.raise_for_status()
     return response.json()
 ```
 
 Add `import json` at the top of `client.py` if missing.
+
+Update Task 13 Step 4's `send_file` wiring to pass the configured cap:
+
+```python
+uploaded = await self.client.upload_attachment(
+    chat.native_id, path, mime_type=None, max_bytes=self.config.attachment_max_bytes,
+)
+```
+
+Add a client-test that asserts the cap is enforced:
+
+```python
+@pytest.mark.asyncio
+async def test_upload_attachment_rejects_oversize_files(tmp_path, fake_httpx):
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"x" * 200)
+    client = GoogleChatClient(http=fake_httpx)
+    with pytest.raises(ValueError, match="exceeds max_bytes"):
+        await client.upload_attachment("spaces/AAA", src, mime_type=None, max_bytes=100)
+    assert fake_httpx.calls == [], "must not POST when oversize"
+```
 
 - [ ] **Step 4: Wire `send_file`/`send_voice` through the upload path**
 
@@ -2638,13 +2915,25 @@ from link_project_to_chat.google_chat.transport import GoogleChatTransport
 Replace the "Google Chat transport" section's capability paragraph with:
 
 ```markdown
-Google Chat v1 supports text, slash commands (`/lp2c …`), card buttons with
+Google Chat v1.1 supports text, slash commands (`/lp2c …`), card buttons with
 HMAC-signed callbacks, thread-aware replies, attachment download
-(uploaded-content) and upload, and both `endpoint_url` and `project_number`
-audience verification modes. Prompts use a card-button + `SUBMIT_DIALOG`
-form-input flow; native inline `REQUEST_DIALOG` responses (where the bot
-returns a dialog synchronously from the HTTP route) are intentionally
-deferred because they conflict with the fast-ack queue model.
+(uploaded-content) and upload (capped by `attachment_max_bytes`), prompt
+dialogs with form-input submissions, and both `endpoint_url` and
+`project_number` audience verification modes.
+
+Known v1.1 limitations (carried forward from the v1 design spec):
+
+- The HMAC secret for callback tokens is per-process (`secrets.token_bytes(32)`
+  at start). Any card or prompt posted before a bot restart becomes
+  unverifiable afterward. Re-trigger the prompt on the user's next message.
+- Prompt submissions are space-bound by default. The transport supports
+  sender-binding via `expected_sender_native_id` (`open_prompt` keyword), but
+  bot.py wiring to thread the originating user through is a follow-up.
+- The duplicate-event cache is in-memory only; a restart resets the seen-event
+  set, so a Google retry that arrives across a restart could double-dispatch.
+- Native inline `REQUEST_DIALOG` (where the bot returns a dialog synchronously
+  from the HTTP route) is intentionally deferred — it conflicts with the
+  fast-ack queue model. v1.1 uses card-button + `SUBMIT_DIALOG` instead.
 ```
 
 - [ ] **Step 3: Update `docs/CHANGELOG.md`**
@@ -2847,11 +3136,12 @@ async def test_projectbot_google_chat_end_to_end(tmp_path: Path):
 - [ ] **Step 2: Run full verification**
 
 ```bash
-source .venv/bin/activate
 pytest -q
 git diff --check
 python3 -m compileall -q src/link_project_to_chat
 ```
+
+(Activate the project venv first if one exists at `.venv/`.)
 
 Expected:
 - pytest passes (baseline count + new tests from this plan)
