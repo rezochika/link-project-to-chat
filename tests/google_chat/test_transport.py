@@ -59,6 +59,30 @@ def test_google_chat_chat_refs_use_google_transport_id():
     assert chat.transport_id == "google_chat"
 
 
+def test_verify_request_uses_project_number_when_audiences_empty(monkeypatch):
+    from link_project_to_chat.google_chat import auth as auth_mod
+
+    captured = {}
+
+    def fake_verify_google_chat_request(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(auth_mod, "verify_google_chat_request", fake_verify_google_chat_request)
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=[],
+            auth_audience_type="project_number",
+            project_number="123",
+        ),
+    )
+
+    transport.verify_request({"authorization": "Bearer token"})
+
+    assert captured["mode"] == "project_number"
+    assert captured["audiences"] == ["123"]
+
+
 @pytest.mark.asyncio
 async def test_message_event_normalizes_to_incoming_message():
     transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
@@ -522,7 +546,7 @@ async def test_send_text_preserves_thread_name_in_reply_to_native():
 
 
 @pytest.mark.asyncio
-async def test_send_voice_preserves_reply_to_thread(tmp_path):
+async def test_send_voice_fallback_preserves_reply_to_thread(tmp_path):
     fake = _FakeClient()
     transport = GoogleChatTransport(
         config=GoogleChatConfig(
@@ -543,22 +567,17 @@ async def test_send_voice_preserves_reply_to_thread(tmp_path):
 
     result = await transport.send_voice(chat, path, reply_to=reply_to)
 
-    upload_call = fake.calls[0]
-    message_call = fake.calls[1]
-    assert upload_call["space"] == "spaces/AAA"
-    assert upload_call["path"] == path
-    assert upload_call["max_bytes"] == 123
+    assert len(fake.calls) == 1
+    message_call = fake.calls[0]
     assert message_call["thread_name"] == "spaces/AAA/threads/T1"
-    assert message_call["body"] == {
-        "text": "",
-        "attachment": [{"attachmentDataRef": {"resourceName": "spaces/AAA/attachments/1"}}],
-    }
+    assert "voice.opus" in message_call["body"]["text"]
+    assert "attachment" not in message_call["body"]
     assert result.native["thread_name"] == "spaces/AAA/threads/T1"
     assert result.native["is_app_created"] is True
 
 
 @pytest.mark.asyncio
-async def test_send_file_passes_display_name_to_upload(tmp_path):
+async def test_send_file_falls_back_to_text_without_upload(tmp_path):
     fake = _FakeClient()
     transport = GoogleChatTransport(
         config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
@@ -568,9 +587,14 @@ async def test_send_file_passes_display_name_to_upload(tmp_path):
     path = tmp_path / "tmp-random-name"
     path.write_bytes(b"content")
 
-    await transport.send_file(chat, path, display_name="report.txt")
+    result = await transport.send_file(chat, path, caption="See attached", display_name="report.txt")
 
-    assert fake.calls[0]["display_name"] == "report.txt"
+    assert len(fake.calls) == 1
+    message_call = fake.calls[0]
+    assert message_call["body"] == {
+        "text": "See attached\n\n[Google Chat file upload is not available with app authentication: report.txt]",
+    }
+    assert result.native_id == "spaces/AAA/messages/1"
 
 
 @pytest.mark.asyncio

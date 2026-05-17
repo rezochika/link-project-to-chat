@@ -175,8 +175,15 @@ class GoogleChatTransport:
         return verify_google_chat_request(
             headers=headers,
             mode=self.config.auth_audience_type,
-            audiences=self.config.allowed_audiences,
+            audiences=self._effective_allowed_audiences(),
         )
+
+    def _effective_allowed_audiences(self) -> list[str]:
+        if self.config.allowed_audiences:
+            return self.config.allowed_audiences
+        if self.config.auth_audience_type == "project_number" and self.config.project_number:
+            return [self.config.project_number]
+        return []
 
     async def enqueue_verified_event(
         self,
@@ -761,31 +768,13 @@ class GoogleChatTransport:
         display_name=None,
         reply_to: MessageRef | None = None,
     ):
-        request_id = self._new_request_id()
-        uploaded = await self.client.upload_attachment(
-            chat.native_id,
-            path,
-            mime_type=None,
-            max_bytes=self.config.attachment_max_bytes,
-            display_name=display_name,
-        )
-        body = {"text": caption or "", "attachment": [uploaded]}
-        native: dict[str, object] = {}
-        if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
-            native["thread_name"] = reply_to.native["thread_name"]
-        result = await self.client.create_message(
-            chat.native_id,
-            body,
-            thread_name=native.get("thread_name"),
-            request_id=request_id,
-        )
-        native["request_id"] = request_id
-        native["message_name"] = result["name"]
-        native["is_app_created"] = True
-        return MessageRef("google_chat", result["name"], chat, native=native)
+        file_name = display_name or Path(path).name
+        fallback = f"[Google Chat file upload is not available with app authentication: {file_name}]"
+        text = f"{caption}\n\n{fallback}" if caption else fallback
+        return await self.send_text(chat, text, reply_to=reply_to)
 
     async def send_voice(self, chat, path, *, reply_to=None):
-        return await self.send_file(chat, path, display_name=path.name, reply_to=reply_to)
+        return await self.send_file(chat, path, display_name=Path(path).name, reply_to=reply_to)
 
     # ── Prompt support ────────────────────────────────────────────────────
 

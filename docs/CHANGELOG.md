@@ -28,9 +28,9 @@
   Attachment download via `attachmentDataRef.resourceName` writes bytes into a
   per-message tempdir capped by `attachment_max_bytes` and surfaces them as
   `IncomingMessage.files` (typed `IncomingFile`, with `original_name`,
-  `mime_type`, and `size_bytes`). Attachment upload posts multipart media to
-  Google Chat, and `send_file`/`send_voice` now deliver real files instead of
-  fallback text.
+  `mime_type`, and `size_bytes`). `send_file`/`send_voice` now return a
+  thread-aware text fallback instead of claiming outbound upload support;
+  Google Chat multipart upload requires user OAuth and is deferred.
 - `auth_audience_type="project_number"` now verifies JWTs against
   `chat@system.gserviceaccount.com`'s public x509 certs.
 

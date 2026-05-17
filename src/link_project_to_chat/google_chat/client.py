@@ -49,6 +49,12 @@ class GoogleChatClient:
         max_bytes: int = 25_000_000,
         display_name: str | None = None,
     ) -> dict:
+        """Upload using Google Chat media.upload.
+
+        This endpoint requires a user-authenticated HTTP client with Chat
+        message scopes. The default transport uses service-account app auth
+        (`chat.bot`) and therefore does not call this helper.
+        """
         if max_bytes <= 0:
             raise ValueError("max_bytes must be > 0")
         size_bytes = path.stat().st_size

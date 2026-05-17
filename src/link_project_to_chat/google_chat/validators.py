@@ -10,9 +10,9 @@ class GoogleChatStartupError(Exception):
 
 
 def _derived_audience(cfg: GoogleChatConfig) -> str | None:
-    """Derive endpoint URL audience when public URL and endpoint path are set."""
-    if cfg.auth_audience_type != "endpoint_url":
-        return None
+    """Derive the configured Google Chat request-verification audience."""
+    if cfg.auth_audience_type == "project_number":
+        return cfg.project_number or None
     if not cfg.public_url or not cfg.endpoint_path:
         return None
     return cfg.public_url.rstrip("/") + cfg.endpoint_path
@@ -39,12 +39,17 @@ def validate_google_chat_for_start(cfg: GoogleChatConfig) -> None:
     if cfg.endpoint_path and not cfg.endpoint_path.startswith("/"):
         raise GoogleChatStartupError("google_chat.endpoint_path must start with '/'")
 
+    if cfg.auth_audience_type == "project_number" and not cfg.project_number:
+        raise GoogleChatStartupError(
+            "google_chat.project_number is required when auth_audience_type is 'project_number'",
+        )
+
     if not cfg.allowed_audiences:
         derived = _derived_audience(cfg)
         if derived is None:
             raise GoogleChatStartupError(
                 "google_chat.allowed_audiences is empty and cannot be derived; set the list explicitly "
-                "or, for endpoint_url mode, set both public_url and endpoint_path",
+                "or set endpoint_url public_url + endpoint_path / project_number mode project_number",
             )
         cfg.allowed_audiences = [derived]
 
@@ -63,9 +68,4 @@ def validate_google_chat_for_start(cfg: GoogleChatConfig) -> None:
     if cfg.root_command_id is None:
         raise GoogleChatStartupError(
             "google_chat.root_command_id is required; set it to the appCommandId you assigned to /lp2c",
-        )
-
-    if cfg.auth_audience_type == "project_number" and not cfg.project_number:
-        raise GoogleChatStartupError(
-            "google_chat.project_number is required when auth_audience_type is 'project_number'",
         )

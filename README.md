@@ -96,9 +96,9 @@ link-project-to-chat start --project NAME --transport google_chat
 
 Google Chat v1.1 supports text, slash commands (`/lp2c ...`), card buttons with
 HMAC-signed callbacks, thread-aware replies, attachment download
-(uploaded-content) and upload (capped by `attachment_max_bytes`), prompt
-dialogs with form-input submissions, and both `endpoint_url` and
-`project_number` audience verification modes.
+(uploaded-content, capped by `attachment_max_bytes`), prompt dialogs with
+form-input submissions, and both `endpoint_url` and `project_number` audience
+verification modes.
 
 Known v1.1 limitations (carried forward from the v1 design spec):
 
@@ -113,6 +113,10 @@ Known v1.1 limitations (carried forward from the v1 design spec):
 - Native inline `REQUEST_DIALOG` (where the bot returns a dialog synchronously
   from the HTTP route) is intentionally deferred because it conflicts with the
   fast-ack queue model. v1.1 uses card-button + `SUBMIT_DIALOG` instead.
+- Outbound file and voice upload is deferred. Google Chat `media.upload`
+  requires user OAuth scopes, while this transport uses service-account app
+  auth (`chat.bot`); `send_file` and `send_voice` return a thread-aware text
+  fallback instead.
 
 ## Example session
 

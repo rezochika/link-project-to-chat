@@ -37,8 +37,8 @@ class _FakeGoogleChatClient:
     Exposes: create_message, update_message, upload_attachment,
     download_attachment (all async). create_message returns a synthetic
     message dict; update_message echoes the name back. upload_attachment
-    returns a synthetic attachmentDataRef and download_attachment writes
-    fake bytes.
+    fails if called because the production app-auth transport must use the
+    text fallback, and download_attachment writes fake bytes.
     """
 
     def __init__(self) -> None:
@@ -75,9 +75,7 @@ class _FakeGoogleChatClient:
         max_bytes=25_000_000,
         display_name=None,
     ) -> dict:
-        if Path(path).stat().st_size > max_bytes:
-            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
-        return {"attachmentDataRef": {"resourceName": f"{space}/attachments/{self._counter + 1}"}}
+        raise AssertionError("Google Chat app-auth transport must not upload outbound files")
 
     async def download_attachment(self, resource_name, destination, *, max_bytes=25_000_000) -> None:
         data = b"fake google chat attachment"
