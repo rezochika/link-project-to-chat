@@ -32,7 +32,7 @@
   Google Chat, and `send_file`/`send_voice` now deliver real files instead of
   fallback text.
 - `auth_audience_type="project_number"` now verifies JWTs against
-  `chat@system.gserviceaccount.com`'s public certs (JWKS).
+  `chat@system.gserviceaccount.com`'s public x509 certs.
 
 ## 1.2.0 — 2026-05-16
 
