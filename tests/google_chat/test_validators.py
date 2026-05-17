@@ -38,6 +38,17 @@ def test_unreadable_service_account_file_rejected(tmp_path):
         validate_google_chat_for_start(cfg)
 
 
+def test_service_account_file_without_read_permission_rejected(tmp_path):
+    cfg = _good(tmp_path)
+    key = Path(cfg.service_account_file)
+    key.chmod(0o000)
+    try:
+        with pytest.raises(GoogleChatStartupError, match="service_account_file|readable"):
+            validate_google_chat_for_start(cfg)
+    finally:
+        key.chmod(0o600)
+
+
 def test_empty_audiences_rejected_when_not_derivable(tmp_path):
     cfg = _good(tmp_path)
     cfg.allowed_audiences = []
@@ -75,6 +86,13 @@ def test_nonpositive_ttl_rejected(tmp_path):
         validate_google_chat_for_start(cfg)
 
 
+def test_nonpositive_pending_prompt_ttl_rejected(tmp_path):
+    cfg = _good(tmp_path)
+    cfg.pending_prompt_ttl_seconds = 0
+    with pytest.raises(GoogleChatStartupError, match="pending_prompt_ttl_seconds"):
+        validate_google_chat_for_start(cfg)
+
+
 def test_nonpositive_max_message_bytes_rejected(tmp_path):
     cfg = _good(tmp_path)
     cfg.max_message_bytes = 0
@@ -85,6 +103,13 @@ def test_nonpositive_max_message_bytes_rejected(tmp_path):
 def test_invalid_port_rejected(tmp_path):
     cfg = _good(tmp_path)
     cfg.port = 70000
+    with pytest.raises(GoogleChatStartupError, match="port"):
+        validate_google_chat_for_start(cfg)
+
+
+def test_negative_port_rejected(tmp_path):
+    cfg = _good(tmp_path)
+    cfg.port = -1
     with pytest.raises(GoogleChatStartupError, match="port"):
         validate_google_chat_for_start(cfg)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 from link_project_to_chat.config import GoogleChatConfig
@@ -25,6 +26,10 @@ def validate_google_chat_for_start(cfg: GoogleChatConfig) -> None:
         )
     path = Path(cfg.service_account_file)
     if not path.is_file():
+        raise GoogleChatStartupError(
+            f"google_chat.service_account_file is not a readable file: {cfg.service_account_file}",
+        )
+    if path.stat().st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH) == 0:
         raise GoogleChatStartupError(
             f"google_chat.service_account_file is not a readable file: {cfg.service_account_file}",
         )
