@@ -795,3 +795,29 @@ async def test_send_typing_is_noop_and_does_not_raise():
     )
     chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
     await transport.send_typing(chat)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_drops_event_when_queue_full(caplog):
+    import asyncio
+
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+    )
+    # Replace the production-sized queue with a tiny one so the overflow
+    # path is reachable from a unit test without flooding 256 puts.
+    transport._pending_events = asyncio.Queue(maxsize=2)
+
+    verified = object()  # opaque; enqueue does not inspect VerifiedGoogleChatRequest shape
+
+    await transport.enqueue_verified_event({"type": "MESSAGE", "i": 1}, verified, headers={})
+    await transport.enqueue_verified_event({"type": "MESSAGE", "i": 2}, verified, headers={})
+    assert transport.pending_event_count == 2
+    assert transport._overflowed_events == 0
+
+    with caplog.at_level("WARNING", logger="link_project_to_chat.google_chat.transport"):
+        await transport.enqueue_verified_event({"type": "MESSAGE", "i": 3}, verified, headers={})
+
+    assert transport.pending_event_count == 2  # queue stayed at maxsize, third event dropped
+    assert transport._overflowed_events == 1
+    assert any("pending-event queue full" in rec.message for rec in caplog.records)

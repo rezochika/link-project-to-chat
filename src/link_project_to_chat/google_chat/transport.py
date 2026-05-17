@@ -43,6 +43,7 @@ PROMPT_TIMEOUT_OPTION = "__timeout__"
 SERVER_START_TIMEOUT_SECONDS = 5.0
 SERVER_STOP_TIMEOUT_SECONDS = 5.0
 EVENT_DRAIN_TIMEOUT_SECONDS = 5.0
+PENDING_EVENT_QUEUE_MAX_SIZE = 256
 
 
 @dataclass
@@ -126,13 +127,15 @@ class GoogleChatTransport:
             handle=None,
             is_bot=True,
         )
-        # Unbounded by design: v1 has no Pub/Sub or persisted-queue layer.
-        # The dispatch loop attached in `start()` (or driven directly by
-        # `inject_message` / `inject_command` in tests) must drain this
-        # faster than events arrive. A bounded queue + overflow policy
-        # is tracked under the Google Chat follow-up list in docs/TODO.md.
-        self._pending_events: asyncio.Queue = asyncio.Queue()
+        # Bounded so an unresponsive consumer can't grow memory without
+        # bound. The dispatch loop attached in `start()` (or driven directly
+        # by `inject_message` / `inject_command` in tests) must drain this
+        # faster than events arrive at sustained load; on overflow the
+        # incoming event is dropped, counted via `_overflowed_events`, and
+        # logged at WARNING.
+        self._pending_events: asyncio.Queue = asyncio.Queue(maxsize=PENDING_EVENT_QUEUE_MAX_SIZE)
         self._fast_ack_timeouts: int = 0
+        self._overflowed_events: int = 0
         self._message_handlers: list = []
         self._command_handlers: dict[str, object] = {}
         self._button_handlers: list = []
@@ -192,11 +195,22 @@ class GoogleChatTransport:
         *,
         headers: dict,
     ) -> None:
-        self._pending_events.put_nowait({"payload": payload, "verified": verified, "headers": headers})
+        try:
+            self._pending_events.put_nowait({"payload": payload, "verified": verified, "headers": headers})
+        except asyncio.QueueFull:
+            self._note_queue_overflow()
 
     def note_fast_ack_timeout(self) -> None:
         self._fast_ack_timeouts += 1
         logger.warning("Google Chat fast-ack budget exceeded; event dropped (total=%d)", self._fast_ack_timeouts)
+
+    def _note_queue_overflow(self) -> None:
+        self._overflowed_events += 1
+        logger.warning(
+            "Google Chat pending-event queue full (maxsize=%d); event dropped (total=%d)",
+            self._pending_events.maxsize,
+            self._overflowed_events,
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -768,6 +782,11 @@ class GoogleChatTransport:
         display_name=None,
         reply_to: MessageRef | None = None,
     ):
+        # `GoogleChatClient.upload_attachment` exists for callers wiring
+        # a user-authenticated HTTP client (see its docstring); under the
+        # default service-account `chat.bot` auth the `media.upload`
+        # endpoint 403s, so v1 surfaces a text fallback instead of
+        # attempting (and failing) the upload.
         file_name = display_name or Path(path).name
         fallback = f"[Google Chat file upload is not available with app authentication: {file_name}]"
         text = f"{caption}\n\n{fallback}" if caption else fallback

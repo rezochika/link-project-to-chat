@@ -125,6 +125,37 @@ def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
     assert fetch_calls == ["fetch"]
 
 
+def test_get_chat_certs_caches_within_ttl_and_refetches_after_expiry(monkeypatch):
+    from link_project_to_chat.google_chat import auth as auth_mod
+
+    fetch_calls = []
+
+    def fake_fetch_certs():
+        fetch_calls.append("fetch")
+        return {"kid1": f"PEM-{len(fetch_calls)}"}
+
+    monkeypatch.setattr(auth_mod, "_CHAT_CERTS_CACHE", None)
+    monkeypatch.setattr(auth_mod, "_fetch_chat_certs", fake_fetch_certs)
+
+    first = auth_mod._get_chat_certs(now=0.0)
+    assert first == {"kid1": "PEM-1"}
+    assert fetch_calls == ["fetch"]
+
+    # Within the TTL window — must hit cache, no new fetch.
+    cached = auth_mod._get_chat_certs(now=auth_mod._CHAT_CERTS_CACHE_TTL_SECONDS - 1.0)
+    assert cached == {"kid1": "PEM-1"}
+    assert fetch_calls == ["fetch"]
+
+    # One second past the TTL — must refetch.
+    refreshed = auth_mod._get_chat_certs(now=auth_mod._CHAT_CERTS_CACHE_TTL_SECONDS + 1.0)
+    assert refreshed == {"kid1": "PEM-2"}
+    assert fetch_calls == ["fetch", "fetch"]
+
+    # Still within the TTL of the new fetch — no more fetches.
+    auth_mod._get_chat_certs(now=auth_mod._CHAT_CERTS_CACHE_TTL_SECONDS + 2.0)
+    assert fetch_calls == ["fetch", "fetch"]
+
+
 def test_decode_chat_jwt_passes_certs_and_audience_to_google_auth(monkeypatch):
     from google.auth import jwt as google_jwt
 
