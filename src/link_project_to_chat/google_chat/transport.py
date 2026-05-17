@@ -496,11 +496,16 @@ class GoogleChatTransport:
                     tempdir = tempfile.TemporaryDirectory(prefix="lptc-google-chat-")
                 original_name = _safe_attachment_name(attachment.get("contentName"))
                 destination = _unique_destination(Path(tempdir.name), original_name, used_names)
-                await self.client.download_attachment(
-                    resource_name,
-                    destination,
-                    max_bytes=self.config.attachment_max_bytes,
-                )
+                try:
+                    await self.client.download_attachment(
+                        resource_name,
+                        destination,
+                        max_bytes=self.config.attachment_max_bytes,
+                    )
+                except Exception:
+                    logger.exception("GoogleChatTransport: attachment download failed")
+                    has_unsupported_media = True
+                    continue
                 files.append(
                     IncomingFile(
                         path=destination,
@@ -514,7 +519,7 @@ class GoogleChatTransport:
                 chat=chat,
                 sender=sender,
                 text=text,
-                files=files,
+                files=[] if has_unsupported_media else files,
                 reply_to=None,
                 message=message,
                 has_unsupported_media=has_unsupported_media,

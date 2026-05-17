@@ -620,6 +620,54 @@ async def test_attachment_data_ref_downloads_into_files():
 
 
 @pytest.mark.asyncio
+async def test_attachment_download_failure_delivers_unsupported_message():
+    class _FakeClient:
+        async def download_attachment(self, resource_name, destination, *, max_bytes):
+            raise ValueError("too large")
+
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=_FakeClient(),
+    )
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg))
+    payload = json.loads((FIXTURES / "attachment_uploaded_content.json").read_text())
+
+    await transport.dispatch_event(payload)
+
+    assert len(seen) == 1
+    assert seen[0].files == []
+    assert seen[0].has_unsupported_media is True
+
+
+@pytest.mark.asyncio
+async def test_mixed_downloadable_and_unsupported_attachment_delivers_no_files():
+    downloaded_paths = []
+
+    class _FakeClient:
+        async def download_attachment(self, resource_name, destination, *, max_bytes):
+            destination.write_bytes(b"downloaded")
+            downloaded_paths.append(destination)
+
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=_FakeClient(),
+    )
+    seen = []
+    transport.on_message(lambda msg: seen.append(msg))
+    payload = json.loads((FIXTURES / "attachment_uploaded_content.json").read_text())
+    payload["message"]["attachment"].append({"driveDataRef": {"driveFileId": "1"}})
+
+    await transport.dispatch_event(payload)
+
+    assert len(seen) == 1
+    assert seen[0].files == []
+    assert seen[0].has_unsupported_media is True
+    assert downloaded_paths
+    assert all(not path.exists() for path in downloaded_paths)
+
+
+@pytest.mark.asyncio
 async def test_on_ready_callbacks_fire_with_self_identity():
     transport = GoogleChatTransport(
         config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
