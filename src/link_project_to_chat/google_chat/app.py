@@ -20,15 +20,16 @@ def create_google_chat_app(transport, request_verifier: Callable | None = None) 
     @app.post(transport.config.endpoint_path)
     async def google_chat_events(request: Request):
         verifier = request_verifier or transport.verify_request
+        headers = dict(request.headers)
         try:
             async with asyncio.timeout(FAST_ACK_BUDGET_SECONDS):
                 try:
-                    verified = verifier(request.headers)
+                    verified = await asyncio.to_thread(verifier, headers)
                 except GoogleChatAuthError as exc:
                     logger.warning("Google Chat request rejected: %s", exc)
                     return JSONResponse({"error": "unauthorized"}, status_code=401)
                 payload = await request.json()
-                await transport.enqueue_verified_event(payload, verified, headers=dict(request.headers))
+                await transport.enqueue_verified_event(payload, verified, headers=headers)
         except TimeoutError:
             # The fast-ack budget was missed. Return 200 so Google Chat
             # does not retry the event (which would risk dupes); the

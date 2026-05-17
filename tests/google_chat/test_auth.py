@@ -123,3 +123,21 @@ def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
     )
     assert again.audience == "123"
     assert fetch_calls == ["fetch"]
+
+
+def test_decode_chat_jwt_passes_certs_and_audience_to_google_auth(monkeypatch):
+    from google.auth import jwt as google_jwt
+
+    from link_project_to_chat.google_chat import auth as auth_mod
+
+    calls = []
+    claims = {"iss": "chat@system.gserviceaccount.com", "aud": "aud"}
+
+    def fake_decode(*args, **kwargs):
+        calls.append((args, kwargs))
+        return claims
+
+    monkeypatch.setattr(google_jwt, "decode", fake_decode)
+
+    assert auth_mod._decode_chat_jwt("token", {"kid": "pem"}, "aud") is claims
+    assert calls == [(("token",), {"certs": {"kid": "pem"}, "audience": "aud"})]

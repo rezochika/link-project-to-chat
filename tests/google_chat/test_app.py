@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -44,4 +45,39 @@ async def test_route_fast_acks_valid_event():
 
     assert response.status_code == 200
     assert response.json() == {}
+    assert transport.pending_event_count == 1
+
+
+@pytest.mark.asyncio
+async def test_route_runs_slow_sync_verification_off_event_loop():
+    transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
+
+    def verifier(headers):
+        time.sleep(0.2)
+        return VerifiedGoogleChatRequest(
+            issuer="https://accounts.google.com",
+            audience="https://x.test/google-chat/events",
+            subject="chat",
+            email="chat@system.gserviceaccount.com",
+            expires_at=1770000000,
+            auth_mode="endpoint_url",
+        )
+
+    app = create_google_chat_app(transport, request_verifier=verifier)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request_task = asyncio.create_task(
+            client.post("/google-chat/events", headers={"authorization": "Bearer ok"}, json={"type": "MESSAGE"})
+        )
+
+        started = time.monotonic()
+        await asyncio.sleep(0.05)
+        sleep_elapsed = time.monotonic() - started
+
+        assert sleep_elapsed < 0.15
+        assert not request_task.done()
+
+        response = await request_task
+
+    assert response.status_code == 200
     assert transport.pending_event_count == 1
