@@ -16,6 +16,8 @@ def _derived_audience(cfg: GoogleChatConfig) -> str | None:
         return None
     if not cfg.public_url or not cfg.endpoint_path:
         return None
+    if not cfg.endpoint_path.startswith("/"):
+        raise GoogleChatStartupError("google_chat.endpoint_path must start with '/'")
     return cfg.public_url.rstrip("/") + cfg.endpoint_path
 
 

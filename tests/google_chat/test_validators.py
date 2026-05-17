@@ -68,6 +68,16 @@ def test_empty_audiences_derived_from_public_url_and_endpoint_path(tmp_path):
     assert cfg.allowed_audiences == ["https://bot.example.test/google-chat/events"]
 
 
+def test_endpoint_path_without_leading_slash_rejected_before_deriving(tmp_path):
+    cfg = _good(tmp_path)
+    cfg.allowed_audiences = []
+    cfg.auth_audience_type = "endpoint_url"
+    cfg.public_url = "https://bot.example.test"
+    cfg.endpoint_path = "google-chat/events"
+    with pytest.raises(GoogleChatStartupError, match="endpoint_path"):
+        validate_google_chat_for_start(cfg)
+
+
 def test_empty_audiences_not_derived_in_project_number_mode(tmp_path):
     cfg = _good(tmp_path)
     cfg.allowed_audiences = []
