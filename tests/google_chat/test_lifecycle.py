@@ -196,6 +196,66 @@ async def test_queue_consumer_drains_events_to_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_start_does_not_dispatch_queued_events_before_on_ready_finishes(tmp_path):
+    cfg = _runnable_cfg(tmp_path)
+    cfg.host = "127.0.0.1"
+    cfg.port = 0
+    transport = GoogleChatTransport(
+        config=cfg,
+        credentials_factory=_fake_credentials_factory,
+        serve=True,
+    )
+    ready_started = asyncio.Event()
+    ready = False
+    seen_ready_values = []
+
+    async def slow_ready(identity):
+        nonlocal ready
+        ready_started.set()
+        await asyncio.sleep(0.05)
+        ready = True
+
+    transport.on_ready(slow_ready)
+    transport.on_message(lambda msg: seen_ready_values.append(ready))
+
+    start_task = asyncio.create_task(transport.start())
+    try:
+        await asyncio.wait_for(ready_started.wait(), timeout=1)
+        verified = VerifiedGoogleChatRequest(
+            issuer="https://accounts.google.com",
+            audience="https://x.test/google-chat/events",
+            subject="chat",
+            email="chat@system.gserviceaccount.com",
+            expires_at=1770000000,
+            auth_mode="endpoint_url",
+        )
+        payload = {
+            "type": "MESSAGE",
+            "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+            "message": {"name": "spaces/AAA/messages/1", "text": "hi"},
+            "user": {"name": "users/111", "displayName": "R"},
+        }
+        await transport.enqueue_verified_event(payload, verified, headers={})
+        await asyncio.sleep(0.02)
+        assert seen_ready_values == []
+
+        await start_task
+        for _ in range(50):
+            if seen_ready_values:
+                break
+            await asyncio.sleep(0.01)
+        assert seen_ready_values == [True]
+    finally:
+        if not start_task.done():
+            start_task.cancel()
+            try:
+                await start_task
+            except asyncio.CancelledError:
+                pass
+        await transport.stop()
+
+
+@pytest.mark.asyncio
 async def test_start_serves_http_endpoint(tmp_path):
     cfg = _runnable_cfg(tmp_path)
     cfg.host = "127.0.0.1"

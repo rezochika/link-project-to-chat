@@ -102,6 +102,7 @@ class GoogleChatTransport:
         self._consumer_task: asyncio.Task | None = None
         self._server_task: asyncio.Task | None = None
         self._uvicorn_server = None
+        self._server_socket: socket.socket | None = None
         self._owns_client = False
         self.self_identity = Identity(
             transport_id="google_chat",
@@ -134,6 +135,10 @@ class GoogleChatTransport:
     @property
     def bound_port(self) -> int:
         """Return the active HTTP port, including the OS-assigned port for 0."""
+        if self._server_socket is not None:
+            sockname = self._server_socket.getsockname()
+            if isinstance(sockname, tuple) and len(sockname) >= 2:
+                return int(sockname[1])
         servers = getattr(self._uvicorn_server, "servers", None)
         if servers:
             for server in servers:
@@ -173,9 +178,12 @@ class GoogleChatTransport:
         from .validators import validate_google_chat_for_start  # noqa: PLC0415
 
         validate_google_chat_for_start(self.config)
+        should_start_server = self._serve and (self._server_task is None or self._server_task.done())
         try:
-            if self._serve and (self._server_task is None or self._server_task.done()):
-                await self._start_server()
+            if should_start_server and self._server_socket is None:
+                # Prove the bind before on_ready, but do not accept HTTP
+                # traffic until callbacks have registered plugins/hooks.
+                self._server_socket = self._bind_server_socket()
             if self.client is None:
                 from .client import GoogleChatClient  # noqa: PLC0415
                 from .credentials import build_google_chat_http_client  # noqa: PLC0415
@@ -186,12 +194,14 @@ class GoogleChatTransport:
                 )
                 self.client = GoogleChatClient(http=self._http)
                 self._owns_client = True
+            await self._fire_on_ready()
             if self._consumer_task is None or self._consumer_task.done():
                 self._consumer_task = asyncio.create_task(
                     self._consume_events(),
                     name="google-chat-consumer",
                 )
-            await self._fire_on_ready()
+            if should_start_server:
+                await self._start_server()
         except BaseException:
             await self._cleanup_after_failed_start()
             raise
@@ -250,7 +260,10 @@ class GoogleChatTransport:
 
         import uvicorn  # noqa: PLC0415
 
-        bound_socket = self._bind_server_socket()
+        bound_socket = self._server_socket
+        if bound_socket is None:
+            bound_socket = self._bind_server_socket()
+        self._server_socket = None
         app = create_google_chat_app(self)
         config = uvicorn.Config(
             app,
@@ -301,6 +314,9 @@ class GoogleChatTransport:
         return RuntimeError(message)
 
     async def _stop_server(self) -> None:
+        if self._server_socket is not None:
+            self._server_socket.close()
+            self._server_socket = None
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         if self._server_task is not None:
