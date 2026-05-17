@@ -7,6 +7,10 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
+_CHAT_CERTS_URL = "https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com"
+_CHAT_CERTS_CACHE_TTL_SECONDS = 3600.0
+_CHAT_CERTS_CACHE: tuple[float, dict] | None = None
+
 
 class GoogleChatAuthError(Exception):
     """Google Chat platform request verification failed."""
@@ -107,9 +111,35 @@ def _default_oidc_verifier(token: str, audience: str) -> dict:
     return _id_token.verify_oauth2_token(token, _grequests.Request(), audience)
 
 
+def _fetch_chat_certs() -> dict:
+    import httpx  # noqa: PLC0415
+
+    with httpx.Client(timeout=10.0) as http:
+        response = http.get(_CHAT_CERTS_URL)
+        response.raise_for_status()
+        return response.json()
+
+
+def _get_chat_certs(*, now: float | None = None) -> dict:
+    global _CHAT_CERTS_CACHE
+    import time  # noqa: PLC0415
+
+    current = time.monotonic() if now is None else now
+    if _CHAT_CERTS_CACHE is not None:
+        fetched_at, certs = _CHAT_CERTS_CACHE
+        if current - fetched_at < _CHAT_CERTS_CACHE_TTL_SECONDS:
+            return certs
+    certs = _fetch_chat_certs()
+    _CHAT_CERTS_CACHE = (current, certs)
+    return certs
+
+
+def _decode_chat_jwt(token: str, certs: dict, audience: str) -> dict:
+    from google.auth import jwt as google_jwt  # noqa: PLC0415
+
+    return google_jwt.decode(token, certs=certs, audience=audience)
+
+
 def _default_chat_jwt_verifier(token: str, audience: str) -> dict:
-    # See https://developers.google.com/workspace/chat/authenticate-authorize-chat-app
-    raise NotImplementedError(
-        "project_number JWT verification requires fetching Google Chat public certs; "
-        "v1 deployments should use endpoint_url mode or inject jwt_verifier"
-    )
+    certs = _get_chat_certs()
+    return _decode_chat_jwt(token, certs, audience)
