@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import httpx
 import pytest
 
 pytest.importorskip("httpx")
@@ -161,5 +162,37 @@ async def test_queue_consumer_drains_events_to_dispatch(tmp_path):
                 break
             await asyncio.sleep(0.01)
         assert seen == ["hi"]
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_serves_http_endpoint(tmp_path):
+    cfg = _runnable_cfg(tmp_path)
+    cfg.host = "127.0.0.1"
+    cfg.port = 0
+
+    def fake_credentials_factory(path, scopes):
+        class _C:
+            token = "fake"
+            valid = True
+
+            def refresh(self, request):
+                pass
+
+        return _C()
+
+    transport = GoogleChatTransport(
+        config=cfg,
+        credentials_factory=fake_credentials_factory,
+        serve=True,
+    )
+
+    await transport.start()
+    try:
+        url = f"http://127.0.0.1:{transport.bound_port}{cfg.endpoint_path}"
+        async with httpx.AsyncClient() as http:
+            response = await http.post(url, json={"type": "MESSAGE"})
+        assert response.status_code == 401
     finally:
         await transport.stop()

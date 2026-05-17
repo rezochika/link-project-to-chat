@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 PROMPT_CANCEL_OPTION = "__cancel__"
 PROMPT_TIMEOUT_OPTION = "__timeout__"
+SERVER_START_TIMEOUT_SECONDS = 5.0
+SERVER_STOP_TIMEOUT_SECONDS = 5.0
+EVENT_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -127,6 +130,19 @@ class GoogleChatTransport:
     def pending_event_count(self) -> int:
         return self._pending_events.qsize()
 
+    @property
+    def bound_port(self) -> int:
+        """Return the active HTTP port, including the OS-assigned port for 0."""
+        servers = getattr(self._uvicorn_server, "servers", None)
+        if servers:
+            for server in servers:
+                sockets = getattr(server, "sockets", None) or []
+                for sock in sockets:
+                    sockname = sock.getsockname()
+                    if isinstance(sockname, tuple) and len(sockname) >= 2:
+                        return int(sockname[1])
+        return int(self.config.port)
+
     def verify_request(self, headers) -> "VerifiedGoogleChatRequest":
         from .auth import verify_google_chat_request  # noqa: PLC0415
 
@@ -172,9 +188,17 @@ class GoogleChatTransport:
                 self._consume_events(),
                 name="google-chat-consumer",
             )
+        if self._serve and (self._server_task is None or self._server_task.done()):
+            await self._start_server()
 
     async def stop(self) -> None:
-        """Fire registered on_stop callbacks then clean up state."""
+        """Stop intake, drain queued work, fire callbacks, and clean up state."""
+        await self._stop_server()
+        if self._consumer_task is not None:
+            try:
+                await asyncio.wait_for(self._pending_events.join(), timeout=EVENT_DRAIN_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning("GoogleChatTransport: timed out draining pending events during stop")
         if self._consumer_task is not None:
             consumer_task = self._consumer_task
             self._consumer_task = None
@@ -198,14 +222,65 @@ class GoogleChatTransport:
             self._owns_client = False
 
     def run(self) -> None:
-        """Synchronous entry point. Google Chat uses HTTP push (no polling loop).
+        """Synchronous entry point for CLI use. Blocks for the transport lifetime."""
+        asyncio.run(self._run_with_lifecycle())
 
-        Production deployments call `start()` directly from the ASGI runner;
-        this method is a protocol stub that satisfies the Transport contract and
-        is used only in test/CLI contexts where the caller needs a blocking call.
-        """
-        import asyncio as _asyncio  # noqa: PLC0415
-        _asyncio.run(self.start())
+    async def _run_with_lifecycle(self) -> None:
+        await self.start()
+        try:
+            if self._server_task is not None:
+                await self._server_task
+            else:
+                await asyncio.Event().wait()
+        finally:
+            await self.stop()
+
+    async def _start_server(self) -> None:
+        from .app import create_google_chat_app  # noqa: PLC0415
+
+        import uvicorn  # noqa: PLC0415
+
+        app = create_google_chat_app(self)
+        config = uvicorn.Config(
+            app,
+            host=self.config.host,
+            port=self.config.port,
+            lifespan="off",
+            log_level="warning",
+        )
+        self._uvicorn_server = uvicorn.Server(config)
+        self._server_task = asyncio.create_task(
+            self._uvicorn_server.serve(),
+            name="google-chat-uvicorn",
+        )
+        try:
+            async with asyncio.timeout(SERVER_START_TIMEOUT_SECONDS):
+                while not self._uvicorn_server.started:
+                    if self._server_task.done():
+                        await self._server_task
+                        raise RuntimeError("Google Chat HTTP server stopped before startup")
+                    await asyncio.sleep(0.01)
+        except TimeoutError as exc:
+            await self._stop_server()
+            raise RuntimeError("Timed out starting Google Chat HTTP server") from exc
+
+    async def _stop_server(self) -> None:
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
+        if self._server_task is not None:
+            server_task = self._server_task
+            self._server_task = None
+            try:
+                await asyncio.wait_for(server_task, timeout=SERVER_STOP_TIMEOUT_SECONDS)
+            except TimeoutError:
+                server_task.cancel()
+                try:
+                    await server_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._uvicorn_server = None
 
     def on_stop(self, callback) -> None:
         self._stop_callbacks.append(callback)
