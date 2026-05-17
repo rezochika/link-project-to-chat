@@ -351,6 +351,24 @@ class RoomBinding:
 
 
 @dataclass
+class GoogleChatConfig:
+    service_account_file: str = ""
+    app_id: str = ""
+    project_number: str = ""
+    auth_audience_type: str = "endpoint_url"
+    allowed_audiences: list[str] = field(default_factory=list)
+    endpoint_path: str = "/google-chat/events"
+    public_url: str = ""
+    host: str = "127.0.0.1"
+    port: int = 8090
+    root_command_name: str = "lp2c"
+    root_command_id: int | None = None
+    callback_token_ttl_seconds: int = 900
+    pending_prompt_ttl_seconds: int = 900
+    max_message_bytes: int = 32_000
+
+
+@dataclass
 class ProjectConfig:
     path: str
     telegram_bot_token: str
@@ -449,6 +467,9 @@ class Config:
     # ``PluginContext.data_dir``. Operators set ``meta_dir`` in config.json
     # to relocate storage to a different volume (e.g. ``/var/lib/lptc/data``).
     meta_dir: Path = field(default_factory=lambda: DEFAULT_META_DIR)
+    # Google Chat transport configuration. Omitted from saved JSON when equal
+    # to the default (all fields at their zero/default values).
+    google_chat: GoogleChatConfig = field(default_factory=GoogleChatConfig)
     # Runtime flag set by load_config when legacy auth fields were read; CLI
     # start uses it to force a save before serving traffic. ``save_config``
     # does not emit this key; ``repr=False, compare=False`` keeps it out of
@@ -691,6 +712,31 @@ def _cleanup_malformed_projects(path: Path, names: list[str]) -> None:
         pass
 
 
+def _is_valid_room_id(transport_id: str, native_id: str) -> bool:
+    """Per-transport shape check for a room binding's native_id.
+
+    Centralises the prefix rules so adding Discord/Slack later updates one
+    place instead of every call site.
+    """
+    if not transport_id or not native_id:
+        return False
+    if transport_id == "google_chat":
+        return native_id.startswith("spaces/")
+    return True
+
+
+def _team_has_room(team: dict) -> bool:
+    """Return True if the team dict has a structured room binding with valid shape."""
+    room = team.get("room")
+    if not isinstance(room, dict):
+        return False
+    transport_id = room.get("transport_id")
+    native_id = room.get("native_id")
+    if not isinstance(transport_id, str) or not isinstance(native_id, str):
+        return False
+    return _is_valid_room_id(transport_id, native_id)
+
+
 def _split_team_entries(
     teams: object,
 ) -> tuple[dict[str, dict], list[tuple[str, list[str]]]]:
@@ -698,7 +744,8 @@ def _split_team_entries(
 
     Returns ``(valid, malformed)`` where ``malformed`` is a list of
     ``(team_name, missing_fields)`` tuples. A team is valid when its raw
-    entry is a dict and contains both ``path`` and ``group_chat_id``.
+    entry is a dict and contains ``path`` AND either ``group_chat_id`` or
+    a structured ``room`` block (transport-portable alternative).
     """
     if not isinstance(teams, dict):
         return {}, []
@@ -709,7 +756,9 @@ def _split_team_entries(
         if not isinstance(team, dict):
             malformed.append((name, ["entry-not-dict"]))
             continue
-        missing = [r for r in ("path", "group_chat_id") if r not in team]
+        has_path = "path" in team
+        has_room_id = "group_chat_id" in team or _team_has_room(team)
+        missing = (["path"] if not has_path else []) + (["group_chat_id or room"] if not has_room_id else [])
         if missing:
             malformed.append((name, missing))
         else:
@@ -745,19 +794,59 @@ def _team_is_configured(raw: dict, team_name: str) -> bool:
     return (
         isinstance(team, dict)
         and "path" in team
-        and "group_chat_id" in team
+        and ("group_chat_id" in team or _team_has_room(team))
     )
 
 
 def _make_room_binding(raw: dict | None) -> RoomBinding | None:
-    """Build a structured room binding from raw config, ignoring malformed rows."""
+    """Build a structured room binding from raw config, ignoring malformed rows.
+
+    For Google Chat entries, the native_id must start with ``spaces/`` — any
+    other shape is silently dropped so the manager can re-derive it.
+    """
     if not raw:
         return None
     transport_id = raw.get("transport_id")
     native_id = raw.get("native_id")
     if not transport_id or not native_id:
         return None
+    if not _is_valid_room_id(str(transport_id), str(native_id)):
+        return None
     return RoomBinding(transport_id=str(transport_id), native_id=str(native_id))
+
+
+def _parse_bot_peer(raw: object) -> "BotPeerRef | None":
+    """Build a BotPeerRef from raw config, with Google Chat shape validation.
+
+    For Google Chat entries, the native_id must start with ``users/`` — any
+    other shape is silently dropped so the manager can re-derive the peer
+    from the next addition response.
+    """
+    if not isinstance(raw, dict):
+        return None
+    transport_id = raw.get("transport_id")
+    native_id = raw.get("native_id")
+    if not isinstance(transport_id, str) or not isinstance(native_id, str):
+        return None
+    if transport_id == "google_chat" and not native_id.startswith("users/"):
+        # Google Chat REST identifies app/bot peers as `users/<id>`.
+        # A malformed entry would cause downstream API calls to 4xx,
+        # so we drop it here and let the manager re-derive the peer
+        # from the next addition response.
+        logger.warning(
+            "dropping malformed bot_peer for transport %r: native_id %r is not a 'users/' path",
+            transport_id,
+            native_id,
+        )
+        return None
+    handle = raw.get("handle")
+    display_name = raw.get("display_name")
+    return BotPeerRef(
+        transport_id=transport_id,
+        native_id=native_id,
+        handle=handle if isinstance(handle, str) else None,
+        display_name=display_name if isinstance(display_name, str) else "",
+    )
 
 
 def _make_team_bot_config(b: dict) -> TeamBotConfig:
@@ -789,11 +878,64 @@ def _make_team_bot_config(b: dict) -> TeamBotConfig:
         model=bot_model,
         effort=bot_effort,
         show_thinking=bot_show_thinking,
+        bot_peer=_parse_bot_peer(b.get("bot_peer")),
         backend=b.get("backend", "claude"),
         backend_state=backend_state,
         context_enabled=bool(b.get("context_enabled", True)),
         context_history_limit=int(b.get("context_history_limit", 10)),
     )
+
+
+def _parse_google_chat(raw: object) -> GoogleChatConfig:
+    if raw is None:
+        return GoogleChatConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("google_chat must be an object")
+    allowed = raw.get("allowed_audiences", [])
+    if not isinstance(allowed, list) or not all(isinstance(v, str) for v in allowed):
+        raise ConfigError("google_chat.allowed_audiences must be a list of strings")
+    auth_type = str(raw.get("auth_audience_type", "endpoint_url"))
+    if auth_type not in {"endpoint_url", "project_number"}:
+        raise ConfigError("google_chat.auth_audience_type must be endpoint_url or project_number")
+    return GoogleChatConfig(
+        service_account_file=str(raw.get("service_account_file", "")),
+        app_id=str(raw.get("app_id", "")),
+        project_number=str(raw.get("project_number", "")),
+        auth_audience_type=auth_type,
+        allowed_audiences=allowed,
+        endpoint_path=str(raw.get("endpoint_path", "/google-chat/events")),
+        public_url=str(raw.get("public_url", "")),
+        host=str(raw.get("host", "127.0.0.1")),
+        port=int(raw.get("port", 8090)),
+        root_command_name=str(raw.get("root_command_name", "lp2c")),
+        root_command_id=None if raw.get("root_command_id") is None else int(raw.get("root_command_id")),
+        callback_token_ttl_seconds=int(raw.get("callback_token_ttl_seconds", 900)),
+        pending_prompt_ttl_seconds=int(raw.get("pending_prompt_ttl_seconds", 900)),
+        max_message_bytes=int(raw.get("max_message_bytes", 32_000)),
+    )
+
+
+def _serialize_google_chat(cfg: GoogleChatConfig) -> dict:
+    return {
+        "service_account_file": cfg.service_account_file,
+        "app_id": cfg.app_id,
+        "project_number": cfg.project_number,
+        "auth_audience_type": cfg.auth_audience_type,
+        "allowed_audiences": list(cfg.allowed_audiences),
+        "endpoint_path": cfg.endpoint_path,
+        "public_url": cfg.public_url,
+        "host": cfg.host,
+        "port": cfg.port,
+        "root_command_name": cfg.root_command_name,
+        "root_command_id": cfg.root_command_id,
+        "callback_token_ttl_seconds": cfg.callback_token_ttl_seconds,
+        "pending_prompt_ttl_seconds": cfg.pending_prompt_ttl_seconds,
+        "max_message_bytes": cfg.max_message_bytes,
+    }
+
+
+def _google_chat_is_default(cfg: GoogleChatConfig) -> bool:
+    return cfg == GoogleChatConfig()
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> Config:
@@ -870,6 +1012,7 @@ def _load_config_unlocked(
         config.tts_backend = raw.get("tts_backend", "")
         config.tts_model = raw.get("tts_model", "tts-1")
         config.tts_voice = raw.get("tts_voice", "alloy")
+        config.google_chat = _parse_google_chat(raw.get("google_chat"))
         config.default_backend = raw.get("default_backend", "claude")
         config.default_model_claude = raw.get(
             "default_model_claude", raw.get("default_model", "")
@@ -971,7 +1114,7 @@ def _load_config_unlocked(
         for name, team in valid_teams.items():
             team_cfg = TeamConfig(
                 path=team["path"],
-                group_chat_id=team["group_chat_id"],
+                group_chat_id=int(team.get("group_chat_id", 0)),
                 room=_make_room_binding(team.get("room")),
                 bots={
                     role: _make_team_bot_config(b)
@@ -1028,6 +1171,13 @@ def _serialize_team_bot(b: "TeamBotConfig") -> dict:
         entry["autostart"] = True
     if b.bot_username:
         entry["bot_username"] = b.bot_username
+    if b.bot_peer is not None:
+        entry["bot_peer"] = {
+            "transport_id": b.bot_peer.transport_id,
+            "native_id": b.bot_peer.native_id,
+            "handle": b.bot_peer.handle,
+            "display_name": b.bot_peer.display_name,
+        }
     if not b.context_enabled:
         entry["context_enabled"] = False
     if b.context_history_limit != 10:
@@ -1095,6 +1245,10 @@ def _save_config_unlocked(config: Config, path: Path) -> None:
         raw["meta_dir"] = str(config.meta_dir)
     else:
         raw.pop("meta_dir", None)
+    if not _google_chat_is_default(config.google_chat):
+        raw["google_chat"] = _serialize_google_chat(config.google_chat)
+    else:
+        raw.pop("google_chat", None)
     raw["manager_telegram_bot_token"] = config.manager_telegram_bot_token
     raw.pop("manager_bot_token", None)  # remove old name if present
     if config.github_pat:
@@ -1399,7 +1553,7 @@ def load_teams(path: Path = DEFAULT_CONFIG) -> dict[str, TeamConfig]:
             return {
                 name: TeamConfig(
                     path=team["path"],
-                    group_chat_id=team["group_chat_id"],
+                    group_chat_id=int(team.get("group_chat_id", 0)),
                     room=_make_room_binding(team.get("room")),
                     bots={
                         role: _make_team_bot_config(b)

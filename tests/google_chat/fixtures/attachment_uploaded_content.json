@@ -1,0 +1,17 @@
+{
+  "type": "MESSAGE",
+  "eventTime": "2026-05-16T00:00:00Z",
+  "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+  "message": {
+    "name": "spaces/AAA/messages/3",
+    "text": "file",
+    "attachment": [
+      {
+        "contentName": "report.txt",
+        "contentType": "text/plain",
+        "attachmentDataRef": {"resourceName": "spaces/AAA/messages/3/attachments/A1"}
+      }
+    ]
+  },
+  "user": {"name": "users/111", "displayName": "R", "email": "r@example.test"}
+}

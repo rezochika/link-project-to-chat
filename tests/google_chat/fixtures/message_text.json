@@ -1,0 +1,7 @@
+{
+  "type": "MESSAGE",
+  "eventTime": "2026-05-16T00:00:00Z",
+  "space": {"name": "spaces/AAA", "spaceType": "GROUP_CHAT"},
+  "message": {"name": "spaces/AAA/messages/1", "text": "hello", "thread": {"name": "spaces/AAA/threads/T1"}},
+  "user": {"name": "users/111", "displayName": "R", "email": "r@example.test"}
+}

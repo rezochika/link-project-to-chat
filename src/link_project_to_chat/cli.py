@@ -454,7 +454,7 @@ def configure(
 @click.option(
     "--transport",
     "transport_kind",
-    type=click.Choice(["telegram", "web"]),
+    type=click.Choice(["telegram", "web", "google_chat"]),
     default="telegram",
     show_default=True,
     help="Which transport to run the bot on.",
@@ -466,6 +466,9 @@ def configure(
     default=8080,
     help="Listen port (web transport only).",
 )
+@click.option("--google-chat-host", default=None, help="Host override for Google Chat transport.")
+@click.option("--google-chat-port", type=int, default=None, help="Port override for Google Chat transport.")
+@click.option("--google-chat-public-url", default=None, help="Public URL override for Google Chat transport.")
 @click.pass_context
 def start(
     ctx,
@@ -483,6 +486,9 @@ def start(
     disallowed_tools: str | None,
     transport_kind: str,
     web_port: int,
+    google_chat_host: str | None,
+    google_chat_port: int | None,
+    google_chat_public_url: str | None,
 ):
     """Start the Telegram bot.
 
@@ -525,6 +531,13 @@ def start(
         return
 
     config = load_config(cfg_path)
+
+    if google_chat_host is not None:
+        config.google_chat.host = google_chat_host
+    if google_chat_port is not None:
+        config.google_chat.port = google_chat_port
+    if google_chat_public_url is not None:
+        config.google_chat.public_url = google_chat_public_url
 
     from .config import resolve_project_allowed_users
 

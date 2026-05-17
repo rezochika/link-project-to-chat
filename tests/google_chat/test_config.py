@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from link_project_to_chat.config import ConfigError, GoogleChatConfig, load_config, save_config
+
+
+def _write(path: Path, raw: dict) -> None:
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+
+def test_missing_google_chat_block_loads_default(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {"projects": {}})
+
+    cfg = load_config(cfg_file)
+
+    assert cfg.google_chat == GoogleChatConfig()
+
+
+def test_google_chat_config_round_trips_non_defaults(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(
+        cfg_file,
+        {
+            "google_chat": {
+                "service_account_file": "/secure/key.json",
+                "app_id": "app-1",
+                "project_number": "123",
+                "auth_audience_type": "project_number",
+                "allowed_audiences": ["123"],
+                "endpoint_path": "/chat",
+                "public_url": "https://chat.example.test",
+                "host": "0.0.0.0",
+                "port": 8099,
+                "root_command_name": "lp2c",
+                "root_command_id": 7,
+                "callback_token_ttl_seconds": 60,
+                "pending_prompt_ttl_seconds": 120,
+                "max_message_bytes": 32000,
+            }
+        },
+    )
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert raw["google_chat"]["project_number"] == "123"
+    assert raw["google_chat"]["root_command_id"] == 7
+
+
+def test_default_google_chat_config_is_omitted_on_save(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {"google_chat": {}})
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert "google_chat" not in raw
+
+
+def test_non_dict_google_chat_is_config_error(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {"google_chat": "bad"})
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_file)
+
+
+def test_invalid_allowed_audiences_is_config_error(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    _write(cfg_file, {"google_chat": {"allowed_audiences": "https://bad"}})
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_file)
+
+
+def test_google_room_only_team_is_not_cleaned_up(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(
+        cfg_file,
+        {
+            "teams": {
+                "alpha": {
+                    "path": str(project),
+                    "room": {"transport_id": "google_chat", "native_id": "spaces/AAA"},
+                    "bots": {},
+                }
+            }
+        },
+    )
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert raw["teams"]["alpha"]["room"]["transport_id"] == "google_chat"
+
+
+def test_google_bot_peer_round_trips(tmp_path: Path):
+    cfg_file = tmp_path / "config.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    _write(
+        cfg_file,
+        {
+            "teams": {
+                "alpha": {
+                    "path": str(project),
+                    "room": {"transport_id": "google_chat", "native_id": "spaces/AAA"},
+                    "bots": {
+                        "worker": {
+                            "bot_peer": {
+                                "transport_id": "google_chat",
+                                "native_id": "users/app-worker",
+                                "handle": None,
+                                "display_name": "Worker",
+                            }
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    cfg = load_config(cfg_file)
+    save_config(cfg, cfg_file)
+    raw = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+    assert raw["teams"]["alpha"]["bots"]["worker"]["bot_peer"]["native_id"] == "users/app-worker"

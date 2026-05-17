@@ -1,0 +1,8 @@
+{
+  "type": "APP_COMMAND",
+  "eventTime": "2026-05-16T00:00:00Z",
+  "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+  "message": {"name": "spaces/AAA/messages/2", "text": "/lp2c help"},
+  "user": {"name": "users/111", "displayName": "R", "email": "r@example.test"},
+  "appCommandMetadata": {"appCommandId": 7, "appCommandType": "SLASH_COMMAND"}
+}
