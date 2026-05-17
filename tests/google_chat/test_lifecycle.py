@@ -5,12 +5,11 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("httpx")
-pytest.importorskip("fastapi")
-pytest.importorskip("uvicorn")
 
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.google_chat.client import GoogleChatClient
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
+from link_project_to_chat.google_chat.validators import GoogleChatStartupError
 
 
 def _runnable_cfg(tmp_path: Path) -> GoogleChatConfig:
@@ -25,28 +24,64 @@ def _runnable_cfg(tmp_path: Path) -> GoogleChatConfig:
     )
 
 
+def _fake_credentials_factory(path, scopes):
+    class _C:
+        token = "fake"
+        valid = True
+
+        def refresh(self, request):
+            pass
+
+    return _C()
+
+
 @pytest.mark.asyncio
 async def test_start_constructs_google_chat_client_when_none_injected(tmp_path):
     cfg = _runnable_cfg(tmp_path)
 
-    def fake_credentials_factory(path, scopes):
-        class _C:
-            token = "fake"
-            valid = True
-
-            def refresh(self, request):
-                pass
-
-        return _C()
-
     transport = GoogleChatTransport(
         config=cfg,
-        credentials_factory=fake_credentials_factory,
+        credentials_factory=_fake_credentials_factory,
         serve=False,
     )
 
     await transport.start()
     try:
         assert isinstance(transport.client, GoogleChatClient)
+    finally:
+        await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_validates_default_config_before_on_ready():
+    transport = GoogleChatTransport(config=GoogleChatConfig(), serve=False)
+    fired = []
+    transport.on_ready(lambda identity: fired.append(identity))
+
+    with pytest.raises(GoogleChatStartupError):
+        await transport.start()
+
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_owned_client_and_later_start_rebuilds(tmp_path):
+    transport = GoogleChatTransport(
+        config=_runnable_cfg(tmp_path),
+        credentials_factory=_fake_credentials_factory,
+        serve=False,
+    )
+
+    await transport.start()
+    first_client = transport.client
+    assert isinstance(first_client, GoogleChatClient)
+
+    await transport.stop()
+    assert transport.client is None
+
+    await transport.start()
+    try:
+        assert isinstance(transport.client, GoogleChatClient)
+        assert transport.client is not first_client
     finally:
         await transport.stop()

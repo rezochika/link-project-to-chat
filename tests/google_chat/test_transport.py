@@ -153,9 +153,16 @@ async def test_on_ready_callbacks_fire_with_self_identity():
 
 
 @pytest.mark.asyncio
-async def test_start_fires_on_ready_callbacks_with_self_identity():
+async def test_start_fires_on_ready_callbacks_with_self_identity(tmp_path):
+    service_account = tmp_path / "key.json"
+    service_account.write_text("{}", encoding="utf-8")
     transport = GoogleChatTransport(
-        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        config=GoogleChatConfig(
+            service_account_file=str(service_account),
+            allowed_audiences=["https://x.test/google-chat/events"],
+            root_command_id=1,
+        ),
+        client=_FakeClient(),
     )
     fired_with = []
     transport.on_ready(lambda identity: fired_with.append(identity))

@@ -98,6 +98,7 @@ class GoogleChatTransport:
         self._consumer_task: asyncio.Task | None = None
         self._server_task: asyncio.Task | None = None
         self._uvicorn_server = None
+        self._owns_client = False
         self.self_identity = Identity(
             transport_id="google_chat",
             native_id="google_chat:app",
@@ -152,17 +153,21 @@ class GoogleChatTransport:
 
     async def start(self) -> None:
         """Prepare outbound Google Chat API access and fire readiness hooks."""
-        if self.client is None and self.config.service_account_file:
+        from .validators import validate_google_chat_for_start  # noqa: PLC0415
+
+        validate_google_chat_for_start(self.config)
+        if self.client is None:
             from .client import GoogleChatClient  # noqa: PLC0415
             from .credentials import build_google_chat_http_client  # noqa: PLC0415
-            from .validators import validate_google_chat_for_start  # noqa: PLC0415
 
-            validate_google_chat_for_start(self.config)
             self._http = build_google_chat_http_client(
                 self.config,
                 credentials_factory=self._credentials_factory,
             )
             self.client = GoogleChatClient(http=self._http)
+            self._owns_client = True
+        else:
+            self._owns_client = False
         await self._fire_on_ready()
 
     async def stop(self) -> None:
@@ -177,6 +182,9 @@ class GoogleChatTransport:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        if self._owns_client:
+            self.client = None
+            self._owns_client = False
 
     def run(self) -> None:
         """Synchronous entry point. Google Chat uses HTTP push (no polling loop).
