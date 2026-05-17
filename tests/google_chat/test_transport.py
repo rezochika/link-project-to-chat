@@ -351,8 +351,16 @@ class _FakeClient:
         self.calls.append({"message_name": message_name, "body": body, "update_mask": update_mask})
         return {"name": message_name}
 
-    async def upload_attachment(self, space, path, *, mime_type=None, max_bytes=25_000_000):
-        self.calls.append({"space": space, "path": path, "mime_type": mime_type, "max_bytes": max_bytes})
+    async def upload_attachment(self, space, path, *, mime_type=None, max_bytes=25_000_000, display_name=None):
+        self.calls.append(
+            {
+                "space": space,
+                "path": path,
+                "mime_type": mime_type,
+                "max_bytes": max_bytes,
+                "display_name": display_name,
+            }
+        )
         return {"attachmentDataRef": {"resourceName": f"{space}/attachments/1"}}
 
 
@@ -547,6 +555,22 @@ async def test_send_voice_preserves_reply_to_thread(tmp_path):
     }
     assert result.native["thread_name"] == "spaces/AAA/threads/T1"
     assert result.native["is_app_created"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_file_passes_display_name_to_upload(tmp_path):
+    fake = _FakeClient()
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=fake,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    path = tmp_path / "tmp-random-name"
+    path.write_bytes(b"content")
+
+    await transport.send_file(chat, path, display_name="report.txt")
+
+    assert fake.calls[0]["display_name"] == "report.txt"
 
 
 @pytest.mark.asyncio

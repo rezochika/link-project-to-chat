@@ -767,6 +767,7 @@ class GoogleChatTransport:
             path,
             mime_type=None,
             max_bytes=self.config.attachment_max_bytes,
+            display_name=display_name,
         )
         body = {"text": caption or "", "attachment": [uploaded]}
         native: dict[str, object] = {}

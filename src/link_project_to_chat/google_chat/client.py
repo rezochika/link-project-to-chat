@@ -47,6 +47,7 @@ class GoogleChatClient:
         *,
         mime_type: str | None,
         max_bytes: int = 25_000_000,
+        display_name: str | None = None,
     ) -> dict:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be > 0")
@@ -54,10 +55,10 @@ class GoogleChatClient:
         if size_bytes > max_bytes:
             raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
 
-        metadata = {"filename": path.name}
+        metadata = {"filename": display_name or path.name}
         with path.open("rb") as fh:
             response = await self._http.post(
-                f"/v1/{space}/attachments:upload",
+                f"/upload/v1/{space}/attachments:upload",
                 params={"uploadType": "multipart"},
                 files={
                     "metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),

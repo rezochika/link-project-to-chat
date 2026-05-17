@@ -66,7 +66,15 @@ class _FakeGoogleChatClient:
     ) -> dict:
         return {"name": message_name}
 
-    async def upload_attachment(self, space, path, *, mime_type=None, max_bytes=25_000_000) -> dict:
+    async def upload_attachment(
+        self,
+        space,
+        path,
+        *,
+        mime_type=None,
+        max_bytes=25_000_000,
+        display_name=None,
+    ) -> dict:
         if Path(path).stat().st_size > max_bytes:
             raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
         return {"attachmentDataRef": {"resourceName": f"{space}/attachments/{self._counter + 1}"}}

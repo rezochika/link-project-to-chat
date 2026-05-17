@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -123,8 +124,25 @@ async def test_upload_attachment_posts_multipart_with_resource_name(fake_httpx, 
     result = await client.upload_attachment("spaces/AAA", src, mime_type="text/plain")
 
     assert result["attachmentDataRef"]["resourceName"] == "spaces/AAA/attachments/X1"
-    assert fake_httpx.calls[0].url == "/v1/spaces/AAA/attachments:upload"
+    assert fake_httpx.calls[0].url == "/upload/v1/spaces/AAA/attachments:upload"
     assert fake_httpx.calls[0].params["uploadType"] == "multipart"
+
+
+@pytest.mark.asyncio
+async def test_upload_attachment_uses_display_name_in_metadata(fake_httpx, tmp_path: Path):
+    src = tmp_path / "tmp-random-name"
+    src.write_bytes(b"fake file bytes")
+    client = GoogleChatClient(http=fake_httpx)
+
+    await client.upload_attachment(
+        "spaces/AAA",
+        src,
+        mime_type="text/plain",
+        display_name="report.txt",
+    )
+
+    metadata = fake_httpx.calls[0].files["metadata"]
+    assert json.loads(metadata[1]) == {"filename": "report.txt"}
 
 
 @pytest.mark.asyncio
