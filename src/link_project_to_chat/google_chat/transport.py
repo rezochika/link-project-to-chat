@@ -540,11 +540,23 @@ class GoogleChatTransport:
                     await result
         elif kind == "prompt":
             prompt_id = verified.get("prompt_id")
-            prompt = self._pending_prompts.get(prompt_id)
-            if prompt is None:
+            pending = self._pending_prompts.get(prompt_id)
+            if pending is None:
                 logger.debug("CARD_CLICKED prompt_id=%r not pending; dropping", prompt_id)
                 return
-            await self.inject_prompt_reply(prompt.prompt, sender=sender, option=value)
+            expected_sender = verified.get("sender")
+            if expected_sender and expected_sender != sender.native_id:
+                logger.warning("CARD_CLICKED prompt sender mismatch; dropping")
+                return
+            if pending.sender is not None and pending.sender.native_id != sender.native_id:
+                logger.warning("CARD_CLICKED pending prompt sender mismatch; dropping")
+                return
+            if pending.expires_at < time.monotonic():
+                self._pending_prompts.pop(prompt_id, None)
+                logger.debug("CARD_CLICKED prompt_id=%r expired; dropping", prompt_id)
+                return
+            self._pending_prompts.pop(prompt_id, None)
+            await self.inject_prompt_reply(pending.prompt, sender=sender, option=value)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

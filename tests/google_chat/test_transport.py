@@ -25,6 +25,13 @@ from link_project_to_chat.transport.base import (
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def _card_click_payload(token: str, *, user: str = "users/111") -> dict:
+    payload = json.loads((FIXTURES / "card_click.json").read_text())
+    payload["user"]["name"] = user
+    payload["action"]["parameters"][0]["value"] = token
+    return payload
+
+
 def test_google_chat_transport_has_expected_identity():
     cfg = GoogleChatConfig(service_account_file="/tmp/key.json", allowed_audiences=["https://x.test/google-chat/events"])
     transport = GoogleChatTransport(config=cfg)
@@ -118,15 +125,150 @@ async def test_card_click_routes_to_button_handler(tmp_path):
 
     token = make_callback_token(
         secret=transport._callback_secret,
-        payload={"space": "spaces/AAA", "sender": "users/1", "kind": "button", "value": "run"},
+        payload={"space": "spaces/AAA", "kind": "button", "value": "run"},
         ttl_seconds=60,
         now=int(time.time()),
     )
-    payload = json.loads((FIXTURES / "card_click.json").read_text())
-    payload["action"]["parameters"][0]["value"] = token
+
+    await transport.dispatch_event(_card_click_payload(token))
+    assert seen == ["run"]
+
+
+@pytest.mark.asyncio
+async def test_card_click_prompt_rejects_wrong_sender():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            callback_token_ttl_seconds=60,
+        ),
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission))
+
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="confirm", title="Confirm", body="Continue?", kind=PromptKind.CONFIRM),
+    )
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "sender": "users/222",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+            "value": "yes",
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+
+    await transport.dispatch_event(_card_click_payload(token, user="users/111"))
+
+    assert seen == []
+    assert prompt.native_id in transport._pending_prompts
+
+    prompt_without_token_sender = await transport.open_prompt(
+        chat,
+        PromptSpec(key="confirm2", title="Confirm", body="Continue?", kind=PromptKind.CONFIRM),
+    )
+    transport._pending_prompts[prompt_without_token_sender.native_id].sender = Identity(
+        "google_chat",
+        "users/222",
+        "Expected",
+        None,
+        False,
+    )
+    token_without_sender = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "kind": "prompt",
+            "prompt_id": prompt_without_token_sender.native_id,
+            "value": "yes",
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+
+    await transport.dispatch_event(_card_click_payload(token_without_sender, user="users/111"))
+
+    assert seen == []
+    assert prompt_without_token_sender.native_id in transport._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_card_click_prompt_drops_expired_pending_prompt():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            callback_token_ttl_seconds=60,
+        ),
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission))
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="confirm", title="Confirm", body="Continue?", kind=PromptKind.CONFIRM),
+    )
+    transport._pending_prompts[prompt.native_id].expires_at = time.monotonic() - 1
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "sender": "users/111",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+            "value": "yes",
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+
+    await transport.dispatch_event(_card_click_payload(token))
+
+    assert seen == []
+    assert prompt.native_id not in transport._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_card_click_prompt_consumes_pending_prompt_before_dispatch():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            callback_token_ttl_seconds=60,
+        ),
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission.option))
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="confirm", title="Confirm", body="Continue?", kind=PromptKind.CONFIRM),
+    )
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "sender": "users/111",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+            "value": "yes",
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+    payload = _card_click_payload(token)
 
     await transport.dispatch_event(payload)
-    assert seen == ["run"]
+    await transport.dispatch_event(payload)
+
+    assert seen == ["yes"]
+    assert prompt.native_id not in transport._pending_prompts
 
 
 class _FakeClient:
