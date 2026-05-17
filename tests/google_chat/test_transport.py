@@ -137,3 +137,25 @@ async def test_uploaded_content_attachment_also_sets_unsupported_media():
     await transport.dispatch_event(payload)
 
     assert seen[0].has_unsupported_media is True
+
+
+@pytest.mark.asyncio
+async def test_on_ready_callbacks_fire_with_self_identity():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+    )
+    fired_with = []
+    transport.on_ready(lambda identity: fired_with.append(identity))
+
+    await transport._fire_on_ready()
+
+    assert fired_with == [transport.self_identity]
+
+
+@pytest.mark.asyncio
+async def test_send_typing_is_noop_and_does_not_raise():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    await transport.send_typing(chat)

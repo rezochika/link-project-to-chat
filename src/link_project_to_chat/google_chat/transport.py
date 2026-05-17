@@ -109,6 +109,7 @@ class GoogleChatTransport:
         self._command_handlers: dict[str, object] = {}
         self._button_handlers: list = []
         self._stop_callbacks: list = []
+        self._on_ready_callbacks: list = []
         self._authorizer = None
         self._pending_prompts: dict[str, PendingPrompt] = {}
         self._prompt_submit_handlers: list = []
@@ -167,6 +168,18 @@ class GoogleChatTransport:
 
     def on_stop(self, callback) -> None:
         self._stop_callbacks.append(callback)
+
+    def on_ready(self, callback) -> None:
+        self._on_ready_callbacks.append(callback)
+
+    async def _fire_on_ready(self) -> None:
+        for cb in self._on_ready_callbacks:
+            try:
+                result = cb(self.self_identity)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("GoogleChatTransport: on_ready callback raised")
 
     # ── Inbound registration ──────────────────────────────────────────────
 
@@ -283,6 +296,12 @@ class GoogleChatTransport:
         return text
 
     # ── Outbound ──────────────────────────────────────────────────────────
+
+    async def send_typing(self, chat: ChatRef) -> None:
+        # Google Chat REST has no typing-indicator endpoint. Implementing as a
+        # no-op satisfies the Transport protocol so `ProjectBot._on_task_started`
+        # doesn't spam best-effort failures.
+        return None
 
     async def send_text(
         self,
