@@ -98,6 +98,11 @@ class GoogleChatTransport:
             handle=None,
             is_bot=True,
         )
+        # Unbounded by design: v1 has no Pub/Sub or persisted-queue layer.
+        # The dispatch loop attached in `start()` (or driven directly by
+        # `inject_message` / `inject_command` in tests) must drain this
+        # faster than events arrive. A bounded queue + overflow policy
+        # is tracked under the Google Chat follow-up list in docs/TODO.md.
         self._pending_events: asyncio.Queue = asyncio.Queue()
         self._fast_ack_timeouts: int = 0
         self._message_handlers: list = []
@@ -290,6 +295,15 @@ class GoogleChatTransport:
     ) -> MessageRef:
         rendered = self.render_markdown(text) if html else text
         self._check_message_bytes(rendered)
+        if buttons is not None:
+            # Card rendering exists in `cards.build_buttons_card` but is not
+            # wired into the production send path yet — the inbound
+            # `CARD_CLICKED` dispatch is still a v1 deferred item. Warning
+            # rather than silently dropping so a caller learns the limit
+            # without a surprising no-button UI.
+            logger.warning(
+                "GoogleChatTransport.send_text: buttons argument is not yet wired; ignored",
+            )
         request_id = self._new_request_id()
         body = {"text": rendered}
         native: dict[str, object] = {}

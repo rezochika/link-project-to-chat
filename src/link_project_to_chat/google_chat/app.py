@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .auth import GoogleChatAuthError
+
+logger = logging.getLogger(__name__)
 
 FAST_ACK_BUDGET_SECONDS = 2.0
 
@@ -21,7 +24,8 @@ def create_google_chat_app(transport, request_verifier: Callable | None = None) 
             async with asyncio.timeout(FAST_ACK_BUDGET_SECONDS):
                 try:
                     verified = verifier(request.headers)
-                except GoogleChatAuthError:
+                except GoogleChatAuthError as exc:
+                    logger.warning("Google Chat request rejected: %s", exc)
                     return JSONResponse({"error": "unauthorized"}, status_code=401)
                 payload = await request.json()
                 await transport.enqueue_verified_event(payload, verified, headers=dict(request.headers))
