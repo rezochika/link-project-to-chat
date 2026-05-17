@@ -735,11 +735,27 @@ class GoogleChatTransport:
         msg = self._pending_prompt_messages.get(prompt.native_id)
         if msg is None:
             return
-        if spec.kind is PromptKind.DISPLAY or self.client is None:
+        pending = self._pending_prompts.get(prompt.native_id)
+        was_posted_with_cards = pending is not None and pending.kind is not PromptKind.DISPLAY
+        if self.client is None:
+            return
+        if spec.kind is PromptKind.DISPLAY and not was_posted_with_cards:
             await self.edit_text(msg, spec.body)
+            if pending is not None:
+                pending.kind = spec.kind
+            return
+        if spec.kind is PromptKind.DISPLAY:
+            self._check_message_bytes(spec.body)
+            await self.client.update_message(
+                msg.native_id,
+                {"text": spec.body, "cardsV2": []},
+                update_mask="text,cardsV2",
+                allow_missing=False,
+            )
+            if pending is not None:
+                pending.kind = spec.kind
             return
 
-        pending = self._pending_prompts.get(prompt.native_id)
         expected_sender_native_id = pending.sender.native_id if pending and pending.sender is not None else None
         body = self._build_prompt_message_body(
             prompt_id=prompt.native_id,
@@ -754,6 +770,8 @@ class GoogleChatTransport:
             update_mask="text,cardsV2",
             allow_missing=False,
         )
+        if pending is not None:
+            pending.kind = spec.kind
 
     def _build_prompt_message_body(
         self,

@@ -334,6 +334,31 @@ async def test_update_prompt_edits_pending_prompt_message():
 
 
 @pytest.mark.asyncio
+async def test_update_prompt_clears_cards_when_interactive_prompt_becomes_display():
+    fake = _FakeClient()
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=fake,
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="name", title="Name", body="Enter name", kind=PromptKind.TEXT),
+    )
+    await transport.update_prompt(
+        prompt,
+        PromptSpec(key="name", title="Name", body="Name saved", kind=PromptKind.DISPLAY),
+    )
+
+    update = fake.calls[-1]
+    assert update["message_name"] == "spaces/AAA/messages/1"
+    assert update["body"] == {"text": "Name saved", "cardsV2": []}
+    assert update["update_mask"] == "text,cardsV2"
+
+
+@pytest.mark.asyncio
 async def test_dialog_submit_routes_to_prompt_submit_handler():
     transport = GoogleChatTransport(
         config=GoogleChatConfig(
