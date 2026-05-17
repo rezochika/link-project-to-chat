@@ -582,6 +582,44 @@ async def test_uploaded_content_attachment_also_sets_unsupported_media():
 
 
 @pytest.mark.asyncio
+async def test_attachment_data_ref_downloads_into_files():
+    class _FakeClient:
+        async def download_attachment(self, resource_name, destination, *, max_bytes):
+            assert resource_name == "spaces/AAA/messages/3/attachments/A1"
+            assert destination.name == "report.txt"
+            assert max_bytes == 123
+            destination.write_bytes(b"downloaded")
+
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            attachment_max_bytes=123,
+        ),
+        client=_FakeClient(),
+    )
+    seen = []
+    captured_path = None
+
+    def handler(msg):
+        nonlocal captured_path
+        seen.append(msg)
+        captured_path = msg.files[0].path
+        assert msg.files[0].path.read_bytes() == b"downloaded"
+
+    transport.on_message(handler)
+    payload = json.loads((FIXTURES / "attachment_uploaded_content.json").read_text())
+
+    await transport.dispatch_event(payload)
+
+    assert seen[0].has_unsupported_media is False
+    assert seen[0].files[0].original_name == "report.txt"
+    assert seen[0].files[0].mime_type == "text/plain"
+    assert seen[0].files[0].size_bytes == len(b"downloaded")
+    assert captured_path is not None
+    assert not captured_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_on_ready_callbacks_fire_with_self_identity():
     transport = GoogleChatTransport(
         config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),

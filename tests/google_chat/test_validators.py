@@ -152,5 +152,12 @@ def test_project_number_mode_requires_project_number(tmp_path):
         validate_google_chat_for_start(cfg)
 
 
+def test_nonpositive_attachment_max_bytes_rejected(tmp_path):
+    cfg = _good(tmp_path)
+    cfg.attachment_max_bytes = 0
+    with pytest.raises(GoogleChatStartupError, match="attachment_max_bytes"):
+        validate_google_chat_for_start(cfg)
+
+
 def test_valid_config_passes(tmp_path):
     validate_google_chat_for_start(_good(tmp_path))

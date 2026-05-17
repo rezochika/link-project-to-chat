@@ -42,5 +42,28 @@ class GoogleChatClient:
     async def upload_attachment(self, space: str, path: Path, *, mime_type: str | None) -> dict:
         raise NotImplementedError("Google Chat upload support lands in Task 11")
 
-    async def download_attachment(self, resource_name: str, destination: Path) -> None:
-        raise NotImplementedError("Google Chat download support lands in Task 11")
+    async def download_attachment(
+        self,
+        resource_name: str,
+        destination: Path,
+        *,
+        max_bytes: int = 25_000_000,
+    ) -> None:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be > 0")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        try:
+            async with self._http.stream("GET", f"/v1/media/{resource_name}?alt=media") as response:
+                if hasattr(response, "raise_for_status"):
+                    response.raise_for_status()
+                with destination.open("wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+                        fh.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise

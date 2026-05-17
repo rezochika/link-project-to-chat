@@ -7,10 +7,12 @@ import json
 import logging
 import secrets
 import socket
+import tempfile
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -21,6 +23,7 @@ from link_project_to_chat.transport.base import (
     ChatRef,
     CommandInvocation,
     Identity,
+    IncomingFile,
     IncomingMessage,
     MessageRef,
     PromptKind,
@@ -67,17 +70,24 @@ def _identity_from_user(user: dict) -> Identity:
     )
 
 
-def _has_unsupported_attachment(message_data: dict) -> bool:
-    """Return True if any attachment in the message cannot be delivered in v1.
+def _safe_attachment_name(content_name: object, *, fallback: str = "attachment") -> str:
+    raw_name = str(content_name or fallback).replace("\\", "/")
+    leaf = raw_name.rsplit("/", 1)[-1].strip()
+    if leaf in {"", ".", ".."}:
+        return fallback
+    return leaf
 
-    - driveDataRef: requires OAuth Drive scopes not provisioned in v1.
-    - attachmentDataRef: download_attachment is NotImplementedError in v1.
-    Any non-empty attachment list is conservatively flagged as unsupported.
-    """
-    for attachment in message_data.get("attachment", []):
-        if "driveDataRef" in attachment or "attachmentDataRef" in attachment:
-            return True
-    return False
+
+def _unique_destination(directory: Path, name: str, used_names: set[str]) -> Path:
+    candidate = name
+    stem = Path(name).stem or "attachment"
+    suffix = Path(name).suffix
+    counter = 1
+    while candidate in used_names:
+        candidate = f"{stem}-{counter}{suffix}"
+        counter += 1
+    used_names.add(candidate)
+    return directory / candidate
 
 
 class GoogleChatTransport:
@@ -470,20 +480,52 @@ class GoogleChatTransport:
             chat,
             native={"thread_name": thread_name} if thread_name else {},
         )
-        has_unsupported_media = _has_unsupported_attachment(message_data)
-        msg = IncomingMessage(
-            chat=chat,
-            sender=sender,
-            text=text,
-            files=[],
-            reply_to=None,
-            message=message,
-            has_unsupported_media=has_unsupported_media,
-        )
-        for handler in self._message_handlers:
-            result = handler(msg)
-            if inspect.isawaitable(result):
-                await result
+        tempdir: tempfile.TemporaryDirectory | None = None
+        try:
+            files: list[IncomingFile] = []
+            has_unsupported_media = False
+            used_names: set[str] = set()
+            for attachment in message_data.get("attachment", []):
+                data_ref = attachment.get("attachmentDataRef")
+                resource_name = data_ref.get("resourceName") if isinstance(data_ref, dict) else None
+                if "driveDataRef" in attachment or not resource_name or self.client is None:
+                    has_unsupported_media = True
+                    continue
+
+                if tempdir is None:
+                    tempdir = tempfile.TemporaryDirectory(prefix="lptc-google-chat-")
+                original_name = _safe_attachment_name(attachment.get("contentName"))
+                destination = _unique_destination(Path(tempdir.name), original_name, used_names)
+                await self.client.download_attachment(
+                    resource_name,
+                    destination,
+                    max_bytes=self.config.attachment_max_bytes,
+                )
+                files.append(
+                    IncomingFile(
+                        path=destination,
+                        original_name=original_name,
+                        mime_type=attachment.get("contentType"),
+                        size_bytes=destination.stat().st_size,
+                    ),
+                )
+
+            msg = IncomingMessage(
+                chat=chat,
+                sender=sender,
+                text=text,
+                files=files,
+                reply_to=None,
+                message=message,
+                has_unsupported_media=has_unsupported_media,
+            )
+            for handler in self._message_handlers:
+                result = handler(msg)
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            if tempdir is not None:
+                tempdir.cleanup()
 
     async def _dispatch_app_command(self, payload: dict) -> None:
         app_command_id = payload["appCommandMetadata"]["appCommandId"]

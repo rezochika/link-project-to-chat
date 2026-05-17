@@ -54,6 +54,8 @@ def validate_google_chat_for_start(cfg: GoogleChatConfig) -> None:
         raise GoogleChatStartupError("google_chat.pending_prompt_ttl_seconds must be > 0")
     if cfg.max_message_bytes <= 0:
         raise GoogleChatStartupError("google_chat.max_message_bytes must be > 0")
+    if cfg.attachment_max_bytes <= 0:
+        raise GoogleChatStartupError("google_chat.attachment_max_bytes must be > 0")
 
     if cfg.port < 0 or cfg.port > 65535:
         raise GoogleChatStartupError(f"google_chat.port must be in 0..65535 (got {cfg.port})")
