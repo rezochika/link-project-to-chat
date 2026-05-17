@@ -7,7 +7,17 @@ import pytest
 
 from link_project_to_chat.config import Config, GoogleChatConfig
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
-from link_project_to_chat.transport.base import ChatKind, ChatRef, Identity, MessageRef, PromptKind, PromptSpec
+from link_project_to_chat.transport.base import (
+    Button,
+    ButtonStyle,
+    Buttons,
+    ChatKind,
+    ChatRef,
+    Identity,
+    MessageRef,
+    PromptKind,
+    PromptSpec,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -126,6 +136,34 @@ async def test_send_text_preserves_thread_name_in_reply_to_native():
 
     assert fake.calls[0]["thread_name"] == "spaces/AAA/threads/T1"
     assert result.native["thread_name"] == "spaces/AAA/threads/T1"
+
+
+@pytest.mark.asyncio
+async def test_send_text_with_buttons_includes_cards_v2(tmp_path):
+    sa = tmp_path / "key.json"
+    sa.write_text("{}", encoding="utf-8")
+
+    captured = {}
+
+    class _FakeClient:
+        async def create_message(self, space, body, *, thread_name=None, request_id=None, message_reply_option=None):
+            captured["body"] = body
+            return {"name": f"{space}/messages/1"}
+
+    cfg = GoogleChatConfig(
+        service_account_file=str(sa),
+        allowed_audiences=["https://x.test/google-chat/events"],
+        root_command_id=1,
+    )
+    transport = GoogleChatTransport(config=cfg, client=_FakeClient(), serve=False)
+
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM)
+    buttons = Buttons(rows=[[Button("Run", "run", ButtonStyle.PRIMARY)]])
+    await transport.send_text(chat, "hi", buttons=buttons)
+
+    assert captured["body"]["text"] == "hi"
+    assert captured["body"]["cardsV2"][0]["cardId"] == "lp2c-buttons"
+    assert "cardsV2" not in captured["body"]["cardsV2"][0]
 
 
 @pytest.mark.asyncio

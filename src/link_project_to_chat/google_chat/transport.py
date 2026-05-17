@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import secrets
 import socket
 import time
 from collections.abc import Callable
@@ -127,6 +128,7 @@ class GoogleChatTransport:
         self._pending_prompts: dict[str, PendingPrompt] = {}
         self._prompt_submit_handlers: list = []
         self._prompt_seq: int = 0
+        self._callback_secret: bytes = secrets.token_bytes(32)
 
     @property
     def pending_event_count(self) -> int:
@@ -516,17 +518,22 @@ class GoogleChatTransport:
     ) -> MessageRef:
         rendered = self.render_markdown(text) if html else text
         self._check_message_bytes(rendered)
-        if buttons is not None:
-            # Card rendering exists in `cards.build_buttons_card` but is not
-            # wired into the production send path yet — the inbound
-            # `CARD_CLICKED` dispatch is still a v1 deferred item. Warning
-            # rather than silently dropping so a caller learns the limit
-            # without a surprising no-button UI.
-            logger.warning(
-                "GoogleChatTransport.send_text: buttons argument is not yet wired; ignored",
-            )
         request_id = self._new_request_id()
         body = {"text": rendered}
+        if buttons is not None:
+            from .cards import build_buttons_card  # noqa: PLC0415
+
+            body.update(
+                build_buttons_card(
+                    buttons,
+                    secret=self._callback_secret,
+                    space=chat.native_id,
+                    sender="",
+                    message=request_id,
+                    now=int(time.time()),
+                    ttl_seconds=self.config.callback_token_ttl_seconds,
+                )
+            )
         native: dict[str, object] = {}
         if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
             native["thread_name"] = reply_to.native["thread_name"]
