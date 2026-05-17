@@ -59,6 +59,39 @@ async def test_command_event_uses_configured_root_command_id():
     assert seen[0].args == []
 
 
+@pytest.mark.asyncio
+async def test_app_command_runs_authorizer_and_drops_unauthorized():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            root_command_id=7,
+            allowed_audiences=["https://x.test/google-chat/events"],
+        ),
+    )
+    transport.set_authorizer(lambda identity: False)
+
+    fired = []
+    transport.on_command("help", lambda cmd: fired.append(cmd))
+
+    payload = json.loads((FIXTURES / "app_command_help.json").read_text())
+    await transport.dispatch_event(payload)
+
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_app_command_dropped_when_root_command_id_unset():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+    )
+    fired = []
+    transport.on_command("help", lambda cmd: fired.append(cmd))
+
+    payload = json.loads((FIXTURES / "app_command_help.json").read_text())
+    await transport.dispatch_event(payload)
+
+    assert fired == []
+
+
 class _FakeClient:
     def __init__(self):
         self.calls = []

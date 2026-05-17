@@ -436,7 +436,7 @@ class GoogleChatTransport:
 
     async def _dispatch_app_command(self, payload: dict) -> None:
         app_command_id = payload["appCommandMetadata"]["appCommandId"]
-        if app_command_id != self.config.root_command_id:
+        if self.config.root_command_id is None or app_command_id != self.config.root_command_id:
             logger.debug(
                 "GoogleChatTransport: ignoring appCommandId=%d (root_command_id=%s)",
                 app_command_id,
@@ -446,6 +446,13 @@ class GoogleChatTransport:
 
         chat = _chat_from_space(payload["space"])
         sender = _identity_from_user(payload["user"])
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
+
         message_data = payload["message"]
         raw_text = message_data.get("text", "")
         thread_name = message_data.get("thread", {}).get("name")
