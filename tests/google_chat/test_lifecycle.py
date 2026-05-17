@@ -14,6 +14,7 @@ from link_project_to_chat.google_chat.auth import VerifiedGoogleChatRequest
 from link_project_to_chat.google_chat.client import GoogleChatClient
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
 from link_project_to_chat.google_chat.validators import GoogleChatStartupError
+from link_project_to_chat.transport.base import ChatKind, ChatRef
 
 
 def _runnable_cfg(tmp_path: Path) -> GoogleChatConfig:
@@ -37,6 +38,33 @@ def _fake_credentials_factory(path, scopes):
             pass
 
     return _C()
+
+
+class _FinalSendClient:
+    def __init__(self):
+        self.closed = False
+        self.calls = []
+
+    async def create_message(self, space, body, *, thread_name=None, request_id=None, message_reply_option=None):
+        if self.closed:
+            raise RuntimeError("client already closed")
+        self.calls.append(
+            {
+                "space": space,
+                "body": body,
+                "thread_name": thread_name,
+                "request_id": request_id,
+            }
+        )
+        return {"name": f"{space}/messages/final"}
+
+
+class _FinalSendHttp:
+    def __init__(self, client: _FinalSendClient):
+        self._client = client
+
+    async def aclose(self):
+        self._client.closed = True
 
 
 @pytest.mark.asyncio
@@ -232,3 +260,36 @@ async def test_start_port_conflict_cleans_up_partial_startup(tmp_path):
         assert transport._uvicorn_server is None
     finally:
         listener.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_allows_on_stop_callback_to_send_before_client_close(tmp_path):
+    cfg = _runnable_cfg(tmp_path)
+    cfg.host = "127.0.0.1"
+    cfg.port = 0
+    client = _FinalSendClient()
+    transport = GoogleChatTransport(config=cfg, client=client, serve=True)
+    transport._http = _FinalSendHttp(client)
+    transport._owns_client = True
+    callback_seen = []
+
+    async def final_send():
+        callback_seen.append(transport._uvicorn_server is None)
+        await transport.send_text(
+            ChatRef("google_chat", "spaces/AAA", ChatKind.ROOM),
+            "final shutdown message",
+        )
+
+    transport.on_stop(final_send)
+
+    await transport.start()
+    await transport.stop()
+
+    assert callback_seen == [True]
+    assert len(client.calls) == 1
+    assert client.calls[0]["space"] == "spaces/AAA"
+    assert client.calls[0]["body"] == {"text": "final shutdown message"}
+    assert client.calls[0]["thread_name"] is None
+    assert client.calls[0]["request_id"].startswith("lp2c-")
+    assert client.closed is True
+    assert transport.client is None

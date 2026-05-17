@@ -197,7 +197,12 @@ class GoogleChatTransport:
             raise
 
     async def stop(self) -> None:
-        """Stop intake, drain queued work, fire callbacks, and clean up state."""
+        """Stop intake, drain queued work, fire callbacks, and clean up state.
+
+        Google Chat shuts down HTTP intake before plugin callbacks so no new
+        inbound events arrive during shutdown. Outbound REST resources stay
+        alive until after callbacks so plugins can send final messages.
+        """
         await self._stop_server()
         if self._consumer_task is not None:
             try:
