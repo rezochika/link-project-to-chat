@@ -127,6 +127,7 @@ class GoogleChatTransport:
         self._on_ready_callbacks: list = []
         self._authorizer = None
         self._pending_prompts: dict[str, PendingPrompt] = {}
+        self._pending_prompt_messages: dict[str, MessageRef] = {}
         self._prompt_submit_handlers: list = []
         self._prompt_seq: int = 0
         self._callback_secret: bytes = secrets.token_bytes(32)
@@ -501,6 +502,10 @@ class GoogleChatTransport:
 
         action = payload.get("action", {})
         params = {param.get("key"): param.get("value") for param in action.get("parameters", [])}
+        common = payload.get("common", {})
+        common_params = common.get("parameters", {})
+        if isinstance(common_params, dict):
+            params.update(common_params)
         token = params.get("callback_token")
         if not token:
             logger.warning("CARD_CLICKED missing callback_token; dropping")
@@ -553,10 +558,17 @@ class GoogleChatTransport:
                 return
             if pending.expires_at < time.monotonic():
                 self._pending_prompts.pop(prompt_id, None)
+                self._pending_prompt_messages.pop(prompt_id, None)
                 logger.debug("CARD_CLICKED prompt_id=%r expired; dropping", prompt_id)
                 return
             self._pending_prompts.pop(prompt_id, None)
-            await self.inject_prompt_reply(pending.prompt, sender=sender, option=value)
+            self._pending_prompt_messages.pop(prompt_id, None)
+            form_field = params.get("form_field")
+            if form_field:
+                text = self._extract_form_input(payload, form_field)
+                await self.inject_prompt_reply(pending.prompt, sender=sender, text=text)
+            else:
+                await self.inject_prompt_reply(pending.prompt, sender=sender, option=value)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -572,6 +584,18 @@ class GoogleChatTransport:
 
     def render_markdown(self, text: str) -> str:
         return text
+
+    def _extract_form_input(self, payload: dict, form_field: str) -> str:
+        value = (
+            payload.get("common", {})
+            .get("formInputs", {})
+            .get(form_field, {})
+            .get("stringInputs", {})
+            .get("value", [])
+        )
+        if not value:
+            return ""
+        return str(value[0])
 
     # ── Outbound ──────────────────────────────────────────────────────────
 
@@ -657,6 +681,7 @@ class GoogleChatTransport:
         spec: PromptSpec,
         *,
         reply_to: MessageRef | None = None,
+        expected_sender_native_id: str | None = None,
     ) -> PromptRef:
         prompt_id = f"p-{self._prompt_seq}"
         self._prompt_seq += 1
@@ -670,17 +695,89 @@ class GoogleChatTransport:
         self._pending_prompts[prompt_id] = PendingPrompt(
             prompt=ref,
             chat=chat,
-            sender=None,
+            sender=(
+                Identity("google_chat", expected_sender_native_id, expected_sender_native_id, None, False)
+                if expected_sender_native_id is not None
+                else None
+            ),
             kind=spec.kind,
             expires_at=expires_at,
         )
-        # Post the question as a plain message when a client is available.
-        if self.client is not None:
-            await self.send_text(chat, spec.body, reply_to=reply_to)
+        if self.client is None:
+            return ref
+        if spec.kind is PromptKind.DISPLAY:
+            self._pending_prompt_messages[prompt_id] = await self.send_text(chat, spec.body, reply_to=reply_to)
+            return ref
+
+        request_id = self._new_request_id()
+        body = self._build_prompt_message_body(
+            prompt_id=prompt_id,
+            spec=spec,
+            chat=chat,
+            expected_sender_native_id=expected_sender_native_id,
+        )
+        native: dict[str, object] = {}
+        if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
+            native["thread_name"] = reply_to.native["thread_name"]
+        result = await self.client.create_message(
+            chat.native_id,
+            body,
+            thread_name=native.get("thread_name"),
+            request_id=request_id,
+        )
+        native["request_id"] = request_id
+        native["message_name"] = result["name"]
+        native["is_app_created"] = True
+        self._pending_prompt_messages[prompt_id] = MessageRef("google_chat", result["name"], chat, native=native)
         return ref
 
     async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
-        raise NotImplementedError("update_prompt not yet implemented for GoogleChatTransport")
+        msg = self._pending_prompt_messages.get(prompt.native_id)
+        if msg is None:
+            return
+        if spec.kind is PromptKind.DISPLAY or self.client is None:
+            await self.edit_text(msg, spec.body)
+            return
+
+        pending = self._pending_prompts.get(prompt.native_id)
+        expected_sender_native_id = pending.sender.native_id if pending and pending.sender is not None else None
+        body = self._build_prompt_message_body(
+            prompt_id=prompt.native_id,
+            spec=spec,
+            chat=prompt.chat,
+            expected_sender_native_id=expected_sender_native_id,
+        )
+        self._check_message_bytes(body["text"])
+        await self.client.update_message(
+            msg.native_id,
+            body,
+            update_mask="text,cardsV2",
+            allow_missing=False,
+        )
+
+    def _build_prompt_message_body(
+        self,
+        *,
+        prompt_id: str,
+        spec: PromptSpec,
+        chat: ChatRef,
+        expected_sender_native_id: str | None,
+    ) -> dict:
+        from .cards import build_prompt_card  # noqa: PLC0415
+
+        body = {"text": spec.body}
+        body.update(
+            build_prompt_card(
+                spec,
+                secret=self._callback_secret,
+                space=chat.native_id,
+                prompt_id=prompt_id,
+                expected_sender_native_id=expected_sender_native_id,
+                now=int(time.time()),
+                ttl_seconds=self.config.callback_token_ttl_seconds,
+            )
+        )
+        return body
 
     async def close_prompt(
         self,
@@ -689,6 +786,7 @@ class GoogleChatTransport:
         final_text: str | None = None,
     ) -> None:
         self._pending_prompts.pop(prompt.native_id, None)
+        self._pending_prompt_messages.pop(prompt.native_id, None)
 
     async def inject_prompt_reply(
         self,

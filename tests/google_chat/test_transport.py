@@ -32,6 +32,13 @@ def _card_click_payload(token: str, *, user: str = "users/111") -> dict:
     return payload
 
 
+def _dialog_submit_payload(token: str, *, user: str = "users/111") -> dict:
+    payload = json.loads((FIXTURES / "dialog_submit_text.json").read_text())
+    payload["user"]["name"] = user
+    payload["common"]["parameters"]["callback_token"] = token
+    return payload
+
+
 def test_google_chat_transport_has_expected_identity():
     cfg = GoogleChatConfig(service_account_file="/tmp/key.json", allowed_audiences=["https://x.test/google-chat/events"])
     transport = GoogleChatTransport(config=cfg)
@@ -284,6 +291,117 @@ class _FakeClient:
     async def update_message(self, message_name, body, *, update_mask, allow_missing=False):
         self.calls.append({"message_name": message_name, "body": body, "update_mask": update_mask})
         return {"name": message_name}
+
+
+@pytest.mark.asyncio
+async def test_update_prompt_edits_pending_prompt_message():
+    fake = _FakeClient()
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+        client=fake,
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+
+    display_prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="status", title="Status", body="Working", kind=PromptKind.DISPLAY),
+    )
+    await transport.update_prompt(
+        display_prompt,
+        PromptSpec(key="status", title="Status", body="Still working", kind=PromptKind.DISPLAY),
+    )
+
+    display_update = fake.calls[-1]
+    assert display_update["message_name"] == "spaces/AAA/messages/1"
+    assert display_update["body"] == {"text": "Still working"}
+    assert display_update["update_mask"] == "text"
+
+    text_prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="name", title="Name", body="Enter name", kind=PromptKind.TEXT),
+    )
+    await transport.update_prompt(
+        text_prompt,
+        PromptSpec(key="name", title="Name", body="Enter full name", kind=PromptKind.TEXT),
+    )
+
+    text_update = fake.calls[-1]
+    assert text_update["message_name"] == "spaces/AAA/messages/2"
+    assert text_update["body"]["text"] == "Enter full name"
+    assert text_update["body"]["cardsV2"][0]["cardId"] == "lp2c-prompt"
+    assert text_update["update_mask"] == "text,cardsV2"
+
+
+@pytest.mark.asyncio
+async def test_dialog_submit_routes_to_prompt_submit_handler():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            callback_token_ttl_seconds=60,
+        ),
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission.text))
+
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="name", title="Name", body="Enter name", kind=PromptKind.TEXT),
+    )
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "sender": "users/111",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+
+    await transport.dispatch_event(_dialog_submit_payload(token))
+
+    assert seen == ["typed-answer"]
+    assert prompt.native_id not in transport._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_dialog_submit_rejects_wrong_sender_when_bound():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(
+            allowed_audiences=["https://x.test/google-chat/events"],
+            callback_token_ttl_seconds=60,
+        ),
+        serve=False,
+    )
+    chat = ChatRef("google_chat", "spaces/AAA", ChatKind.DM)
+    seen = []
+    transport.on_prompt_submit(lambda submission: seen.append(submission.text))
+
+    prompt = await transport.open_prompt(
+        chat,
+        PromptSpec(key="name", title="Name", body="Enter name", kind=PromptKind.TEXT),
+        expected_sender_native_id="users/111",
+    )
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={
+            "space": "spaces/AAA",
+            "sender": "users/111",
+            "kind": "prompt",
+            "prompt_id": prompt.native_id,
+        },
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+
+    await transport.dispatch_event(_dialog_submit_payload(token, user="users/222"))
+
+    assert seen == []
+    assert prompt.native_id in transport._pending_prompts
 
 
 @pytest.mark.asyncio
