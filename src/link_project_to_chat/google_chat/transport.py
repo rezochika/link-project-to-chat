@@ -4,8 +4,9 @@ import asyncio
 import inspect
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from link_project_to_chat.config import GoogleChatConfig
@@ -86,11 +87,17 @@ class GoogleChatTransport:
         *,
         config: GoogleChatConfig,
         client: "GoogleChatClient | None" = None,
+        credentials_factory: Callable[[str, tuple[str, ...]], Any] | None = None,
+        serve: bool = True,
     ) -> None:
         self.config = config
-        # Tests pass a fake here; production wiring constructs the real
-        # `GoogleChatClient` in `start()` once Task 9 lands.
         self.client = client
+        self._credentials_factory = credentials_factory
+        self._serve = serve
+        self._http = None
+        self._consumer_task: asyncio.Task | None = None
+        self._server_task: asyncio.Task | None = None
+        self._uvicorn_server = None
         self.self_identity = Identity(
             transport_id="google_chat",
             native_id="google_chat:app",
@@ -144,7 +151,18 @@ class GoogleChatTransport:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """No-op in v1; real HTTP server startup is wired in the app layer."""
+        """Prepare outbound Google Chat API access and fire readiness hooks."""
+        if self.client is None and self.config.service_account_file:
+            from .client import GoogleChatClient  # noqa: PLC0415
+            from .credentials import build_google_chat_http_client  # noqa: PLC0415
+            from .validators import validate_google_chat_for_start  # noqa: PLC0415
+
+            validate_google_chat_for_start(self.config)
+            self._http = build_google_chat_http_client(
+                self.config,
+                credentials_factory=self._credentials_factory,
+            )
+            self.client = GoogleChatClient(http=self._http)
         await self._fire_on_ready()
 
     async def stop(self) -> None:
@@ -156,6 +174,9 @@ class GoogleChatTransport:
                     await result
             except Exception:
                 logger.exception("GoogleChatTransport: on_stop callback raised")
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     def run(self) -> None:
         """Synchronous entry point. Google Chat uses HTTP push (no polling loop).
