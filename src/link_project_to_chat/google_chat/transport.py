@@ -145,6 +145,7 @@ class GoogleChatTransport:
 
     async def start(self) -> None:
         """No-op in v1; real HTTP server startup is wired in the app layer."""
+        await self._fire_on_ready()
 
     async def stop(self) -> None:
         """Fire registered on_stop callbacks then clean up state."""

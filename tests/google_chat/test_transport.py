@@ -153,6 +153,19 @@ async def test_on_ready_callbacks_fire_with_self_identity():
 
 
 @pytest.mark.asyncio
+async def test_start_fires_on_ready_callbacks_with_self_identity():
+    transport = GoogleChatTransport(
+        config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
+    )
+    fired_with = []
+    transport.on_ready(lambda identity: fired_with.append(identity))
+
+    await transport.start()
+
+    assert fired_with == [transport.self_identity]
+
+
+@pytest.mark.asyncio
 async def test_send_typing_is_noop_and_does_not_raise():
     transport = GoogleChatTransport(
         config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]),
