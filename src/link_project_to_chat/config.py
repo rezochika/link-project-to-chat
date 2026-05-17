@@ -366,6 +366,7 @@ class GoogleChatConfig:
     callback_token_ttl_seconds: int = 900
     pending_prompt_ttl_seconds: int = 900
     max_message_bytes: int = 32_000
+    attachment_max_bytes: int = 25_000_000
 
 
 @dataclass
@@ -912,6 +913,7 @@ def _parse_google_chat(raw: object) -> GoogleChatConfig:
         callback_token_ttl_seconds=int(raw.get("callback_token_ttl_seconds", 900)),
         pending_prompt_ttl_seconds=int(raw.get("pending_prompt_ttl_seconds", 900)),
         max_message_bytes=int(raw.get("max_message_bytes", 32_000)),
+        attachment_max_bytes=int(raw.get("attachment_max_bytes", 25_000_000)),
     )
 
 
@@ -931,6 +933,7 @@ def _serialize_google_chat(cfg: GoogleChatConfig) -> dict:
         "callback_token_ttl_seconds": cfg.callback_token_ttl_seconds,
         "pending_prompt_ttl_seconds": cfg.pending_prompt_ttl_seconds,
         "max_message_bytes": cfg.max_message_bytes,
+        "attachment_max_bytes": cfg.attachment_max_bytes,
     }
 
 

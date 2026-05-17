@@ -87,10 +87,57 @@ def test_aud_mismatch_exhausts_all_audiences_and_raises():
         )
 
 
-def test_project_number_default_jwt_verifier_surfaces_not_implemented():
-    with pytest.raises(NotImplementedError, match="project_number JWT verification"):
-        verify_google_chat_request(
-            headers={"authorization": "Bearer token"},
-            mode="project_number",
-            audiences=["123"],
-        )
+def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
+    from link_project_to_chat.google_chat import auth as auth_mod
+
+    sample_claims = {"iss": "chat@system.gserviceaccount.com", "aud": "123", "exp": 1770000000, "sub": "chat"}
+    fetch_calls = []
+
+    def fake_jwt_decode(token, certs, audience):
+        assert token == "fake-jwt"
+        assert audience == "123"
+        assert isinstance(certs, dict)
+        return sample_claims
+
+    def fake_fetch_certs():
+        fetch_calls.append("fetch")
+        return {"kid1": "PEM-BODY"}
+
+    monkeypatch.setattr(auth_mod, "_CHAT_CERTS_CACHE", None)
+    monkeypatch.setattr(auth_mod, "_fetch_chat_certs", fake_fetch_certs)
+    monkeypatch.setattr(auth_mod, "_decode_chat_jwt", fake_jwt_decode)
+
+    verified = auth_mod.verify_google_chat_request(
+        headers={"authorization": "Bearer fake-jwt"},
+        mode="project_number",
+        audiences=["123"],
+    )
+
+    assert verified.audience == "123"
+    assert verified.auth_mode == "project_number"
+
+    again = auth_mod.verify_google_chat_request(
+        headers={"authorization": "Bearer fake-jwt"},
+        mode="project_number",
+        audiences=["123"],
+    )
+    assert again.audience == "123"
+    assert fetch_calls == ["fetch"]
+
+
+def test_decode_chat_jwt_passes_certs_and_audience_to_google_auth(monkeypatch):
+    from google.auth import jwt as google_jwt
+
+    from link_project_to_chat.google_chat import auth as auth_mod
+
+    calls = []
+    claims = {"iss": "chat@system.gserviceaccount.com", "aud": "aud"}
+
+    def fake_decode(*args, **kwargs):
+        calls.append((args, kwargs))
+        return claims
+
+    monkeypatch.setattr(google_jwt, "decode", fake_decode)
+
+    assert auth_mod._decode_chat_jwt("token", {"kid": "pem"}, "aud") is claims
+    assert calls == [(("token",), {"certs": {"kid": "pem"}, "audience": "aud"})]

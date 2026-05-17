@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 
@@ -39,8 +40,61 @@ class GoogleChatClient:
         response = await self._http.patch(f"/v1/{message_name}", json=body, params=params)
         return response.json()
 
-    async def upload_attachment(self, space: str, path: Path, *, mime_type: str | None) -> dict:
-        raise NotImplementedError("Google Chat upload support lands in Task 11")
+    async def upload_attachment(
+        self,
+        space: str,
+        path: Path,
+        *,
+        mime_type: str | None,
+        max_bytes: int = 25_000_000,
+        display_name: str | None = None,
+    ) -> dict:
+        """Upload using Google Chat media.upload.
 
-    async def download_attachment(self, resource_name: str, destination: Path) -> None:
-        raise NotImplementedError("Google Chat download support lands in Task 11")
+        This endpoint requires a user-authenticated HTTP client with Chat
+        message scopes. The default transport uses service-account app auth
+        (`chat.bot`) and therefore does not call this helper.
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be > 0")
+        size_bytes = path.stat().st_size
+        if size_bytes > max_bytes:
+            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+
+        metadata = {"filename": display_name or path.name}
+        with path.open("rb") as fh:
+            response = await self._http.post(
+                f"/upload/v1/{space}/attachments:upload",
+                params={"uploadType": "multipart"},
+                files={
+                    "metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),
+                    "file": (path.name, fh, mime_type or "application/octet-stream"),
+                },
+            )
+        return response.json()
+
+    async def download_attachment(
+        self,
+        resource_name: str,
+        destination: Path,
+        *,
+        max_bytes: int = 25_000_000,
+    ) -> None:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be > 0")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        try:
+            async with self._http.stream("GET", f"/v1/media/{resource_name}?alt=media") as response:
+                if hasattr(response, "raise_for_status"):
+                    response.raise_for_status()
+                with destination.open("wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise ValueError(f"Google Chat attachment exceeds max_bytes={max_bytes}")
+                        fh.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise

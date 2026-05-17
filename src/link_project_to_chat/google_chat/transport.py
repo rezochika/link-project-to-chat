@@ -1,19 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import logging
+import secrets
+import socket
+import tempfile
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.transport.base import (
+    ButtonClick,
     ChatKind,
     ChatRef,
     CommandInvocation,
     Identity,
+    IncomingFile,
     IncomingMessage,
     MessageRef,
     PromptKind,
@@ -30,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 PROMPT_CANCEL_OPTION = "__cancel__"
 PROMPT_TIMEOUT_OPTION = "__timeout__"
+SERVER_START_TIMEOUT_SECONDS = 5.0
+SERVER_STOP_TIMEOUT_SECONDS = 5.0
+EVENT_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -57,17 +70,24 @@ def _identity_from_user(user: dict) -> Identity:
     )
 
 
-def _has_unsupported_attachment(message_data: dict) -> bool:
-    """Return True if any attachment in the message cannot be delivered in v1.
+def _safe_attachment_name(content_name: object, *, fallback: str = "attachment") -> str:
+    raw_name = str(content_name or fallback).replace("\\", "/")
+    leaf = raw_name.rsplit("/", 1)[-1].strip()
+    if leaf in {"", ".", ".."}:
+        return fallback
+    return leaf
 
-    - driveDataRef: requires OAuth Drive scopes not provisioned in v1.
-    - attachmentDataRef: download_attachment is NotImplementedError in v1.
-    Any non-empty attachment list is conservatively flagged as unsupported.
-    """
-    for attachment in message_data.get("attachment", []):
-        if "driveDataRef" in attachment or "attachmentDataRef" in attachment:
-            return True
-    return False
+
+def _unique_destination(directory: Path, name: str, used_names: set[str]) -> Path:
+    candidate = name
+    stem = Path(name).stem or "attachment"
+    suffix = Path(name).suffix
+    counter = 1
+    while candidate in used_names:
+        candidate = f"{stem}-{counter}{suffix}"
+        counter += 1
+    used_names.add(candidate)
+    return directory / candidate
 
 
 class GoogleChatTransport:
@@ -86,11 +106,19 @@ class GoogleChatTransport:
         *,
         config: GoogleChatConfig,
         client: "GoogleChatClient | None" = None,
+        credentials_factory: Callable[[str, tuple[str, ...]], Any] | None = None,
+        serve: bool = True,
     ) -> None:
         self.config = config
-        # Tests pass a fake here; production wiring constructs the real
-        # `GoogleChatClient` in `start()` once Task 9 lands.
         self.client = client
+        self._credentials_factory = credentials_factory
+        self._serve = serve
+        self._http = None
+        self._consumer_task: asyncio.Task | None = None
+        self._server_task: asyncio.Task | None = None
+        self._uvicorn_server = None
+        self._server_socket: socket.socket | None = None
+        self._owns_client = False
         self.self_identity = Identity(
             transport_id="google_chat",
             native_id="google_chat:app",
@@ -109,14 +137,37 @@ class GoogleChatTransport:
         self._command_handlers: dict[str, object] = {}
         self._button_handlers: list = []
         self._stop_callbacks: list = []
+        self._on_ready_callbacks: list = []
         self._authorizer = None
         self._pending_prompts: dict[str, PendingPrompt] = {}
+        self._pending_prompt_messages: dict[str, MessageRef] = {}
         self._prompt_submit_handlers: list = []
         self._prompt_seq: int = 0
+        self._callback_secret: bytes = secrets.token_bytes(32)
+        self._seen_event_cache: OrderedDict[str, float] = OrderedDict()
+        self._seen_event_cache_max = 4096
+        self._seen_event_ttl_seconds = 600.0
 
     @property
     def pending_event_count(self) -> int:
         return self._pending_events.qsize()
+
+    @property
+    def bound_port(self) -> int:
+        """Return the active HTTP port, including the OS-assigned port for 0."""
+        if self._server_socket is not None:
+            sockname = self._server_socket.getsockname()
+            if isinstance(sockname, tuple) and len(sockname) >= 2:
+                return int(sockname[1])
+        servers = getattr(self._uvicorn_server, "servers", None)
+        if servers:
+            for server in servers:
+                sockets = getattr(server, "sockets", None) or []
+                for sock in sockets:
+                    sockname = sock.getsockname()
+                    if isinstance(sockname, tuple) and len(sockname) >= 2:
+                        return int(sockname[1])
+        return int(self.config.port)
 
     def verify_request(self, headers) -> "VerifiedGoogleChatRequest":
         from .auth import verify_google_chat_request  # noqa: PLC0415
@@ -124,8 +175,15 @@ class GoogleChatTransport:
         return verify_google_chat_request(
             headers=headers,
             mode=self.config.auth_audience_type,
-            audiences=self.config.allowed_audiences,
+            audiences=self._effective_allowed_audiences(),
         )
+
+    def _effective_allowed_audiences(self) -> list[str]:
+        if self.config.allowed_audiences:
+            return self.config.allowed_audiences
+        if self.config.auth_audience_type == "project_number" and self.config.project_number:
+            return [self.config.project_number]
+        return []
 
     async def enqueue_verified_event(
         self,
@@ -143,10 +201,59 @@ class GoogleChatTransport:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """No-op in v1; real HTTP server startup is wired in the app layer."""
+        """Prepare outbound Google Chat API access and fire readiness hooks."""
+        from .validators import validate_google_chat_for_start  # noqa: PLC0415
+
+        validate_google_chat_for_start(self.config)
+        should_start_server = self._serve and (self._server_task is None or self._server_task.done())
+        try:
+            if should_start_server and self._server_socket is None:
+                # Prove the bind before on_ready, but do not accept HTTP
+                # traffic until callbacks have registered plugins/hooks.
+                self._server_socket = self._bind_server_socket()
+            if self.client is None:
+                from .client import GoogleChatClient  # noqa: PLC0415
+                from .credentials import build_google_chat_http_client  # noqa: PLC0415
+
+                self._http = build_google_chat_http_client(
+                    self.config,
+                    credentials_factory=self._credentials_factory,
+                )
+                self.client = GoogleChatClient(http=self._http)
+                self._owns_client = True
+            await self._fire_on_ready()
+            if self._consumer_task is None or self._consumer_task.done():
+                self._consumer_task = asyncio.create_task(
+                    self._consume_events(),
+                    name="google-chat-consumer",
+                )
+            if should_start_server:
+                await self._start_server()
+        except BaseException:
+            await self._cleanup_after_failed_start()
+            raise
 
     async def stop(self) -> None:
-        """Fire registered on_stop callbacks then clean up state."""
+        """Stop intake, drain queued work, fire callbacks, and clean up state.
+
+        Google Chat shuts down HTTP intake before plugin callbacks so no new
+        inbound events arrive during shutdown. Outbound REST resources stay
+        alive until after callbacks so plugins can send final messages.
+        """
+        await self._stop_server()
+        if self._consumer_task is not None:
+            try:
+                await asyncio.wait_for(self._pending_events.join(), timeout=EVENT_DRAIN_TIMEOUT_SECONDS)
+            except TimeoutError:
+                logger.warning("GoogleChatTransport: timed out draining pending events during stop")
+        if self._consumer_task is not None:
+            consumer_task = self._consumer_task
+            self._consumer_task = None
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
         for cb in self._stop_callbacks:
             try:
                 result = cb()
@@ -154,19 +261,137 @@ class GoogleChatTransport:
                     await result
             except Exception:
                 logger.exception("GoogleChatTransport: on_stop callback raised")
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+        if self._owns_client:
+            self.client = None
+            self._owns_client = False
 
     def run(self) -> None:
-        """Synchronous entry point. Google Chat uses HTTP push (no polling loop).
+        """Synchronous entry point for CLI use. Blocks for the transport lifetime."""
+        asyncio.run(self._run_with_lifecycle())
 
-        Production deployments call `start()` directly from the ASGI runner;
-        this method is a protocol stub that satisfies the Transport contract and
-        is used only in test/CLI contexts where the caller needs a blocking call.
-        """
-        import asyncio as _asyncio  # noqa: PLC0415
-        _asyncio.run(self.start())
+    async def _run_with_lifecycle(self) -> None:
+        await self.start()
+        try:
+            if self._server_task is not None:
+                await self._server_task
+            else:
+                await asyncio.Event().wait()
+        finally:
+            await self.stop()
+
+    async def _start_server(self) -> None:
+        from .app import create_google_chat_app  # noqa: PLC0415
+
+        import uvicorn  # noqa: PLC0415
+
+        bound_socket = self._server_socket
+        if bound_socket is None:
+            bound_socket = self._bind_server_socket()
+        self._server_socket = None
+        app = create_google_chat_app(self)
+        config = uvicorn.Config(
+            app,
+            host=self.config.host,
+            port=self.config.port,
+            lifespan="off",
+            log_level="warning",
+        )
+        self._uvicorn_server = uvicorn.Server(config)
+        self._server_task = asyncio.create_task(
+            self._uvicorn_server.serve(sockets=[bound_socket]),
+            name="google-chat-uvicorn",
+        )
+        try:
+            async with asyncio.timeout(SERVER_START_TIMEOUT_SECONDS):
+                while not self._uvicorn_server.started:
+                    if self._server_task.done():
+                        try:
+                            await self._server_task
+                        except BaseException as exc:
+                            raise self._server_start_error(exc) from exc
+                        raise self._server_start_error()
+                    await asyncio.sleep(0.01)
+            bound_socket = None
+        except TimeoutError as exc:
+            await self._stop_server()
+            raise self._server_start_error("timed out") from exc
+        finally:
+            if bound_socket is not None:
+                bound_socket.close()
+
+    def _bind_server_socket(self) -> socket.socket:
+        family = socket.AF_INET6 if ":" in self.config.host else socket.AF_INET
+        sock = socket.socket(family)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self.config.host, self.config.port))
+        except OSError as exc:
+            sock.close()
+            raise self._server_start_error(exc) from exc
+        sock.set_inheritable(True)
+        return sock
+
+    def _server_start_error(self, reason: object | None = None) -> RuntimeError:
+        message = f"Failed to start Google Chat HTTP server on {self.config.host}:{self.config.port}"
+        if reason is not None:
+            message = f"{message}: {reason}"
+        return RuntimeError(message)
+
+    async def _stop_server(self) -> None:
+        if self._server_socket is not None:
+            self._server_socket.close()
+            self._server_socket = None
+        if self._uvicorn_server is not None:
+            self._uvicorn_server.should_exit = True
+        if self._server_task is not None:
+            server_task = self._server_task
+            self._server_task = None
+            try:
+                await asyncio.wait_for(server_task, timeout=SERVER_STOP_TIMEOUT_SECONDS)
+            except TimeoutError:
+                server_task.cancel()
+                try:
+                    await server_task
+                except BaseException:
+                    pass
+            except BaseException:
+                pass
+        self._uvicorn_server = None
+
+    async def _cleanup_after_failed_start(self) -> None:
+        await self._stop_server()
+        if self._consumer_task is not None:
+            consumer_task = self._consumer_task
+            self._consumer_task = None
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+        if self._owns_client:
+            self.client = None
+            self._owns_client = False
 
     def on_stop(self, callback) -> None:
         self._stop_callbacks.append(callback)
+
+    def on_ready(self, callback) -> None:
+        self._on_ready_callbacks.append(callback)
+
+    async def _fire_on_ready(self) -> None:
+        for cb in self._on_ready_callbacks:
+            try:
+                result = cb(self.self_identity)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("GoogleChatTransport: on_ready callback raised")
 
     # ── Inbound registration ──────────────────────────────────────────────
 
@@ -186,12 +411,63 @@ class GoogleChatTransport:
 
     async def dispatch_event(self, payload: dict) -> None:
         event_type = payload.get("type")
+        if event_type in {"MESSAGE", "APP_COMMAND", "CARD_CLICKED"}:
+            key = self._event_idempotency_key(payload)
+            if key is not None and self._seen_event(key):
+                logger.debug("GoogleChatTransport: suppressing duplicate event type=%r", event_type)
+                return
         if event_type == "MESSAGE":
             await self._dispatch_message(payload)
         elif event_type == "APP_COMMAND":
             await self._dispatch_app_command(payload)
+        elif event_type == "CARD_CLICKED":
+            await self._dispatch_card_clicked(payload)
         else:
             logger.debug("GoogleChatTransport: ignoring unknown event type %r", event_type)
+
+    async def _consume_events(self) -> None:
+        while True:
+            envelope = await self._pending_events.get()
+            try:
+                await self.dispatch_event(envelope["payload"])
+            except Exception:
+                logger.exception("GoogleChatTransport: queued event dispatch failed")
+            finally:
+                self._pending_events.task_done()
+
+    def _event_idempotency_key(self, payload: dict) -> str | None:
+        parts = {
+            "type": payload.get("type"),
+            "eventTime": payload.get("eventTime"),
+            "space.name": payload.get("space", {}).get("name"),
+            "message.name": payload.get("message", {}).get("name"),
+            "user.name": payload.get("user", {}).get("name"),
+        }
+        if all(value is None for value in parts.values()):
+            return None
+        encoded = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _seen_event(self, key: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self._seen_event_ttl_seconds
+        while self._seen_event_cache:
+            oldest_key, oldest_seen_at = next(iter(self._seen_event_cache.items()))
+            if oldest_seen_at >= cutoff:
+                break
+            self._seen_event_cache.pop(oldest_key)
+        seen_at = self._seen_event_cache.get(key)
+        if seen_at is not None:
+            if seen_at < cutoff:
+                self._seen_event_cache.pop(key, None)
+            else:
+                self._seen_event_cache[key] = now
+                self._seen_event_cache.move_to_end(key)
+                return True
+        self._seen_event_cache[key] = now
+        while len(self._seen_event_cache) > self._seen_event_cache_max:
+            self._seen_event_cache.popitem(last=False)
+        return False
 
     async def _dispatch_message(self, payload: dict) -> None:
         chat = _chat_from_space(payload["space"])
@@ -211,24 +487,61 @@ class GoogleChatTransport:
             chat,
             native={"thread_name": thread_name} if thread_name else {},
         )
-        has_unsupported_media = _has_unsupported_attachment(message_data)
-        msg = IncomingMessage(
-            chat=chat,
-            sender=sender,
-            text=text,
-            files=[],
-            reply_to=None,
-            message=message,
-            has_unsupported_media=has_unsupported_media,
-        )
-        for handler in self._message_handlers:
-            result = handler(msg)
-            if inspect.isawaitable(result):
-                await result
+        tempdir: tempfile.TemporaryDirectory | None = None
+        try:
+            files: list[IncomingFile] = []
+            has_unsupported_media = False
+            used_names: set[str] = set()
+            for attachment in message_data.get("attachment", []):
+                data_ref = attachment.get("attachmentDataRef")
+                resource_name = data_ref.get("resourceName") if isinstance(data_ref, dict) else None
+                if "driveDataRef" in attachment or not resource_name or self.client is None:
+                    has_unsupported_media = True
+                    continue
+
+                if tempdir is None:
+                    tempdir = tempfile.TemporaryDirectory(prefix="lptc-google-chat-")
+                original_name = _safe_attachment_name(attachment.get("contentName"))
+                destination = _unique_destination(Path(tempdir.name), original_name, used_names)
+                try:
+                    await self.client.download_attachment(
+                        resource_name,
+                        destination,
+                        max_bytes=self.config.attachment_max_bytes,
+                    )
+                except Exception:
+                    logger.exception("GoogleChatTransport: attachment download failed")
+                    has_unsupported_media = True
+                    continue
+                files.append(
+                    IncomingFile(
+                        path=destination,
+                        original_name=original_name,
+                        mime_type=attachment.get("contentType"),
+                        size_bytes=destination.stat().st_size,
+                    ),
+                )
+
+            msg = IncomingMessage(
+                chat=chat,
+                sender=sender,
+                text=text,
+                files=[] if has_unsupported_media else files,
+                reply_to=None,
+                message=message,
+                has_unsupported_media=has_unsupported_media,
+            )
+            for handler in self._message_handlers:
+                result = handler(msg)
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            if tempdir is not None:
+                tempdir.cleanup()
 
     async def _dispatch_app_command(self, payload: dict) -> None:
         app_command_id = payload["appCommandMetadata"]["appCommandId"]
-        if app_command_id != self.config.root_command_id:
+        if self.config.root_command_id is None or app_command_id != self.config.root_command_id:
             logger.debug(
                 "GoogleChatTransport: ignoring appCommandId=%d (root_command_id=%s)",
                 app_command_id,
@@ -238,6 +551,13 @@ class GoogleChatTransport:
 
         chat = _chat_from_space(payload["space"])
         sender = _identity_from_user(payload["user"])
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
+
         message_data = payload["message"]
         raw_text = message_data.get("text", "")
         thread_name = message_data.get("thread", {}).get("name")
@@ -267,6 +587,88 @@ class GoogleChatTransport:
             if inspect.isawaitable(result):
                 await result
 
+    async def _dispatch_card_clicked(self, payload: dict) -> None:
+        from .cards import CallbackTokenError, verify_callback_token  # noqa: PLC0415
+
+        chat = _chat_from_space(payload["space"])
+        sender = _identity_from_user(payload["user"])
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
+
+        action = payload.get("action", {})
+        params = {param.get("key"): param.get("value") for param in action.get("parameters", [])}
+        common = payload.get("common", {})
+        common_params = common.get("parameters", {})
+        if isinstance(common_params, dict):
+            params.update(common_params)
+        token = params.get("callback_token")
+        if not token:
+            logger.warning("CARD_CLICKED missing callback_token; dropping")
+            return
+        try:
+            verified = verify_callback_token(
+                secret=self._callback_secret,
+                token=token,
+                now=int(time.time()),
+            )
+        except CallbackTokenError as exc:
+            logger.warning("CARD_CLICKED callback_token rejected: %s", exc)
+            return
+
+        if verified.get("space") != chat.native_id:
+            logger.warning("CARD_CLICKED callback_token bound to a different space; dropping")
+            return
+
+        kind = verified.get("kind")
+        value = verified.get("value")
+        if kind == "button":
+            message = MessageRef(
+                transport_id="google_chat",
+                native_id=payload["message"]["name"],
+                chat=chat,
+            )
+            click = ButtonClick(
+                chat=chat,
+                message=message,
+                sender=sender,
+                value=value or "",
+                native=payload,
+            )
+            for handler in self._button_handlers:
+                result = handler(click)
+                if inspect.isawaitable(result):
+                    await result
+        elif kind == "prompt":
+            prompt_id = verified.get("prompt_id")
+            pending = self._pending_prompts.get(prompt_id)
+            if pending is None:
+                logger.debug("CARD_CLICKED prompt_id=%r not pending; dropping", prompt_id)
+                return
+            expected_sender = verified.get("sender")
+            if expected_sender and expected_sender != sender.native_id:
+                logger.warning("CARD_CLICKED prompt sender mismatch; dropping")
+                return
+            if pending.sender is not None and pending.sender.native_id != sender.native_id:
+                logger.warning("CARD_CLICKED pending prompt sender mismatch; dropping")
+                return
+            if pending.expires_at < time.monotonic():
+                self._pending_prompts.pop(prompt_id, None)
+                self._pending_prompt_messages.pop(prompt_id, None)
+                logger.debug("CARD_CLICKED prompt_id=%r expired; dropping", prompt_id)
+                return
+            self._pending_prompts.pop(prompt_id, None)
+            self._pending_prompt_messages.pop(prompt_id, None)
+            form_field = params.get("form_field")
+            if form_field:
+                text = self._extract_form_input(payload, form_field)
+                await self.inject_prompt_reply(pending.prompt, sender=sender, text=text)
+            else:
+                await self.inject_prompt_reply(pending.prompt, sender=sender, option=value)
+
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _new_request_id(self) -> str:
@@ -282,7 +684,25 @@ class GoogleChatTransport:
     def render_markdown(self, text: str) -> str:
         return text
 
+    def _extract_form_input(self, payload: dict, form_field: str) -> str:
+        value = (
+            payload.get("common", {})
+            .get("formInputs", {})
+            .get(form_field, {})
+            .get("stringInputs", {})
+            .get("value", [])
+        )
+        if not value:
+            return ""
+        return str(value[0])
+
     # ── Outbound ──────────────────────────────────────────────────────────
+
+    async def send_typing(self, chat: ChatRef) -> None:
+        # Google Chat REST has no typing-indicator endpoint. Implementing as a
+        # no-op satisfies the Transport protocol so `ProjectBot._on_task_started`
+        # doesn't spam best-effort failures.
+        return None
 
     async def send_text(
         self,
@@ -295,17 +715,22 @@ class GoogleChatTransport:
     ) -> MessageRef:
         rendered = self.render_markdown(text) if html else text
         self._check_message_bytes(rendered)
-        if buttons is not None:
-            # Card rendering exists in `cards.build_buttons_card` but is not
-            # wired into the production send path yet — the inbound
-            # `CARD_CLICKED` dispatch is still a v1 deferred item. Warning
-            # rather than silently dropping so a caller learns the limit
-            # without a surprising no-button UI.
-            logger.warning(
-                "GoogleChatTransport.send_text: buttons argument is not yet wired; ignored",
-            )
         request_id = self._new_request_id()
         body = {"text": rendered}
+        if buttons is not None:
+            from .cards import build_buttons_card  # noqa: PLC0415
+
+            body.update(
+                build_buttons_card(
+                    buttons,
+                    secret=self._callback_secret,
+                    space=chat.native_id,
+                    sender="",
+                    message=request_id,
+                    now=int(time.time()),
+                    ttl_seconds=self.config.callback_token_ttl_seconds,
+                )
+            )
         native: dict[str, object] = {}
         if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
             native["thread_name"] = reply_to.native["thread_name"]
@@ -334,15 +759,22 @@ class GoogleChatTransport:
             return
         await self.client.update_message(msg.native_id, {"text": rendered}, update_mask="text", allow_missing=False)
 
-    async def send_file(self, chat, path, *, caption=None, display_name=None):
-        label = display_name or path.name
-        text = f"File upload is not supported for Google Chat yet: {label}"
-        if caption:
-            text = f"{caption}\n\n{text}"
-        return await self.send_text(chat, text)
+    async def send_file(
+        self,
+        chat,
+        path,
+        *,
+        caption=None,
+        display_name=None,
+        reply_to: MessageRef | None = None,
+    ):
+        file_name = display_name or Path(path).name
+        fallback = f"[Google Chat file upload is not available with app authentication: {file_name}]"
+        text = f"{caption}\n\n{fallback}" if caption else fallback
+        return await self.send_text(chat, text, reply_to=reply_to)
 
     async def send_voice(self, chat, path, *, reply_to=None):
-        return await self.send_text(chat, f"Voice upload is not supported for Google Chat yet: {path.name}", reply_to=reply_to)
+        return await self.send_file(chat, path, display_name=Path(path).name, reply_to=reply_to)
 
     # ── Prompt support ────────────────────────────────────────────────────
 
@@ -355,6 +787,7 @@ class GoogleChatTransport:
         spec: PromptSpec,
         *,
         reply_to: MessageRef | None = None,
+        expected_sender_native_id: str | None = None,
     ) -> PromptRef:
         prompt_id = f"p-{self._prompt_seq}"
         self._prompt_seq += 1
@@ -368,17 +801,107 @@ class GoogleChatTransport:
         self._pending_prompts[prompt_id] = PendingPrompt(
             prompt=ref,
             chat=chat,
-            sender=None,
+            sender=(
+                Identity("google_chat", expected_sender_native_id, expected_sender_native_id, None, False)
+                if expected_sender_native_id is not None
+                else None
+            ),
             kind=spec.kind,
             expires_at=expires_at,
         )
-        # Post the question as a plain message when a client is available.
-        if self.client is not None:
-            await self.send_text(chat, spec.body, reply_to=reply_to)
+        if self.client is None:
+            return ref
+        if spec.kind is PromptKind.DISPLAY:
+            self._pending_prompt_messages[prompt_id] = await self.send_text(chat, spec.body, reply_to=reply_to)
+            return ref
+
+        request_id = self._new_request_id()
+        body = self._build_prompt_message_body(
+            prompt_id=prompt_id,
+            spec=spec,
+            chat=chat,
+            expected_sender_native_id=expected_sender_native_id,
+        )
+        native: dict[str, object] = {}
+        if reply_to and isinstance(reply_to.native, dict) and reply_to.native.get("thread_name"):
+            native["thread_name"] = reply_to.native["thread_name"]
+        result = await self.client.create_message(
+            chat.native_id,
+            body,
+            thread_name=native.get("thread_name"),
+            request_id=request_id,
+        )
+        native["request_id"] = request_id
+        native["message_name"] = result["name"]
+        native["is_app_created"] = True
+        self._pending_prompt_messages[prompt_id] = MessageRef("google_chat", result["name"], chat, native=native)
         return ref
 
     async def update_prompt(self, prompt: PromptRef, spec: PromptSpec) -> None:
-        raise NotImplementedError("update_prompt not yet implemented for GoogleChatTransport")
+        msg = self._pending_prompt_messages.get(prompt.native_id)
+        if msg is None:
+            return
+        pending = self._pending_prompts.get(prompt.native_id)
+        was_posted_with_cards = pending is not None and pending.kind is not PromptKind.DISPLAY
+        if self.client is None:
+            return
+        if spec.kind is PromptKind.DISPLAY and not was_posted_with_cards:
+            await self.edit_text(msg, spec.body)
+            if pending is not None:
+                pending.kind = spec.kind
+            return
+        if spec.kind is PromptKind.DISPLAY:
+            self._check_message_bytes(spec.body)
+            await self.client.update_message(
+                msg.native_id,
+                {"text": spec.body, "cardsV2": []},
+                update_mask="text,cardsV2",
+                allow_missing=False,
+            )
+            if pending is not None:
+                pending.kind = spec.kind
+            return
+
+        expected_sender_native_id = pending.sender.native_id if pending and pending.sender is not None else None
+        body = self._build_prompt_message_body(
+            prompt_id=prompt.native_id,
+            spec=spec,
+            chat=prompt.chat,
+            expected_sender_native_id=expected_sender_native_id,
+        )
+        self._check_message_bytes(body["text"])
+        await self.client.update_message(
+            msg.native_id,
+            body,
+            update_mask="text,cardsV2",
+            allow_missing=False,
+        )
+        if pending is not None:
+            pending.kind = spec.kind
+
+    def _build_prompt_message_body(
+        self,
+        *,
+        prompt_id: str,
+        spec: PromptSpec,
+        chat: ChatRef,
+        expected_sender_native_id: str | None,
+    ) -> dict:
+        from .cards import build_prompt_card  # noqa: PLC0415
+
+        body = {"text": spec.body}
+        body.update(
+            build_prompt_card(
+                spec,
+                secret=self._callback_secret,
+                space=chat.native_id,
+                prompt_id=prompt_id,
+                expected_sender_native_id=expected_sender_native_id,
+                now=int(time.time()),
+                ttl_seconds=self.config.callback_token_ttl_seconds,
+            )
+        )
+        return body
 
     async def close_prompt(
         self,
@@ -387,6 +910,7 @@ class GoogleChatTransport:
         final_text: str | None = None,
     ) -> None:
         self._pending_prompts.pop(prompt.native_id, None)
+        self._pending_prompt_messages.pop(prompt.native_id, None)
 
     async def inject_prompt_reply(
         self,
