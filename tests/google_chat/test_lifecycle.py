@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from pathlib import Path
 
 import httpx
@@ -196,3 +197,38 @@ async def test_start_serves_http_endpoint(tmp_path):
         assert response.status_code == 401
     finally:
         await transport.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_port_conflict_cleans_up_partial_startup(tmp_path):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+
+    cfg = _runnable_cfg(tmp_path)
+    cfg.host = "127.0.0.1"
+    cfg.port = port
+
+    transport = GoogleChatTransport(
+        config=cfg,
+        credentials_factory=_fake_credentials_factory,
+        serve=True,
+    )
+    ready = []
+    transport.on_ready(lambda identity: ready.append(identity))
+
+    try:
+        with pytest.raises(RuntimeError, match=f"{cfg.host}:{cfg.port}"):
+            await transport.start()
+
+        assert ready == []
+        assert transport._consumer_task is None
+        assert transport.client is None
+        assert transport._http is None
+        assert transport._owns_client is False
+        assert transport._server_task is None
+        assert transport._uvicorn_server is None
+    finally:
+        listener.close()

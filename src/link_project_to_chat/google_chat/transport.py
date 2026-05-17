@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import socket
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -172,24 +173,28 @@ class GoogleChatTransport:
         from .validators import validate_google_chat_for_start  # noqa: PLC0415
 
         validate_google_chat_for_start(self.config)
-        if self.client is None:
-            from .client import GoogleChatClient  # noqa: PLC0415
-            from .credentials import build_google_chat_http_client  # noqa: PLC0415
+        try:
+            if self._serve and (self._server_task is None or self._server_task.done()):
+                await self._start_server()
+            if self.client is None:
+                from .client import GoogleChatClient  # noqa: PLC0415
+                from .credentials import build_google_chat_http_client  # noqa: PLC0415
 
-            self._http = build_google_chat_http_client(
-                self.config,
-                credentials_factory=self._credentials_factory,
-            )
-            self.client = GoogleChatClient(http=self._http)
-            self._owns_client = True
-        await self._fire_on_ready()
-        if self._consumer_task is None or self._consumer_task.done():
-            self._consumer_task = asyncio.create_task(
-                self._consume_events(),
-                name="google-chat-consumer",
-            )
-        if self._serve and (self._server_task is None or self._server_task.done()):
-            await self._start_server()
+                self._http = build_google_chat_http_client(
+                    self.config,
+                    credentials_factory=self._credentials_factory,
+                )
+                self.client = GoogleChatClient(http=self._http)
+                self._owns_client = True
+            if self._consumer_task is None or self._consumer_task.done():
+                self._consumer_task = asyncio.create_task(
+                    self._consume_events(),
+                    name="google-chat-consumer",
+                )
+            await self._fire_on_ready()
+        except BaseException:
+            await self._cleanup_after_failed_start()
+            raise
 
     async def stop(self) -> None:
         """Stop intake, drain queued work, fire callbacks, and clean up state."""
@@ -240,6 +245,7 @@ class GoogleChatTransport:
 
         import uvicorn  # noqa: PLC0415
 
+        bound_socket = self._bind_server_socket()
         app = create_google_chat_app(self)
         config = uvicorn.Config(
             app,
@@ -250,19 +256,44 @@ class GoogleChatTransport:
         )
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(
-            self._uvicorn_server.serve(),
+            self._uvicorn_server.serve(sockets=[bound_socket]),
             name="google-chat-uvicorn",
         )
         try:
             async with asyncio.timeout(SERVER_START_TIMEOUT_SECONDS):
                 while not self._uvicorn_server.started:
                     if self._server_task.done():
-                        await self._server_task
-                        raise RuntimeError("Google Chat HTTP server stopped before startup")
+                        try:
+                            await self._server_task
+                        except BaseException as exc:
+                            raise self._server_start_error(exc) from exc
+                        raise self._server_start_error()
                     await asyncio.sleep(0.01)
+            bound_socket = None
         except TimeoutError as exc:
             await self._stop_server()
-            raise RuntimeError("Timed out starting Google Chat HTTP server") from exc
+            raise self._server_start_error("timed out") from exc
+        finally:
+            if bound_socket is not None:
+                bound_socket.close()
+
+    def _bind_server_socket(self) -> socket.socket:
+        family = socket.AF_INET6 if ":" in self.config.host else socket.AF_INET
+        sock = socket.socket(family)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((self.config.host, self.config.port))
+        except OSError as exc:
+            sock.close()
+            raise self._server_start_error(exc) from exc
+        sock.set_inheritable(True)
+        return sock
+
+    def _server_start_error(self, reason: object | None = None) -> RuntimeError:
+        message = f"Failed to start Google Chat HTTP server on {self.config.host}:{self.config.port}"
+        if reason is not None:
+            message = f"{message}: {reason}"
+        return RuntimeError(message)
 
     async def _stop_server(self) -> None:
         if self._uvicorn_server is not None:
@@ -276,11 +307,28 @@ class GoogleChatTransport:
                 server_task.cancel()
                 try:
                     await server_task
-                except (asyncio.CancelledError, Exception):
+                except BaseException:
                     pass
-            except (asyncio.CancelledError, Exception):
+            except BaseException:
                 pass
         self._uvicorn_server = None
+
+    async def _cleanup_after_failed_start(self) -> None:
+        await self._stop_server()
+        if self._consumer_task is not None:
+            consumer_task = self._consumer_task
+            self._consumer_task = None
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
+        if self._owns_client:
+            self.client = None
+            self._owns_client = False
 
     def on_stop(self, callback) -> None:
         self._stop_callbacks.append(callback)
