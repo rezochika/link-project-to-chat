@@ -6,7 +6,7 @@
 
 **Architecture:** Land fixes in dependency order. First make the lifecycle work end-to-end (`on_ready`, validation, real client construction, queue consumer, uvicorn server). Then fix correctness gaps in app-command dispatch. Then close feature gaps (cards out, card-click in, dialog submit, attachments, project_number auth). End with doc alignment and a smoke test that boots the bot against the google_chat transport.
 
-**Tech Stack:** Python 3.14, `httpx`, `google-auth`, `fastapi[standard]` (`uvicorn`), pytest with `asyncio_mode=auto`. No new third-party dependencies.
+**Tech Stack:** Python `>=3.11` as declared by `pyproject.toml`, `httpx`, `google-auth`, `fastapi[standard]` (`uvicorn`), pytest with `asyncio_mode=auto`. No new third-party dependencies.
 
 **Reference findings:** 2026-05-17 audit (this conversation), original spec [`docs/superpowers/specs/2026-04-25-transport-google-chat-design.md`](../specs/2026-04-25-transport-google-chat-design.md), original plan [`docs/superpowers/plans/2026-05-16-google-chat-transport.md`](2026-05-16-google-chat-transport.md).
 
@@ -30,7 +30,7 @@
 
 - `src/link_project_to_chat/google_chat/transport.py` — heavy: add `on_ready`, real lifecycle, real client construction, queue consumer, authorizer on app commands, fix `root_command_id` log bug, CARD_CLICKED dispatch, real `update_prompt`, attachment download wiring, cards-out wiring.
 - `src/link_project_to_chat/google_chat/client.py` — implement `upload_attachment` and `download_attachment`.
-- `src/link_project_to_chat/google_chat/cards.py` — add `build_dialog_card` if missing; expose card-payload helpers used by transport.
+- `src/link_project_to_chat/google_chat/cards.py` — add `build_prompt_card` if missing; expose card-payload helpers used by transport.
 - `src/link_project_to_chat/google_chat/auth.py` — implement `_default_chat_jwt_verifier` against Google Chat JWKS.
 - `src/link_project_to_chat/google_chat/app.py` — no structural changes (single endpoint already handles every event type via `dispatch_event`); minor: pass headers through unchanged.
 - `tests/google_chat/test_transport.py` — extend for cards/buttons/prompts/attachments tests added per task.
@@ -39,7 +39,7 @@
 - `tests/google_chat/test_auth.py` — cover `project_number` JWKS verifier.
 - `README.md` — align "card buttons" and "attachment" wording with what now actually works.
 - `docs/CHANGELOG.md` — entry for the fix release.
-- `docs/TODO.md` — flip Google Chat row to reflect full parity; remove the v1-limitation list that no longer applies.
+- `docs/TODO.md` — flip Google Chat row to reflect implemented transport parity while preserving explicit v1.1 limitations (per-process callback secrets, in-memory dedupe, space-bound prompts by default, no Pub/Sub delivery).
 
 ---
 
@@ -1280,6 +1280,7 @@ def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
     from link_project_to_chat.google_chat import auth as auth_mod
 
     sample_claims = {"iss": "chat@system.gserviceaccount.com", "aud": "123", "exp": 1770000000, "sub": "chat"}
+    fetch_calls = []
 
     def fake_jwt_decode(token, certs, audience):
         assert token == "fake-jwt"
@@ -1288,8 +1289,10 @@ def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
         return sample_claims
 
     def fake_fetch_certs():
+        fetch_calls.append("fetch")
         return {"kid1": "PEM-BODY"}
 
+    monkeypatch.setattr(auth_mod, "_CHAT_CERTS_CACHE", None)
     monkeypatch.setattr(auth_mod, "_fetch_chat_certs", fake_fetch_certs)
     monkeypatch.setattr(auth_mod, "_decode_chat_jwt", fake_jwt_decode)
 
@@ -1301,6 +1304,16 @@ def test_default_chat_jwt_verifier_uses_injected_jwks(monkeypatch):
 
     assert verified.audience == "123"
     assert verified.auth_mode == "project_number"
+
+    # Second verification should reuse the process-local cert cache, not make
+    # another network fetch.
+    again = auth_mod.verify_google_chat_request(
+        headers={"authorization": "Bearer fake-jwt"},
+        mode="project_number",
+        audiences=["123"],
+    )
+    assert again.audience == "123"
+    assert fetch_calls == ["fetch"]
 ```
 
 - [ ] **Step 2: Verify RED**
@@ -1317,6 +1330,8 @@ In `auth.py`, replace `_default_chat_jwt_verifier` and add helpers:
 
 ```python
 _CHAT_CERTS_URL = "https://www.googleapis.com/service_accounts/v1/metadata/x509/chat@system.gserviceaccount.com"
+_CHAT_CERTS_CACHE_TTL_SECONDS = 3600.0
+_CHAT_CERTS_CACHE: tuple[float, dict] | None = None
 
 
 def _fetch_chat_certs() -> dict:
@@ -1328,6 +1343,23 @@ def _fetch_chat_certs() -> dict:
         return response.json()
 
 
+def _get_chat_certs(*, now: float | None = None) -> dict:
+    """Return Google Chat signing certs with a process-local TTL cache."""
+    global _CHAT_CERTS_CACHE
+
+    import time  # noqa: PLC0415
+
+    current = time.monotonic() if now is None else now
+    if _CHAT_CERTS_CACHE is not None:
+        fetched_at, certs = _CHAT_CERTS_CACHE
+        if current - fetched_at < _CHAT_CERTS_CACHE_TTL_SECONDS:
+            return certs
+
+    certs = _fetch_chat_certs()
+    _CHAT_CERTS_CACHE = (current, certs)
+    return certs
+
+
 def _decode_chat_jwt(token: str, certs: dict, audience: str) -> dict:
     from google.auth import jwt as google_jwt  # noqa: PLC0415
 
@@ -1335,7 +1367,7 @@ def _decode_chat_jwt(token: str, certs: dict, audience: str) -> dict:
 
 
 def _default_chat_jwt_verifier(token: str, audience: str) -> dict:
-    certs = _fetch_chat_certs()
+    certs = _get_chat_certs()
     return _decode_chat_jwt(token, certs, audience)
 ```
 
@@ -1986,9 +2018,15 @@ async def open_prompt(
     """Open a prompt. The optional `expected_sender_native_id` is a Google
     Chat-specific extension over the base Transport protocol: when set, the
     callback token binds to that user and `_dispatch_card_clicked` rejects
-    submissions whose `sender.native_id` does not match. When None (the
-    current bot.py call shape), the prompt is space-bound only — anyone in
-    the space may submit. Threading bot.py to populate this is a follow-up."""
+    submissions whose `sender.native_id` does not match.
+
+    v1.1 intentionally keeps bot.py unchanged: normal bot-driven prompts call
+    the base Transport protocol and remain space-bound, so any member of the
+    Google Chat space may submit. This is an explicit accepted limitation,
+    documented in Task 14; do not claim production wrong-user rejection unless
+    a later plan changes the base protocol and threads the originating sender
+    from bot.py into this keyword.
+    """
     from .cards import build_prompt_card  # noqa: PLC0415
 
     prompt_id = f"p-{self._prompt_seq}"
@@ -2783,7 +2821,12 @@ async def send_file(
     display_name: str | None = None,
     reply_to: MessageRef | None = None,
 ) -> MessageRef:
-    uploaded = await self.client.upload_attachment(chat.native_id, path, mime_type=None)
+    uploaded = await self.client.upload_attachment(
+        chat.native_id,
+        path,
+        mime_type=None,
+        max_bytes=self.config.attachment_max_bytes,
+    )
     body: dict = {"text": caption or "", "attachment": [uploaded]}
     request_id = self._new_request_id()
     native: dict[str, object] = {}
@@ -2815,7 +2858,8 @@ async def test_send_voice_preserves_reply_to_thread(tmp_path):
     captured: dict = {}
 
     class _FakeClient:
-        async def upload_attachment(self, space, path, *, mime_type):
+        async def upload_attachment(self, space, path, *, mime_type, max_bytes):
+            captured["max_bytes"] = max_bytes
             return {"attachmentDataRef": {"resourceName": "spaces/AAA/attachments/X"}}
 
         async def create_message(self, space, body, *, thread_name=None, request_id=None, message_reply_option=None):
@@ -2836,6 +2880,7 @@ async def test_send_voice_preserves_reply_to_thread(tmp_path):
     await transport.send_voice(chat, voice, reply_to=reply_target)
 
     assert captured["thread_name"] == "spaces/AAA/threads/T"
+    assert captured["max_bytes"] == cfg.attachment_max_bytes
 ```
 
 - [ ] **Step 5: Update the contract-suite fake to support upload**
@@ -2845,7 +2890,9 @@ async def test_send_voice_preserves_reply_to_thread(tmp_path):
 Replace the stub in `tests/transport/test_contract.py:70-74` with a working fake:
 
 ```python
-async def upload_attachment(self, space, path, *, mime_type=None) -> dict:
+async def upload_attachment(self, space, path, *, mime_type=None, max_bytes: int = 25_000_000) -> dict:
+    if path.stat().st_size > max_bytes:
+        raise ValueError(f"upload {path.name} exceeds max_bytes={max_bytes}")
     self._counter += 1
     return {
         "attachmentDataRef": {
@@ -2978,10 +3025,14 @@ Add a new entry at the top:
 
 - [ ] **Step 4: Update `docs/TODO.md`**
 
-Flip the `#4 Google Chat` row's limitation list to:
+Flip the `#4 Google Chat` row's limitation list to an explicit production-status
+summary. Do **not** call this "full parity" without caveats: callback tokens are
+per-process, duplicate-event idempotency is in-memory, normal prompts are
+space-bound by default, native inline `REQUEST_DIALOG` is deferred, and Pub/Sub
+delivery is still out of scope.
 
 ```markdown
-| #4 Google Chat | [spec](...) | [plan](...) | ✅ | HTTP Chat app events + Google Chat REST API; full lifecycle, cards in/out, attachment up/down, both audience modes. Pub/Sub delivery still HTTP-only (no Pub/Sub mode). |
+| #4 Google Chat | [spec](...) | [plan](...) | ✅ | HTTP Chat app events + Google Chat REST API; lifecycle, cards in/out, attachment up/down, and both audience modes implemented. v1.1 caveats: per-process callback tokens, in-memory event dedupe, space-bound prompts by default, native inline `REQUEST_DIALOG` deferred, and no Pub/Sub delivery mode. |
 ```
 
 - [ ] **Step 5: Commit**
