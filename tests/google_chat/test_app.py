@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import time
+import threading
 
 import pytest
 
@@ -55,9 +55,12 @@ async def test_route_fast_acks_valid_event():
 @pytest.mark.asyncio
 async def test_route_runs_slow_sync_verification_off_event_loop():
     transport = GoogleChatTransport(config=GoogleChatConfig(allowed_audiences=["https://x.test/google-chat/events"]))
+    verifier_started = threading.Event()
+    verifier_can_finish = threading.Event()
 
     def verifier(headers):
-        time.sleep(0.2)
+        verifier_started.set()
+        verifier_can_finish.wait(timeout=1.0)
         return VerifiedGoogleChatRequest(
             issuer="https://accounts.google.com",
             audience="https://x.test/google-chat/events",
@@ -73,15 +76,29 @@ async def test_route_runs_slow_sync_verification_off_event_loop():
         request_task = asyncio.create_task(
             client.post("/google-chat/events", headers={"authorization": "Bearer ok"}, json={"type": "MESSAGE"})
         )
+        try:
+            assert await asyncio.to_thread(verifier_started.wait, 1.0)
 
-        started = time.monotonic()
-        await asyncio.sleep(0.05)
-        sleep_elapsed = time.monotonic() - started
+            loop_ran = asyncio.Event()
 
-        assert sleep_elapsed < 0.15
-        assert not request_task.done()
+            async def set_loop_ran():
+                loop_ran.set()
 
-        response = await request_task
+            sentinel_task = asyncio.create_task(set_loop_ran())
+            await asyncio.wait_for(loop_ran.wait(), timeout=1.0)
+            await sentinel_task
+
+            assert not request_task.done()
+            verifier_can_finish.set()
+            response = await request_task
+        finally:
+            verifier_can_finish.set()
+            if not request_task.done():
+                request_task.cancel()
+                try:
+                    await request_task
+                except asyncio.CancelledError:
+                    pass
 
     assert response.status_code == 200
     assert transport.pending_event_count == 1
