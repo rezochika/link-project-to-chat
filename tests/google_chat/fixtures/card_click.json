@@ -1,0 +1,13 @@
+{
+  "type": "CARD_CLICKED",
+  "eventTime": "2026-05-17T00:00:00Z",
+  "space": {"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"},
+  "message": {"name": "spaces/AAA/messages/1"},
+  "user": {"name": "users/111", "displayName": "R"},
+  "action": {
+    "actionMethodName": "lp2c.button",
+    "parameters": [
+      {"key": "callback_token", "value": "REPLACED_AT_RUNTIME"}
+    ]
+  }
+}

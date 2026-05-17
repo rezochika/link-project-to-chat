@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from link_project_to_chat.config import GoogleChatConfig
 from link_project_to_chat.transport.base import (
+    ButtonClick,
     ChatKind,
     ChatRef,
     CommandInvocation,
@@ -390,6 +391,8 @@ class GoogleChatTransport:
             await self._dispatch_message(payload)
         elif event_type == "APP_COMMAND":
             await self._dispatch_app_command(payload)
+        elif event_type == "CARD_CLICKED":
+            await self._dispatch_card_clicked(payload)
         else:
             logger.debug("GoogleChatTransport: ignoring unknown event type %r", event_type)
 
@@ -483,6 +486,65 @@ class GoogleChatTransport:
             result = handler(ci)
             if inspect.isawaitable(result):
                 await result
+
+    async def _dispatch_card_clicked(self, payload: dict) -> None:
+        from .cards import CallbackTokenError, verify_callback_token  # noqa: PLC0415
+
+        chat = _chat_from_space(payload["space"])
+        sender = _identity_from_user(payload["user"])
+        if self._authorizer is not None:
+            allowed = self._authorizer(sender)
+            if inspect.isawaitable(allowed):
+                allowed = await allowed
+            if not allowed:
+                return
+
+        action = payload.get("action", {})
+        params = {param.get("key"): param.get("value") for param in action.get("parameters", [])}
+        token = params.get("callback_token")
+        if not token:
+            logger.warning("CARD_CLICKED missing callback_token; dropping")
+            return
+        try:
+            verified = verify_callback_token(
+                secret=self._callback_secret,
+                token=token,
+                now=int(time.time()),
+            )
+        except CallbackTokenError as exc:
+            logger.warning("CARD_CLICKED callback_token rejected: %s", exc)
+            return
+
+        if verified.get("space") != chat.native_id:
+            logger.warning("CARD_CLICKED callback_token bound to a different space; dropping")
+            return
+
+        kind = verified.get("kind")
+        value = verified.get("value")
+        if kind == "button":
+            message = MessageRef(
+                transport_id="google_chat",
+                native_id=payload["message"]["name"],
+                chat=chat,
+            )
+            click = ButtonClick(
+                chat=chat,
+                message=message,
+                sender=sender,
+                value=value or "",
+                native=payload,
+            )
+            for handler in self._button_handlers:
+                result = handler(click)
+                if inspect.isawaitable(result):
+                    await result
+        elif kind == "prompt":
+            prompt_id = verified.get("prompt_id")
+            prompt = self._pending_prompts.get(prompt_id)
+            if prompt is None:
+                logger.debug("CARD_CLICKED prompt_id=%r not pending; dropping", prompt_id)
+                return
+            await self.inject_prompt_reply(prompt.prompt, sender=sender, option=value)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

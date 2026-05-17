@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 from link_project_to_chat.config import Config, GoogleChatConfig
+from link_project_to_chat.google_chat.cards import make_callback_token
 from link_project_to_chat.google_chat.transport import GoogleChatTransport
 from link_project_to_chat.transport.base import (
     Button,
@@ -100,6 +102,31 @@ async def test_app_command_dropped_when_root_command_id_unset():
     await transport.dispatch_event(payload)
 
     assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_card_click_routes_to_button_handler(tmp_path):
+    cfg = GoogleChatConfig(
+        allowed_audiences=["https://x.test/google-chat/events"],
+        callback_token_ttl_seconds=60,
+        root_command_id=1,
+    )
+    transport = GoogleChatTransport(config=cfg, serve=False)
+
+    seen = []
+    transport.on_button(lambda click: seen.append(click.value))
+
+    token = make_callback_token(
+        secret=transport._callback_secret,
+        payload={"space": "spaces/AAA", "sender": "users/1", "kind": "button", "value": "run"},
+        ttl_seconds=60,
+        now=int(time.time()),
+    )
+    payload = json.loads((FIXTURES / "card_click.json").read_text())
+    payload["action"]["parameters"][0]["value"] = token
+
+    await transport.dispatch_event(payload)
+    assert seen == ["run"]
 
 
 class _FakeClient:
